@@ -1,0 +1,36 @@
+name = "world-cloudflare"
+main = "src/worker.ts"
+compatibility_date = "2024-11-27"
+compatibility_flags = ["nodejs_compat"]
+
+[durable_objects]
+bindings = [
+  { name = "WORKFLOW_DB", class_name = "WorkflowRunDO" },
+  { name = "WORKFLOW_STREAMS", class_name = "StreamDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowRunDO", "StreamDO"]
+
+# Cloudflare Queues configuration
+[[queues.producers]]
+binding = "WORKFLOW_QUEUE"
+queue = "workflow-queue"
+
+[[queues.consumers]]
+queue = "workflow-queue"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "workflow-dlq"
+
+# KV namespace for global indexing
+[[kv_namespaces]]
+binding = "WORKFLOW_INDEX"
+id = "preview_id"  # Replace with actual KV namespace ID in production
+
+[env.production]
+kv_namespaces = [
+  { binding = "WORKFLOW_INDEX", id = "production_id" }  # Replace with production KV ID
+]

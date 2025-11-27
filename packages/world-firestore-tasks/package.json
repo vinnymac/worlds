@@ -1,0 +1,61 @@
+{
+  "name": "@fantasticfour/world-firestore-tasks",
+  "version": "1.0.0",
+  "description": "GCP Firestore + Cloud Tasks World implementation with real-time streaming and excellent developer experience",
+  "type": "module",
+  "main": "dist/index.js",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fantasticfour/workflow.git",
+    "directory": "packages/world-firestore-tasks"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.10.0",
+    "@google-cloud/tasks": "^6.2.1",
+    "@vercel/queue": "catalog:",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "ulid": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/gcloud": "11.8.1",
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "axios": "1.13.2",
+    "testcontainers": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "keywords": [
+    "workflow",
+    "gcp",
+    "firestore",
+    "cloud-tasks",
+    "serverless",
+    "durable-functions",
+    "real-time"
+  ],
+  "author": "vinnymac",
+  "packageManager": "pnpm@10.23.0",
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

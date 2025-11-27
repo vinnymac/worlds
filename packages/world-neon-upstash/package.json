@@ -1,0 +1,68 @@
+{
+  "name": "@fantasticfour/world-neon-upstash",
+  "version": "1.0.0",
+  "description": "Serverless World implementation using Neon Postgres for storage and Upstash QStash for queue management - scales to zero with pay-per-use pricing",
+  "type": "module",
+  "main": "dist/index.js",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fantasticfour/workflow.git",
+    "directory": "packages/world-neon-upstash"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "node dist/cli.js",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.3",
+    "@upstash/qstash": "^2.7.38",
+    "@vercel/queue": "catalog:",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "dotenv": "catalog:",
+    "drizzle-orm": "catalog:",
+    "postgres": "catalog:",
+    "ulid": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "catalog:",
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "drizzle-kit": "catalog:",
+    "testcontainers": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "keywords": [
+    "workflow",
+    "neon",
+    "upstash",
+    "postgres",
+    "serverless",
+    "durable-functions",
+    "qstash"
+  ],
+  "author": "vinnymac",
+  "packageManager": "pnpm@10.23.0",
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

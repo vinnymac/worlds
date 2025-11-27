@@ -1,0 +1,46 @@
+{
+  "name": "fantasticfour-workflow",
+  "version": "1.0.0",
+  "description": "Monorepo for @fantasticfour workflow worlds",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fantasticfour/workflow.git"
+  },
+  "license": "Apache-2.0",
+  "author": "vinnymac",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "test": "turbo test",
+    "typecheck": "turbo typecheck",
+    "clean": "turbo clean",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "publish-packages": "pnpm build && changeset publish",
+    "prepare": "husky",
+    "ci:version": "changeset version",
+    "ci:publish": "pnpm build && pnpm publish -r"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.7",
+    "@changesets/cli": "^2.29.7",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "turbo": "^2.6.1",
+    "typescript": "^5.9.3"
+  },
+  "lint-staged": {
+    "**/*": "biome format --write --no-errors-on-unmatched"
+  },
+  "packageManager": "pnpm@10.23.0",
+  "engines": {
+    "node": "^18.0.0 || ^20.0.0 || ^22.0.0 || ^24.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "volta": {
+    "node": "22.21.1",
+    "pnpm": "10.23.0"
+  }
+}

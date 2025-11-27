@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig/node.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "node"],
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "outDir": "./dist"
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}

@@ -1,0 +1,69 @@
+# Workflow data
+.workflow-data
+
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.tsbuildinfo
+*.tsbuildinfo
+
+# Turborepo
+.turbo/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Temp
+tmp/
+temp/
+
+# Platform specific
+.vercel
+.nuxt
+.next
+
+# Single letter scratch scripts
+?.ts
+?.mjs
+
+# Rust
+/target
+^target/
+target
+*.wasm
+
+# SWC plugin cache
+.swc
+
+# Claude local settings
+.claude/settings.local.json

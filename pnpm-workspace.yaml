@@ -1,0 +1,28 @@
+packages:
+  - "packages/*"
+
+catalog:
+  "@types/node": ^22.19.0
+  "@biomejs/biome": ^2.3.7
+  dotenv: ^17.2.3
+  ioredis: ^5.8.2
+  typescript: ^5.9.3
+  ulid: ^3.0.1
+  vitest: ^3.2.4
+  zod: 4.1.11
+  "@vercel/queue": 0.0.0-alpha.23
+  "@workflow/errors": ^4.0.1-beta.5
+  "@workflow/world": ^4.0.1-beta.6
+  "@workflow/world-local": ^4.0.1-beta.11
+  "@workflow/world-testing": ^4.0.1-beta.20
+  "drizzle-orm": ^0.44.7
+  "drizzle-kit": ^0.31.7
+  postgres: ^3.4.7
+  testcontainers: 11.8.1
+  "@testcontainers/postgresql": ^11.8.1
+  "@testcontainers/redis": ^11.8.1
+
+onlyBuiltDependencies:
+  - esbuild
+
+savePrefix: ""

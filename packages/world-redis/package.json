@@ -1,0 +1,67 @@
+{
+  "name": "@fantasticfour/world-redis",
+  "version": "1.0.0",
+  "description": "Pure Redis-based World implementation using Redis Lists for lightweight and simple workflow execution",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "fantasticfour-redis-setup": "./bin/setup.js"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fantasticfour/workflow.git",
+    "directory": "packages/world-redis"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vercel/queue": "catalog:",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "dotenv": "catalog:",
+    "ioredis": "catalog:",
+    "ulid": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/redis": "catalog:",
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "keywords": [
+    "workflow",
+    "redis",
+    "durable-functions"
+  ],
+  "author": "",
+  "packageManager": "pnpm@10.23.0",
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

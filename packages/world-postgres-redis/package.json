@@ -1,0 +1,67 @@
+{
+  "name": "@fantasticfour/world-postgres-redis",
+  "version": "1.0.0",
+  "description": "Hybrid World implementation using PostgreSQL for durable storage with Redis Lists for queue management",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "src/drizzle/migrations"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fantasticfour/workflow.git",
+    "directory": "packages/world-postgres-redis"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:push": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@vercel/queue": "catalog:",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "dotenv": "catalog:",
+    "drizzle-orm": "catalog:",
+    "ioredis": "catalog:",
+    "postgres": "catalog:",
+    "ulid": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "catalog:",
+    "@testcontainers/redis": "catalog:",
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "drizzle-kit": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "keywords": [
+    "workflow",
+    "postgres",
+    "postgresql",
+    "redis",
+    "durable-functions"
+  ],
+  "author": "",
+  "packageManager": "pnpm@10.23.0",
+  "volta": {
+    "extends": "../../package.json"
+  }
+}
