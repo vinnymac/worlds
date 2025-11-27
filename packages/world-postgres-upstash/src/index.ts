@@ -1,15 +1,16 @@
-import { neon, neonConfig } from '@neondatabase/serverless';
+import createPostgres from 'postgres';
 import type { World } from '@workflow/world';
-import { drizzle } from 'drizzle-orm/neon-http';
+import { drizzle } from 'drizzle-orm/postgres-js';
 import { createQueue, type QStashConfig } from './queue.js';
 import * as schema from './schema.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
 
-export interface NeonUpstashWorldConfig {
+export interface PostgresUpstashWorldConfig {
   /**
-   * Neon database connection string
-   * Example: postgresql://user:pass@ep-xxx.us-east-1.aws.neon.tech/dbname?sslmode=require
+   * PostgreSQL database connection string
+   * Works with any PostgreSQL provider: Neon, Supabase, AWS RDS, etc.
+   * Example: postgresql://user:pass@host:5432/dbname
    */
   databaseUrl: string;
 
@@ -37,18 +38,13 @@ export interface NeonUpstashWorldConfig {
    * Optional environment for hook tracking (defaults to NODE_ENV or 'development')
    */
   environment?: string;
-
-  /**
-   * Optional Neon configuration
-   */
-  neonConfig?: Partial<typeof neonConfig>;
 }
 
-export function createNeonUpstashWorld(
-  config: NeonUpstashWorldConfig = {
+export function createPostgresUpstashWorld(
+  config: PostgresUpstashWorldConfig = {
     databaseUrl:
       process.env.DATABASE_URL ||
-      'postgresql://localhost:5432/neon_upstash_test',
+      'postgresql://localhost:5432/postgres_upstash_test',
     qstash: {
       token: process.env.QSTASH_TOKEN || '',
       targetUrl: process.env.QSTASH_URL || 'http://localhost:8080',
@@ -58,20 +54,15 @@ export function createNeonUpstashWorld(
   const {
     databaseUrl,
     qstash,
-    deploymentId = 'neon-upstash-default',
+    deploymentId = 'postgres-upstash-default',
     ownerId = '',
     projectId = '',
     environment = process.env.NODE_ENV || 'development',
   } = config;
 
-  // Configure Neon
-  if (config.neonConfig) {
-    Object.assign(neonConfig, config.neonConfig);
-  }
-
-  // Create Neon client
-  const sql = neon(databaseUrl);
-  const db = drizzle(sql, { schema });
+  // Create PostgreSQL client using standard wire protocol
+  const postgres = createPostgres(databaseUrl);
+  const db = drizzle(postgres, { schema });
 
   // Create world components
   const storage = createStorage(db, deploymentId, {
@@ -93,4 +84,4 @@ export type { QStashConfig };
 export { schema };
 
 // Re-export as createWorld for @workflow/core compatibility
-export { createNeonUpstashWorld as createWorld };
+export { createPostgresUpstashWorld as createWorld };

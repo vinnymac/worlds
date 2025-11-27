@@ -1,13 +1,13 @@
 import type { Streamer } from '@workflow/world';
 import { and, asc, eq, gt } from 'drizzle-orm';
-import type { NeonHttpDatabase } from 'drizzle-orm/neon-http';
+import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { monotonicFactory } from 'ulid';
 import * as schema from './schema.js';
 
 const { streams } = schema;
 
 export function createStreamer(
-  drizzle: NeonHttpDatabase<typeof schema>
+  drizzle: PostgresJsDatabase<typeof schema>
 ): Streamer {
   const ulid = monotonicFactory();
 
@@ -49,7 +49,7 @@ export function createStreamer(
     },
 
     async readFromStream(streamName: string) {
-      // HTTP-based polling implementation (no LISTEN/NOTIFY in Neon HTTP)
+      // HTTP-based polling implementation
       let closed = false;
       let lastChunkId: `chnk_${string}` | undefined;
 

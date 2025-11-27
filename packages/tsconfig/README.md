@@ -25,7 +25,7 @@ For bundler-based packages (extends `base.json`):
 - Bundler module resolution
 - ES2022 modules
 - JSON import support
-- Used by: world-neon-upstash, world-cloudflare, world-dynamodb-sqs, world-firestore-tasks
+- Used by: world-postgres-upstash, world-cloudflare, world-dynamodb-sqs, world-firestore-tasks
 
 ## Usage
 

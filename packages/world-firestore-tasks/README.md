@@ -194,7 +194,7 @@ export TARGET_URL="https://my-app.run.app"
 **Consider alternatives when:**
 - SQL queryability required → use @fantasticfour/world-postgres-redis
 - AWS ecosystem → use @fantasticfour/world-dynamodb-sqs
-- Multi-cloud strategy → use @fantasticfour/world-neon-upstash
+- Multi-cloud strategy → use @fantasticfour/world-postgres-upstash
 - Edge deployment → use @fantasticfour/world-cloudflare
 
 ## Performance Characteristics

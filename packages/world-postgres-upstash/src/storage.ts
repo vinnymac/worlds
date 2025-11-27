@@ -11,11 +11,14 @@ import type {
   WorkflowRun,
 } from '@workflow/world';
 import { and, desc, eq, gt, lt, sql } from 'drizzle-orm';
-import type { NeonHttpDatabase } from 'drizzle-orm/neon-http';
+import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { monotonicFactory } from 'ulid';
 import type { SerializedContent } from './schema.js';
 import * as schema from './schema.js';
 import { compact } from './util.js';
+
+// Type for Drizzle client with our schema
+type Drizzle = PostgresJsDatabase<typeof schema>;
 
 /**
  * Serialize a StructuredError object into a JSON string
@@ -132,7 +135,7 @@ function deserializeStepError(step: any): Step {
 }
 
 export function createRunsStorage(
-  drizzle: NeonHttpDatabase<typeof schema>,
+  drizzle: Drizzle,
   _deploymentId: string
 ): Storage['runs'] {
   const ulid = monotonicFactory();
@@ -141,8 +144,7 @@ export function createRunsStorage(
     .select()
     .from(runs)
     .where(eq(runs.runId, sql.placeholder('id')))
-    .limit(1)
-    .prepare('workflow_runs_get');
+    .limit(1);
 
   return {
     async get(id) {
@@ -290,9 +292,18 @@ export function createRunsStorage(
         .onConflictDoNothing()
         .returning();
       if (!value) {
-        throw new WorkflowAPIError(`Run ${runId} already exists`, {
-          status: 409,
-        });
+        // Run already exists - fetch and return it instead of throwing 409
+        const [existing] = await drizzle
+          .select()
+          .from(runs)
+          .where(eq(runs.runId, runId))
+          .limit(1);
+        if (!existing) {
+          throw new WorkflowAPIError(`Run ${runId} not found`, {
+            status: 404,
+          });
+        }
+        return deserializeRunError(compact(existing));
       }
       return deserializeRunError(compact(value));
     },
@@ -345,9 +356,7 @@ function map<T, R>(obj: T | null | undefined, fn: (v: T) => R): undefined | R {
   return obj ? fn(obj) : undefined;
 }
 
-export function createEventsStorage(
-  drizzle: NeonHttpDatabase<typeof schema>
-): Storage['events'] {
+export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
   const ulid = monotonicFactory();
   const events = schema.events;
 
@@ -433,7 +442,7 @@ export function createEventsStorage(
 }
 
 export function createHooksStorage(
-  drizzle: NeonHttpDatabase<typeof schema>,
+  drizzle: Drizzle,
   hookContext: { ownerId: string; projectId: string; environment: string }
 ): Storage['hooks'] {
   const hooks = schema.hooks;
@@ -441,8 +450,7 @@ export function createHooksStorage(
     .select()
     .from(hooks)
     .where(eq(hooks.token, sql.placeholder('token')))
-    .limit(1)
-    .prepare('workflow_hooks_get_by_token');
+    .limit(1);
 
   return {
     async get(hookId) {
@@ -467,9 +475,18 @@ export function createHooksStorage(
         .onConflictDoNothing()
         .returning();
       if (!value) {
-        throw new WorkflowAPIError(`Hook ${data.hookId} already exists`, {
-          status: 409,
-        });
+        // Hook already exists - fetch and return it instead of throwing 409
+        const [existing] = await drizzle
+          .select()
+          .from(hooks)
+          .where(eq(hooks.hookId, data.hookId))
+          .limit(1);
+        if (!existing) {
+          throw new WorkflowAPIError(`Hook ${data.hookId} not found`, {
+            status: 404,
+          });
+        }
+        return compact(existing);
       }
       return compact(value);
     },
@@ -517,9 +534,7 @@ export function createHooksStorage(
   };
 }
 
-export function createStepsStorage(
-  drizzle: NeonHttpDatabase<typeof schema>
-): Storage['steps'] {
+export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
   const steps = schema.steps;
 
   return {
@@ -537,9 +552,19 @@ export function createStepsStorage(
         .onConflictDoNothing()
         .returning();
       if (!value) {
-        throw new WorkflowAPIError(`Step ${data.stepId} already exists`, {
-          status: 409,
-        });
+        // Step already exists - fetch and return it instead of throwing 409
+        // This matches Firestore's behavior and allows the workflow runtime to continue
+        const [existing] = await drizzle
+          .select()
+          .from(steps)
+          .where(eq(steps.stepId, data.stepId))
+          .limit(1);
+        if (!existing) {
+          throw new WorkflowAPIError(`Step ${data.stepId} not found`, {
+            status: 404,
+          });
+        }
+        return deserializeStepError(compact(existing));
       }
       return deserializeStepError(compact(value));
     },
@@ -629,7 +654,7 @@ export function createStepsStorage(
   };
 }
 export function createStorage(
-  drizzle: NeonHttpDatabase<typeof schema>,
+  drizzle: Drizzle,
   deploymentId: string,
   hookContext: { ownerId: string; projectId: string; environment: string }
 ): Storage {

@@ -14,12 +14,19 @@ concurrency:
 
 jobs:
   unit:
-    name: Unit Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Unit Tests (${{ matrix.package }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        package:
+          - '@fantasticfour/world-cloudflare'
+          - '@fantasticfour/world-dynamodb-sqs'
+          - '@fantasticfour/world-firestore-tasks'
+          - '@fantasticfour/world-postgres-upstash'
+          - '@fantasticfour/world-postgres-redis'
+          - '@fantasticfour/world-redis'
+          - '@fantasticfour/world-redis-bullmq'
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
@@ -44,5 +51,5 @@ jobs:
       - name: Build Packages
         run: pnpm build --force
 
-      - name: Run Unit Tests
-        run: pnpm test
+      - name: Run Unit Tests for ${{ matrix.package }}
+        run: pnpm --filter "${{ matrix.package }}" test
