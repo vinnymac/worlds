@@ -22,5 +22,5 @@ if (process.platform === 'win32') {
   });
 
   test('smoke', () => {});
-  createTestSuite('./dist/index.js');
+  createTestSuite('@fantasticfour/world-redis-bullmq');
 }

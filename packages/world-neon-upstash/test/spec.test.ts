@@ -62,5 +62,5 @@ if (shouldSkipTests) {
   });
 
   test('smoke', () => {});
-  createTestSuite('./dist/index.js');
+  createTestSuite('@fantasticfour/world-neon-upstash');
 }
