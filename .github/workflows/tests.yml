@@ -42,7 +42,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Packages
-        run: pnpm build
+        run: pnpm build --force
 
       - name: Run Unit Tests
         run: pnpm test
