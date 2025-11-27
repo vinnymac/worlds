@@ -5,24 +5,24 @@ on:
     branches:
       - main
     tags:
-      - '!*'
+      - "!*"
   pull_request:
 
 concurrency:
-  group: \${{ github.workflow }}-\${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   unit:
-    name: Unit Tests (\${{ matrix.os }})
-    runs-on: \${{ matrix.os }}
+    name: Unit Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04-arm]
     env:
-      TURBO_TOKEN: \${{ secrets.TURBO_TOKEN }}
-      TURBO_TEAM: \${{ vars.TURBO_TEAM }}
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: 'pnpm'
+          cache: "pnpm"
 
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
