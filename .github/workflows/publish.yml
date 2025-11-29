@@ -1,0 +1,56 @@
+name: Publish
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  publish:
+    name: Publish to npm
+    # Only run if PR was merged and was created by changesets
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'changeset-release/')
+    runs-on: ubuntu-24.04-arm
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10.23.0
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: "pnpm"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure latest npm for Trusted Publishing
+        run: npm install -g npm@latest
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: pnpm build
+
+      - name: Publish to npm with OIDC
+        run: pnpm changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push tags
+        run: git push --follow-tags
