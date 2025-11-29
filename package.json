@@ -22,7 +22,7 @@
     "publish-packages": "pnpm build && changeset publish",
     "prepare": "husky",
     "ci:version": "changeset version",
-    "ci:publish": "pnpm build && pnpm publish -r --provenance --no-git-checks"
+    "ci:publish": "pnpm build && changeset publish"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.7",
