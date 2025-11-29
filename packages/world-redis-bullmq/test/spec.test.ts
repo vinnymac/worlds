@@ -9,9 +9,7 @@ if (process.platform === 'win32') {
   let container: Awaited<ReturnType<RedisContainer['start']>>;
 
   beforeAll(async () => {
-    container = await new RedisContainer(
-      'public.ecr.aws/docker/library/redis:7-alpine'
-    ).start();
+    container = await new RedisContainer('redis:7-alpine').start();
     const redisUrl = container.getConnectionUrl();
     process.env.WORKFLOW_REDIS_URL = redisUrl;
     process.env.REDIS_URL = redisUrl;
