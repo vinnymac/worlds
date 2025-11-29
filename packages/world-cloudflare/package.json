@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-cloudflare",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Cloudflare Durable Objects World implementation with edge-native SQLite storage and global <10ms latency",
   "type": "module",
   "main": "dist/index.js",
