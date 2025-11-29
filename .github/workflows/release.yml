@@ -43,10 +43,6 @@ jobs:
         with:
           node-version: 24.x
           cache: "pnpm"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Ensure latest npm for Trusted Publishing
-        run: npm install -g npm@latest
 
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
