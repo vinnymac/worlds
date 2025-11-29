@@ -20,7 +20,7 @@ import {
 } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
 
-describe('Storage (Neon integration)', () => {
+describe('Storage (PostgreSQL integration)', () => {
   if (process.platform === 'win32') {
     test.skip('skipped on Windows since it relies on a docker container', () => {});
     return;
@@ -444,22 +444,23 @@ describe('Storage (Neon integration)', () => {
         expect(step.updatedAt).toBeInstanceOf(Date);
       });
 
-      it('should reject duplicate step creation', async () => {
-        await steps.create(runId, {
+      it('should return existing step on duplicate creation', async () => {
+        const step1 = await steps.create(runId, {
           stepId: 'step-1',
           stepName: 'test-step',
           input: [],
         });
 
-        await expect(
-          steps.create(runId, {
-            stepId: 'step-1',
-            stepName: 'test-step',
-            input: [],
-          })
-        ).rejects.toMatchObject({
-          status: 409,
+        const step2 = await steps.create(runId, {
+          stepId: 'step-1',
+          stepName: 'test-step',
+          input: [],
         });
+
+        // Should return the existing step (idempotent behavior)
+        expect(step2.stepId).toBe(step1.stepId);
+        expect(step2.runId).toBe(step1.runId);
+        expect(step2.status).toBe(step1.status);
       });
     });
 
@@ -737,20 +738,21 @@ describe('Storage (Neon integration)', () => {
         expect(hook.createdAt).toBeInstanceOf(Date);
       });
 
-      it('should reject duplicate hook creation', async () => {
-        await hooks.create(runId, {
+      it('should return existing hook on duplicate creation', async () => {
+        const hook1 = await hooks.create(runId, {
           hookId: 'hook-1',
           token: 'token-123',
         });
 
-        await expect(
-          hooks.create(runId, {
-            hookId: 'hook-1',
-            token: 'token-456',
-          })
-        ).rejects.toMatchObject({
-          status: 409,
+        const hook2 = await hooks.create(runId, {
+          hookId: 'hook-1',
+          token: 'token-456',
         });
+
+        // Should return the existing hook (idempotent behavior)
+        expect(hook2.hookId).toBe(hook1.hookId);
+        expect(hook2.runId).toBe(hook1.runId);
+        expect(hook2.token).toBe(hook1.token); // Original token, not the new one
       });
     });
 

@@ -134,7 +134,7 @@ export WORKFLOW_REDIS_URL="redis://localhost:6379"
 **Consider alternatives when:**
 - You need simplicity over features → use @fantasticfour/world-redis
 - You need SQL queryability → use @fantasticfour/world-postgres-redis
-- You're on serverless platforms → use @fantasticfour/world-neon-upstash
+- You're on serverless platforms → use @fantasticfour/world-postgres-upstash
 
 ## Performance Considerations
 

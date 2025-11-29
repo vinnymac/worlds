@@ -1,7 +1,7 @@
 {
-  "name": "@fantasticfour/world-neon-upstash",
+  "name": "@fantasticfour/world-postgres-upstash",
   "version": "1.0.0",
-  "description": "Serverless World implementation using Neon Postgres for storage and Upstash QStash for queue management - scales to zero with pay-per-use pricing",
+  "description": "World implementation using PostgreSQL for storage and Upstash QStash for queue management - works with any PostgreSQL provider (Neon, Supabase, RDS, etc.)",
   "type": "module",
   "main": "dist/index.js",
   "publishConfig": {
@@ -11,7 +11,7 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git",
-    "directory": "packages/world-neon-upstash"
+    "directory": "packages/world-postgres-upstash"
   },
   "exports": {
     ".": {
@@ -30,7 +30,6 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^0.10.3",
     "@upstash/qstash": "^2.7.38",
     "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
@@ -53,12 +52,13 @@
   },
   "keywords": [
     "workflow",
-    "neon",
-    "upstash",
     "postgres",
-    "serverless",
-    "durable-functions",
-    "qstash"
+    "postgresql",
+    "upstash",
+    "qstash",
+    "neon",
+    "supabase",
+    "durable-functions"
   ],
   "author": "vinnymac",
   "packageManager": "pnpm@10.23.0",

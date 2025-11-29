@@ -11,7 +11,8 @@ async function setupDatabase() {
   config();
 
   const connectionString =
-    process.env.DATABASE_URL || 'postgresql://localhost:5432/neon_upstash_test';
+    process.env.DATABASE_URL ||
+    'postgresql://localhost:5432/postgres_upstash_test';
 
   console.log('🔧 Setting up database schema...');
   console.log(
