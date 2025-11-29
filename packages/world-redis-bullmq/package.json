@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-redis-bullmq",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Production-grade Redis World implementation using BullMQ for robust job queue management",
   "type": "module",
   "main": "dist/index.js",
