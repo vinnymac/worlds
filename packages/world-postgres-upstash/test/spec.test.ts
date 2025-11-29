@@ -19,7 +19,9 @@ if (shouldSkipTests) {
 
   beforeAll(async () => {
     // Start PostgreSQL container with explicit wait for database readiness
-    postgresContainer = await new PostgreSqlContainer('postgres:15-alpine')
+    postgresContainer = await new PostgreSqlContainer(
+      'public.ecr.aws/docker/library/postgres:15-alpine'
+    )
       .withDatabase('main')
       .withUsername('postgres')
       .withPassword('postgres')
