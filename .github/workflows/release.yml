@@ -23,6 +23,7 @@ jobs:
        github.event.pull_request.merged == true &&
        startsWith(github.event.pull_request.head.ref, 'changeset-release/'))
     runs-on: ubuntu-24.04-arm
+    environment: release
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
