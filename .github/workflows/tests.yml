@@ -30,7 +30,6 @@ jobs:
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
-      TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX: public.ecr.aws/docker/library/
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -51,6 +50,12 @@ jobs:
 
       - name: Build Packages
         run: pnpm build --force
+
+      - name: Pre-pull Testcontainers images
+        run: |
+          docker pull testcontainers/ryuk:0.8.1 || true
+          docker pull public.ecr.aws/docker/library/postgres:15-alpine || true
+          docker pull public.ecr.aws/docker/library/redis:7-alpine || true
 
       - name: Run Unit Tests for ${{ matrix.package }}
         run: pnpm --filter "${{ matrix.package }}" test
