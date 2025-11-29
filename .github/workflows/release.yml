@@ -55,7 +55,7 @@ jobs:
         run: pnpm build
 
       - name: Publish to npm with OIDC
-        run: pnpm changeset publish
+        run: pnpm ci:publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
