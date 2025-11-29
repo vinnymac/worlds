@@ -37,7 +37,6 @@
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",
-    "dotenv": "catalog:",
     "drizzle-orm": "catalog:",
     "ioredis": "catalog:",
     "postgres": "catalog:",
@@ -49,6 +48,7 @@
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
+    "dotenv": "catalog:",
     "drizzle-kit": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"

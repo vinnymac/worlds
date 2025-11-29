@@ -31,7 +31,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",
