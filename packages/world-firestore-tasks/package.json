@@ -30,7 +30,6 @@
   "dependencies": {
     "@google-cloud/firestore": "^7.10.0",
     "@google-cloud/tasks": "^6.2.1",
-    "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",

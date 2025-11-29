@@ -43,7 +43,6 @@
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",
-    "dotenv": "catalog:",
     "ioredis": "catalog:",
     "ulid": "catalog:",
     "zod": "catalog:"
@@ -52,6 +51,7 @@
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
+    "dotenv": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
