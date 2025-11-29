@@ -14,8 +14,14 @@ permissions:
 jobs:
   publish:
     name: Publish to npm
-    # Only run if PR was merged and was created by changesets
-    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'changeset-release/')
+    # Run if either:
+    # 1. PR was merged and created by changesets, OR
+    # 2. Manually triggered via workflow_dispatch
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.head.ref, 'changeset-release/'))
     runs-on: ubuntu-24.04-arm
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
