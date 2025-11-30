@@ -588,6 +588,20 @@ describe('Storage (Firestore integration)', () => {
         expect(event.eventType).toBe('workflow_completed');
         expect(event.correlationId).toBeUndefined();
       });
+
+      it('should create a new event with null byte in payload', async () => {
+        const event = await storage.events.create(testRunId, {
+          eventType: 'step_failed' as const,
+          correlationId: 'corr_123',
+          eventData: { error: 'Error with null byte \u0000 in message' },
+        });
+
+        expect(event.runId).toBe(testRunId);
+        expect(event.eventId).toMatch(/^wevt_/);
+        expect(event.eventType).toBe('step_failed');
+        expect(event.correlationId).toBe('corr_123');
+        expect(event.createdAt).toBeInstanceOf(Date);
+      });
     });
 
     describe('list', () => {

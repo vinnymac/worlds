@@ -36,7 +36,7 @@ describe('Storage (PostgreSQL integration)', () => {
   let streamer: ReturnType<typeof createStreamer>;
 
   async function truncateTables() {
-    await sql`TRUNCATE TABLE workflow_events, workflow_steps, workflow_hooks, workflow_runs, workflow_stream_chunks RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE TABLE workflow.workflow_events, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_runs, workflow.workflow_stream_chunks RESTART IDENTITY CASCADE`;
   }
 
   beforeAll(async () => {
@@ -64,7 +64,7 @@ describe('Storage (PostgreSQL integration)', () => {
       projectId: 'test-project',
       environment: 'test',
     });
-    streamer = createStreamer(db);
+    streamer = createStreamer(sql, db);
   }, 120_000);
 
   beforeEach(async () => {
@@ -629,6 +629,20 @@ describe('Storage (PostgreSQL integration)', () => {
 
         expect(event.correlationId).toBe('correlation-123');
       });
+
+      it('should create a new event with null byte in payload', async () => {
+        const event = await events.create(runId, {
+          eventType: 'step.failed' as const,
+          correlationId: 'corr_123',
+          eventData: { error: 'Error with null byte \u0000 in message' },
+        });
+
+        expect(event.runId).toBe(runId);
+        expect(event.eventId).toMatch(/^wevt_/);
+        expect(event.eventType).toBe('step.failed');
+        expect(event.correlationId).toBe('corr_123');
+        expect(event.createdAt).toBeInstanceOf(Date);
+      });
     });
 
     describe('list', () => {
@@ -707,6 +721,48 @@ describe('Storage (PostgreSQL integration)', () => {
         expect(page2.data).toHaveLength(1);
         expect(page2.hasMore).toBe(false);
       });
+
+      it('should handle hook lifecycle events', async () => {
+        const hookId = 'hook_test123';
+
+        // Create a typical hook lifecycle
+        const created = await events.create(runId, {
+          eventType: 'hook_created' as const,
+          correlationId: hookId,
+        });
+
+        const received1 = await events.create(runId, {
+          eventType: 'hook_received' as const,
+          correlationId: hookId,
+          eventData: { payload: { request: 1 } },
+        });
+
+        const received2 = await events.create(runId, {
+          eventType: 'hook_received' as const,
+          correlationId: hookId,
+          eventData: { payload: { request: 2 } },
+        });
+
+        const disposed = await events.create(runId, {
+          eventType: 'hook_disposed' as const,
+          correlationId: hookId,
+        });
+
+        const result = await events.listByCorrelationId({
+          correlationId: hookId,
+          pagination: {},
+        });
+
+        expect(result.data).toHaveLength(4);
+        expect(result.data[0].eventId).toBe(created.eventId);
+        expect(result.data[0].eventType).toBe('hook_created');
+        expect(result.data[1].eventId).toBe(received1.eventId);
+        expect(result.data[1].eventType).toBe('hook_received');
+        expect(result.data[2].eventId).toBe(received2.eventId);
+        expect(result.data[2].eventType).toBe('hook_received');
+        expect(result.data[3].eventId).toBe(disposed.eventId);
+        expect(result.data[3].eventType).toBe('hook_disposed');
+      });
     });
   });
 
@@ -768,9 +824,8 @@ describe('Storage (PostgreSQL integration)', () => {
         expect(hook?.token).toBe('token-123');
       });
 
-      it('should return undefined for non-existent hook', async () => {
-        const hook = await hooks.get('missing');
-        expect(hook).toBeUndefined();
+      it('should throw error for non-existent hook', async () => {
+        await expect(hooks.get('missing')).rejects.toThrow();
       });
     });
 
@@ -836,12 +891,13 @@ describe('Storage (PostgreSQL integration)', () => {
 
         await hooks.dispose('hook-1');
 
-        const hook = await hooks.get('hook-1');
-        expect(hook).toBeUndefined();
+        await expect(hooks.get('hook-1')).rejects.toThrow();
       });
 
-      it('should not throw for non-existent hook', async () => {
-        await expect(hooks.dispose('missing')).resolves.toBeUndefined();
+      it('should throw for non-existent hook', async () => {
+        await expect(hooks.dispose('missing')).rejects.toMatchObject({
+          status: 404,
+        });
       });
     });
   });

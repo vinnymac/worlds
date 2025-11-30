@@ -32,7 +32,7 @@ async function setupDatabase() {
       'src',
       'drizzle',
       'migrations',
-      '0000_redundant_smasher.sql'
+      '0000_cheerful_kylun.sql'
     );
     const migrationSQL = await readFile(migrationPath, 'utf-8');
 

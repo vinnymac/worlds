@@ -13,16 +13,19 @@ import {
   integer,
   jsonb,
   pgEnum,
-  pgTable,
+  pgSchema,
   primaryKey,
   text,
   timestamp,
   varchar,
 } from 'drizzle-orm/pg-core';
+import { Cbor, type Cborized } from './cbor.js';
 
 function mustBeMoreThanOne<T>(t: T[]) {
   return t as [T, ...T[]];
 }
+
+export const schema = pgSchema('workflow');
 
 export const workflowRunStatus = pgEnum(
   'status',
@@ -49,16 +52,23 @@ type DrizzlishOfType<T extends object> = {
  */
 export type SerializedContent = any[];
 
-export const runs = pgTable(
+export const runs = schema.table(
   'workflow_runs',
   {
     runId: varchar('id').primaryKey(),
-    output: jsonb('output').$type<SerializedContent>(),
+    /** @deprecated */
+    outputJson: jsonb('output').$type<SerializedContent>(),
+    output: Cbor<SerializedContent>()('output_cbor'),
     deploymentId: varchar('deployment_id').notNull(),
     status: workflowRunStatus('status').notNull(),
     workflowName: varchar('name').notNull(),
-    executionContext: jsonb('execution_context').$type<Record<string, any>>(),
-    input: jsonb('input').$type<SerializedContent>().notNull(),
+    /** @deprecated */
+    executionContextJson:
+      jsonb('execution_context').$type<Record<string, any>>(),
+    executionContext: Cbor<Record<string, any>>()('execution_context_cbor'),
+    /** @deprecated */
+    inputJson: jsonb('input').$type<SerializedContent>(),
+    input: Cbor<SerializedContent>()('input_cbor'),
     error: text('error'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
@@ -67,14 +77,16 @@ export const runs = pgTable(
       .notNull(),
     completedAt: timestamp('completed_at'),
     startedAt: timestamp('started_at'),
-  } satisfies DrizzlishOfType<WorkflowRun>,
-  (tb) => ({
-    workflowNameIdx: index().on(tb.workflowName),
-    statusIdx: index().on(tb.status),
-  })
+  } satisfies DrizzlishOfType<
+    Cborized<
+      Omit<WorkflowRun, 'input'> & { input?: unknown },
+      'input' | 'output' | 'executionContext'
+    >
+  >,
+  (tb) => [index().on(tb.workflowName), index().on(tb.status)]
 );
 
-export const events = pgTable(
+export const events = schema.table(
   'workflow_events',
   {
     eventId: varchar('id').primaryKey(),
@@ -82,23 +94,28 @@ export const events = pgTable(
     correlationId: varchar('correlation_id'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     runId: varchar('run_id').notNull(),
-    eventData: jsonb('payload'),
-  } satisfies DrizzlishOfType<Event & { eventData?: undefined }>,
-  (tb) => ({
-    runFk: index().on(tb.runId),
-    correlationIdFk: index().on(tb.correlationId),
-  })
+    /** @deprecated */
+    eventDataJson: jsonb('payload'),
+    eventData: Cbor<unknown>()('payload_cbor'),
+  } satisfies DrizzlishOfType<
+    Cborized<Event & { eventData?: undefined }, 'eventData'>
+  >,
+  (tb) => [index().on(tb.runId), index().on(tb.correlationId)]
 );
 
-export const steps = pgTable(
+export const steps = schema.table(
   'workflow_steps',
   {
     runId: varchar('run_id').notNull(),
     stepId: varchar('step_id').primaryKey(),
     stepName: varchar('step_name').notNull(),
     status: stepStatus('status').notNull(),
-    input: jsonb('input').$type<SerializedContent>().notNull(),
-    output: jsonb('output').$type<SerializedContent>(),
+    /** @deprecated */
+    inputJson: jsonb('input').$type<SerializedContent>(),
+    input: Cbor<SerializedContent>()('input_cbor').notNull(),
+    /** @deprecated */
+    outputJson: jsonb('output').$type<SerializedContent>(),
+    output: Cbor<SerializedContent>()('output_cbor'),
     error: text('error'),
     attempt: integer('attempt').notNull(),
     startedAt: timestamp('started_at'),
@@ -109,14 +126,11 @@ export const steps = pgTable(
       .$onUpdateFn(() => new Date())
       .notNull(),
     retryAfter: timestamp('retry_after'),
-  } satisfies DrizzlishOfType<Step>,
-  (tb) => ({
-    runFk: index().on(tb.runId),
-    statusIdx: index().on(tb.status),
-  })
+  } satisfies DrizzlishOfType<Cborized<Step, 'input' | 'output'>>,
+  (tb) => [index().on(tb.runId), index().on(tb.status)]
 );
 
-export const hooks = pgTable(
+export const hooks = schema.table(
   'workflow_hooks',
   {
     runId: varchar('run_id').notNull(),
@@ -126,12 +140,11 @@ export const hooks = pgTable(
     projectId: varchar('project_id').notNull(),
     environment: varchar('environment').notNull(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
-    metadata: jsonb('metadata').$type<SerializedContent>(),
-  } satisfies DrizzlishOfType<Hook>,
-  (tb) => ({
-    runFk: index().on(tb.runId),
-    tokenIdx: index().on(tb.token),
-  })
+    /** @deprecated */
+    metadataJson: jsonb('metadata').$type<SerializedContent>(),
+    metadata: Cbor<unknown>()('metadata_cbor'),
+  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
+  (tb) => [index().on(tb.runId), index().on(tb.token)]
 );
 
 const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
@@ -140,7 +153,7 @@ const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
   },
 });
 
-export const streams = pgTable(
+export const streams = schema.table(
   'workflow_stream_chunks',
   {
     chunkId: varchar('id').$type<`chnk_${string}`>().notNull(),

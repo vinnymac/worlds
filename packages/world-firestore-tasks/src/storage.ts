@@ -4,19 +4,25 @@ import type {
   CreateHookRequest,
   CreateStepRequest,
   Event,
+  GetHookParams,
+  GetStepParams,
+  GetWorkflowRunParams,
   Hook,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
   ListWorkflowRunsParams,
   PaginatedResponse,
+  ResolveData,
   Step,
   Storage,
   UpdateStepRequest,
   UpdateWorkflowRunRequest,
   WorkflowRun,
 } from '@workflow/world';
+import { HookSchema } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
+import { compact } from './util.js';
 
 interface FirestoreStorageConfig {
   firestore: Firestore;
@@ -219,6 +225,38 @@ function deserializeNestedArrays(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Filter data based on ResolveData parameter.
+ * When resolveData is 'none', strips specified keys to reduce data transfer.
+ */
+function filterData<T extends object>(
+  data: T,
+  resolveData: ResolveData | undefined,
+  keysToStrip: (keyof T)[]
+): T {
+  if (resolveData === 'none') {
+    const newData = { ...data };
+    for (const key of keysToStrip) {
+      if (key in newData) {
+        delete newData[key];
+      }
+    }
+    return newData;
+  }
+  return data;
+}
+
+/**
+ * Filter hook data based on resolveData parameter
+ */
+function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
+  if (resolveData === 'none' && 'metadata' in hook) {
+    const { metadata: _, ...rest } = hook;
+    return { metadata: undefined, ...rest };
+  }
+  return hook;
+}
+
 export function createStorage(config: FirestoreStorageConfig): Storage {
   const { firestore } = config;
   const ulid = monotonicFactory();
@@ -271,7 +309,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         } as WorkflowRun;
       },
 
-      async get(runId: string) {
+      async get(runId: string, params?: GetWorkflowRunParams) {
         const doc = await firestore
           .collection('workflow_runs')
           .doc(runId)
@@ -284,7 +322,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         }
 
         const data = doc.data() as FirebaseFirestore.DocumentData;
-        return deserializeRunError({
+        const run = deserializeRunError({
           ...data,
           // Deserialize nested arrays that were serialized during storage
           input: deserializeNestedArrays(data.input),
@@ -294,6 +332,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           startedAt: fromFirestoreTimestamp(data.startedAt),
           completedAt: fromFirestoreTimestamp(data.completedAt),
         });
+        return filterData(run, params?.resolveData, ['input', 'output']);
       },
 
       async cancel(runId: string) {
@@ -402,7 +441,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         return {
           data: values.map((doc) => {
             const data = doc.data();
-            return deserializeRunError({
+            const run = deserializeRunError({
               ...data,
               // Deserialize nested arrays that were serialized during storage
               input: deserializeNestedArrays(data.input),
@@ -412,6 +451,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               startedAt: fromFirestoreTimestamp(data.startedAt),
               completedAt: fromFirestoreTimestamp(data.completedAt),
             });
+            return filterData(run, params?.resolveData, ['input', 'output']);
           }),
           cursor: values.at(-1)?.id ?? null,
           hasMore,
@@ -572,7 +612,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         } as Step;
       },
 
-      async get(runId: string, stepId: string) {
+      async get(runId: string, stepId: string, params?: GetStepParams) {
         const doc = await firestore
           .collection('workflow_runs')
           .doc(runId)
@@ -587,7 +627,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         }
 
         const data = doc.data() as FirebaseFirestore.DocumentData;
-        return deserializeStepError({
+        const step = deserializeStepError({
           ...data,
           // Deserialize nested arrays that were serialized during storage
           input: deserializeNestedArrays(data.input),
@@ -598,6 +638,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           completedAt: fromFirestoreTimestamp(data.completedAt),
           retryAfter: fromFirestoreTimestamp(data.retryAfter),
         });
+        return filterData(step, params?.resolveData, ['input', 'output']);
       },
 
       async update(runId: string, stepId: string, data: UpdateStepRequest) {
@@ -684,7 +725,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         return {
           data: values.map((doc) => {
             const data = doc.data();
-            return deserializeStepError({
+            const step = deserializeStepError({
               ...data,
               // Deserialize nested arrays that were serialized during storage
               input: deserializeNestedArrays(data.input),
@@ -695,6 +736,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               completedAt: fromFirestoreTimestamp(data.completedAt),
               retryAfter: fromFirestoreTimestamp(data.retryAfter),
             });
+            return filterData(step, params?.resolveData, ['input', 'output']);
           }),
           cursor: values.at(-1)?.id ?? null,
           hasMore,
@@ -703,7 +745,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     },
 
     hooks: {
-      async create(runId: string, data: CreateHookRequest) {
+      async create(
+        runId: string,
+        data: CreateHookRequest,
+        params?: GetHookParams
+      ) {
         const now = new Date();
 
         const hook = {
@@ -714,7 +760,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           projectId: '',
           environment: '',
           createdAt: now,
-          metadata: undefined,
+          metadata: data.metadata,
         };
 
         await Promise.all([
@@ -727,10 +773,12 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           firestore.collection('hooks_by_token').doc(data.token).set(hook),
         ]);
 
-        return hook;
+        const parsed = HookSchema.parse(compact(hook));
+        const resolveData = params?.resolveData ?? 'all';
+        return filterHookData(parsed, resolveData);
       },
 
-      async get(_hookId: string) {
+      async get(_hookId: string, _params?: GetHookParams) {
         throw new WorkflowAPIError(
           'Hook lookup by ID not implemented for Firestore',
           {
@@ -739,7 +787,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         );
       },
 
-      async getByToken(token: string) {
+      async getByToken(token: string, params?: GetHookParams) {
         const doc = await firestore
           .collection('hooks_by_token')
           .doc(token)
@@ -752,7 +800,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         }
 
         const data = doc.data() as FirebaseFirestore.DocumentData;
-        return {
+        const parsed = HookSchema.parse({
           runId: data.runId,
           hookId: data.hookId,
           token: data.token,
@@ -761,7 +809,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           environment: data.environment || '',
           createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
           metadata: data.metadata,
-        };
+        });
+        const resolveData = params?.resolveData ?? 'all';
+        return filterHookData(parsed, resolveData);
       },
 
       async list(params: ListHooksParams): Promise<PaginatedResponse<Hook>> {
@@ -800,7 +850,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         return {
           data: values.map((doc) => {
             const data = doc.data();
-            return {
+            const parsed = HookSchema.parse({
               runId: data.runId,
               hookId: data.hookId,
               token: data.token,
@@ -809,14 +859,15 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               environment: data.environment || '',
               createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
               metadata: data.metadata,
-            };
+            });
+            return filterHookData(parsed, params?.resolveData ?? 'all');
           }),
           cursor: values.at(-1)?.id ?? null,
           hasMore,
         };
       },
 
-      async dispose(_hookId: string) {
+      async dispose(_hookId: string, _params?: GetHookParams) {
         throw new WorkflowAPIError(
           'Hook disposal by ID not implemented for Firestore',
           {

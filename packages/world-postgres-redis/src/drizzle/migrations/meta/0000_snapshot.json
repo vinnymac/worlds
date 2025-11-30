@@ -1,5 +1,5 @@
 {
-  "id": "f14e53dd-67a1-4765-9a42-804ea1777eb4",
+  "id": "63ca3536-4e04-4db1-a856-b5eb6d323b58",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -366,7 +366,7 @@
           "name": "input_cbor",
           "type": "bytea",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "output": {
           "name": "output",

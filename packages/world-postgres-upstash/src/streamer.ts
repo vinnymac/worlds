@@ -1,15 +1,96 @@
+import { EventEmitter } from 'node:events';
 import type { Streamer } from '@workflow/world';
-import { and, asc, eq, gt } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
+import type { Sql } from 'postgres';
 import { monotonicFactory } from 'ulid';
+import * as z from 'zod';
 import * as schema from './schema.js';
+import { Mutex } from './util.js';
 
 const { streams } = schema;
 
+const StreamPublishMessage = z.object({
+  streamId: z.string(),
+  chunkId: z.templateLiteral(['chnk_', z.string()]),
+});
+
+interface StreamChunkEvent {
+  id: `chnk_${string}`;
+  data: Uint8Array;
+  eof: boolean;
+}
+
+class Rc<T extends { drop(): void }> {
+  private refCount = 0;
+  constructor(private resource: T) {}
+  acquire() {
+    this.refCount++;
+    return {
+      ...this.resource,
+      [Symbol.dispose]: () => {
+        this.release();
+      },
+    };
+  }
+  release() {
+    this.refCount--;
+    if (this.refCount <= 0) {
+      this.resource.drop();
+    }
+  }
+}
+
 export function createStreamer(
+  postgres: Sql,
   drizzle: PostgresJsDatabase<typeof schema>
 ): Streamer {
   const ulid = monotonicFactory();
+  const events = new EventEmitter<{
+    [key: `strm:${string}`]: [StreamChunkEvent];
+  }>();
+  const genChunkId = () => `chnk_${ulid()}` as const;
+  const mutexes = new Map<string, Rc<{ drop(): void; mutex: Mutex }>>();
+  const getMutex = (key: string) => {
+    let mutex = mutexes.get(key);
+    if (!mutex) {
+      mutex = new Rc({
+        mutex: new Mutex(),
+        drop: () => mutexes.delete(key),
+      });
+      mutexes.set(key, mutex);
+    }
+    return mutex.acquire();
+  };
+
+  const STREAM_TOPIC = 'workflow_event_chunk';
+  postgres.listen(STREAM_TOPIC, async (msg) => {
+    const parsed = await Promise.resolve(msg)
+      .then(JSON.parse)
+      .then(StreamPublishMessage.parse);
+
+    const key = `strm:${parsed.streamId}` as const;
+    if (!events.listenerCount(key)) {
+      return;
+    }
+
+    const resource = getMutex(key);
+    await resource.mutex.andThen(async () => {
+      const [value] = await drizzle
+        .select({ eof: streams.eof, data: streams.chunkData })
+        .from(streams)
+        .where(
+          and(
+            eq(streams.streamId, parsed.streamId),
+            eq(streams.chunkId, parsed.chunkId)
+          )
+        )
+        .limit(1);
+      if (!value) return;
+      const { data, eof } = value;
+      events.emit(key, { id: parsed.chunkId, data, eof });
+    });
+  });
 
   return {
     async writeToStream(
@@ -20,90 +101,122 @@ export function createStreamer(
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
-      const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const buffer =
-        typeof chunk === 'string'
-          ? Buffer.from(chunk)
-          : Buffer.isBuffer(chunk)
-            ? chunk
-            : Buffer.from(chunk);
+      const chunkId = genChunkId();
       await drizzle.insert(streams).values({
         chunkId,
         streamId: name,
-        chunkData: buffer,
+        chunkData: !Buffer.isBuffer(chunk) ? Buffer.from(chunk) : chunk,
         eof: false,
       });
+      postgres.notify(
+        STREAM_TOPIC,
+        JSON.stringify(
+          StreamPublishMessage.encode({
+            chunkId,
+            streamId: name,
+          })
+        )
+      );
     },
 
-    async closeStream(name: string, _runId: string | Promise<string>) {
-      // Await runId if it's a promise
+    async closeStream(
+      name: string,
+      _runId: string | Promise<string>
+    ): Promise<void> {
+      // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
-      const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
+      const chunkId = genChunkId();
       await drizzle.insert(streams).values({
         chunkId,
         streamId: name,
         chunkData: Buffer.from([]),
         eof: true,
       });
+      postgres.notify(
+        'workflow_event_chunk',
+        JSON.stringify(
+          StreamPublishMessage.encode({
+            streamId: name,
+            chunkId,
+          })
+        )
+      );
     },
 
-    async readFromStream(streamName: string) {
-      // HTTP-based polling implementation
-      let closed = false;
-      let lastChunkId: `chnk_${string}` | undefined;
-
-      const processChunks = (
-        chunks: Array<{
-          chunkId: `chnk_${string}`;
-          chunkData: Buffer;
-          eof: boolean;
-        }>,
-        controller: ReadableStreamDefaultController<Uint8Array>
-      ): boolean => {
-        for (const chunk of chunks) {
-          if (chunk.eof) {
-            closed = true;
-            controller.close();
-            return true;
-          }
-          controller.enqueue(new Uint8Array(chunk.chunkData));
-          lastChunkId = chunk.chunkId;
-        }
-        return false;
-      };
+    async readFromStream(
+      name: string,
+      startIndex?: number
+    ): Promise<ReadableStream<Uint8Array>> {
+      const cleanups: (() => void)[] = [];
 
       return new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          if (closed) {
-            controller.close();
-            return;
+        async start(controller) {
+          // an empty string is always < than any string,
+          // so `'' < ulid()` and `ulid() < ulid()` (maintaining order)
+          let lastChunkId = '';
+          let offset = startIndex ?? 0;
+          let buffer = [] as StreamChunkEvent[] | null;
+
+          // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: upstream pattern for streaming
+          function enqueue(msg: {
+            id: string;
+            data: Uint8Array;
+            eof: boolean;
+          }) {
+            // Skip if already sent or out of order
+            if (lastChunkId >= msg.id) return;
+
+            // Skip if still offsetting
+            if (offset > 0) {
+              offset--;
+              return;
+            }
+
+            // Enqueue data if present
+            if (msg.data.byteLength) {
+              controller.enqueue(new Uint8Array(msg.data));
+            }
+
+            // Close stream if EOF
+            if (msg.eof) {
+              controller.close();
+            }
+
+            lastChunkId = msg.id;
           }
 
-          const whereClause = lastChunkId
-            ? and(
-                eq(streams.streamId, streamName),
-                gt(streams.chunkId, lastChunkId)
-              )
-            : eq(streams.streamId, streamName);
+          function onData(data: StreamChunkEvent) {
+            if (buffer) {
+              buffer.push(data);
+              return;
+            }
+            enqueue(data);
+          }
+          events.on(`strm:${name}`, onData);
+          cleanups.push(() => {
+            events.off(`strm:${name}`, onData);
+          });
 
           const chunks = await drizzle
-            .select()
+            .select({
+              id: streams.chunkId,
+              eof: streams.eof,
+              data: streams.chunkData,
+            })
             .from(streams)
-            .where(whereClause)
-            .orderBy(asc(streams.chunkId))
-            .limit(10);
+            .where(and(eq(streams.streamId, name)))
+            .orderBy(streams.chunkId);
 
-          if (chunks.length === 0) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            return;
+          for (const chunk of [...chunks, ...(buffer ?? [])]) {
+            enqueue(chunk);
           }
-
-          processChunks(chunks, controller);
+          buffer = null;
         },
-
         cancel() {
-          closed = true;
+          for (const fn of cleanups) {
+            fn();
+          }
         },
       });
     },

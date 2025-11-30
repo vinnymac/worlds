@@ -32,7 +32,7 @@ describe('Storage (Postgres integration)', () => {
   let events: ReturnType<typeof createEventsStorage>;
 
   async function truncateTables() {
-    await sql`TRUNCATE TABLE workflow_events, workflow_steps, workflow_hooks, workflow_runs RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE TABLE workflow.workflow_events, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_runs, workflow.workflow_stream_chunks RESTART IDENTITY CASCADE`;
   }
 
   beforeAll(async () => {
@@ -536,6 +536,20 @@ describe('Storage (Postgres integration)', () => {
 
         expect(event.eventType).toBe('workflow_completed');
         expect(event.correlationId).toBeUndefined();
+      });
+
+      it('should create a new event with null byte in payload', async () => {
+        const event = await events.create(testRunId, {
+          eventType: 'step_failed' as const,
+          correlationId: 'corr_123',
+          eventData: { error: 'Error with null byte \u0000 in message' },
+        });
+
+        expect(event.runId).toBe(testRunId);
+        expect(event.eventId).toMatch(/^wevt_/);
+        expect(event.eventType).toBe('step_failed');
+        expect(event.correlationId).toBe('corr_123');
+        expect(event.createdAt).toBeInstanceOf(Date);
       });
     });
 

@@ -85,6 +85,19 @@ describe('Storage (Redis integration)', () => {
         expect(run.createdAt).toBeInstanceOf(Date);
         expect(run.updatedAt).toBeInstanceOf(Date);
       });
+
+      it('should handle minimal run data', async () => {
+        const runData = {
+          deploymentId: 'deployment-123',
+          workflowName: 'minimal-workflow',
+          input: [],
+        };
+
+        const run = await runs.create(runData);
+
+        expect(run.executionContext).toBeUndefined();
+        expect(run.input).toEqual([]);
+      });
     });
 
     describe('get', () => {
@@ -303,6 +316,20 @@ describe('Storage (Redis integration)', () => {
         expect(updated.completedAt).toBeInstanceOf(Date);
         expect(updated.output).toEqual(['ok']);
       });
+
+      it('should update attempt count', async () => {
+        await steps.create(testRunId, {
+          stepId: 'step-123',
+          stepName: 'test-step',
+          input: ['input1'],
+        });
+
+        const updated = await steps.update(testRunId, 'step-123', {
+          attempt: 2,
+        });
+
+        expect(updated.attempt).toBe(2);
+      });
     });
   });
 
@@ -330,6 +357,20 @@ describe('Storage (Redis integration)', () => {
         expect(event.runId).toBe(testRunId);
         expect(event.eventId).toMatch(/^wevt_/);
         expect(event.eventType).toBe('step_started');
+        expect(event.correlationId).toBe('corr_123');
+        expect(event.createdAt).toBeInstanceOf(Date);
+      });
+
+      it('should create a new event with null byte in payload', async () => {
+        const event = await events.create(testRunId, {
+          eventType: 'step_failed' as const,
+          correlationId: 'corr_123',
+          eventData: { error: 'Error with null byte \u0000 in message' },
+        });
+
+        expect(event.runId).toBe(testRunId);
+        expect(event.eventId).toMatch(/^wevt_/);
+        expect(event.eventType).toBe('step_failed');
         expect(event.correlationId).toBe('corr_123');
         expect(event.createdAt).toBeInstanceOf(Date);
       });
@@ -391,6 +432,54 @@ describe('Storage (Redis integration)', () => {
         expect(result.data[1].eventId).toBe(event2.eventId);
         expect(result.data[0].correlationId).toBe(correlationId);
         expect(result.data[1].correlationId).toBe(correlationId);
+      });
+
+      it('should handle hook lifecycle events', async () => {
+        const hookId = 'hook_test123';
+
+        // Create a typical hook lifecycle
+        const created = await events.create(testRunId, {
+          eventType: 'hook_created' as const,
+          correlationId: hookId,
+        });
+
+        await setTimeout(5);
+
+        const received1 = await events.create(testRunId, {
+          eventType: 'hook_received' as const,
+          correlationId: hookId,
+          eventData: { payload: { request: 1 } },
+        });
+
+        await setTimeout(5);
+
+        const received2 = await events.create(testRunId, {
+          eventType: 'hook_received' as const,
+          correlationId: hookId,
+          eventData: { payload: { request: 2 } },
+        });
+
+        await setTimeout(5);
+
+        const disposed = await events.create(testRunId, {
+          eventType: 'hook_disposed' as const,
+          correlationId: hookId,
+        });
+
+        const result = await events.listByCorrelationId({
+          correlationId: hookId,
+          pagination: {},
+        });
+
+        expect(result.data).toHaveLength(4);
+        expect(result.data[0].eventId).toBe(created.eventId);
+        expect(result.data[0].eventType).toBe('hook_created');
+        expect(result.data[1].eventId).toBe(received1.eventId);
+        expect(result.data[1].eventType).toBe('hook_received');
+        expect(result.data[2].eventId).toBe(received2.eventId);
+        expect(result.data[2].eventType).toBe('hook_received');
+        expect(result.data[3].eventId).toBe(disposed.eventId);
+        expect(result.data[3].eventType).toBe('hook_disposed');
       });
     });
   });
