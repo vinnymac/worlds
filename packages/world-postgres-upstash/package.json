@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-postgres-upstash",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "World implementation using PostgreSQL for storage and Upstash QStash for queue management - works with any PostgreSQL provider (Neon, Supabase, RDS, etc.)",
   "type": "module",
   "main": "dist/index.js",
