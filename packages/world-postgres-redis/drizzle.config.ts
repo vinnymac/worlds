@@ -7,6 +7,6 @@ export default defineConfig({
       process.env.DATABASE_URL ||
       'postgresql://world:world@localhost:5432/world',
   },
-  schema: './src/drizzle/schema.ts',
+  schema: './dist/drizzle/schema.js',
   out: './src/drizzle/migrations',
 });

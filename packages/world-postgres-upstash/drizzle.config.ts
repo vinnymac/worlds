@@ -7,6 +7,6 @@ export default defineConfig({
       process.env.DATABASE_URL ||
       'postgresql://localhost:5432/postgres_upstash_test',
   },
-  schema: './src/schema.ts',
+  schema: './dist/schema.js',
   out: './migrations',
 });

@@ -69,5 +69,5 @@ if (shouldSkipTests) {
     await postgresContainer?.stop();
   });
 
-  createTestSuite('@fantasticfour/world-postgres-upstash');
+  createTestSuite('./dist/index.js');
 }

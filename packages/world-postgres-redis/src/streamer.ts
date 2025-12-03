@@ -215,7 +215,9 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
           buffer = null;
         },
         cancel() {
-          cleanups.forEach((fn) => void fn());
+          for (const fn of cleanups) {
+            fn();
+          }
         },
       });
     },

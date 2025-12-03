@@ -4,6 +4,7 @@ packages:
 catalog:
   "@types/node": ^22.19.0
   "@biomejs/biome": ^2.3.7
+  "cbor-x": ^1.6.0
   dotenv: ^17.2.3
   ioredis: ^5.8.2
   typescript: ^5.9.3

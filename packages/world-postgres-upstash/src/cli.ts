@@ -29,7 +29,7 @@ async function setupDatabase() {
       __dirname,
       '..',
       'migrations',
-      '0000_tired_cyclops.sql'
+      '0000_organic_whirlwind.sql'
     );
     const migrationSQL = await readFile(migrationPath, 'utf-8');
 

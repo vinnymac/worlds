@@ -71,7 +71,7 @@ export function createPostgresUpstashWorld(
     environment,
   });
   const queue = createQueue(qstash, deploymentId);
-  const streamer = createStreamer(db);
+  const streamer = createStreamer(postgres, db);
 
   return {
     ...storage,

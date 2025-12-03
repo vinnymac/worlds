@@ -4,6 +4,14 @@
   "description": "World implementation using PostgreSQL for storage and Upstash QStash for queue management - works with any PostgreSQL provider (Neon, Supabase, RDS, etc.)",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "world-postgres-upstash-setup": "./bin/setup.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "migrations"
+  ],
   "publishConfig": {
     "access": "public",
     "provenance": true
@@ -18,10 +26,19 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./migrations/*.sql": "./migrations/*.sql"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x bin/setup.js",
     "dev": "tsc --watch",
     "clean": "tsc --build --clean && rm -rf dist",
     "test": "vitest run",
@@ -35,6 +52,7 @@
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",
+    "cbor-x": "catalog:",
     "drizzle-orm": "catalog:",
     "postgres": "catalog:",
     "ulid": "catalog:",

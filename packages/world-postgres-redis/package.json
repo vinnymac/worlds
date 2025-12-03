@@ -4,8 +4,12 @@
   "description": "Hybrid World implementation using PostgreSQL for durable storage with Redis Lists for queue management",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "world-postgres-redis-setup": "./bin/setup.js"
+  },
   "files": [
     "dist",
+    "bin",
     "src/drizzle/migrations"
   ],
   "publishConfig": {
@@ -22,10 +26,19 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./drizzle/schema": {
+      "types": "./dist/drizzle/schema.d.ts",
+      "default": "./dist/drizzle/schema.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./drizzle/migrations/*.sql": "./src/drizzle/migrations/*.sql"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x bin/setup.js",
     "dev": "tsc --watch",
     "clean": "tsc --build --clean && rm -rf dist",
     "test": "vitest run",
@@ -37,6 +50,7 @@
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",
+    "cbor-x": "catalog:",
     "drizzle-orm": "catalog:",
     "ioredis": "catalog:",
     "postgres": "catalog:",

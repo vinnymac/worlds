@@ -18,6 +18,7 @@ import type {
   ListWorkflowRunsParams,
   PaginatedResponse,
   PauseWorkflowRunParams,
+  ResolveData,
   ResumeWorkflowRunParams,
   Step,
   Storage,
@@ -25,6 +26,7 @@ import type {
   UpdateWorkflowRunRequest,
   WorkflowRun,
 } from '@workflow/world';
+import { HookSchema } from '@workflow/world';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import { compact } from './util.js';
@@ -71,6 +73,103 @@ function dateReviver(key: string, value: any): any {
  */
 function parseWithDates<T>(json: string): T {
   return JSON.parse(json, dateReviver);
+}
+
+/**
+ * Serialize a StructuredError object into a JSON string.
+ * Stores error.message, error.stack, and error.code as a JSON string.
+ * Handles both string errors (old interface) and StructuredError objects (new interface).
+ */
+function serializeError<T extends { error?: any }>(data: T): any {
+  if (!data.error) {
+    return data;
+  }
+
+  // If error is already a string, pass it through unchanged
+  if (typeof data.error === 'string') {
+    return data;
+  }
+
+  const { error, ...rest } = data;
+  return {
+    ...rest,
+    error: JSON.stringify({
+      message: (error as any).message,
+      stack: (error as any).stack,
+      code: (error as any).code,
+    }),
+  };
+}
+
+/**
+ * Deserialize error JSON string into a StructuredError object.
+ * Handles backwards compatibility with plain string errors.
+ */
+function deserializeError<T extends { error?: any }>(entity: T): T {
+  const { error, ...rest } = entity;
+
+  if (!error) {
+    return entity;
+  }
+
+  // Try to parse as structured error JSON
+  if (error) {
+    try {
+      const parsed = JSON.parse(error);
+      if (typeof parsed === 'object' && parsed.message !== undefined) {
+        return {
+          ...rest,
+          error: {
+            message: parsed.message,
+            stack: parsed.stack,
+            code: parsed.code,
+          },
+        } as T;
+      }
+    } catch {
+      // Not JSON, treat as plain string
+    }
+  }
+
+  // Backwards compatibility: treat plain string as error message
+  return {
+    ...rest,
+    error: {
+      message: error || '',
+    },
+  } as T;
+}
+
+/**
+ * Filter data based on ResolveData parameter.
+ * When resolveData is 'none', strips specified keys to reduce data transfer.
+ */
+function filterData<T extends object>(
+  data: T,
+  resolveData: ResolveData | undefined,
+  keysToStrip: (keyof T)[]
+): T {
+  if (resolveData === 'none') {
+    const newData = { ...data };
+    for (const key of keysToStrip) {
+      if (key in newData) {
+        delete newData[key];
+      }
+    }
+    return newData;
+  }
+  return data;
+}
+
+/**
+ * Filter hook data based on resolveData parameter
+ */
+function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
+  if (resolveData === 'none' && 'metadata' in hook) {
+    const { metadata: _, ...rest } = hook;
+    return { metadata: undefined, ...rest };
+  }
+  return hook;
 }
 
 /**
@@ -125,7 +224,9 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
         continue;
       }
 
-      const run: WorkflowRun = parseWithDates<WorkflowRun>(result[1] as string);
+      const run: WorkflowRun = deserializeError(
+        parseWithDates<WorkflowRun>(result[1] as string)
+      );
 
       // Apply filters
       const statusMatches = !params?.status || run.status === params.status;
@@ -133,7 +234,11 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
         !params?.workflowName || run.workflowName === params.workflowName;
 
       if (statusMatches && nameMatches) {
-        runs.push(compact(run));
+        const filtered = filterData(run, params?.resolveData, [
+          'input',
+          'output',
+        ]);
+        runs.push(compact(filtered));
       }
     }
 
@@ -180,15 +285,13 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
       return compact(run);
     },
 
-    async get(
-      id: string,
-      _params?: GetWorkflowRunParams
-    ): Promise<WorkflowRun> {
+    async get(id: string, params?: GetWorkflowRunParams): Promise<WorkflowRun> {
       const data = await redis.get(runKey(id));
       if (!data) {
         throw new WorkflowAPIError(`Run not found: ${id}`, { status: 404 });
       }
-      return parseWithDates<WorkflowRun>(data);
+      const run = deserializeError(parseWithDates<WorkflowRun>(data));
+      return filterData(run, params?.resolveData, ['input', 'output']);
     },
 
     async update(
@@ -201,8 +304,10 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
       }
 
       const currentRun = parseWithDates<WorkflowRun>(existingData);
+      // Serialize the error field if present
+      const serialized = serializeError(data);
       const updates: any = {
-        ...data,
+        ...serialized,
         updatedAt: new Date(),
       };
 
@@ -240,7 +345,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
 
       await pipeline.exec();
 
-      return compact(updatedRun);
+      return deserializeError(compact(updatedRun));
     },
 
     async list(
@@ -510,7 +615,11 @@ export function createStepsStorage(
   }
 
   // Helper: Get step data from Redis key
-  async function getStepData(key: string, stepId: string): Promise<Step> {
+  async function getStepData(
+    key: string,
+    stepId: string,
+    params?: GetStepParams
+  ): Promise<Step> {
     const data = await redis.get(key);
 
     if (!data) {
@@ -519,7 +628,8 @@ export function createStepsStorage(
       });
     }
 
-    return parseWithDates<Step>(data);
+    const step = deserializeError(parseWithDates<Step>(data));
+    return filterData(step, params?.resolveData, ['input', 'output']);
   }
 
   return {
@@ -557,7 +667,7 @@ export function createStepsStorage(
     async get(
       runId: string | undefined,
       stepId: string,
-      _params?: GetStepParams
+      params?: GetStepParams
     ): Promise<Step> {
       // If runId not provided, scan for the step (slower but necessary)
       if (!runId) {
@@ -570,11 +680,11 @@ export function createStepsStorage(
           });
         }
 
-        return getStepData(foundKey, stepId);
+        return getStepData(foundKey, stepId, params);
       }
 
       // Fast path: Direct key lookup when runId is provided
-      return getStepData(stepKey(runId, stepId), stepId);
+      return getStepData(stepKey(runId, stepId), stepId, params);
     },
 
     async update(
@@ -590,9 +700,11 @@ export function createStepsStorage(
       }
 
       const currentStep = parseWithDates<Step>(existingData);
+      // Serialize the error field if present
+      const serialized = serializeError(data);
       const now = new Date();
       const updates: Partial<Step> = {
-        ...data,
+        ...serialized,
         updatedAt: now,
       };
 
@@ -610,7 +722,7 @@ export function createStepsStorage(
 
       await redis.set(stepKey(runId, stepId), JSON.stringify(updatedStep));
 
-      return compact(updatedStep);
+      return deserializeError(compact(updatedStep));
     },
 
     async list(
@@ -640,7 +752,14 @@ export function createStepsStorage(
       const steps: Step[] = [];
       for (const result of results ?? []) {
         if (result?.[1]) {
-          steps.push(parseWithDates<Step>(result[1] as string));
+          const step = deserializeError(
+            parseWithDates<Step>(result[1] as string)
+          );
+          const filtered = filterData(step, params?.resolveData, [
+            'input',
+            'output',
+          ]);
+          steps.push(filtered);
         }
       }
 
@@ -673,7 +792,7 @@ export function createHooksStorage(
     async create(
       runId: string,
       data: CreateHookRequest,
-      _params?: GetHookParams
+      params?: GetHookParams
     ): Promise<Hook> {
       const createdAt = new Date();
 
@@ -708,27 +827,32 @@ export function createHooksStorage(
         .zadd(hooksIndexKey(runId), createdAt.getTime(), data.hookId)
         .exec();
 
-      return hook;
+      const parsed = HookSchema.parse(compact(hook));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterHookData(parsed, resolveData);
     },
 
-    async get(hookId: string, _params?: GetHookParams): Promise<Hook> {
+    async get(hookId: string, params?: GetHookParams): Promise<Hook> {
       const data = await redis.get(hookKey(hookId));
       if (!data) {
         throw new WorkflowAPIError(`Hook not found: ${hookId}`, {
           status: 404,
         });
       }
-      return parseWithDates<Hook>(data);
+      const hook = parseWithDates<Hook>(data);
+      const parsed = HookSchema.parse(compact(hook));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterHookData(parsed, resolveData);
     },
 
-    async getByToken(token: string, _params?: GetHookParams): Promise<Hook> {
+    async getByToken(token: string, params?: GetHookParams): Promise<Hook> {
       const hookId = await redis.get(hooksByTokenKey(token));
       if (!hookId) {
         throw new WorkflowAPIError(`Hook not found for token: ${token}`, {
           status: 404,
         });
       }
-      return this.get(hookId);
+      return this.get(hookId, params);
     },
 
     async list(params: ListHooksParams): Promise<PaginatedResponse<Hook>> {
@@ -760,7 +884,10 @@ export function createHooksStorage(
       const hooks: Hook[] = [];
       for (const result of results ?? []) {
         if (result?.[1]) {
-          hooks.push(parseWithDates<Hook>(result[1] as string));
+          const hook = parseWithDates<Hook>(result[1] as string);
+          const parsed = HookSchema.parse(compact(hook));
+          const filtered = filterHookData(parsed, params?.resolveData ?? 'all');
+          hooks.push(filtered);
         }
       }
 
@@ -768,13 +895,13 @@ export function createHooksStorage(
       const hasMore = hooks.length > limit;
 
       return {
-        data: values.map(compact),
+        data: values,
         cursor: values.at(-1)?.hookId ?? null,
         hasMore,
       };
     },
 
-    async dispose(hookId: string, _params?: GetHookParams): Promise<Hook> {
+    async dispose(hookId: string, params?: GetHookParams): Promise<Hook> {
       const data = await redis.get(hookKey(hookId));
       if (!data) {
         throw new WorkflowAPIError(`Hook not found: ${hookId}`, {
@@ -792,7 +919,9 @@ export function createHooksStorage(
         .zrem(hooksIndexKey(hook.runId), hookId)
         .exec();
 
-      return hook;
+      const parsed = HookSchema.parse(compact(hook));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterHookData(parsed, resolveData);
     },
   };
 }

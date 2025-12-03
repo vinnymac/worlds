@@ -27,6 +27,7 @@ import type {
   WorkflowRun,
   WorkflowRunStatus,
 } from '@workflow/world';
+import { HookSchema } from '@workflow/world';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import { compact } from './util.js';
@@ -159,6 +160,17 @@ function filterData<T extends object>(
     return newData;
   }
   return data;
+}
+
+/**
+ * Filter hook data based on resolveData parameter
+ */
+function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
+  if (resolveData === 'none' && 'metadata' in hook) {
+    const { metadata: _, ...rest } = hook;
+    return { metadata: undefined, ...rest };
+  }
+  return hook;
 }
 
 /**
@@ -832,7 +844,7 @@ export function createHooksStorage(
     async create(
       runId: string,
       data: CreateHookRequest,
-      _params?: GetHookParams
+      params?: GetHookParams
     ): Promise<Hook> {
       const createdAt = new Date();
 
@@ -865,10 +877,12 @@ export function createHooksStorage(
         .zadd(hooksIndexKey(runId), createdAt.getTime(), data.hookId)
         .exec();
 
-      return hook;
+      const parsed = HookSchema.parse(compact(hook));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterHookData(parsed, resolveData);
     },
 
-    async get(hookId: string, _params?: GetHookParams): Promise<Hook> {
+    async get(hookId: string, params?: GetHookParams): Promise<Hook> {
       const data = await redis.get(hookKey(hookId));
       if (!data) {
         throw new WorkflowAPIError(`Hook not found: ${hookId}`, {
@@ -876,7 +890,9 @@ export function createHooksStorage(
         });
       }
       const hook = parseWithDates<Hook>(data);
-      return compact(hook);
+      const parsed = HookSchema.parse(compact(hook));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterHookData(parsed, resolveData);
     },
 
     async getByToken(token: string, params?: GetHookParams): Promise<Hook> {
@@ -933,7 +949,7 @@ export function createHooksStorage(
       };
     },
 
-    async dispose(hookId: string, _params?: GetHookParams): Promise<Hook> {
+    async dispose(hookId: string, params?: GetHookParams): Promise<Hook> {
       const data = await redis.get(hookKey(hookId));
       if (!data) {
         throw new WorkflowAPIError(`Hook not found: ${hookId}`, {
@@ -951,7 +967,9 @@ export function createHooksStorage(
         .zrem(hooksIndexKey(hook.runId), hookId)
         .exec();
 
-      return hook;
+      const parsed = HookSchema.parse(compact(hook));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterHookData(parsed, resolveData);
     },
   };
 }

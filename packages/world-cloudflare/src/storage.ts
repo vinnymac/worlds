@@ -3,19 +3,25 @@ import type {
   CreateHookRequest,
   CreateStepRequest,
   Event,
+  GetHookParams,
+  GetStepParams,
+  GetWorkflowRunParams,
   Hook,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
   ListWorkflowRunsParams,
   PaginatedResponse,
+  ResolveData,
   Step,
   Storage,
   UpdateStepRequest,
   UpdateWorkflowRunRequest,
   WorkflowRun,
 } from '@workflow/world';
+import { HookSchema } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
+import { compact } from './util.js';
 
 export interface CloudflareStorageConfig {
   env: {
@@ -147,6 +153,38 @@ function deserializeStepError(data: unknown): Step {
   } as Step;
 }
 
+/**
+ * Filter data based on ResolveData parameter.
+ * When resolveData is 'none', strips specified keys to reduce data transfer.
+ */
+function filterData<T extends object>(
+  data: T,
+  resolveData: ResolveData | undefined,
+  keysToStrip: (keyof T)[]
+): T {
+  if (resolveData === 'none') {
+    const newData = { ...data };
+    for (const key of keysToStrip) {
+      if (key in newData) {
+        delete newData[key];
+      }
+    }
+    return newData;
+  }
+  return data;
+}
+
+/**
+ * Filter hook data based on resolveData parameter
+ */
+function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
+  if (resolveData === 'none' && 'metadata' in hook) {
+    const { metadata: _, ...rest } = hook;
+    return { metadata: undefined, ...rest };
+  }
+  return hook;
+}
+
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const ulid = monotonicFactory();
@@ -186,7 +224,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         return run;
       },
 
-      async get(runId: string) {
+      async get(runId: string, params?: GetWorkflowRunParams) {
         const stub = getRunDO(runId);
         const run = await stub.getRun();
 
@@ -196,7 +234,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
 
-        return run;
+        return filterData(run, params?.resolveData, ['input', 'output']);
       },
 
       async cancel(runId: string) {
@@ -263,7 +301,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             if (!meta) return null;
             const { runId } = JSON.parse(meta);
             try {
-              return await this.get(runId);
+              return await this.get(runId, {
+                resolveData: params?.resolveData,
+              });
             } catch {
               return null;
             }
@@ -360,7 +400,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         return step;
       },
 
-      async get(runId: string, stepId: string) {
+      async get(runId: string, stepId: string, params?: GetStepParams) {
         const stub = getRunDO(runId);
         const data = await stub.getStep(stepId);
 
@@ -370,7 +410,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
 
-        return deserializeStepError({
+        const step = deserializeStepError({
           ...data,
           createdAt: new Date(data.createdAt),
           updatedAt: new Date(data.updatedAt),
@@ -380,6 +420,8 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             : undefined,
           retryAfter: data.retryAfter ? new Date(data.retryAfter) : undefined,
         });
+
+        return filterData(step, params?.resolveData, ['input', 'output']);
       },
 
       async update(runId: string, stepId: string, data: UpdateStepRequest) {
@@ -420,16 +462,17 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         });
 
         return {
-          data: result.data.map((s: Step) =>
-            deserializeStepError({
+          data: result.data.map((s: Step) => {
+            const step = deserializeStepError({
               ...s,
               createdAt: new Date(s.createdAt),
               updatedAt: new Date(s.updatedAt),
               startedAt: s.startedAt ? new Date(s.startedAt) : undefined,
               completedAt: s.completedAt ? new Date(s.completedAt) : undefined,
               retryAfter: s.retryAfter ? new Date(s.retryAfter) : undefined,
-            })
-          ),
+            });
+            return filterData(step, params?.resolveData, ['input', 'output']);
+          }),
           cursor: result.cursor ?? null,
           hasMore: result.hasMore ?? false,
         };
@@ -437,7 +480,11 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     },
 
     hooks: {
-      async create(runId: string, data: CreateHookRequest) {
+      async create(
+        runId: string,
+        data: CreateHookRequest,
+        params?: GetHookParams
+      ) {
         const now = new Date();
 
         const hook = {
@@ -448,7 +495,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           projectId: '',
           environment: '',
           createdAt: now,
-          metadata: undefined,
+          metadata: data.metadata,
         };
 
         const stub = getRunDO(runId);
@@ -460,10 +507,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           JSON.stringify(hook)
         );
 
-        return hook;
+        const parsed = HookSchema.parse(compact(hook));
+        const resolveData = params?.resolveData ?? 'all';
+        return filterHookData(parsed, resolveData);
       },
 
-      async get(_hookId: string) {
+      async get(_hookId: string, _params?: GetHookParams) {
         throw new WorkflowAPIError(
           'Hook lookup by ID not implemented for Cloudflare',
           {
@@ -472,7 +521,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         );
       },
 
-      async getByToken(token: string) {
+      async getByToken(token: string, params?: GetHookParams) {
         const data = await env.WORKFLOW_INDEX.get(`hook:${token}`);
 
         if (!data) {
@@ -482,10 +531,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         }
 
         const hook = JSON.parse(data);
-        return {
+        const parsed = HookSchema.parse({
           ...hook,
           createdAt: new Date(hook.createdAt),
-        };
+        });
+        const resolveData = params?.resolveData ?? 'all';
+        return filterHookData(parsed, resolveData);
       },
 
       async list(params: ListHooksParams): Promise<PaginatedResponse<Hook>> {
@@ -505,16 +556,19 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
 
         return {
-          data: result.data.map((h: Hook) => ({
-            ...h,
-            createdAt: new Date(h.createdAt),
-          })),
+          data: result.data.map((h: Hook) => {
+            const parsed = HookSchema.parse({
+              ...h,
+              createdAt: new Date(h.createdAt),
+            });
+            return filterHookData(parsed, params?.resolveData ?? 'all');
+          }),
           cursor: result.cursor ?? null,
           hasMore: result.hasMore ?? false,
         };
       },
 
-      async dispose(_hookId: string) {
+      async dispose(_hookId: string, _params?: GetHookParams) {
         throw new WorkflowAPIError(
           'Hook disposal by ID not implemented for Cloudflare',
           {
