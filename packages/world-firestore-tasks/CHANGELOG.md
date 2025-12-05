@@ -1,5 +1,11 @@
 # @fantasticfour/world-firestore-tasks
 
+## 1.0.3
+
+### Patch Changes
+
+- d44be4d: Sync with upstream changes from world-postgres such as cbor-x
+
 ## 1.0.2
 
 ### Patch Changes
