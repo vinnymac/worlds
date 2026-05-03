@@ -21,10 +21,9 @@ jobs:
       matrix:
         package:
           - '@fantasticfour/world-cloudflare'
-          - '@fantasticfour/world-dynamodb-sqs'
           - '@fantasticfour/world-firestore-tasks'
-          - '@fantasticfour/world-postgres-upstash'
           - '@fantasticfour/world-postgres-redis'
+          - '@fantasticfour/world-postgres-upstash'
           - '@fantasticfour/world-redis'
           - '@fantasticfour/world-redis-bullmq'
     env:
