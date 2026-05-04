@@ -973,13 +973,36 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     } as Storage['steps'],
 
     hooks: {
-      async get(_hookId: string, _params?: GetHookParams) {
-        throw new WorkflowWorldError(
-          'Hook lookup by ID not implemented for Firestore',
-          {
-            status: 501,
-          }
-        );
+      async get(hookId: string, params?: GetHookParams) {
+        // Query hooks across all runs by hookId
+        // We need to use a collection group query since hooks are stored in subcollections
+        const hooksQuery = await firestore
+          .collectionGroup('hooks')
+          .where('hookId', '==', hookId)
+          .limit(1)
+          .get();
+
+        if (hooksQuery.empty) {
+          throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
+            status: 404,
+          });
+        }
+
+        const doc = hooksQuery.docs[0];
+        const data = doc.data() as FirebaseFirestore.DocumentData;
+        const parsed = HookSchema.parse({
+          runId: data.runId,
+          hookId: data.hookId,
+          token: data.token,
+          ownerId: data.ownerId || '',
+          projectId: data.projectId || '',
+          environment: data.environment || '',
+          specVersion: data.specVersion,
+          createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
+          metadata: deserializeNestedArrays(data.metadata),
+        });
+        const resolveData = params?.resolveData ?? 'all';
+        return filterHookData(parsed, resolveData);
       },
 
       async getByToken(token: string, params?: GetHookParams) {
