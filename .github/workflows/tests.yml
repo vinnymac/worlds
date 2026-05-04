@@ -55,6 +55,7 @@ jobs:
           docker pull testcontainers/ryuk:0.8.1 || true
           docker pull public.ecr.aws/docker/library/postgres:15-alpine || true
           docker pull public.ecr.aws/docker/library/redis:7-alpine || true
+          docker pull gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators || true
 
       - name: Run Unit Tests for ${{ matrix.package }}
         run: pnpm --filter "${{ matrix.package }}" test
