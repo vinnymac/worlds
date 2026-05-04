@@ -257,5 +257,5 @@ export function createStreamer(config: StreamerConfig): Streamer {
         },
       });
     },
-  };
+  } as any as Streamer; // Type assertion for updated API with old @workflow/world types
 }

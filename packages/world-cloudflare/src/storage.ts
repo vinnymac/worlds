@@ -1,8 +1,10 @@
-import { WorkflowAPIError } from '@workflow/errors';
+import { WorkflowWorldError } from '@workflow/errors';
 import type {
-  CreateHookRequest,
-  CreateStepRequest,
+  CreateEventParams,
+  CreateEventRequest,
   Event,
+  EventResult,
+  GetEventParams,
   GetHookParams,
   GetStepParams,
   GetWorkflowRunParams,
@@ -13,11 +15,13 @@ import type {
   ListWorkflowRunsParams,
   PaginatedResponse,
   ResolveData,
+  RunCreatedEventRequest,
   Step,
+  StepWithoutData,
   Storage,
   UpdateStepRequest,
-  UpdateWorkflowRunRequest,
   WorkflowRun,
+  WorkflowRunWithoutData,
 } from '@workflow/world';
 import { HookSchema } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
@@ -51,77 +55,9 @@ interface SerializedError {
   code?: string;
 }
 
-type SerializedWorkflowRunUpdate = Omit<UpdateWorkflowRunRequest, 'error'> & {
-  error?: SerializedError;
-};
-
 type SerializedStepUpdate = Omit<UpdateStepRequest, 'error'> & {
   error?: SerializedError;
 };
-
-function serializeRunError(
-  data: UpdateWorkflowRunRequest
-): SerializedWorkflowRunUpdate {
-  if (!data.error) {
-    return data;
-  }
-
-  const { error, ...rest } = data;
-  return {
-    ...rest,
-    error: {
-      message: error.message,
-      stack: error.stack,
-      code: error.code,
-    },
-  };
-}
-
-function isValidRunData(
-  data: unknown
-): data is Record<string, unknown> & { error?: unknown } {
-  return typeof data === 'object' && data !== null;
-}
-
-function _deserializeRunError(data: unknown): WorkflowRun {
-  if (!isValidRunData(data)) {
-    throw new WorkflowAPIError('Invalid run data', { status: 500 });
-  }
-
-  if (!data.error) {
-    return data as WorkflowRun;
-  }
-
-  const error = data.error as {
-    message?: string;
-    stack?: string;
-    code?: string;
-  };
-  return {
-    ...data,
-    error: {
-      message: error.message || '',
-      stack: error.stack,
-      code: error.code,
-    },
-  } as WorkflowRun;
-}
-
-function serializeStepError(data: UpdateStepRequest): SerializedStepUpdate {
-  if (!data.error) {
-    return data;
-  }
-
-  const { error, ...rest } = data;
-  return {
-    ...rest,
-    error: {
-      message: error.message,
-      stack: error.stack,
-      code: error.code,
-    },
-  };
-}
 
 function isValidStepData(
   data: unknown
@@ -131,7 +67,7 @@ function isValidStepData(
 
 function deserializeStepError(data: unknown): Step {
   if (!isValidStepData(data)) {
-    throw new WorkflowAPIError('Invalid step data', { status: 500 });
+    throw new WorkflowWorldError('Invalid step data', { status: 500 });
   }
 
   if (!data.error) {
@@ -185,6 +121,19 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
   return hook;
 }
 
+/**
+ * Serialize an error object for storage.
+ */
+function serializeError(error: unknown): SerializedError | undefined {
+  if (!error) return undefined;
+  const err = error as { message?: string; stack?: string; code?: string };
+  return {
+    message: err.message || '',
+    stack: err.stack,
+    code: err.code,
+  };
+}
+
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const ulid = monotonicFactory();
@@ -197,39 +146,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
   return {
     runs: {
-      async create(data) {
-        const runId = `wrun_${ulid()}`;
-
-        const stub = getRunDO(runId);
-        const run = await stub.createRun({
-          runId,
-          workflowName: data.workflowName,
-          input: data.input,
-          executionContext: data.executionContext as
-            | Record<string, unknown>
-            | undefined,
-          deploymentId: data.deploymentId,
-        });
-
-        // Index for list operations
-        await env.WORKFLOW_INDEX.put(
-          `run:${data.workflowName}:${runId}`,
-          JSON.stringify({
-            runId,
-            createdAt: run.createdAt.toISOString(),
-            status: 'pending',
-          })
-        );
-
-        return run;
-      },
-
       async get(runId: string, params?: GetWorkflowRunParams) {
         const stub = getRunDO(runId);
         const run = await stub.getRun();
 
         if (!run) {
-          throw new WorkflowAPIError(`Run not found: ${runId}`, {
+          throw new WorkflowWorldError(`Run not found: ${runId}`, {
             status: 404,
           });
         }
@@ -237,50 +159,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         return filterData(run, params?.resolveData, ['input', 'output']);
       },
 
-      async cancel(runId: string) {
-        const stub = getRunDO(runId);
-        return await stub.cancelRun({});
-      },
-
-      async pause(runId: string) {
-        const stub = getRunDO(runId);
-        return await stub.pauseRun({});
-      },
-
-      async resume(runId: string) {
-        const stub = getRunDO(runId);
-        const now = new Date();
-        return await stub.resumeRun({ updatedAt: now });
-      },
-
-      async update(runId: string, data: UpdateWorkflowRunRequest) {
-        const stub = getRunDO(runId);
-        const now = new Date();
-
-        const serialized = serializeRunError(data);
-        const updates: any = { ...serialized, updatedAt: now };
-
-        // Set startedAt when transitioning to 'running' (if not already in data)
-        if (data.status === 'running' && !(serialized as any).startedAt) {
-          updates.startedAt = now;
-        }
-
-        // Set completedAt when transitioning to terminal states (if not already in data)
-        if (
-          (data.status === 'completed' ||
-            data.status === 'failed' ||
-            data.status === 'cancelled') &&
-          !(serialized as any).completedAt
-        ) {
-          updates.completedAt = now;
-        }
-
-        return await stub.updateRun(updates);
-      },
-
       async list(
-        params: ListWorkflowRunsParams
-      ): Promise<PaginatedResponse<WorkflowRun>> {
+        params?: ListWorkflowRunsParams
+      ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
         const limit = params?.pagination?.limit ?? 20;
         const prefix = params?.workflowName
           ? `run:${params.workflowName}:`
@@ -322,24 +203,301 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           hasMore,
         };
       },
-    },
+    } as Storage['runs'],
 
     events: {
-      async create(runId: string, data) {
+      async create(
+        runId: string | null,
+        data: RunCreatedEventRequest | CreateEventRequest,
+        _params?: CreateEventParams
+      ): Promise<EventResult> {
         const eventId = `wevt_${ulid()}`;
         const now = new Date();
 
-        const eventData = {
+        // For run_created events, generate a runId if null
+        const effectiveRunId =
+          runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
+
+        const eventRecord: Record<string, unknown> = {
           ...data,
-          runId,
+          runId: effectiveRunId,
           eventId,
           createdAt: now,
         };
 
-        const stub = getRunDO(runId);
-        await stub.createEvent(eventData);
+        // Store the event in the DO
+        const stub = getRunDO(effectiveRunId);
+        await stub.createEvent(eventRecord);
 
-        return eventData;
+        const event = eventRecord as unknown as Event;
+        const result: EventResult = { event };
+
+        const eventData = (data as any).eventData;
+
+        switch (data.eventType) {
+          case 'run_created': {
+            const runData = eventData as RunCreatedEventRequest['eventData'];
+            const run = await stub.createRun({
+              runId: effectiveRunId,
+              workflowName: runData.workflowName,
+              input: runData.input,
+              executionContext: runData.executionContext as
+                | Record<string, unknown>
+                | undefined,
+              deploymentId: runData.deploymentId,
+            });
+
+            // Index for list operations
+            await env.WORKFLOW_INDEX.put(
+              `run:${runData.workflowName}:${effectiveRunId}`,
+              JSON.stringify({
+                runId: effectiveRunId,
+                createdAt: run.createdAt.toISOString(),
+                status: 'pending',
+              })
+            );
+
+            result.run = run;
+            break;
+          }
+          case 'run_started': {
+            const updates: any = {
+              status: 'running',
+              updatedAt: now,
+              startedAt: now,
+            };
+            if (eventData?.input !== undefined) {
+              updates.input = eventData.input;
+            }
+            if (eventData?.deploymentId !== undefined) {
+              updates.deploymentId = eventData.deploymentId;
+            }
+            result.run = await stub.updateRun(updates);
+            break;
+          }
+          case 'run_completed': {
+            const updates: any = {
+              status: 'completed',
+              updatedAt: now,
+              completedAt: now,
+            };
+            if (eventData?.output !== undefined) {
+              updates.output = eventData.output;
+            }
+            result.run = await stub.updateRun(updates);
+            break;
+          }
+          case 'run_failed': {
+            const updates: any = {
+              status: 'failed',
+              updatedAt: now,
+              completedAt: now,
+            };
+            if (eventData?.error !== undefined) {
+              updates.error = serializeError(eventData.error);
+            }
+            result.run = await stub.updateRun(updates);
+            break;
+          }
+          case 'run_cancelled': {
+            result.run = await stub.cancelRun({
+              updatedAt: now,
+            });
+            break;
+          }
+          case 'step_created': {
+            const correlationId = (data as any).correlationId;
+            const stepNow = new Date();
+            const step: Step = {
+              runId: effectiveRunId,
+              stepId: correlationId,
+              stepName: eventData.stepName,
+              status: 'pending',
+              input: eventData.input,
+              output: undefined,
+              error: undefined,
+              attempt: 1,
+              createdAt: stepNow,
+              updatedAt: stepNow,
+              startedAt: undefined,
+              completedAt: undefined,
+              retryAfter: undefined,
+            };
+            await stub.createStep(step);
+            result.step = step;
+            break;
+          }
+          case 'step_started': {
+            const correlationId = (data as any).correlationId;
+            const updates: any = {
+              status: 'running',
+              updatedAt: now,
+              startedAt: now,
+            };
+            if (eventData?.attempt !== undefined) {
+              updates.attempt = eventData.attempt;
+            }
+            await stub.updateStep(correlationId, updates);
+            const stepData = await stub.getStep(correlationId);
+            result.step = deserializeStepError({
+              ...stepData,
+              createdAt: new Date(stepData.createdAt),
+              updatedAt: new Date(stepData.updatedAt),
+              startedAt: stepData.startedAt
+                ? new Date(stepData.startedAt)
+                : undefined,
+              completedAt: stepData.completedAt
+                ? new Date(stepData.completedAt)
+                : undefined,
+              retryAfter: stepData.retryAfter
+                ? new Date(stepData.retryAfter)
+                : undefined,
+            });
+            break;
+          }
+          case 'step_completed': {
+            const correlationId = (data as any).correlationId;
+            const updates: any = {
+              status: 'completed',
+              updatedAt: now,
+              completedAt: now,
+            };
+            if (eventData?.result !== undefined) {
+              updates.output = eventData.result;
+            }
+            await stub.updateStep(correlationId, updates);
+            const stepData = await stub.getStep(correlationId);
+            result.step = deserializeStepError({
+              ...stepData,
+              createdAt: new Date(stepData.createdAt),
+              updatedAt: new Date(stepData.updatedAt),
+              startedAt: stepData.startedAt
+                ? new Date(stepData.startedAt)
+                : undefined,
+              completedAt: stepData.completedAt
+                ? new Date(stepData.completedAt)
+                : undefined,
+              retryAfter: stepData.retryAfter
+                ? new Date(stepData.retryAfter)
+                : undefined,
+            });
+            break;
+          }
+          case 'step_failed': {
+            const correlationId = (data as any).correlationId;
+            const updates: any = {
+              status: 'failed',
+              updatedAt: now,
+              completedAt: now,
+            };
+            if (eventData?.error !== undefined) {
+              updates.error = serializeError(eventData.error);
+            }
+            await stub.updateStep(correlationId, updates);
+            const stepData = await stub.getStep(correlationId);
+            result.step = deserializeStepError({
+              ...stepData,
+              createdAt: new Date(stepData.createdAt),
+              updatedAt: new Date(stepData.updatedAt),
+              startedAt: stepData.startedAt
+                ? new Date(stepData.startedAt)
+                : undefined,
+              completedAt: stepData.completedAt
+                ? new Date(stepData.completedAt)
+                : undefined,
+              retryAfter: stepData.retryAfter
+                ? new Date(stepData.retryAfter)
+                : undefined,
+            });
+            break;
+          }
+          case 'step_retrying': {
+            const correlationId = (data as any).correlationId;
+            const currentStep = await stub.getStep(correlationId);
+            const updates: any = {
+              status: 'pending',
+              updatedAt: now,
+              attempt: ((currentStep?.attempt || 1) as number) + 1,
+            };
+            if (eventData?.error !== undefined) {
+              updates.error = serializeError(eventData.error);
+            }
+            if (eventData?.retryAfter !== undefined) {
+              updates.retryAfter = new Date(eventData.retryAfter as string);
+            }
+            await stub.updateStep(correlationId, updates);
+            const stepData = await stub.getStep(correlationId);
+            result.step = deserializeStepError({
+              ...stepData,
+              createdAt: new Date(stepData.createdAt),
+              updatedAt: new Date(stepData.updatedAt),
+              startedAt: stepData.startedAt
+                ? new Date(stepData.startedAt)
+                : undefined,
+              completedAt: stepData.completedAt
+                ? new Date(stepData.completedAt)
+                : undefined,
+              retryAfter: stepData.retryAfter
+                ? new Date(stepData.retryAfter)
+                : undefined,
+            });
+            break;
+          }
+          case 'hook_created': {
+            const correlationId = (data as any).correlationId;
+            const hookNow = new Date();
+
+            const hook = {
+              runId: effectiveRunId,
+              hookId: correlationId,
+              token: eventData.token,
+              ownerId: '',
+              projectId: '',
+              environment: '',
+              createdAt: hookNow,
+              metadata: eventData.metadata,
+            };
+
+            await stub.createHook(hook);
+
+            // Index by token for lookup
+            await env.WORKFLOW_INDEX.put(
+              `hook:${eventData.token}`,
+              JSON.stringify(hook)
+            );
+
+            result.hook = HookSchema.parse(compact(hook));
+            break;
+          }
+          // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
+          // are event-only; no entity mutation needed at the storage level
+        }
+
+        return result;
+      },
+
+      async get(
+        runId: string,
+        eventId: string,
+        _params?: GetEventParams
+      ): Promise<Event> {
+        const stub = getRunDO(runId);
+        const result = await stub.listEvents({
+          limit: 1000,
+          sortOrder: 'asc',
+        });
+
+        const event = result.data.find((e: Event) => e.eventId === eventId);
+        if (!event) {
+          throw new WorkflowWorldError(`Event not found: ${eventId}`, {
+            status: 404,
+          });
+        }
+
+        return {
+          ...event,
+          createdAt: new Date(event.createdAt),
+        };
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -375,37 +533,22 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     },
 
     steps: {
-      async create(runId: string, data: CreateStepRequest) {
-        const now = new Date();
-
-        const step: Step = {
-          runId,
-          stepId: data.stepId,
-          stepName: data.stepName,
-          status: 'pending',
-          input: data.input,
-          output: undefined,
-          error: undefined,
-          attempt: 1,
-          createdAt: now,
-          updatedAt: now,
-          startedAt: undefined,
-          completedAt: undefined,
-          retryAfter: undefined,
-        };
-
-        const stub = getRunDO(runId);
-        await stub.createStep(step);
-
-        return step;
-      },
-
-      async get(runId: string, stepId: string, params?: GetStepParams) {
+      async get(
+        runId: string | undefined,
+        stepId: string,
+        params?: GetStepParams
+      ) {
+        if (!runId) {
+          throw new WorkflowWorldError(
+            'runId is required for Cloudflare step lookup',
+            { status: 400 }
+          );
+        }
         const stub = getRunDO(runId);
         const data = await stub.getStep(stepId);
 
         if (!data) {
-          throw new WorkflowAPIError(`Step not found: ${stepId}`, {
+          throw new WorkflowWorldError(`Step not found: ${stepId}`, {
             status: 404,
           });
         }
@@ -424,34 +567,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         return filterData(step, params?.resolveData, ['input', 'output']);
       },
 
-      async update(runId: string, stepId: string, data: UpdateStepRequest) {
-        const stub = getRunDO(runId);
-        const now = new Date();
-
-        const serialized = serializeStepError(data);
-        const updates: any = { ...serialized, updatedAt: now };
-
-        // Set startedAt when transitioning to 'running' (if not already in data)
-        if (data.status === 'running' && !(serialized as any).startedAt) {
-          updates.startedAt = now;
-        }
-
-        // Set completedAt when transitioning to terminal states (if not already in data)
-        if (
-          (data.status === 'completed' || data.status === 'failed') &&
-          !(serialized as any).completedAt
-        ) {
-          updates.completedAt = now;
-        }
-
-        await stub.updateStep(stepId, updates);
-
-        return this.get(runId, stepId);
-      },
-
       async list(
         params: ListWorkflowRunStepsParams
-      ): Promise<PaginatedResponse<Step>> {
+      ): Promise<PaginatedResponse<Step | StepWithoutData>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 20;
 
@@ -477,43 +595,11 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           hasMore: result.hasMore ?? false,
         };
       },
-    },
+    } as Storage['steps'],
 
     hooks: {
-      async create(
-        runId: string,
-        data: CreateHookRequest,
-        params?: GetHookParams
-      ) {
-        const now = new Date();
-
-        const hook = {
-          runId,
-          hookId: data.hookId,
-          token: data.token,
-          ownerId: '',
-          projectId: '',
-          environment: '',
-          createdAt: now,
-          metadata: data.metadata,
-        };
-
-        const stub = getRunDO(runId);
-        await stub.createHook(hook);
-
-        // Index by token for lookup
-        await env.WORKFLOW_INDEX.put(
-          `hook:${data.token}`,
-          JSON.stringify(hook)
-        );
-
-        const parsed = HookSchema.parse(compact(hook));
-        const resolveData = params?.resolveData ?? 'all';
-        return filterHookData(parsed, resolveData);
-      },
-
       async get(_hookId: string, _params?: GetHookParams) {
-        throw new WorkflowAPIError(
+        throw new WorkflowWorldError(
           'Hook lookup by ID not implemented for Cloudflare',
           {
             status: 501,
@@ -525,7 +611,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const data = await env.WORKFLOW_INDEX.get(`hook:${token}`);
 
         if (!data) {
-          throw new WorkflowAPIError(`Hook not found for token: ${token}`, {
+          throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
             status: 404,
           });
         }
@@ -541,7 +627,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
       async list(params: ListHooksParams): Promise<PaginatedResponse<Hook>> {
         if (!params.runId) {
-          throw new WorkflowAPIError('runId is required for listing hooks', {
+          throw new WorkflowWorldError('runId is required for listing hooks', {
             status: 400,
           });
         }
@@ -566,15 +652,6 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           cursor: result.cursor ?? null,
           hasMore: result.hasMore ?? false,
         };
-      },
-
-      async dispose(_hookId: string, _params?: GetHookParams) {
-        throw new WorkflowAPIError(
-          'Hook disposal by ID not implemented for Cloudflare',
-          {
-            status: 501,
-          }
-        );
       },
     },
   };

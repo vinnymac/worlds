@@ -1,7 +1,7 @@
 import type { CloudTasksClient } from '@google-cloud/tasks';
 import type { Queue } from '@workflow/world';
 import { MessageId } from '@workflow/world';
-import { createEmbeddedWorld } from '@workflow/world-local';
+import { createLocalWorld } from '@workflow/world-local';
 
 interface CloudTasksConfig {
   client?: CloudTasksClient;
@@ -21,7 +21,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
 
   // Create embedded world for test orchestration (like world-redis and world-cloudflare)
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createEmbeddedWorld({ dataDir: undefined, port });
+  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   // Detect test mode
   const isTest =

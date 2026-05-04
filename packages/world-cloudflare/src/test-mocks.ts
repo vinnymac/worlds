@@ -90,14 +90,6 @@ class MockWorkflowRunDOStub {
     return this.updateRun({ ...updates, status: 'cancelled' });
   }
 
-  async pauseRun(updates: any): Promise<WorkflowRun> {
-    return this.updateRun({ ...updates, status: 'paused' });
-  }
-
-  async resumeRun(updates: any): Promise<WorkflowRun> {
-    return this.updateRun({ ...updates, status: 'running' });
-  }
-
   async createStep(stepData: Step): Promise<Step> {
     const storage = getDOStorage(this.runId);
     const steps = storage.get('steps') || new Map<string, Step>();

@@ -4,8 +4,6 @@ import type {
   Event,
   Hook,
   Step,
-  UpdateStepRequest,
-  UpdateWorkflowRunRequest,
   WorkflowRun,
 } from '@workflow/world';
 
@@ -51,9 +49,10 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   /**
-   * Update the workflow run with automatic timestamp handling
+   * Update the workflow run with automatic timestamp handling.
+   * Uses Record<string, unknown> to avoid discriminated union type conflicts.
    */
-  async updateRun(updates: UpdateWorkflowRunRequest): Promise<WorkflowRun> {
+  async updateRun(updates: Record<string, unknown>): Promise<WorkflowRun> {
     const current = await this.ctx.storage.get<WorkflowRun>('run');
     if (!current) {
       throw new Error('Run not found');
@@ -88,30 +87,10 @@ export class WorkflowRunDO extends DurableObject {
   /**
    * Cancel the workflow run
    */
-  async cancelRun(updates: Partial<WorkflowRun>): Promise<WorkflowRun> {
+  async cancelRun(updates: Record<string, unknown>): Promise<WorkflowRun> {
     return this.updateRun({
       ...updates,
       status: 'cancelled',
-    });
-  }
-
-  /**
-   * Pause the workflow run
-   */
-  async pauseRun(updates: Partial<WorkflowRun>): Promise<WorkflowRun> {
-    return this.updateRun({
-      ...updates,
-      status: 'paused',
-    });
-  }
-
-  /**
-   * Resume the workflow run
-   */
-  async resumeRun(updates: Partial<WorkflowRun>): Promise<WorkflowRun> {
-    return this.updateRun({
-      ...updates,
-      status: 'running',
     });
   }
 
@@ -138,9 +117,13 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   /**
-   * Update a step with automatic timestamp handling
+   * Update a step with automatic timestamp handling.
+   * Uses Record<string, unknown> to avoid discriminated union type conflicts.
    */
-  async updateStep(stepId: string, updates: UpdateStepRequest): Promise<Step> {
+  async updateStep(
+    stepId: string,
+    updates: Record<string, unknown>
+  ): Promise<Step> {
     const stepsMap =
       (await this.ctx.storage.get<Map<string, Step>>('steps')) || new Map();
     const current = stepsMap.get(stepId);

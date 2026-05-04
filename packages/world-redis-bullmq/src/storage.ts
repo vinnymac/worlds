@@ -1,12 +1,9 @@
-import { WorkflowAPIError } from '@workflow/errors';
+import { WorkflowWorldError } from '@workflow/errors';
 import type {
-  CancelWorkflowRunParams,
   CreateEventParams,
   CreateEventRequest,
-  CreateHookRequest,
-  CreateStepRequest,
-  CreateWorkflowRunRequest,
   Event,
+  EventResult,
   GetHookParams,
   GetStepParams,
   GetWorkflowRunParams,
@@ -17,16 +14,23 @@ import type {
   ListWorkflowRunStepsParams,
   ListWorkflowRunsParams,
   PaginatedResponse,
-  PauseWorkflowRunParams,
   ResolveData,
-  ResumeWorkflowRunParams,
+  RunCreatedEventRequest,
   Step,
+  StepWithoutData,
   Storage,
-  UpdateStepRequest,
-  UpdateWorkflowRunRequest,
   WorkflowRun,
+  WorkflowRunWithoutData,
 } from '@workflow/world';
-import { HookSchema } from '@workflow/world';
+import {
+  EventSchema,
+  HookSchema,
+  isLegacySpecVersion,
+  requiresNewerWorld,
+  SPEC_VERSION_CURRENT,
+  StepSchema,
+  WorkflowRunSchema,
+} from '@workflow/world';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import { compact } from './util.js';
@@ -141,27 +145,6 @@ function deserializeError<T extends { error?: any }>(entity: T): T {
 }
 
 /**
- * Filter data based on ResolveData parameter.
- * When resolveData is 'none', strips specified keys to reduce data transfer.
- */
-function filterData<T extends object>(
-  data: T,
-  resolveData: ResolveData | undefined,
-  keysToStrip: (keyof T)[]
-): T {
-  if (resolveData === 'none') {
-    const newData = { ...data };
-    for (const key of keysToStrip) {
-      if (key in newData) {
-        delete newData[key];
-      }
-    }
-    return newData;
-  }
-  return data;
-}
-
-/**
  * Filter hook data based on resolveData parameter
  */
 function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
@@ -172,12 +155,56 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
   return hook;
 }
 
+function filterStepData(step: Step, resolveData: 'none'): StepWithoutData;
+function filterStepData(step: Step, resolveData: 'all'): Step;
+function filterStepData(
+  step: Step,
+  resolveData: ResolveData
+): Step | StepWithoutData;
+function filterStepData(
+  step: Step,
+  resolveData: ResolveData
+): Step | StepWithoutData {
+  if (resolveData === 'none') {
+    const { input: _, output: __, ...rest } = step;
+    return { input: undefined, output: undefined, ...rest };
+  }
+  return step;
+}
+
+function filterRunData(
+  run: WorkflowRun,
+  resolveData: 'none'
+): WorkflowRunWithoutData;
+function filterRunData(run: WorkflowRun, resolveData: 'all'): WorkflowRun;
+function filterRunData(
+  run: WorkflowRun,
+  resolveData: ResolveData
+): WorkflowRun | WorkflowRunWithoutData;
+function filterRunData(
+  run: WorkflowRun,
+  resolveData: ResolveData
+): WorkflowRun | WorkflowRunWithoutData {
+  if (resolveData === 'none') {
+    const { input: _, output: __, ...rest } = run;
+    return { input: undefined, output: undefined, ...rest };
+  }
+  return run;
+}
+
+function filterEventData(event: Event, resolveData: ResolveData): Event {
+  if (resolveData === 'none' && 'eventData' in event) {
+    const { eventData: _, ...rest } = event;
+    return rest as Event;
+  }
+  return event;
+}
+
 /**
  * Create storage for workflow runs using Redis hashes and sorted sets
  */
 export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
   const { redis, keyPrefix } = config;
-  const ulid = monotonicFactory();
 
   const runKey = (id: string) => `${keyPrefix}run:${id}`;
   const runsIndexKey = () => `${keyPrefix}runs:index`;
@@ -216,8 +243,8 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
   function parseRunsFromPipeline(
     results: any[] | null,
     params?: ListWorkflowRunsParams
-  ): WorkflowRun[] {
-    const runs: WorkflowRun[] = [];
+  ): (WorkflowRun | WorkflowRunWithoutData)[] {
+    const runs: (WorkflowRun | WorkflowRunWithoutData)[] = [];
 
     for (const result of results ?? []) {
       if (!result?.[1]) {
@@ -234,11 +261,9 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
         !params?.workflowName || run.workflowName === params.workflowName;
 
       if (statusMatches && nameMatches) {
-        const filtered = filterData(run, params?.resolveData, [
-          'input',
-          'output',
-        ]);
-        runs.push(compact(filtered));
+        const resolveData = params?.resolveData ?? 'all';
+        const parsed = WorkflowRunSchema.parse(compact(run));
+        runs.push(filterRunData(parsed, resolveData));
       }
     }
 
@@ -246,111 +271,18 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
   }
 
   return {
-    async create(data: CreateWorkflowRunRequest): Promise<WorkflowRun> {
-      const runId = `wrun_${ulid()}`;
-      const now = new Date();
-
-      const run = {
-        runId,
-        deploymentId: data.deploymentId,
-        workflowName: data.workflowName,
-        status: 'pending' as const,
-        input: data.input,
-        executionContext: data.executionContext as Record<string, any> | null,
-        output: undefined,
-        error: undefined,
-        completedAt: undefined,
-        startedAt: undefined,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      // Use SET NX to ensure run doesn't already exist
-      const existed = await redis.setnx(runKey(runId), JSON.stringify(run));
-      if (!existed) {
-        throw new WorkflowAPIError(`Run ${runId} already exists`, {
-          status: 409,
-        });
-      }
-
-      // Add to indexes - use timestamp as score for ordering, runId as member
-      const score = now.getTime();
-      await redis
-        .pipeline()
-        .zadd(runsIndexKey(), score, runId)
-        .zadd(runsByNameKey(data.workflowName), score, runId)
-        .zadd(runsByStatusKey('pending'), score, runId)
-        .exec();
-
-      return compact(run);
-    },
-
-    async get(id: string, params?: GetWorkflowRunParams): Promise<WorkflowRun> {
+    get: (async (id: string, params?: GetWorkflowRunParams) => {
       const data = await redis.get(runKey(id));
       if (!data) {
-        throw new WorkflowAPIError(`Run not found: ${id}`, { status: 404 });
+        throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
       }
       const run = deserializeError(parseWithDates<WorkflowRun>(data));
-      return filterData(run, params?.resolveData, ['input', 'output']);
-    },
+      const parsed = WorkflowRunSchema.parse(compact(run));
+      const resolveData = params?.resolveData ?? 'all';
+      return filterRunData(parsed, resolveData);
+    }) as Storage['runs']['get'],
 
-    async update(
-      id: string,
-      data: UpdateWorkflowRunRequest
-    ): Promise<WorkflowRun> {
-      const existingData = await redis.get(runKey(id));
-      if (!existingData) {
-        throw new WorkflowAPIError(`Run not found: ${id}`, { status: 404 });
-      }
-
-      const currentRun = parseWithDates<WorkflowRun>(existingData);
-      // Serialize the error field if present
-      const serialized = serializeError(data);
-      const updates: any = {
-        ...serialized,
-        updatedAt: new Date(),
-      };
-
-      // Set startedAt only on first transition to 'running'
-      if (data.status === 'running' && !currentRun.startedAt) {
-        updates.startedAt = new Date();
-      }
-
-      // Set completedAt on terminal states
-      if (
-        data.status === 'completed' ||
-        data.status === 'failed' ||
-        data.status === 'cancelled'
-      ) {
-        updates.completedAt = new Date();
-      }
-
-      const updatedRun = { ...currentRun, ...updates } as WorkflowRun;
-
-      // Update run and reindex if status changed
-      const pipeline = redis
-        .pipeline()
-        .set(runKey(id), JSON.stringify(updatedRun));
-
-      if (data.status && data.status !== currentRun.status) {
-        // Remove from old status index
-        pipeline.zrem(runsByStatusKey(currentRun.status), id);
-        // Add to new status index with current timestamp
-        pipeline.zadd(
-          runsByStatusKey(data.status),
-          updatedRun.updatedAt.getTime(),
-          id
-        );
-      }
-
-      await pipeline.exec();
-
-      return deserializeError(compact(updatedRun));
-    },
-
-    async list(
-      params?: ListWorkflowRunsParams
-    ): Promise<PaginatedResponse<WorkflowRun>> {
+    list: (async (params?: ListWorkflowRunsParams) => {
       const limit = params?.pagination?.limit ?? 20;
       const fromCursor = params?.pagination?.cursor;
 
@@ -374,50 +306,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
         hasMore,
         cursor: values.at(-1)?.runId ?? null,
       };
-    },
-
-    async cancel(
-      id: string,
-      _params?: CancelWorkflowRunParams
-    ): Promise<WorkflowRun> {
-      return this.update(id, { status: 'cancelled' });
-    },
-
-    async pause(
-      id: string,
-      _params?: PauseWorkflowRunParams
-    ): Promise<WorkflowRun> {
-      return this.update(id, { status: 'paused' });
-    },
-
-    async resume(
-      id: string,
-      _params?: ResumeWorkflowRunParams
-    ): Promise<WorkflowRun> {
-      const existingData = await redis.get(runKey(id));
-      if (!existingData) {
-        throw new WorkflowAPIError(`Run not found: ${id}`, { status: 404 });
-      }
-
-      const currentRun = parseWithDates<WorkflowRun>(existingData);
-      if (currentRun.status !== 'paused') {
-        throw new WorkflowAPIError(`Paused run not found: ${id}`, {
-          status: 404,
-        });
-      }
-
-      const updates: Partial<WorkflowRun> = {
-        status: 'running',
-        updatedAt: new Date(),
-      };
-
-      // Set startedAt only if not already set
-      if (!currentRun.startedAt) {
-        updates.startedAt = new Date();
-      }
-
-      return this.update(id, updates);
-    },
+    }) as Storage['runs']['list'],
   };
 }
 
@@ -435,6 +324,42 @@ export function createEventsStorage(
     `${keyPrefix}events:by_run:${runId}`;
   const eventsByCorrelationKey = (correlationId: string) =>
     `${keyPrefix}events:by_correlation:${correlationId}`;
+
+  // Run key helpers (needed for event-sourced entity mutations)
+  const runKey = (id: string) => `${keyPrefix}run:${id}`;
+  const runsIndexKey = () => `${keyPrefix}runs:index`;
+  const runsByNameKey = (name: string) => `${keyPrefix}runs:by_name:${name}`;
+  const runsByStatusKey = (status: string) =>
+    `${keyPrefix}runs:by_status:${status}`;
+
+  // Step key helpers
+  const stepKey = (runId: string, stepId: string) =>
+    `${keyPrefix}step:${runId}:${stepId}`;
+  const stepsIndexKey = (runId: string) => `${keyPrefix}steps:by_run:${runId}`;
+
+  // Hook key helpers
+  const hookKey = (hookId: string) => `${keyPrefix}hook:${hookId}`;
+  const hooksByTokenKey = (token: string) =>
+    `${keyPrefix}hooks:by_token:${token}`;
+  const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
+
+  // Helper: Clean up hooks when run reaches terminal status
+  async function cleanupHooks(runId: string): Promise<void> {
+    const indexKey = hooksIndexKey(runId);
+    const hookIds = await redis.zrange(indexKey, 0, -1);
+
+    const pipeline = redis.pipeline();
+    for (const hookId of hookIds) {
+      const hookData = await redis.get(hookKey(hookId));
+      if (hookData) {
+        const hook = parseWithDates<Hook>(hookData);
+        pipeline.del(hookKey(hookId));
+        pipeline.del(hooksByTokenKey(hook.token));
+      }
+    }
+    pipeline.del(indexKey);
+    await pipeline.exec();
+  }
 
   // Helper: Calculate start position from cursor with sort order
   async function calculateEventStartPosition(
@@ -475,31 +400,747 @@ export function createEventsStorage(
     return events;
   }
 
+  /**
+   * Handle events for legacy runs (pre-event-sourcing, specVersion < 2).
+   */
+  async function handleLegacyEvent(
+    runId: string,
+    eventId: string,
+    data: any,
+    currentRun: { status: string; specVersion?: number },
+    params?: { resolveData?: ResolveData }
+  ): Promise<EventResult> {
+    const resolveData = params?.resolveData ?? 'all';
+
+    switch (data.eventType) {
+      case 'run_cancelled': {
+        // Legacy: Skip event storage, directly update run to cancelled
+        const now = new Date();
+        const existingData = await redis.get(runKey(runId));
+        if (existingData) {
+          const existing = parseWithDates<WorkflowRun>(existingData);
+          const updatedRun = {
+            ...existing,
+            status: 'cancelled' as const,
+            completedAt: now,
+            updatedAt: now,
+          };
+          await redis.set(runKey(runId), JSON.stringify(updatedRun));
+
+          // Update status index
+          const pipeline = redis.pipeline();
+          pipeline.zrem(runsByStatusKey(existing.status), runId);
+          pipeline.zadd(runsByStatusKey('cancelled'), now.getTime(), runId);
+          await pipeline.exec();
+
+          // Cleanup hooks
+          await cleanupHooks(runId);
+
+          const parsed = WorkflowRunSchema.parse(compact(updatedRun));
+          return {
+            run: filterRunData(parsed, resolveData) as WorkflowRun,
+          };
+        }
+        return {};
+      }
+
+      case 'wait_completed':
+      case 'hook_received': {
+        // Legacy: Store event only (no entity mutation)
+        const createdAt = new Date();
+        const event: Event = {
+          ...data,
+          runId,
+          eventId,
+          createdAt,
+          specVersion: SPEC_VERSION_CURRENT,
+        };
+
+        await redis.set(eventKey(eventId), JSON.stringify(event));
+        const score = createdAt.getTime();
+        const pipeline = redis.pipeline();
+        pipeline.zadd(eventsIndexKey(runId), score, eventId);
+        if (data.correlationId) {
+          pipeline.zadd(
+            eventsByCorrelationKey(data.correlationId),
+            score,
+            eventId
+          );
+        }
+        await pipeline.exec();
+
+        const parsed = EventSchema.parse(event);
+        return { event: filterEventData(parsed, resolveData) };
+      }
+
+      default:
+        throw new Error(
+          `Event type '${data.eventType}' not supported for legacy runs ` +
+            `(specVersion: ${currentRun.specVersion || 'undefined'}). ` +
+            `Please upgrade @workflow packages.`
+        );
+    }
+  }
+
   return {
     async create(
-      runId: string,
-      data: CreateEventRequest,
-      _params?: CreateEventParams
-    ): Promise<Event> {
+      runId: string | null,
+      data: CreateEventRequest | RunCreatedEventRequest,
+      params?: CreateEventParams
+    ): Promise<EventResult> {
       const eventId = `wevt_${ulid()}`;
-      const createdAt = new Date();
+      const now = new Date();
 
-      const event: Event = {
+      // For run_created events, generate runId server-side if null or empty
+      let effectiveRunId: string;
+      if (data.eventType === 'run_created' && (!runId || runId === '')) {
+        effectiveRunId = `wrun_${ulid()}`;
+      } else if (!runId) {
+        throw new Error('runId is required for non-run_created events');
+      } else {
+        effectiveRunId = runId;
+      }
+
+      const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
+
+      // Track entity created/updated for EventResult
+      let run: WorkflowRun | undefined;
+      let step: Step | undefined;
+      let hook: Hook | undefined;
+
+      // Helper to check if run is in terminal state
+      const isRunTerminal = (status: string) =>
+        ['completed', 'failed', 'cancelled'].includes(status);
+
+      // Helper to check if step is in terminal state
+      const isStepTerminal = (status: string) =>
+        ['completed', 'failed'].includes(status);
+
+      // ============================================================
+      // VALIDATION: Terminal state and event ordering checks
+      // ============================================================
+
+      let currentRun: {
+        status: string;
+        specVersion?: number;
+      } | null = null;
+      const skipRunValidationEvents = ['step_completed', 'step_retrying'];
+      if (
+        data.eventType !== 'run_created' &&
+        !skipRunValidationEvents.includes(data.eventType)
+      ) {
+        const runData = await redis.get(runKey(effectiveRunId));
+        if (runData) {
+          const parsed = parseWithDates<WorkflowRun>(runData);
+          currentRun = {
+            status: parsed.status,
+            specVersion: parsed.specVersion,
+          };
+        }
+      }
+
+      // ============================================================
+      // VERSION COMPATIBILITY: Check run spec version
+      // ============================================================
+      if (currentRun) {
+        if (requiresNewerWorld(currentRun.specVersion)) {
+          throw new (await import('@workflow/errors')).RunNotSupportedError(
+            currentRun.specVersion!,
+            SPEC_VERSION_CURRENT
+          );
+        }
+
+        if (isLegacySpecVersion(currentRun.specVersion)) {
+          return handleLegacyEvent(
+            effectiveRunId,
+            eventId,
+            data,
+            currentRun,
+            params
+          );
+        }
+      }
+
+      // Run terminal state validation
+      if (currentRun && isRunTerminal(currentRun.status)) {
+        const runTerminalEvents = [
+          'run_started',
+          'run_completed',
+          'run_failed',
+        ];
+
+        // Idempotent operation: run_cancelled on already cancelled run is allowed
+        if (
+          data.eventType === 'run_cancelled' &&
+          currentRun.status === 'cancelled'
+        ) {
+          // Get full run for return value
+          const fullRunData = await redis.get(runKey(effectiveRunId));
+
+          // Create the event (still record it)
+          const createdAt = new Date();
+          const event = {
+            ...data,
+            runId: effectiveRunId,
+            eventId,
+            createdAt,
+            specVersion: effectiveSpecVersion,
+          };
+          await redis.set(eventKey(eventId), JSON.stringify(event));
+          const score = createdAt.getTime();
+          await redis.zadd(eventsIndexKey(effectiveRunId), score, eventId);
+
+          const parsed = EventSchema.parse(event);
+          const resolveData = params?.resolveData ?? 'all';
+          return {
+            event: filterEventData(parsed, resolveData),
+            run: fullRunData
+              ? (deserializeError(
+                  parseWithDates<WorkflowRun>(fullRunData)
+                ) as WorkflowRun)
+              : undefined,
+          };
+        }
+
+        // Run state transitions are not allowed on terminal runs
+        if (
+          runTerminalEvents.includes(data.eventType) ||
+          data.eventType === 'run_cancelled'
+        ) {
+          throw new WorkflowWorldError(
+            `Cannot transition run from terminal state "${currentRun.status}"`,
+            { status: 410 }
+          );
+        }
+
+        // Creating new entities on terminal runs is not allowed
+        if (
+          data.eventType === 'step_created' ||
+          data.eventType === 'hook_created'
+        ) {
+          throw new WorkflowWorldError(
+            `Cannot create new entities on run in terminal state "${currentRun.status}"`,
+            { status: 410 }
+          );
+        }
+      }
+
+      // Step-related event validation
+      let validatedStep: { status: string; startedAt?: Date } | null = null;
+      const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
+      if (
+        stepEventsNeedingValidation.includes(data.eventType) &&
+        data.correlationId
+      ) {
+        const stepData = await redis.get(
+          stepKey(effectiveRunId, data.correlationId)
+        );
+        if (stepData) {
+          const parsed = parseWithDates<Step>(stepData);
+          validatedStep = {
+            status: parsed.status,
+            startedAt: parsed.startedAt,
+          };
+        }
+
+        if (!validatedStep) {
+          throw new WorkflowWorldError(
+            `Step "${data.correlationId}" not found`,
+            { status: 404 }
+          );
+        }
+
+        if (isStepTerminal(validatedStep.status)) {
+          throw new WorkflowWorldError(
+            `Cannot modify step in terminal state "${validatedStep.status}"`,
+            { status: 410 }
+          );
+        }
+
+        if (currentRun && isRunTerminal(currentRun.status)) {
+          if (validatedStep.status !== 'running') {
+            throw new WorkflowWorldError(
+              `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
+              { status: 410 }
+            );
+          }
+        }
+      }
+
+      // Hook-related event validation
+      const hookEventsRequiringExistence = ['hook_disposed', 'hook_received'];
+      if (
+        hookEventsRequiringExistence.includes(data.eventType) &&
+        data.correlationId
+      ) {
+        const existingHook = await redis.get(hookKey(data.correlationId));
+        if (!existingHook) {
+          throw new WorkflowWorldError(
+            `Hook "${data.correlationId}" not found`,
+            { status: 404 }
+          );
+        }
+      }
+
+      // ============================================================
+      // Entity creation/updates based on event type
+      // ============================================================
+
+      // Handle run_created event: create the run entity atomically
+      if (data.eventType === 'run_created') {
+        const eventData = (data as any).eventData as {
+          deploymentId: string;
+          workflowName: string;
+          input: any[];
+          executionContext?: Record<string, any>;
+        };
+
+        const newRun = {
+          runId: effectiveRunId,
+          deploymentId: eventData.deploymentId,
+          workflowName: eventData.workflowName,
+          specVersion: effectiveSpecVersion,
+          input: eventData.input,
+          executionContext: eventData.executionContext,
+          status: 'pending' as const,
+          output: undefined,
+          error: undefined,
+          completedAt: undefined,
+          startedAt: undefined,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        // Use SET NX to ensure run doesn't already exist
+        const existed = await redis.setnx(
+          runKey(effectiveRunId),
+          JSON.stringify(newRun)
+        );
+        if (existed) {
+          const score = now.getTime();
+          await redis
+            .pipeline()
+            .zadd(runsIndexKey(), score, effectiveRunId)
+            .zadd(runsByNameKey(eventData.workflowName), score, effectiveRunId)
+            .zadd(runsByStatusKey('pending'), score, effectiveRunId)
+            .exec();
+          run = WorkflowRunSchema.parse(compact(newRun));
+        }
+      }
+
+      // Handle run_started event: update run status
+      if (data.eventType === 'run_started') {
+        const existingData = await redis.get(runKey(effectiveRunId));
+        if (existingData) {
+          const existing = parseWithDates<WorkflowRun>(existingData);
+          const updatedRun = {
+            ...existing,
+            status: 'running' as const,
+            startedAt: now,
+            updatedAt: now,
+          };
+          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+
+          // Update status index
+          const pipeline = redis.pipeline();
+          pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
+          pipeline.zadd(
+            runsByStatusKey('running'),
+            now.getTime(),
+            effectiveRunId
+          );
+          await pipeline.exec();
+
+          run = WorkflowRunSchema.parse(compact(updatedRun));
+        }
+      }
+
+      // Handle run_completed event: update run status and cleanup hooks
+      if (data.eventType === 'run_completed') {
+        const eventData = (data as any).eventData as { output?: any };
+        const existingData = await redis.get(runKey(effectiveRunId));
+        if (existingData) {
+          const existing = parseWithDates<WorkflowRun>(existingData);
+          const updatedRun = {
+            ...existing,
+            status: 'completed' as const,
+            output: eventData.output,
+            completedAt: now,
+            updatedAt: now,
+          };
+          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+
+          const pipeline = redis.pipeline();
+          pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
+          pipeline.zadd(
+            runsByStatusKey('completed'),
+            now.getTime(),
+            effectiveRunId
+          );
+          await pipeline.exec();
+
+          await cleanupHooks(effectiveRunId);
+
+          run = WorkflowRunSchema.parse(compact(updatedRun));
+        }
+      }
+
+      // Handle run_failed event: update run status and cleanup hooks
+      if (data.eventType === 'run_failed') {
+        const eventData = (data as any).eventData as {
+          error: any;
+          errorCode?: string;
+        };
+        const errorMessage =
+          typeof eventData.error === 'string'
+            ? eventData.error
+            : (eventData.error?.message ?? 'Unknown error');
+
+        const existingData = await redis.get(runKey(effectiveRunId));
+        if (existingData) {
+          const existing = parseWithDates<WorkflowRun>(existingData);
+          const updatedRun = serializeError({
+            ...existing,
+            status: 'failed' as const,
+            error: {
+              message: errorMessage,
+              stack: eventData.error?.stack,
+              code: eventData.errorCode,
+            },
+            completedAt: now,
+            updatedAt: now,
+          });
+          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+
+          const pipeline = redis.pipeline();
+          pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
+          pipeline.zadd(
+            runsByStatusKey('failed'),
+            now.getTime(),
+            effectiveRunId
+          );
+          await pipeline.exec();
+
+          await cleanupHooks(effectiveRunId);
+
+          run = deserializeError(
+            parseWithDates<WorkflowRun>(JSON.stringify(updatedRun))
+          );
+          run = WorkflowRunSchema.parse(compact(run));
+        }
+      }
+
+      // Handle run_cancelled event: update run status and cleanup hooks
+      if (data.eventType === 'run_cancelled') {
+        const existingData = await redis.get(runKey(effectiveRunId));
+        if (existingData) {
+          const existing = parseWithDates<WorkflowRun>(existingData);
+          const updatedRun = {
+            ...existing,
+            status: 'cancelled' as const,
+            completedAt: now,
+            updatedAt: now,
+          };
+          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+
+          const pipeline = redis.pipeline();
+          pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
+          pipeline.zadd(
+            runsByStatusKey('cancelled'),
+            now.getTime(),
+            effectiveRunId
+          );
+          await pipeline.exec();
+
+          await cleanupHooks(effectiveRunId);
+
+          run = WorkflowRunSchema.parse(compact(updatedRun));
+        }
+      }
+
+      // Handle step_created event: create step entity
+      if (data.eventType === 'step_created') {
+        const eventData = (data as any).eventData as {
+          stepName: string;
+          input: any;
+        };
+
+        const newStep = {
+          runId: effectiveRunId,
+          stepId: data.correlationId!,
+          stepName: eventData.stepName,
+          input: eventData.input,
+          status: 'pending' as const,
+          attempt: 0,
+          specVersion: effectiveSpecVersion,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        const existed = await redis.setnx(
+          stepKey(effectiveRunId, data.correlationId!),
+          JSON.stringify(newStep)
+        );
+        if (existed) {
+          await redis.zadd(
+            stepsIndexKey(effectiveRunId),
+            now.getTime(),
+            data.correlationId!
+          );
+          step = StepSchema.parse(compact(newStep));
+        }
+      }
+
+      // Handle step_started event: increment attempt, set status to 'running'
+      if (data.eventType === 'step_started') {
+        const isFirstStart = !validatedStep?.startedAt;
+        const existingData = await redis.get(
+          stepKey(effectiveRunId, data.correlationId!)
+        );
+        if (existingData) {
+          const existing = parseWithDates<Step>(existingData);
+          const updatedStep = {
+            ...existing,
+            status: 'running' as const,
+            attempt: existing.attempt + 1,
+            ...(isFirstStart ? { startedAt: now } : {}),
+            updatedAt: now,
+          };
+          await redis.set(
+            stepKey(effectiveRunId, data.correlationId!),
+            JSON.stringify(updatedStep)
+          );
+          step = StepSchema.parse(compact(updatedStep));
+        }
+      }
+
+      // Handle step_completed event: update step status
+      if (data.eventType === 'step_completed') {
+        const eventData = (data as any).eventData as { result?: any };
+        const existingData = await redis.get(
+          stepKey(effectiveRunId, data.correlationId!)
+        );
+        if (existingData) {
+          const existing = parseWithDates<Step>(existingData);
+          if (['completed', 'failed'].includes(existing.status)) {
+            throw new WorkflowWorldError(
+              `Cannot modify step in terminal state "${existing.status}"`,
+              { status: 410 }
+            );
+          }
+          const updatedStep = {
+            ...existing,
+            status: 'completed' as const,
+            output: eventData.result,
+            completedAt: now,
+            updatedAt: now,
+          };
+          await redis.set(
+            stepKey(effectiveRunId, data.correlationId!),
+            JSON.stringify(updatedStep)
+          );
+          step = StepSchema.parse(compact(updatedStep));
+        } else {
+          throw new WorkflowWorldError(
+            `Step "${data.correlationId}" not found`,
+            { status: 404 }
+          );
+        }
+      }
+
+      // Handle step_failed event: terminal state with error
+      if (data.eventType === 'step_failed') {
+        const eventData = (data as any).eventData as {
+          error?: any;
+          stack?: string;
+        };
+        const errorMessage =
+          typeof eventData.error === 'string'
+            ? eventData.error
+            : (eventData.error?.message ?? 'Unknown error');
+
+        const existingData = await redis.get(
+          stepKey(effectiveRunId, data.correlationId!)
+        );
+        if (existingData) {
+          const existing = parseWithDates<Step>(existingData);
+          if (['completed', 'failed'].includes(existing.status)) {
+            throw new WorkflowWorldError(
+              `Cannot modify step in terminal state "${existing.status}"`,
+              { status: 410 }
+            );
+          }
+          const updatedStep = serializeError({
+            ...existing,
+            status: 'failed' as const,
+            error: {
+              message: errorMessage,
+              stack: eventData.stack,
+            },
+            completedAt: now,
+            updatedAt: now,
+          });
+          await redis.set(
+            stepKey(effectiveRunId, data.correlationId!),
+            JSON.stringify(updatedStep)
+          );
+          step = deserializeError(
+            parseWithDates<Step>(JSON.stringify(updatedStep))
+          );
+          step = StepSchema.parse(compact(step));
+        } else {
+          throw new WorkflowWorldError(
+            `Step "${data.correlationId}" not found`,
+            { status: 404 }
+          );
+        }
+      }
+
+      // Handle step_retrying event: sets status back to 'pending', records error
+      if (data.eventType === 'step_retrying') {
+        const eventData = (data as any).eventData as {
+          error?: any;
+          stack?: string;
+          retryAfter?: Date;
+        };
+        const errorMessage =
+          typeof eventData.error === 'string'
+            ? eventData.error
+            : (eventData.error?.message ?? 'Unknown error');
+
+        const existingData = await redis.get(
+          stepKey(effectiveRunId, data.correlationId!)
+        );
+        if (existingData) {
+          const existing = parseWithDates<Step>(existingData);
+          const updatedStep = serializeError({
+            ...existing,
+            status: 'pending' as const,
+            error: {
+              message: errorMessage,
+              stack: eventData.stack,
+            },
+            retryAfter: eventData.retryAfter,
+            updatedAt: now,
+          });
+          await redis.set(
+            stepKey(effectiveRunId, data.correlationId!),
+            JSON.stringify(updatedStep)
+          );
+          step = deserializeError(
+            parseWithDates<Step>(JSON.stringify(updatedStep))
+          );
+          step = StepSchema.parse(compact(step));
+        }
+      }
+
+      // Handle hook_created event: create hook entity
+      if (data.eventType === 'hook_created') {
+        const eventData = (data as any).eventData as {
+          token: string;
+          metadata?: any;
+        };
+
+        // Check for duplicate token
+        const existingHookId = await redis.get(
+          hooksByTokenKey(eventData.token)
+        );
+        if (existingHookId) {
+          // Create hook_conflict event instead of throwing 409
+          const conflictEventData = { token: eventData.token };
+          const createdAt = new Date();
+          const conflictEvent = {
+            eventType: 'hook_conflict' as const,
+            correlationId: data.correlationId,
+            eventData: conflictEventData,
+            runId: effectiveRunId,
+            eventId,
+            createdAt,
+            specVersion: effectiveSpecVersion,
+          };
+
+          await redis.set(eventKey(eventId), JSON.stringify(conflictEvent));
+          const score = createdAt.getTime();
+          const pipeline = redis.pipeline();
+          pipeline.zadd(eventsIndexKey(effectiveRunId), score, eventId);
+          if (data.correlationId) {
+            pipeline.zadd(
+              eventsByCorrelationKey(data.correlationId),
+              score,
+              eventId
+            );
+          }
+          await pipeline.exec();
+
+          const parsedConflict = EventSchema.parse(conflictEvent);
+          const resolveData = params?.resolveData ?? 'all';
+          return {
+            event: filterEventData(parsedConflict, resolveData),
+            run,
+            step,
+            hook: undefined,
+          };
+        }
+
+        const newHook: Hook = {
+          runId: effectiveRunId,
+          hookId: data.correlationId!,
+          token: eventData.token,
+          ownerId: '',
+          projectId: '',
+          environment: '',
+          metadata: eventData.metadata,
+          specVersion: effectiveSpecVersion,
+          createdAt: now,
+        };
+
+        const existed = await redis.setnx(
+          hookKey(data.correlationId!),
+          JSON.stringify(newHook)
+        );
+        if (existed) {
+          await redis
+            .pipeline()
+            .set(hooksByTokenKey(eventData.token), data.correlationId!)
+            .zadd(
+              hooksIndexKey(effectiveRunId),
+              now.getTime(),
+              data.correlationId!
+            )
+            .exec();
+          hook = HookSchema.parse(compact(newHook));
+        }
+      }
+
+      // Handle hook_disposed event: delete hook entity
+      if (data.eventType === 'hook_disposed' && data.correlationId) {
+        const hookData = await redis.get(hookKey(data.correlationId));
+        if (hookData) {
+          const existingHook = parseWithDates<Hook>(hookData);
+          await redis
+            .pipeline()
+            .del(hookKey(data.correlationId))
+            .del(hooksByTokenKey(existingHook.token))
+            .zrem(hooksIndexKey(effectiveRunId), data.correlationId)
+            .exec();
+        }
+      }
+
+      // Store the event
+      const createdAt = new Date();
+      const event = {
         ...data,
-        runId,
+        runId: effectiveRunId,
         eventId,
         createdAt,
+        specVersion: effectiveSpecVersion,
       };
 
-      // Store event
       await redis.set(eventKey(eventId), JSON.stringify(event));
 
-      // Add to indexes with timestamp as score
       const score = createdAt.getTime();
-      const pipeline = redis
-        .pipeline()
-        .zadd(eventsIndexKey(runId), score, eventId);
-
+      const pipeline = redis.pipeline();
+      pipeline.zadd(eventsIndexKey(effectiveRunId), score, eventId);
       if (data.correlationId) {
         pipeline.zadd(
           eventsByCorrelationKey(data.correlationId),
@@ -507,10 +1148,26 @@ export function createEventsStorage(
           eventId
         );
       }
-
       await pipeline.exec();
 
-      return event;
+      const parsed = EventSchema.parse(event);
+      const resolveData = params?.resolveData ?? 'all';
+      return {
+        event: filterEventData(parsed, resolveData),
+        run,
+        step,
+        hook,
+      };
+    },
+
+    async get(_runId: string, eventId: string): Promise<Event> {
+      const data = await redis.get(eventKey(eventId));
+      if (!data) {
+        throw new WorkflowWorldError(`Event not found: ${eventId}`, {
+          status: 404,
+        });
+      }
+      return parseWithDates<Event>(data);
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -527,18 +1184,22 @@ export function createEventsStorage(
       const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
       // Fetch events via pipeline
-      const pipeline = redis.pipeline();
-      for (const eventId of eventIds) {
-        pipeline.get(eventKey(eventId));
+      const eventPipeline = redis.pipeline();
+      for (const eid of eventIds) {
+        eventPipeline.get(eventKey(eid));
       }
-      const results = await pipeline.exec();
+      const results = await eventPipeline.exec();
 
       const events = parseEventsFromPipeline(results);
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
 
+      const resolveData = params?.resolveData ?? 'all';
       return {
-        data: values.map(compact),
+        data: values.map((v) => {
+          const parsed = EventSchema.parse(compact(v));
+          return filterEventData(parsed, resolveData);
+        }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
       };
@@ -560,18 +1221,22 @@ export function createEventsStorage(
       const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
       // Fetch events via pipeline
-      const pipeline = redis.pipeline();
-      for (const eventId of eventIds) {
-        pipeline.get(eventKey(eventId));
+      const eventPipeline = redis.pipeline();
+      for (const eid of eventIds) {
+        eventPipeline.get(eventKey(eid));
       }
-      const results = await pipeline.exec();
+      const results = await eventPipeline.exec();
 
       const events = parseEventsFromPipeline(results);
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
 
+      const resolveData = params?.resolveData ?? 'all';
       return {
-        data: values.map(compact),
+        data: values.map((v) => {
+          const parsed = EventSchema.parse(compact(v));
+          return filterEventData(parsed, resolveData);
+        }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
       };
@@ -619,63 +1284,34 @@ export function createStepsStorage(
     key: string,
     stepId: string,
     params?: GetStepParams
-  ): Promise<Step> {
+  ): Promise<Step | StepWithoutData> {
     const data = await redis.get(key);
 
     if (!data) {
-      throw new WorkflowAPIError(`Step not found: ${stepId}`, {
+      throw new WorkflowWorldError(`Step not found: ${stepId}`, {
         status: 404,
       });
     }
 
     const step = deserializeError(parseWithDates<Step>(data));
-    return filterData(step, params?.resolveData, ['input', 'output']);
+    const parsed = StepSchema.parse(compact(step));
+    const resolveData = params?.resolveData ?? 'all';
+    return filterStepData(parsed, resolveData);
   }
 
   return {
-    async create(runId: string, data: CreateStepRequest): Promise<Step> {
-      const now = new Date();
-
-      const step: Step = {
-        runId,
-        stepId: data.stepId,
-        stepName: data.stepName,
-        status: 'pending',
-        input: data.input,
-        attempt: 1,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      // Use SET NX to ensure step doesn't already exist
-      const existed = await redis.setnx(
-        stepKey(runId, data.stepId),
-        JSON.stringify(step)
-      );
-      if (!existed) {
-        throw new WorkflowAPIError(`Step ${data.stepId} already exists`, {
-          status: 409,
-        });
-      }
-
-      // Add to index with timestamp as score
-      await redis.zadd(stepsIndexKey(runId), now.getTime(), data.stepId);
-
-      return step;
-    },
-
-    async get(
+    get: (async (
       runId: string | undefined,
       stepId: string,
       params?: GetStepParams
-    ): Promise<Step> {
+    ) => {
       // If runId not provided, scan for the step (slower but necessary)
       if (!runId) {
         const pattern = `${keyPrefix}step:*:${stepId}`;
         const foundKey = await scanForKey(pattern);
 
         if (!foundKey) {
-          throw new WorkflowAPIError(`Step not found: ${stepId}`, {
+          throw new WorkflowWorldError(`Step not found: ${stepId}`, {
             status: 404,
           });
         }
@@ -685,49 +1321,9 @@ export function createStepsStorage(
 
       // Fast path: Direct key lookup when runId is provided
       return getStepData(stepKey(runId, stepId), stepId, params);
-    },
+    }) as Storage['steps']['get'],
 
-    async update(
-      runId: string,
-      stepId: string,
-      data: UpdateStepRequest
-    ): Promise<Step> {
-      const existingData = await redis.get(stepKey(runId, stepId));
-      if (!existingData) {
-        throw new WorkflowAPIError(`Step not found: ${stepId}`, {
-          status: 404,
-        });
-      }
-
-      const currentStep = parseWithDates<Step>(existingData);
-      // Serialize the error field if present
-      const serialized = serializeError(data);
-      const now = new Date();
-      const updates: Partial<Step> = {
-        ...serialized,
-        updatedAt: now,
-      };
-
-      // Set startedAt only on first transition to 'running'
-      if (data.status === 'running' && !currentStep.startedAt) {
-        updates.startedAt = now;
-      }
-
-      // Set completedAt on terminal states
-      if (data.status === 'completed' || data.status === 'failed') {
-        updates.completedAt = now;
-      }
-
-      const updatedStep: Step = { ...currentStep, ...updates };
-
-      await redis.set(stepKey(runId, stepId), JSON.stringify(updatedStep));
-
-      return deserializeError(compact(updatedStep));
-    },
-
-    async list(
-      params: ListWorkflowRunStepsParams
-    ): Promise<PaginatedResponse<Step>> {
+    list: (async (params: ListWorkflowRunStepsParams) => {
       const limit = params?.pagination?.limit ?? 20;
       const fromCursor = params?.pagination?.cursor;
 
@@ -744,22 +1340,20 @@ export function createStepsStorage(
 
       // Fetch all steps
       const pipeline = redis.pipeline();
-      for (const stepId of stepIds) {
-        pipeline.get(stepKey(params.runId, stepId));
+      for (const sid of stepIds) {
+        pipeline.get(stepKey(params.runId, sid));
       }
       const results = await pipeline.exec();
 
-      const steps: Step[] = [];
+      const resolveData = params?.resolveData ?? 'all';
+      const steps: (Step | StepWithoutData)[] = [];
       for (const result of results ?? []) {
         if (result?.[1]) {
           const step = deserializeError(
             parseWithDates<Step>(result[1] as string)
           );
-          const filtered = filterData(step, params?.resolveData, [
-            'input',
-            'output',
-          ]);
-          steps.push(filtered);
+          const parsed = StepSchema.parse(compact(step));
+          steps.push(filterStepData(parsed, resolveData));
         }
       }
 
@@ -767,11 +1361,11 @@ export function createStepsStorage(
       const hasMore = steps.length > limit;
 
       return {
-        data: values.map(compact),
+        data: values,
         hasMore,
-        cursor: values.at(-1)?.stepId ?? null,
+        cursor: (values.at(-1) as Step | undefined)?.stepId ?? null,
       };
-    },
+    }) as Storage['steps']['list'],
   };
 }
 
@@ -783,59 +1377,16 @@ export function createHooksStorage(
 ): Storage['hooks'] {
   const { redis, keyPrefix } = config;
 
-  const hookKey = (hookId: string) => `${keyPrefix}hook:${hookId}`;
+  const hookKeyFn = (hookId: string) => `${keyPrefix}hook:${hookId}`;
   const hooksByTokenKey = (token: string) =>
     `${keyPrefix}hooks:by_token:${token}`;
   const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
 
   return {
-    async create(
-      runId: string,
-      data: CreateHookRequest,
-      params?: GetHookParams
-    ): Promise<Hook> {
-      const createdAt = new Date();
-
-      const hook: Hook = {
-        runId,
-        hookId: data.hookId,
-        token: data.token,
-        // NOTE: Context fields not available in storage layer. These could be populated
-        // from execution context if workflow framework passes them in CreateHookRequest.
-        ownerId: '',
-        projectId: '',
-        environment: '',
-        metadata: data.metadata,
-        createdAt,
-      };
-
-      // Use SET NX to ensure hook doesn't already exist
-      const existed = await redis.setnx(
-        hookKey(data.hookId),
-        JSON.stringify(hook)
-      );
-      if (!existed) {
-        throw new WorkflowAPIError(`Hook ${data.hookId} already exists`, {
-          status: 409,
-        });
-      }
-
-      // Add to indexes with timestamp as score
-      await redis
-        .pipeline()
-        .set(hooksByTokenKey(data.token), data.hookId)
-        .zadd(hooksIndexKey(runId), createdAt.getTime(), data.hookId)
-        .exec();
-
-      const parsed = HookSchema.parse(compact(hook));
-      const resolveData = params?.resolveData ?? 'all';
-      return filterHookData(parsed, resolveData);
-    },
-
     async get(hookId: string, params?: GetHookParams): Promise<Hook> {
-      const data = await redis.get(hookKey(hookId));
+      const data = await redis.get(hookKeyFn(hookId));
       if (!data) {
-        throw new WorkflowAPIError(`Hook not found: ${hookId}`, {
+        throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
           status: 404,
         });
       }
@@ -848,7 +1399,7 @@ export function createHooksStorage(
     async getByToken(token: string, params?: GetHookParams): Promise<Hook> {
       const hookId = await redis.get(hooksByTokenKey(token));
       if (!hookId) {
-        throw new WorkflowAPIError(`Hook not found for token: ${token}`, {
+        throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
           status: 404,
         });
       }
@@ -876,8 +1427,8 @@ export function createHooksStorage(
 
       // Fetch all hooks
       const pipeline = redis.pipeline();
-      for (const hookId of hookIds) {
-        pipeline.get(hookKey(hookId));
+      for (const hId of hookIds) {
+        pipeline.get(hookKeyFn(hId));
       }
       const results = await pipeline.exec();
 
@@ -899,29 +1450,6 @@ export function createHooksStorage(
         cursor: values.at(-1)?.hookId ?? null,
         hasMore,
       };
-    },
-
-    async dispose(hookId: string, params?: GetHookParams): Promise<Hook> {
-      const data = await redis.get(hookKey(hookId));
-      if (!data) {
-        throw new WorkflowAPIError(`Hook not found: ${hookId}`, {
-          status: 404,
-        });
-      }
-
-      const hook = parseWithDates<Hook>(data);
-
-      // Delete hook and remove from indexes
-      await redis
-        .pipeline()
-        .del(hookKey(hookId))
-        .del(hooksByTokenKey(hook.token))
-        .zrem(hooksIndexKey(hook.runId), hookId)
-        .exec();
-
-      const parsed = HookSchema.parse(compact(hook));
-      const resolveData = params?.resolveData ?? 'all';
-      return filterHookData(parsed, resolveData);
     },
   };
 }

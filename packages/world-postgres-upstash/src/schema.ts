@@ -78,6 +78,8 @@ export const runs = schema.table(
       .notNull(),
     completedAt: timestamp('completed_at'),
     startedAt: timestamp('started_at'),
+    specVersion: integer('spec_version'),
+    expiredAt: timestamp('expired_at'),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
@@ -98,6 +100,7 @@ export const events = schema.table(
     /** @deprecated */
     eventDataJson: jsonb('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
+    specVersion: integer('spec_version'),
   } satisfies DrizzlishOfType<
     Cborized<Event & { eventData?: undefined }, 'eventData'>
   >,
@@ -127,6 +130,7 @@ export const steps = schema.table(
       .$onUpdateFn(() => new Date())
       .notNull(),
     retryAfter: timestamp('retry_after'),
+    specVersion: integer('spec_version'),
   } satisfies DrizzlishOfType<
     Cborized<Omit<Step, 'input'> & { input?: unknown }, 'output' | 'input'>
   >,
@@ -146,6 +150,8 @@ export const hooks = schema.table(
     /** @deprecated */
     metadataJson: jsonb('metadata').$type<SerializedContent>(),
     metadata: Cbor<SerializedContent>()('metadata_cbor'),
+    specVersion: integer('spec_version'),
+    isWebhook: boolean('is_webhook'),
   } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
   (tb) => [index().on(tb.runId), index().on(tb.token)]
 );

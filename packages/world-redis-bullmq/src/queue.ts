@@ -7,7 +7,7 @@ import {
   type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
-import { createEmbeddedWorld } from '@workflow/world-local';
+import { createLocalWorld } from '@workflow/world-local';
 import { Queue, Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
@@ -36,7 +36,7 @@ export function createQueue(
   config: RedisWorldConfig
 ): QueueInterface & { start(): Promise<void> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createEmbeddedWorld({ dataDir: undefined, port });
+  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   const transport = new JsonTransport();
   const generateMessageId = monotonicFactory();

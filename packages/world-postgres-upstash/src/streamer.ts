@@ -1,5 +1,10 @@
 import { EventEmitter } from 'node:events';
-import type { Streamer } from '@workflow/world';
+import type {
+  GetChunksOptions,
+  StreamChunksResponse,
+  StreamInfoResponse,
+  Streamer,
+} from '@workflow/world';
 import { and, eq } from 'drizzle-orm';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import type { Sql } from 'postgres';
@@ -219,6 +224,28 @@ export function createStreamer(
           }
         },
       });
+    },
+
+    async listStreamsByRunId(_runId: string): Promise<string[]> {
+      // Not implemented for Postgres-Upstash
+      return [];
+    },
+
+    async getStreamChunks(
+      _name: string,
+      _runId: string,
+      _options?: GetChunksOptions
+    ): Promise<StreamChunksResponse> {
+      // Not implemented for Postgres-Upstash
+      return { data: [], hasMore: false, cursor: null, done: true };
+    },
+
+    async getStreamInfo(
+      _name: string,
+      _runId: string
+    ): Promise<StreamInfoResponse> {
+      // Not implemented for Postgres-Upstash
+      return { tailIndex: -1, done: false };
     },
   };
 }

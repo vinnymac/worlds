@@ -55,9 +55,6 @@ export function createPostgresUpstashWorld(
     databaseUrl,
     qstash,
     deploymentId = 'postgres-upstash-default',
-    ownerId = '',
-    projectId = '',
-    environment = process.env.NODE_ENV || 'development',
   } = config;
 
   // Create PostgreSQL client using standard wire protocol
@@ -65,11 +62,7 @@ export function createPostgresUpstashWorld(
   const db = drizzle(postgres, { schema });
 
   // Create world components
-  const storage = createStorage(db, deploymentId, {
-    ownerId,
-    projectId,
-    environment,
-  });
+  const storage = createStorage(db);
   const queue = createQueue(qstash, deploymentId);
   const streamer = createStreamer(postgres, db);
 

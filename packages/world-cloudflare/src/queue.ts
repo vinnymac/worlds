@@ -1,6 +1,6 @@
 import type { Queue, ValidQueueName } from '@workflow/world';
 import { MessageId } from '@workflow/world';
-import { createEmbeddedWorld } from '@workflow/world-local';
+import { createLocalWorld } from '@workflow/world-local';
 import { monotonicFactory } from 'ulid';
 
 export interface CloudflareQueueConfig {
@@ -22,7 +22,7 @@ export function createQueue(
 
   // Create embedded world for test orchestration (like upstream world-postgres)
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createEmbeddedWorld({ dataDir: undefined, port });
+  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   // Detect test mode
   const isTest =

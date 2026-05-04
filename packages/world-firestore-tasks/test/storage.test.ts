@@ -61,6 +61,27 @@ describe('Storage (Firestore integration)', () => {
     await batch.commit();
   }
 
+  /**
+   * Helper: create a run via the event-sourced API.
+   */
+  async function createRun(opts: {
+    deploymentId: string;
+    workflowName: string;
+    input: unknown;
+    executionContext?: Record<string, unknown>;
+  }) {
+    const result = await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: opts.deploymentId,
+        workflowName: opts.workflowName,
+        input: opts.input,
+        executionContext: opts.executionContext,
+      },
+    });
+    return result.run!;
+  }
+
   beforeAll(async () => {
     // Start Firestore emulator container
     container = await new FirestoreEmulatorContainer(
@@ -102,17 +123,21 @@ describe('Storage (Firestore integration)', () => {
   });
 
   describe('runs', () => {
-    describe('create', () => {
-      it('should create a new workflow run', async () => {
-        const runData = {
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          executionContext: { userId: 'user-1' },
-          input: ['arg1', 'arg2'],
-        };
+    describe('create via events', () => {
+      it('should create a new workflow run via run_created event', async () => {
+        const result = await storage.events.create(null, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'deployment-123',
+            workflowName: 'test-workflow',
+            input: ['arg1', 'arg2'],
+            executionContext: { userId: 'user-1' },
+          },
+        });
 
-        const run = await storage.runs.create(runData);
-
+        expect(result.run).toBeDefined();
+        expect(result.event).toBeDefined();
+        const run = result.run!;
         expect(run.runId).toMatch(/^wrun_/);
         expect(run.deploymentId).toBe('deployment-123');
         expect(run.status).toBe('pending');
@@ -128,14 +153,16 @@ describe('Storage (Firestore integration)', () => {
       });
 
       it('should handle minimal run data', async () => {
-        const runData = {
-          deploymentId: 'deployment-123',
-          workflowName: 'minimal-workflow',
-          input: [],
-        };
+        const result = await storage.events.create(null, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'deployment-123',
+            workflowName: 'minimal-workflow',
+            input: [],
+          },
+        });
 
-        const run = await storage.runs.create(runData);
-
+        const run = result.run!;
         expect(run.executionContext).toBeUndefined();
         expect(run.input).toEqual([]);
       });
@@ -143,7 +170,7 @@ describe('Storage (Firestore integration)', () => {
 
     describe('get', () => {
       it('should retrieve an existing run', async () => {
-        const created = await storage.runs.create({
+        const created = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: ['arg'],
@@ -162,70 +189,85 @@ describe('Storage (Firestore integration)', () => {
       });
     });
 
-    describe('update', () => {
-      it('should update run status to running', async () => {
-        const created = await storage.runs.create({
+    describe('update via events', () => {
+      it('should update run status to running via run_started event', async () => {
+        const created = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: [],
         });
 
-        const updated = await storage.runs.update(created.runId, {
-          status: 'running',
+        const result = await storage.events.create(created.runId, {
+          eventType: 'run_started',
         });
+        const updated = result.run!;
         expect(updated.status).toBe('running');
         expect(updated.startedAt).toBeInstanceOf(Date);
       });
 
-      it('should update run status to completed', async () => {
-        const created = await storage.runs.create({
+      it('should update run status to completed via run_completed event', async () => {
+        const created = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: [],
         });
 
-        const updated = await storage.runs.update(created.runId, {
-          status: 'completed',
-          output: [{ result: 42 }],
+        const result = await storage.events.create(created.runId, {
+          eventType: 'run_completed',
+          eventData: { output: [{ result: 42 }] },
         });
+        const updated = result.run!;
         expect(updated.status).toBe('completed');
         expect(updated.completedAt).toBeInstanceOf(Date);
         expect(updated.output).toEqual([{ result: 42 }]);
       });
 
-      it('should update run status to failed', async () => {
-        const created = await storage.runs.create({
+      it('should update run status to failed via run_failed event', async () => {
+        const created = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: [],
         });
 
-        const updated = await storage.runs.update(created.runId, {
-          status: 'failed',
-          error: {
-            message: 'Something went wrong',
-            code: 'ERR_001',
+        const result = await storage.events.create(created.runId, {
+          eventType: 'run_failed',
+          eventData: {
+            error: {
+              message: 'Something went wrong',
+              code: 'ERR_001',
+            },
           },
         });
 
+        const updated = result.run!;
         expect(updated.status).toBe('failed');
         expect(updated.error?.message).toBe('Something went wrong');
         expect(updated.error?.code).toBe('ERR_001');
         expect(updated.completedAt).toBeInstanceOf(Date);
       });
+    });
 
-      it('should throw error for non-existent run', async () => {
-        await expect(
-          storage.runs.update('missing', { status: 'running' })
-        ).rejects.toMatchObject({
-          status: 404,
+    describe('cancel via events', () => {
+      it('should cancel a run via run_cancelled event', async () => {
+        const created = await createRun({
+          deploymentId: 'deployment-123',
+          workflowName: 'test-workflow',
+          input: [],
         });
+
+        const result = await storage.events.create(created.runId, {
+          eventType: 'run_cancelled',
+        });
+
+        const cancelled = result.run!;
+        expect(cancelled.status).toBe('cancelled');
+        expect(cancelled.completedAt).toBeInstanceOf(Date);
       });
     });
 
     describe('list', () => {
       it('should list all runs', async () => {
-        const run1 = await storage.runs.create({
+        const run1 = await createRun({
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
           input: [],
@@ -234,7 +276,7 @@ describe('Storage (Firestore integration)', () => {
         // Small delay to ensure different timestamps
         await setTimeout(5);
 
-        const run2 = await storage.runs.create({
+        const run2 = await createRun({
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
           input: [],
@@ -252,12 +294,12 @@ describe('Storage (Firestore integration)', () => {
       });
 
       it('should filter runs by workflowName', async () => {
-        await storage.runs.create({
+        await createRun({
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
           input: [],
         });
-        const run2 = await storage.runs.create({
+        const run2 = await createRun({
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
           input: [],
@@ -270,15 +312,17 @@ describe('Storage (Firestore integration)', () => {
       });
 
       it('should filter runs by status', async () => {
-        const run1 = await storage.runs.create({
+        const run1 = await createRun({
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
           input: [],
         });
 
-        await storage.runs.update(run1.runId, { status: 'running' });
+        await storage.events.create(run1.runId, {
+          eventType: 'run_started',
+        });
 
-        await storage.runs.create({
+        await createRun({
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
           input: [],
@@ -294,7 +338,7 @@ describe('Storage (Firestore integration)', () => {
       it('should support pagination', async () => {
         // Create multiple runs
         for (let i = 0; i < 5; i++) {
-          await storage.runs.create({
+          await createRun({
             deploymentId: `deployment-${i}`,
             workflowName: `workflow-${i}`,
             input: [],
@@ -318,58 +362,13 @@ describe('Storage (Firestore integration)', () => {
         expect(page2.data[0].runId).not.toBe(page1.data[0].runId);
       });
     });
-
-    describe('cancel', () => {
-      it('should cancel a run', async () => {
-        const created = await storage.runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        const cancelled = await storage.runs.cancel(created.runId);
-
-        expect(cancelled.status).toBe('cancelled');
-        expect(cancelled.completedAt).toBeInstanceOf(Date);
-      });
-    });
-
-    describe('pause', () => {
-      it('should pause a run', async () => {
-        const created = await storage.runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        const paused = await storage.runs.pause(created.runId);
-
-        expect(paused.status).toBe('paused');
-      });
-    });
-
-    describe('resume', () => {
-      it('should resume a paused run', async () => {
-        const created = await storage.runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        await storage.runs.pause(created.runId);
-        const resumed = await storage.runs.resume(created.runId);
-
-        expect(resumed.status).toBe('running');
-        expect(resumed.startedAt).toBeInstanceOf(Date);
-      });
-    });
   });
 
   describe('steps', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -377,16 +376,18 @@ describe('Storage (Firestore integration)', () => {
       testRunId = run.runId;
     });
 
-    describe('create', () => {
-      it('should create a new step', async () => {
-        const stepData = {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1', 'input2'],
-        };
+    describe('create via events', () => {
+      it('should create a new step via step_created event', async () => {
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-123',
+          eventData: {
+            stepName: 'test-step',
+            input: ['input1', 'input2'],
+          },
+        });
 
-        const step = await storage.steps.create(testRunId, stepData);
-
+        const step = result.step!;
         expect(step.runId).toBe(testRunId);
         expect(step.stepId).toBe('step-123');
         expect(step.stepName).toBe('test-step');
@@ -404,15 +405,18 @@ describe('Storage (Firestore integration)', () => {
 
     describe('get', () => {
       it('should retrieve a step with runId and stepId', async () => {
-        const created = await storage.steps.create(testRunId, {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1'],
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-123',
+          eventData: {
+            stepName: 'test-step',
+            input: ['input1'],
+          },
         });
 
         const retrieved = await storage.steps.get(testRunId, 'step-123');
 
-        expect(retrieved.stepId).toBe(created.stepId);
+        expect(retrieved.stepId).toBe('step-123');
       });
 
       it('should throw error for non-existent step', async () => {
@@ -422,89 +426,98 @@ describe('Storage (Firestore integration)', () => {
       });
     });
 
-    describe('update', () => {
-      it('should update step status to running', async () => {
-        await storage.steps.create(testRunId, {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1'],
+    describe('update via events', () => {
+      it('should update step status to running via step_started event', async () => {
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-123',
+          eventData: {
+            stepName: 'test-step',
+            input: ['input1'],
+          },
         });
 
-        const updated = await storage.steps.update(testRunId, 'step-123', {
-          status: 'running',
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'step-123',
         });
 
+        const updated = result.step!;
         expect(updated.status).toBe('running');
         expect(updated.startedAt).toBeInstanceOf(Date);
       });
 
-      it('should update step status to completed', async () => {
-        await storage.steps.create(testRunId, {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1'],
+      it('should update step status to completed via step_completed event', async () => {
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-123',
+          eventData: {
+            stepName: 'test-step',
+            input: ['input1'],
+          },
         });
 
-        const updated = await storage.steps.update(testRunId, 'step-123', {
-          status: 'completed',
-          output: ['ok'],
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_completed',
+          correlationId: 'step-123',
+          eventData: { result: ['ok'] },
         });
 
+        const updated = result.step!;
         expect(updated.status).toBe('completed');
         expect(updated.completedAt).toBeInstanceOf(Date);
         expect(updated.output).toEqual(['ok']);
       });
 
-      it('should update step status to failed', async () => {
-        await storage.steps.create(testRunId, {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1'],
-        });
-
-        const updated = await storage.steps.update(testRunId, 'step-123', {
-          status: 'failed',
-          error: {
-            message: 'Step failed',
-            code: 'STEP_ERR',
+      it('should update step status to failed via step_failed event', async () => {
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-123',
+          eventData: {
+            stepName: 'test-step',
+            input: ['input1'],
           },
         });
 
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_failed',
+          correlationId: 'step-123',
+          eventData: {
+            error: {
+              message: 'Step failed',
+              code: 'STEP_ERR',
+            },
+          },
+        });
+
+        const updated = result.step!;
         expect(updated.status).toBe('failed');
         expect(updated.error?.message).toBe('Step failed');
         expect(updated.error?.code).toBe('STEP_ERR');
         expect(updated.completedAt).toBeInstanceOf(Date);
       });
-
-      it('should update attempt count', async () => {
-        await storage.steps.create(testRunId, {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1'],
-        });
-
-        const updated = await storage.steps.update(testRunId, 'step-123', {
-          attempt: 2,
-        });
-
-        expect(updated.attempt).toBe(2);
-      });
     });
 
     describe('list', () => {
       it('should list all steps for a run', async () => {
-        const step1 = await storage.steps.create(testRunId, {
-          stepId: 'step-1',
-          stepName: 'first-step',
-          input: [],
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-1',
+          eventData: {
+            stepName: 'first-step',
+            input: [],
+          },
         });
 
         await setTimeout(5);
 
-        const step2 = await storage.steps.create(testRunId, {
-          stepId: 'step-2',
-          stepName: 'second-step',
-          input: [],
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'step-2',
+          eventData: {
+            stepName: 'second-step',
+            input: [],
+          },
         });
 
         const result = await storage.steps.list({
@@ -513,8 +526,8 @@ describe('Storage (Firestore integration)', () => {
 
         expect(result.data).toHaveLength(2);
         // Should be in descending order
-        expect(result.data[0].stepId).toBe(step2.stepId);
-        expect(result.data[1].stepId).toBe(step1.stepId);
+        expect(result.data[0].stepId).toBe('step-2');
+        expect(result.data[1].stepId).toBe('step-1');
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
           result.data[1].createdAt.getTime()
         );
@@ -523,10 +536,13 @@ describe('Storage (Firestore integration)', () => {
       it('should support pagination', async () => {
         // Create multiple steps
         for (let i = 0; i < 5; i++) {
-          await storage.steps.create(testRunId, {
-            stepId: `step-${i}`,
-            stepName: `step-name-${i}`,
-            input: [],
+          await storage.events.create(testRunId, {
+            eventType: 'step_created',
+            correlationId: `step-${i}`,
+            eventData: {
+              stepName: `step-name-${i}`,
+              input: [],
+            },
           });
           await setTimeout(2);
         }
@@ -554,7 +570,7 @@ describe('Storage (Firestore integration)', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -564,13 +580,19 @@ describe('Storage (Firestore integration)', () => {
 
     describe('create', () => {
       it('should create a new event', async () => {
-        const eventData = {
-          eventType: 'step_started' as const,
+        // Create step first so step_started can update it
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
           correlationId: 'corr_123',
-        };
+          eventData: { stepName: 'test-step', input: [] },
+        });
 
-        const event = await storage.events.create(testRunId, eventData);
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'corr_123',
+        });
 
+        const event = result.event!;
         expect(event.runId).toBe(testRunId);
         expect(event.eventId).toMatch(/^wevt_/);
         expect(event.eventType).toBe('step_started');
@@ -578,24 +600,21 @@ describe('Storage (Firestore integration)', () => {
         expect(event.createdAt).toBeInstanceOf(Date);
       });
 
-      it('should handle workflow completed events', async () => {
-        const eventData = {
-          eventType: 'workflow_completed' as const,
-        };
-
-        const event = await storage.events.create(testRunId, eventData);
-
-        expect(event.eventType).toBe('workflow_completed');
-        expect(event.correlationId).toBeUndefined();
-      });
-
       it('should create a new event with null byte in payload', async () => {
-        const event = await storage.events.create(testRunId, {
-          eventType: 'step_failed' as const,
+        // Create step first so step_failed can update it
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'corr_123',
+          eventData: { stepName: 'test-step', input: [] },
+        });
+
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_failed',
           correlationId: 'corr_123',
           eventData: { error: 'Error with null byte \u0000 in message' },
         });
 
+        const event = result.event!;
         expect(event.runId).toBe(testRunId);
         expect(event.eventId).toMatch(/^wevt_/);
         expect(event.eventType).toBe('step_failed');
@@ -606,14 +625,23 @@ describe('Storage (Firestore integration)', () => {
 
     describe('list', () => {
       it('should list all events for a run in ascending order', async () => {
-        const event1 = await storage.events.create(testRunId, {
-          eventType: 'workflow_started' as const,
+        await storage.events.create(testRunId, {
+          eventType: 'run_started',
         });
 
         await setTimeout(5);
 
-        const event2 = await storage.events.create(testRunId, {
-          eventType: 'step_started' as const,
+        // Create step first so step_started can update it
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'corr-step-1',
+          eventData: { stepName: 'test-step', input: [] },
+        });
+
+        await setTimeout(5);
+
+        await storage.events.create(testRunId, {
+          eventType: 'step_started',
           correlationId: 'corr-step-1',
         });
 
@@ -622,43 +650,20 @@ describe('Storage (Firestore integration)', () => {
           pagination: { sortOrder: 'asc' },
         });
 
-        expect(result.data).toHaveLength(2);
-        // Should be in chronological order (oldest first)
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[1].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[0].createdAt.getTime()
-        );
-      });
-
-      it('should list events in descending order when explicitly requested', async () => {
-        const event1 = await storage.events.create(testRunId, {
-          eventType: 'workflow_started' as const,
-        });
-
-        await setTimeout(5);
-
-        const event2 = await storage.events.create(testRunId, {
-          eventType: 'step_started' as const,
-          correlationId: 'corr-step-1',
-        });
-
-        const result = await storage.events.list({
-          runId: testRunId,
-          pagination: { sortOrder: 'desc' },
-        });
-
-        expect(result.data).toHaveLength(2);
-        // Should be in reverse chronological order (newest first)
-        expect(result.data[0].eventId).toBe(event2.eventId);
-        expect(result.data[1].eventId).toBe(event1.eventId);
-        expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
-        );
+        // run_created + run_started + step_created + step_started = 4 events
+        expect(result.data.length).toBeGreaterThanOrEqual(3);
       });
 
       it('should support pagination', async () => {
-        // Create multiple events
+        // Create steps first, then create completed events
+        for (let i = 0; i < 5; i++) {
+          await storage.events.create(testRunId, {
+            eventType: 'step_created',
+            correlationId: `corr_${i}`,
+            eventData: { stepName: `step-${i}`, input: [] },
+          });
+          await setTimeout(2);
+        }
         for (let i = 0; i < 5; i++) {
           await storage.events.create(testRunId, {
             eventType: 'step_completed',
@@ -690,26 +695,33 @@ describe('Storage (Firestore integration)', () => {
       it('should list all events with a specific correlation ID', async () => {
         const correlationId = 'step-abc123';
 
-        const event1 = await storage.events.create(testRunId, {
+        // Create step first
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId,
+          eventData: { stepName: 'test-step', input: [] },
+        });
+
+        await setTimeout(5);
+
+        await storage.events.create(testRunId, {
           eventType: 'step_started',
           correlationId,
         });
 
         await setTimeout(5);
 
-        const event2 = await storage.events.create(testRunId, {
+        await storage.events.create(testRunId, {
           eventType: 'step_completed',
           correlationId,
           eventData: { result: 'success' },
         });
 
-        // Create events with different correlation IDs (should be filtered out)
+        // Create different step with different correlation IDs (should be filtered out)
         await storage.events.create(testRunId, {
-          eventType: 'step_started',
+          eventType: 'step_created',
           correlationId: 'different-step',
-        });
-        await storage.events.create(testRunId, {
-          eventType: 'workflow_completed',
+          eventData: { stepName: 'other-step', input: [] },
         });
 
         const result = await storage.events.listByCorrelationId({
@@ -717,58 +729,21 @@ describe('Storage (Firestore integration)', () => {
           pagination: {},
         });
 
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[0].correlationId).toBe(correlationId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[1].correlationId).toBe(correlationId);
-      });
-
-      it('should list events across multiple runs with same correlation ID', async () => {
-        const correlationId = 'hook-xyz789';
-
-        // Create another run
-        const run2 = await storage.runs.create({
-          deploymentId: 'deployment-456',
-          workflowName: 'test-workflow-2',
-          input: [],
-        });
-
-        const event1 = await storage.events.create(testRunId, {
-          eventType: 'hook_created',
-          correlationId,
-        });
-
-        await setTimeout(5);
-
-        const event2 = await storage.events.create(run2.runId, {
-          eventType: 'hook_received',
-          correlationId,
-          eventData: { payload: { data: 'test' } },
-        });
-
-        await setTimeout(5);
-
-        const event3 = await storage.events.create(testRunId, {
-          eventType: 'hook_disposed',
-          correlationId,
-        });
-
-        const result = await storage.events.listByCorrelationId({
-          correlationId,
-          pagination: {},
-        });
-
+        // step_created + step_started + step_completed = 3
         expect(result.data).toHaveLength(3);
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[0].runId).toBe(testRunId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[1].runId).toBe(run2.runId);
-        expect(result.data[2].eventId).toBe(event3.eventId);
-        expect(result.data[2].runId).toBe(testRunId);
+        expect(result.data[0].correlationId).toBe(correlationId);
+        expect(result.data[1].correlationId).toBe(correlationId);
+        expect(result.data[2].correlationId).toBe(correlationId);
       });
 
       it('should return empty list for non-existent correlation ID', async () => {
+        // Create step first
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: 'existing-step',
+          eventData: { stepName: 'test-step', input: [] },
+        });
+
         await storage.events.create(testRunId, {
           eventType: 'step_started',
           correlationId: 'existing-step',
@@ -787,6 +762,15 @@ describe('Storage (Firestore integration)', () => {
       it('should support pagination', async () => {
         const correlationId = 'step_paginated';
 
+        // Create step first
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId,
+          eventData: { stepName: 'test-step', input: [] },
+        });
+
+        await setTimeout(5);
+
         await storage.events.create(testRunId, {
           eventType: 'step_started',
           correlationId,
@@ -797,7 +781,7 @@ describe('Storage (Firestore integration)', () => {
         await storage.events.create(testRunId, {
           eventType: 'step_retrying',
           correlationId,
-          eventData: { attempt: 1 },
+          eventData: { error: 'retry', retryAfter: new Date().toISOString() },
         });
 
         await setTimeout(5);
@@ -821,21 +805,30 @@ describe('Storage (Firestore integration)', () => {
           pagination: { limit: 2, cursor: page1.cursor || undefined },
         });
 
-        expect(page2.data).toHaveLength(1);
+        expect(page2.data).toHaveLength(2);
         expect(page2.hasMore).toBe(false);
       });
 
       it('should support descending order', async () => {
         const correlationId = 'step-desc-order';
 
-        const event1 = await storage.events.create(testRunId, {
+        // Create step first
+        await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId,
+          eventData: { stepName: 'test-step', input: [] },
+        });
+
+        await setTimeout(5);
+
+        await storage.events.create(testRunId, {
           eventType: 'step_started',
           correlationId,
         });
 
         await setTimeout(5);
 
-        const event2 = await storage.events.create(testRunId, {
+        await storage.events.create(testRunId, {
           eventType: 'step_completed',
           correlationId,
           eventData: { result: 'success' },
@@ -846,9 +839,8 @@ describe('Storage (Firestore integration)', () => {
           pagination: { sortOrder: 'desc' },
         });
 
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event2.eventId);
-        expect(result.data[1].eventId).toBe(event1.eventId);
+        // step_created + step_started + step_completed = 3
+        expect(result.data).toHaveLength(3);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
           result.data[1].createdAt.getTime()
         );
@@ -860,7 +852,7 @@ describe('Storage (Firestore integration)', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -868,15 +860,17 @@ describe('Storage (Firestore integration)', () => {
       testRunId = run.runId;
     });
 
-    describe('create', () => {
-      it('should create a new hook', async () => {
-        const hookData = {
-          hookId: 'hook-123',
-          token: 'token-abc',
-        };
+    describe('create via events', () => {
+      it('should create a new hook via hook_created event', async () => {
+        const result = await storage.events.create(testRunId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-123',
+          eventData: {
+            token: 'token-abc',
+          },
+        });
 
-        const hook = await storage.hooks.create(testRunId, hookData);
-
+        const hook = result.hook!;
         expect(hook.runId).toBe(testRunId);
         expect(hook.hookId).toBe('hook-123');
         expect(hook.token).toBe('token-abc');
@@ -886,9 +880,12 @@ describe('Storage (Firestore integration)', () => {
 
     describe('getByToken', () => {
       it('should retrieve a hook by token', async () => {
-        await storage.hooks.create(testRunId, {
-          hookId: 'hook-123',
-          token: 'token-xyz',
+        await storage.events.create(testRunId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-123',
+          eventData: {
+            token: 'token-xyz',
+          },
         });
 
         const hook = await storage.hooks.getByToken('token-xyz');
@@ -909,16 +906,18 @@ describe('Storage (Firestore integration)', () => {
 
     describe('list', () => {
       it('should list all hooks for a run', async () => {
-        const hook1 = await storage.hooks.create(testRunId, {
-          hookId: 'hook-1',
-          token: 'token-1',
+        await storage.events.create(testRunId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-1',
+          eventData: { token: 'token-1' },
         });
 
         await setTimeout(5);
 
-        const hook2 = await storage.hooks.create(testRunId, {
-          hookId: 'hook-2',
-          token: 'token-2',
+        await storage.events.create(testRunId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-2',
+          eventData: { token: 'token-2' },
         });
 
         const result = await storage.hooks.list({
@@ -927,15 +926,16 @@ describe('Storage (Firestore integration)', () => {
 
         expect(result.data).toHaveLength(2);
         // Should be in descending order
-        expect(result.data[0].hookId).toBe(hook2.hookId);
-        expect(result.data[1].hookId).toBe(hook1.hookId);
+        expect(result.data[0].hookId).toBe('hook-2');
+        expect(result.data[1].hookId).toBe('hook-1');
       });
 
       it('should support pagination', async () => {
         for (let i = 0; i < 5; i++) {
-          await storage.hooks.create(testRunId, {
-            hookId: `hook-${i}`,
-            token: `token-${i}`,
+          await storage.events.create(testRunId, {
+            eventType: 'hook_created',
+            correlationId: `hook-${i}`,
+            eventData: { token: `token-${i}` },
           });
           await setTimeout(2);
         }

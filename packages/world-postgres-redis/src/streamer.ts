@@ -1,5 +1,10 @@
 import { EventEmitter } from 'node:events';
-import type { Streamer } from '@workflow/world';
+import type {
+  GetChunksOptions,
+  StreamChunksResponse,
+  StreamInfoResponse,
+  Streamer,
+} from '@workflow/world';
 import { and, eq } from 'drizzle-orm';
 import type { Sql } from 'postgres';
 import { monotonicFactory } from 'ulid';
@@ -220,6 +225,28 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
           }
         },
       });
+    },
+
+    async listStreamsByRunId(_runId: string): Promise<string[]> {
+      // Not implemented for Postgres-Redis
+      return [];
+    },
+
+    async getStreamChunks(
+      _name: string,
+      _runId: string,
+      _options?: GetChunksOptions
+    ): Promise<StreamChunksResponse> {
+      // Not implemented for Postgres-Redis
+      return { data: [], hasMore: false, cursor: null, done: true };
+    },
+
+    async getStreamInfo(
+      _name: string,
+      _runId: string
+    ): Promise<StreamInfoResponse> {
+      // Not implemented for Postgres-Redis
+      return { tailIndex: -1, done: false };
     },
   };
 }
