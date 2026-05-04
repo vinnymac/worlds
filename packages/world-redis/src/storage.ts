@@ -72,26 +72,19 @@ function dateReviver(key: string, value: any): any {
 }
 
 /**
- * Parse JSON with automatic date deserialization.
- * Use this instead of JSON.parse() for all Redis-stored objects.
- */
-function parseWithDates<T>(json: string): T {
-  return JSON.parse(json, dateReviver);
-}
-
-/**
  * JSON replacer function that converts Uint8Array to a special marker object.
  * This ensures Uint8Array fields are preserved through JSON.stringify/parse.
+ *
+ * Handles any field that contains a Uint8Array, including nested fields like
+ * eventData.result (step_completed), eventData.output (run_completed),
+ * and top-level fields like input, output, executionContext.
  */
-function uint8ArrayReplacer(key: string, value: any): any {
-  // Only process input, output, and executionContext fields
-  if (key === 'input' || key === 'output' || key === 'executionContext') {
-    if (value instanceof Uint8Array) {
-      return {
-        __uint8array: true,
-        data: Array.from(value),
-      };
-    }
+function uint8ArrayReplacer(_key: string, value: any): any {
+  if (value instanceof Uint8Array) {
+    return {
+      __uint8array: true,
+      data: Array.from(value),
+    };
   }
   return value;
 }
@@ -127,71 +120,6 @@ function stringifyWithUint8Array(obj: any): string {
  */
 function parseWithUint8Array<T>(json: string): T {
   return JSON.parse(json, uint8ArrayReviver);
-}
-
-/**
- * Serialize a StructuredError object into a JSON string.
- * Stores error.message, error.stack, and error.code as a JSON string.
- * Handles both string errors (old interface) and StructuredError objects (new interface).
- */
-function serializeError<T extends { error?: any }>(data: T): any {
-  if (!data.error) {
-    return data;
-  }
-
-  // If error is already a string, pass it through unchanged
-  if (typeof data.error === 'string') {
-    return data;
-  }
-
-  const { error, ...rest } = data;
-  return {
-    ...rest,
-    error: JSON.stringify({
-      message: (error as any).message,
-      stack: (error as any).stack,
-      code: (error as any).code,
-    }),
-  };
-}
-
-/**
- * Deserialize error JSON string into a StructuredError object.
- * Handles backwards compatibility with plain string errors.
- */
-function deserializeError<T extends { error?: any }>(entity: T): T {
-  const { error, ...rest } = entity;
-
-  if (!error) {
-    return entity;
-  }
-
-  // Try to parse as structured error JSON
-  if (error) {
-    try {
-      const parsed = JSON.parse(error);
-      if (typeof parsed === 'object' && parsed.message !== undefined) {
-        return {
-          ...rest,
-          error: {
-            message: parsed.message,
-            stack: parsed.stack,
-            code: parsed.code,
-          },
-        } as T;
-      }
-    } catch {
-      // Not JSON, treat as plain string
-    }
-  }
-
-  // Backwards compatibility: treat plain string as error message
-  return {
-    ...rest,
-    error: {
-      message: error || '',
-    },
-  } as T;
 }
 
 /**
@@ -301,8 +229,8 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
         continue;
       }
 
-      const run: WorkflowRun = deserializeError(
-        parseWithUint8Array<WorkflowRun>(result[1] as string)
+      const run: WorkflowRun = parseWithUint8Array<WorkflowRun>(
+        result[1] as string
       );
 
       // Apply filters
@@ -326,7 +254,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
       if (!data) {
         throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
       }
-      const run = deserializeError(parseWithUint8Array<WorkflowRun>(data));
+      const run = parseWithUint8Array<WorkflowRun>(data);
       const parsed = WorkflowRunSchema.parse(compact(run));
       const resolveData = params?.resolveData ?? 'all';
       return filterRunData(parsed, resolveData);
@@ -402,7 +330,7 @@ export function createEventsStorage(
     for (const hookId of hookIds) {
       const hookData = await redis.get(hookKey(hookId));
       if (hookData) {
-        const hook = parseWithDates<Hook>(hookData);
+        const hook = parseWithUint8Array<Hook>(hookData);
         pipeline.del(hookKey(hookId));
         pipeline.del(hooksByTokenKey(hook.token));
       }
@@ -442,7 +370,7 @@ export function createEventsStorage(
 
     for (const result of results ?? []) {
       if (result?.[1]) {
-        const event = parseWithDates<Event>(result[1] as string);
+        const event = parseWithUint8Array<Event>(result[1] as string);
         events.push(event);
       }
     }
@@ -506,7 +434,7 @@ export function createEventsStorage(
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await redis.set(eventKey(eventId), JSON.stringify(event));
+        await redis.set(eventKey(eventId), stringifyWithUint8Array(event));
         const score = createdAt.getTime();
         const pipeline = redis.pipeline();
         pipeline.zadd(eventsIndexKey(runId), score, eventId);
@@ -636,7 +564,7 @@ export function createEventsStorage(
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          await redis.set(eventKey(eventId), JSON.stringify(event));
+          await redis.set(eventKey(eventId), stringifyWithUint8Array(event));
           const score = createdAt.getTime();
           await redis.zadd(eventsIndexKey(effectiveRunId), score, eventId);
 
@@ -645,9 +573,7 @@ export function createEventsStorage(
           return {
             event: filterEventData(parsed, resolveData),
             run: fullRunData
-              ? (deserializeError(
-                  parseWithUint8Array<WorkflowRun>(fullRunData)
-                ) as WorkflowRun)
+              ? (parseWithUint8Array<WorkflowRun>(fullRunData) as WorkflowRun)
               : undefined,
           };
         }
@@ -855,7 +781,7 @@ export function createEventsStorage(
         const existingData = await redis.get(runKey(effectiveRunId));
         if (existingData) {
           const existing = parseWithUint8Array<WorkflowRun>(existingData);
-          const updatedRun = serializeError({
+          const updatedRun = {
             ...existing,
             status: 'failed' as const,
             error: {
@@ -865,7 +791,7 @@ export function createEventsStorage(
             },
             completedAt: now,
             updatedAt: now,
-          });
+          };
           await redis.set(
             runKey(effectiveRunId),
             stringifyWithUint8Array(updatedRun)
@@ -882,12 +808,7 @@ export function createEventsStorage(
 
           await cleanupHooks(effectiveRunId);
 
-          run = deserializeError(
-            parseWithUint8Array<WorkflowRun>(
-              stringifyWithUint8Array(updatedRun)
-            )
-          );
-          run = WorkflowRunSchema.parse(compact(run));
+          run = WorkflowRunSchema.parse(compact(updatedRun));
         }
       }
 
@@ -1034,7 +955,7 @@ export function createEventsStorage(
               { status: 410 }
             );
           }
-          const updatedStep = serializeError({
+          const updatedStep = {
             ...existing,
             status: 'failed' as const,
             error: {
@@ -1043,15 +964,12 @@ export function createEventsStorage(
             },
             completedAt: now,
             updatedAt: now,
-          });
+          };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
             stringifyWithUint8Array(updatedStep)
           );
-          step = deserializeError(
-            parseWithUint8Array<Step>(stringifyWithUint8Array(updatedStep))
-          );
-          step = StepSchema.parse(compact(step));
+          step = StepSchema.parse(compact(updatedStep));
         } else {
           throw new WorkflowWorldError(
             `Step "${data.correlationId}" not found`,
@@ -1077,7 +995,7 @@ export function createEventsStorage(
         );
         if (existingData) {
           const existing = parseWithUint8Array<Step>(existingData);
-          const updatedStep = serializeError({
+          const updatedStep = {
             ...existing,
             status: 'pending' as const,
             error: {
@@ -1086,15 +1004,12 @@ export function createEventsStorage(
             },
             retryAfter: eventData.retryAfter,
             updatedAt: now,
-          });
+          };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
             stringifyWithUint8Array(updatedStep)
           );
-          step = deserializeError(
-            parseWithUint8Array<Step>(stringifyWithUint8Array(updatedStep))
-          );
-          step = StepSchema.parse(compact(step));
+          step = StepSchema.parse(compact(updatedStep));
         }
       }
 
@@ -1123,7 +1038,10 @@ export function createEventsStorage(
             specVersion: effectiveSpecVersion,
           };
 
-          await redis.set(eventKey(eventId), JSON.stringify(conflictEvent));
+          await redis.set(
+            eventKey(eventId),
+            stringifyWithUint8Array(conflictEvent)
+          );
           const score = createdAt.getTime();
           const pipeline = redis.pipeline();
           pipeline.zadd(eventsIndexKey(effectiveRunId), score, eventId);
@@ -1160,7 +1078,7 @@ export function createEventsStorage(
 
         const existed = await redis.setnx(
           hookKey(data.correlationId!),
-          JSON.stringify(newHook)
+          stringifyWithUint8Array(newHook)
         );
         if (existed) {
           await redis
@@ -1180,7 +1098,7 @@ export function createEventsStorage(
       if (data.eventType === 'hook_disposed' && data.correlationId) {
         const hookData = await redis.get(hookKey(data.correlationId));
         if (hookData) {
-          const existingHook = parseWithDates<Hook>(hookData);
+          const existingHook = parseWithUint8Array<Hook>(hookData);
           await redis
             .pipeline()
             .del(hookKey(data.correlationId))
@@ -1200,7 +1118,7 @@ export function createEventsStorage(
         specVersion: effectiveSpecVersion,
       };
 
-      await redis.set(eventKey(eventId), JSON.stringify(event));
+      await redis.set(eventKey(eventId), stringifyWithUint8Array(event));
 
       const score = createdAt.getTime();
       const pipeline = redis.pipeline();
@@ -1231,7 +1149,7 @@ export function createEventsStorage(
           status: 404,
         });
       }
-      return parseWithDates<Event>(data);
+      return parseWithUint8Array<Event>(data);
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -1357,7 +1275,7 @@ export function createStepsStorage(
       });
     }
 
-    const step = deserializeError(parseWithUint8Array<Step>(data));
+    const step = parseWithUint8Array<Step>(data);
     const parsed = StepSchema.parse(compact(step));
     const resolveData = params?.resolveData ?? 'all';
     return filterStepData(parsed, resolveData);
@@ -1413,9 +1331,7 @@ export function createStepsStorage(
       const steps: (Step | StepWithoutData)[] = [];
       for (const result of results ?? []) {
         if (result?.[1]) {
-          const step = deserializeError(
-            parseWithUint8Array<Step>(result[1] as string)
-          );
+          const step = parseWithUint8Array<Step>(result[1] as string);
           const parsed = StepSchema.parse(compact(step));
           steps.push(filterStepData(parsed, resolveData));
         }
@@ -1454,7 +1370,7 @@ export function createHooksStorage(
           status: 404,
         });
       }
-      const hook = parseWithDates<Hook>(data);
+      const hook = parseWithUint8Array<Hook>(data);
       const parsed = HookSchema.parse(compact(hook));
       const resolveData = params?.resolveData ?? 'all';
       return filterHookData(parsed, resolveData);
@@ -1499,7 +1415,7 @@ export function createHooksStorage(
       const hooks: Hook[] = [];
       for (const result of results ?? []) {
         if (result?.[1]) {
-          const hook = parseWithDates<Hook>(result[1] as string);
+          const hook = parseWithUint8Array<Hook>(result[1] as string);
           const parsed = HookSchema.parse(compact(hook));
           const filtered = filterHookData(parsed, params?.resolveData ?? 'all');
           hooks.push(filtered);
