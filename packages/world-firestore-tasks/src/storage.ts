@@ -24,7 +24,7 @@ import type {
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
-import { HookSchema } from '@workflow/world';
+import { HookSchema, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { compact } from './util.js';
 
@@ -186,21 +186,73 @@ function serializeNestedArrays(value: unknown): unknown {
 }
 
 /**
- * Deserialize a value that might have been serialized to handle nested arrays.
+ * Recursively convert Buffer instances to Uint8Array.
+ * Firestore stores Uint8Array as Buffer, but the spec expects Uint8Array.
  */
-function deserializeNestedArrays(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
+function isBufferLike(value: unknown): value is Buffer | Uint8Array {
+  if (Buffer.isBuffer(value)) return true;
+  if (value instanceof Uint8Array) return true;
+  return false;
+}
 
-  try {
-    const parsed = JSON.parse(value);
-    if (parsed && typeof parsed === 'object' && '__nested_array__' in parsed) {
-      return parsed.__nested_array__;
+function convertBuffersToUint8Array(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+
+  // Check for Buffer or Uint8Array subclass (Buffer extends Uint8Array)
+  // Ensure we return a plain Uint8Array, not a Buffer subclass
+  if (isBufferLike(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+
+  // Check for serialized Buffer objects: { type: 'Buffer', data: [...] }
+  if (
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).type === 'Buffer' &&
+    Array.isArray((value as Record<string, unknown>).data)
+  ) {
+    return new Uint8Array((value as Record<string, unknown>).data as number[]);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(convertBuffersToUint8Array);
+  }
+
+  if (typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = convertBuffersToUint8Array(val);
     }
-  } catch {
-    // Not JSON, return as-is
+    return result;
   }
 
   return value;
+}
+
+/**
+ * Deserialize a value that might have been serialized to handle nested arrays.
+ * Also converts any Buffer instances to Uint8Array.
+ */
+function deserializeNestedArrays(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        '__nested_array__' in parsed
+      ) {
+        return convertBuffersToUint8Array(parsed.__nested_array__);
+      }
+    } catch {
+      // Not JSON, return as-is
+    }
+    return value;
+  }
+
+  return convertBuffersToUint8Array(value);
 }
 
 /**
@@ -334,6 +386,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     const run = {
       runId,
       workflowName: data.workflowName,
+      specVersion: SPEC_VERSION_CURRENT,
       status: 'pending',
       input: serializeNestedArrays(data.input),
       executionContext: data.executionContext as
@@ -623,10 +676,13 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const effectiveRunId =
           runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
 
+        const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
+
         const eventRecord: Record<string, unknown> = {
           ...data,
           runId: effectiveRunId,
           eventId,
+          specVersion: effectiveSpecVersion,
           createdAt: now,
         };
 
