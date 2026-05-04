@@ -167,7 +167,8 @@ describe('Storage (PostgreSQL integration)', () => {
   });
 
   afterAll(async () => {
-    await sqlClient.end();
+    // End the connection with a short timeout to allow pending queries to complete
+    await sqlClient.end({ timeout: 1 });
     await container.stop();
   });
 
