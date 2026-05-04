@@ -818,12 +818,26 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             // Verify hook was created
             if (!result.hook) {
               console.error('[hook_created] Hook creation returned undefined');
+            } else {
+              console.log(
+                '[hook_created] Returning result with hook:',
+                result.hook.hookId
+              );
             }
             break;
           }
           // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
           // are event-only; no entity mutation needed at the storage level
         }
+
+        // Log the complete result before returning
+        console.log('[events.create] Returning result:', {
+          hasEvent: !!result.event,
+          hasRun: !!result.run,
+          hasStep: !!result.step,
+          hasHook: !!result.hook,
+          eventType: data.eventType,
+        });
 
         return result;
       },
