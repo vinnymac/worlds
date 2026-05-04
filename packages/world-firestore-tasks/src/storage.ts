@@ -590,11 +590,6 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     data: { token: string; metadata?: unknown },
     specVersion: number
   ): Promise<Hook> {
-    console.log('[createHookFromEvent] Creating hook:', {
-      runId,
-      hookId,
-      token: data.token,
-    });
     const now = new Date();
 
     const hook = {
@@ -621,10 +616,6 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       ]);
 
       const parsed = HookSchema.parse(compact(hook));
-      console.log(
-        '[createHookFromEvent] Hook created successfully:',
-        parsed.hookId
-      );
       return parsed;
     } catch (error) {
       console.error('[createHookFromEvent] Error creating hook:', error);
@@ -730,25 +721,23 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
         const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
 
-        // Build event record matching Postgres structure
-        // Only include fields that are actually present (don't set undefined)
+        // Build event record matching Postgres/Redis pattern
+        // EventSchema requires eventData to be an object (can be empty {})
         const eventRecord: Record<string, unknown> = {
           runId: effectiveRunId,
           eventId,
           eventType: data.eventType,
+          eventData: data.eventData || {}, // EventSchema requires this to be an object, default to {}
           specVersion: effectiveSpecVersion,
           createdAt: now,
         };
 
-        // Add optional fields only if they exist
+        // Add optional correlationId if present
         if (
           'correlationId' in data &&
           (data as any).correlationId !== undefined
         ) {
           eventRecord.correlationId = (data as any).correlationId;
-        }
-        if ('eventData' in data && data.eventData !== undefined) {
-          eventRecord.eventData = data.eventData;
         }
 
         // Store the event
@@ -759,9 +748,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           .doc(eventId)
           .set(eventRecord);
 
-        // For now, skip EventSchema validation since it seems to have issues with optional eventData
-        // TODO: Investigate why EventSchema.parse fails for events without eventData
-        const result: EventResult = { event: eventRecord as unknown as Event };
+        // Parse and validate using EventSchema like other implementations
+        const parsed = EventSchema.parse(eventRecord);
+        const result: EventResult = { event: parsed };
 
         // Process entity side effects based on event type
         const eventData = (data as any).eventData;
@@ -832,26 +821,12 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             // Verify hook was created
             if (!result.hook) {
               console.error('[hook_created] Hook creation returned undefined');
-            } else {
-              console.log(
-                '[hook_created] Returning result with hook:',
-                result.hook.hookId
-              );
             }
             break;
           }
           // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
           // are event-only; no entity mutation needed at the storage level
         }
-
-        // Log the complete result before returning
-        console.log('[events.create] Returning result:', {
-          hasEvent: !!result.event,
-          hasRun: !!result.run,
-          hasStep: !!result.step,
-          hasHook: !!result.hook,
-          eventType: data.eventType,
-        });
 
         return result;
       },

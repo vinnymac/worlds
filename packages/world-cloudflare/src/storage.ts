@@ -22,7 +22,7 @@ import type {
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
-import { HookSchema } from '@workflow/world';
+import { EventSchema, HookSchema } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { compact } from './util.js';
 
@@ -213,18 +213,22 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const effectiveRunId =
           runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
 
+        // Build event record - EventSchema requires eventData to be an object
         const eventRecord: Record<string, unknown> = {
           ...data,
+          eventData: data.eventData || {}, // EventSchema requires this to be an object, default to {}
           runId: effectiveRunId,
           eventId,
           createdAt: now,
+          specVersion: 1, // TODO: Add specVersion tracking
         };
 
         // Store the event in the DO
         const stub = getRunDO(effectiveRunId);
         await stub.createEvent(eventRecord);
 
-        const event = eventRecord as unknown as Event;
+        // Parse and validate using EventSchema
+        const event = EventSchema.parse(eventRecord);
         const result: EventResult = { event };
 
         const eventData = (data as any).eventData;
