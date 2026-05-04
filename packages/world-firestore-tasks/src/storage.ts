@@ -455,6 +455,16 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     }
 
     await firestore.collection('workflow_runs').doc(runId).update(updates);
+
+    // Cleanup hooks when run reaches terminal state
+    if (
+      eventType === 'run_completed' ||
+      eventType === 'run_failed' ||
+      eventType === 'run_cancelled'
+    ) {
+      await cleanupHooks(runId);
+    }
+
     return getRun(runId);
   }
 
@@ -577,7 +587,8 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
   async function createHookFromEvent(
     runId: string,
     hookId: string,
-    data: { token: string; metadata?: unknown }
+    data: { token: string; metadata?: unknown },
+    specVersion: number
   ): Promise<Hook> {
     const now = new Date();
 
@@ -588,8 +599,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       ownerId: '',
       projectId: '',
       environment: '',
+      specVersion,
       createdAt: now,
-      metadata: data.metadata,
+      metadata: serializeNestedArrays(data.metadata),
     };
 
     await Promise.all([
@@ -603,6 +615,31 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     ]);
 
     return HookSchema.parse(compact(hook));
+  }
+
+  /**
+   * Internal: cleanup (delete) all hooks for a run when it reaches a terminal state.
+   */
+  async function cleanupHooks(runId: string): Promise<void> {
+    const hooksSnapshot = await firestore
+      .collection('workflow_runs')
+      .doc(runId)
+      .collection('hooks')
+      .get();
+
+    const batch = firestore.batch();
+    for (const doc of hooksSnapshot.docs) {
+      const hookData = doc.data();
+      // Delete from subcollection
+      batch.delete(doc.ref);
+      // Delete from hooks_by_token index
+      if (hookData.token) {
+        batch.delete(
+          firestore.collection('hooks_by_token').doc(hookData.token)
+        );
+      }
+    }
+    await batch.commit();
   }
 
   return {
@@ -746,7 +783,8 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             result.hook = await createHookFromEvent(
               effectiveRunId,
               correlationId,
-              eventData as { token: string; metadata?: unknown }
+              eventData as { token: string; metadata?: unknown },
+              effectiveSpecVersion
             );
             break;
           }
@@ -778,6 +816,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const data = doc.data() as FirebaseFirestore.DocumentData;
         return {
           ...data,
+          eventData: convertBuffersToUint8Array(data.eventData),
           createdAt: fromFirestoreTimestamp(data.createdAt),
         } as Event;
       },
@@ -816,6 +855,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const data = doc.data();
             return {
               ...data,
+              eventData: convertBuffersToUint8Array(data.eventData),
               createdAt: fromFirestoreTimestamp(data.createdAt),
             } as Event;
           }),
@@ -853,6 +893,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const data = doc.data();
             return {
               ...data,
+              eventData: convertBuffersToUint8Array(data.eventData),
               createdAt: fromFirestoreTimestamp(data.createdAt),
             } as Event;
           }),
@@ -961,8 +1002,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           ownerId: data.ownerId || '',
           projectId: data.projectId || '',
           environment: data.environment || '',
+          specVersion: data.specVersion,
           createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
-          metadata: data.metadata,
+          metadata: deserializeNestedArrays(data.metadata),
         });
         const resolveData = params?.resolveData ?? 'all';
         return filterHookData(parsed, resolveData);
@@ -1011,8 +1053,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               ownerId: data.ownerId || '',
               projectId: data.projectId || '',
               environment: data.environment || '',
+              specVersion: data.specVersion,
               createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
-              metadata: data.metadata,
+              metadata: deserializeNestedArrays(data.metadata),
             });
             return filterHookData(parsed, params?.resolveData ?? 'all');
           }),
