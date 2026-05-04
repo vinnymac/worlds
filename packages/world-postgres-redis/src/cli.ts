@@ -23,21 +23,22 @@ async function setupDatabase() {
   try {
     const sql = postgres(connectionString);
 
-    // Read the migration SQL file
+    // Read all migration SQL files
     // The migrations are in src/drizzle/migrations, and this CLI is in dist/
     // So we need to go up one level from dist/ to reach src/
-    const migrationPath = join(
-      __dirname,
-      '..',
-      'src',
-      'drizzle',
-      'migrations',
-      '0000_cheerful_kylun.sql'
-    );
-    const migrationSQL = await readFile(migrationPath, 'utf-8');
+    const migrationsDir = join(__dirname, '..', 'src', 'drizzle', 'migrations');
 
-    // Execute the migration
-    await sql.unsafe(migrationSQL);
+    // Read migration files in order
+    const migrationFiles = [
+      '0000_cheerful_kylun.sql',
+      '0001_sudden_wilson_fisk.sql',
+    ];
+
+    for (const file of migrationFiles) {
+      const migrationPath = join(migrationsDir, file);
+      const migrationSQL = await readFile(migrationPath, 'utf-8');
+      await sql.unsafe(migrationSQL);
+    }
 
     console.log('✅ Database schema created successfully!');
     console.log('\nCreated tables:');
