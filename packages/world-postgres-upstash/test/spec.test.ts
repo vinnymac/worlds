@@ -45,7 +45,7 @@ if (shouldSkipTests) {
 
     // Start QStash dev server container
     qstashContainer = await new GenericContainer(
-      'public.ecr.aws/upstash/qstash:latest'
+      'ghcr.io/vinnymac/qstash:latest'
     )
       .withCommand(['qstash', 'dev'])
       .withExposedPorts(8080)
