@@ -28,7 +28,7 @@ describe('Storage (Redis integration)', () => {
   let runs: ReturnType<typeof createRunsStorage>;
   let steps: ReturnType<typeof createStepsStorage>;
   let events: ReturnType<typeof createEventsStorage>;
-  let hooks: ReturnType<typeof createHooksStorage>;
+  let _hooks: ReturnType<typeof createHooksStorage>;
 
   const keyPrefix = 'workflow:test:';
 
@@ -90,7 +90,7 @@ describe('Storage (Redis integration)', () => {
     runs = createRunsStorage(config);
     steps = createStepsStorage(config);
     events = createEventsStorage(config);
-    hooks = createHooksStorage(config);
+    _hooks = createHooksStorage(config);
   }, 120_000);
 
   beforeEach(async () => {
@@ -166,8 +166,8 @@ describe('Storage (Redis integration)', () => {
           eventType: 'run_started',
         });
 
-        expect(result.run!.status).toBe('running');
-        expect(result.run!.startedAt).toBeInstanceOf(Date);
+        expect(result.run?.status).toBe('running');
+        expect(result.run?.startedAt).toBeInstanceOf(Date);
       });
 
       it('should update run status to completed via run_completed event', async () => {
@@ -182,8 +182,8 @@ describe('Storage (Redis integration)', () => {
           eventData: { output: [{ result: 42 }] },
         });
 
-        expect(result.run!.status).toBe('completed');
-        expect(result.run!.completedAt).toBeInstanceOf(Date);
+        expect(result.run?.status).toBe('completed');
+        expect(result.run?.completedAt).toBeInstanceOf(Date);
       });
     });
 
@@ -234,8 +234,8 @@ describe('Storage (Redis integration)', () => {
           eventType: 'run_cancelled',
         });
 
-        expect(result.run!.status).toBe('cancelled');
-        expect(result.run!.completedAt).toBeInstanceOf(Date);
+        expect(result.run?.status).toBe('cancelled');
+        expect(result.run?.completedAt).toBeInstanceOf(Date);
       });
     });
   });
@@ -324,8 +324,8 @@ describe('Storage (Redis integration)', () => {
           eventData: { result: ['ok'] },
         });
 
-        expect(result.step!.status).toBe('completed');
-        expect(result.step!.completedAt).toBeInstanceOf(Date);
+        expect(result.step?.status).toBe('completed');
+        expect(result.step?.completedAt).toBeInstanceOf(Date);
       });
 
       it('should increment attempt on step_started', async () => {
@@ -340,7 +340,7 @@ describe('Storage (Redis integration)', () => {
           correlationId: 'step-123',
         });
 
-        expect(result.step!.attempt).toBe(1);
+        expect(result.step?.attempt).toBe(1);
       });
     });
   });
@@ -366,11 +366,11 @@ describe('Storage (Redis integration)', () => {
           correlationId: 'corr_123',
         });
 
-        expect(result.event!.runId).toBe(testRunId);
-        expect(result.event!.eventId).toMatch(/^wevt_/);
-        expect(result.event!.eventType).toBe('step_started');
-        expect(result.event!.correlationId).toBe('corr_123');
-        expect(result.event!.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_started');
+        expect(result.event?.correlationId).toBe('corr_123');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
 
       it('should create a new event with null byte in payload', async () => {
@@ -392,11 +392,11 @@ describe('Storage (Redis integration)', () => {
           eventData: { error: 'Error with null byte \u0000 in message' },
         });
 
-        expect(result.event!.runId).toBe(testRunId);
-        expect(result.event!.eventId).toMatch(/^wevt_/);
-        expect(result.event!.eventType).toBe('step_failed');
-        expect(result.event!.correlationId).toBe('corr_123');
-        expect(result.event!.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_failed');
+        expect(result.event?.correlationId).toBe('corr_123');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
     });
 
@@ -416,7 +416,7 @@ describe('Storage (Redis integration)', () => {
         // run_created + run_started
         expect(result.data.length).toBeGreaterThanOrEqual(2);
         expect(result.data[0].eventType).toBe('run_created');
-        expect(result.data[1].eventId).toBe(startResult.event!.eventId);
+        expect(result.data[1].eventId).toBe(startResult.event?.eventId);
       });
     });
 
@@ -451,8 +451,8 @@ describe('Storage (Redis integration)', () => {
         // step_created + step_started + step_completed
         expect(result.data).toHaveLength(3);
         expect(result.data[0].eventType).toBe('step_created');
-        expect(result.data[1].eventId).toBe(startResult.event!.eventId);
-        expect(result.data[2].eventId).toBe(completeResult.event!.eventId);
+        expect(result.data[1].eventId).toBe(startResult.event?.eventId);
+        expect(result.data[2].eventId).toBe(completeResult.event?.eventId);
       });
 
       it('should handle hook lifecycle events', async () => {
@@ -494,13 +494,13 @@ describe('Storage (Redis integration)', () => {
         });
 
         expect(result.data).toHaveLength(4);
-        expect(result.data[0].eventId).toBe(createdResult.event!.eventId);
+        expect(result.data[0].eventId).toBe(createdResult.event?.eventId);
         expect(result.data[0].eventType).toBe('hook_created');
-        expect(result.data[1].eventId).toBe(received1Result.event!.eventId);
+        expect(result.data[1].eventId).toBe(received1Result.event?.eventId);
         expect(result.data[1].eventType).toBe('hook_received');
-        expect(result.data[2].eventId).toBe(received2Result.event!.eventId);
+        expect(result.data[2].eventId).toBe(received2Result.event?.eventId);
         expect(result.data[2].eventType).toBe('hook_received');
-        expect(result.data[3].eventId).toBe(disposedResult.event!.eventId);
+        expect(result.data[3].eventId).toBe(disposedResult.event?.eventId);
         expect(result.data[3].eventType).toBe('hook_disposed');
       });
     });

@@ -19,7 +19,6 @@ import type {
   Step,
   StepWithoutData,
   Storage,
-  UpdateStepRequest,
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
@@ -54,10 +53,6 @@ interface SerializedError {
   stack?: string;
   code?: string;
 }
-
-type SerializedStepUpdate = Omit<UpdateStepRequest, 'error'> & {
-  error?: SerializedError;
-};
 
 function isValidStepData(
   data: unknown

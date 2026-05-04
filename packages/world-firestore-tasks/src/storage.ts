@@ -3,7 +3,6 @@ import { WorkflowWorldError } from '@workflow/errors';
 import type {
   CreateEventParams,
   CreateEventRequest,
-  CreateStepRequest,
   Event,
   EventResult,
   GetEventParams,
@@ -11,7 +10,6 @@ import type {
   GetStepParams,
   GetWorkflowRunParams,
   Hook,
-  ListEventsByCorrelationIdParams,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
@@ -75,7 +73,7 @@ function deserializeRunError(data: unknown): WorkflowRun {
   } as WorkflowRun;
 }
 
-function serializeStepError(data: UpdateStepRequest): SerializedStepUpdate {
+function _serializeStepError(data: UpdateStepRequest): SerializedStepUpdate {
   const baseData = {
     ...data,
   };

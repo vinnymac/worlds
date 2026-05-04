@@ -131,7 +131,7 @@ describe('Storage (PostgreSQL integration)', () => {
   let runs: ReturnType<typeof createRunsStorage>;
   let steps: ReturnType<typeof createStepsStorage>;
   let events: ReturnType<typeof createEventsStorage>;
-  let hooks: ReturnType<typeof createHooksStorage>;
+  let _hooks: ReturnType<typeof createHooksStorage>;
   let streamer: ReturnType<typeof createStreamer>;
 
   async function truncateTables() {
@@ -158,7 +158,7 @@ describe('Storage (PostgreSQL integration)', () => {
     runs = createRunsStorage(db);
     steps = createStepsStorage(db);
     events = createEventsStorage(db);
-    hooks = createHooksStorage(db);
+    _hooks = createHooksStorage(db);
     streamer = createStreamer(sqlClient, db);
   }, 120_000);
 
@@ -554,11 +554,11 @@ describe('Storage (PostgreSQL integration)', () => {
           correlationId: 'corr_123',
         });
 
-        expect(result.event!.runId).toBe(testRunId);
-        expect(result.event!.eventId).toMatch(/^wevt_/);
-        expect(result.event!.eventType).toBe('step_started');
-        expect(result.event!.correlationId).toBe('corr_123');
-        expect(result.event!.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_started');
+        expect(result.event?.correlationId).toBe('corr_123');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
 
       it('should handle run completed events', async () => {
@@ -567,8 +567,8 @@ describe('Storage (PostgreSQL integration)', () => {
           eventData: { output: [{ result: 42 }] },
         });
 
-        expect(result.event!.eventType).toBe('run_completed');
-        expect(result.event!.correlationId).toBeUndefined();
+        expect(result.event?.eventType).toBe('run_completed');
+        expect(result.event?.correlationId).toBeUndefined();
       });
 
       it('should create a new event with null byte in payload', async () => {
@@ -588,11 +588,11 @@ describe('Storage (PostgreSQL integration)', () => {
           eventData: { error: 'Error with null byte \u0000 in message' },
         });
 
-        expect(result.event!.runId).toBe(testRunId);
-        expect(result.event!.eventId).toMatch(/^wevt_/);
-        expect(result.event!.eventType).toBe('step_failed');
-        expect(result.event!.correlationId).toBe('corr_123_null');
-        expect(result.event!.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_failed');
+        expect(result.event?.correlationId).toBe('corr_123_null');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
     });
 
@@ -623,15 +623,15 @@ describe('Storage (PostgreSQL integration)', () => {
         // 4 events: run_created, run_started, step_created, step_started
         expect(result.data).toHaveLength(4);
         expect(result.data[0].eventType).toBe('run_created');
-        expect(result.data[1].eventId).toBe(result1.event!.eventId);
-        expect(result.data[3].eventId).toBe(result2.event!.eventId);
+        expect(result.data[1].eventId).toBe(result1.event?.eventId);
+        expect(result.data[3].eventId).toBe(result2.event?.eventId);
         expect(result.data[3].createdAt.getTime()).toBeGreaterThanOrEqual(
           result.data[1].createdAt.getTime()
         );
       });
 
       it('should list events in descending order when explicitly requested', async () => {
-        const result1 = await events.create(testRunId, {
+        const _result1 = await events.create(testRunId, {
           eventType: 'run_started' as const,
         });
 
@@ -654,7 +654,7 @@ describe('Storage (PostgreSQL integration)', () => {
         });
 
         expect(result.data).toHaveLength(4);
-        expect(result.data[0].eventId).toBe(result2.event!.eventId);
+        expect(result.data[0].eventId).toBe(result2.event?.eventId);
         expect(result.data[3].eventType).toBe('run_created');
       });
 
@@ -740,8 +740,8 @@ describe('Storage (PostgreSQL integration)', () => {
         // 3 events: step_created, step_started, step_completed
         expect(result.data).toHaveLength(3);
         expect(result.data[0].eventType).toBe('step_created');
-        expect(result.data[1].eventId).toBe(result1.event!.eventId);
-        expect(result.data[2].eventId).toBe(result2.event!.eventId);
+        expect(result.data[1].eventId).toBe(result1.event?.eventId);
+        expect(result.data[2].eventId).toBe(result2.event?.eventId);
       });
 
       it('should list events across multiple runs with same correlation ID', async () => {
@@ -780,11 +780,11 @@ describe('Storage (PostgreSQL integration)', () => {
         });
 
         expect(result.data).toHaveLength(3);
-        expect(result.data[0].eventId).toBe(result1.event!.eventId);
+        expect(result.data[0].eventId).toBe(result1.event?.eventId);
         expect(result.data[0].runId).toBe(testRunId);
-        expect(result.data[1].eventId).toBe(result2.event!.eventId);
+        expect(result.data[1].eventId).toBe(result2.event?.eventId);
         expect(result.data[1].runId).toBe(run2.runId);
-        expect(result.data[2].eventId).toBe(result3.event!.eventId);
+        expect(result.data[2].eventId).toBe(result3.event?.eventId);
         expect(result.data[2].runId).toBe(testRunId);
       });
 
@@ -847,13 +847,13 @@ describe('Storage (PostgreSQL integration)', () => {
         });
 
         expect(result.data).toHaveLength(4);
-        expect(result.data[0].eventId).toBe(createdResult.event!.eventId);
+        expect(result.data[0].eventId).toBe(createdResult.event?.eventId);
         expect(result.data[0].eventType).toBe('hook_created');
-        expect(result.data[1].eventId).toBe(received1Result.event!.eventId);
+        expect(result.data[1].eventId).toBe(received1Result.event?.eventId);
         expect(result.data[1].eventType).toBe('hook_received');
-        expect(result.data[2].eventId).toBe(received2Result.event!.eventId);
+        expect(result.data[2].eventId).toBe(received2Result.event?.eventId);
         expect(result.data[2].eventType).toBe('hook_received');
-        expect(result.data[3].eventId).toBe(disposedResult.event!.eventId);
+        expect(result.data[3].eventId).toBe(disposedResult.event?.eventId);
         expect(result.data[3].eventType).toBe('hook_disposed');
       });
     });
@@ -1147,7 +1147,7 @@ describe('Storage (PostgreSQL integration)', () => {
         eventData: { token },
       });
 
-      expect(result.event!.eventType).toBe('hook_conflict');
+      expect(result.event?.eventType).toBe('hook_conflict');
       expect(result.hook).toBeUndefined();
     });
 
@@ -1178,7 +1178,7 @@ describe('Storage (PostgreSQL integration)', () => {
       });
 
       expect(result.hook).toBeDefined();
-      expect(result.hook!.token).toBe(token);
+      expect(result.hook?.token).toBe(token);
     });
   });
 
