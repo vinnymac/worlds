@@ -2,7 +2,7 @@ import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { createTestSuite } from '@workflow/world-testing';
-import { afterAll, beforeAll, test } from 'vitest';
+import { afterAll, beforeAll, describe, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on a docker container
 if (process.platform === 'win32') {
@@ -52,5 +52,13 @@ if (process.platform === 'win32') {
 
   test('smoke', () => {});
 
-  createTestSuite('@fantasticfour/world-firestore-tasks');
+  // Wrap createTestSuite in a describe block with extended timeout
+  // to handle slow CI environments (especially Firestore emulator)
+  describe(
+    '@fantasticfour/world-firestore-tasks spec tests',
+    () => {
+      createTestSuite('@fantasticfour/world-firestore-tasks');
+    },
+    { timeout: 120_000 }
+  );
 }
