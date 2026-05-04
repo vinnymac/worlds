@@ -1,0 +1,62 @@
+# NATS JetStream 3-node cluster for local development and testing.
+#
+# Usage:
+#   docker compose -f examples/docker-compose.yml up
+#
+# Each node runs JetStream with file-based storage.
+# Client connections: nats://localhost:4222 (node-1), :4223 (node-2), :4224 (node-3)
+# Monitoring:         http://localhost:8222 (node-1), :8223 (node-2), :8224 (node-3)
+
+services:
+  nats-1:
+    image: nats:2.10-alpine
+    command: >
+      -js
+      --name nats-1
+      --cluster_name workflow
+      --cluster nats://0.0.0.0:6222
+      --routes nats://nats-2:6222,nats://nats-3:6222
+      --http_port 8222
+      --store_dir /data
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-1-data:/data
+
+  nats-2:
+    image: nats:2.10-alpine
+    command: >
+      -js
+      --name nats-2
+      --cluster_name workflow
+      --cluster nats://0.0.0.0:6222
+      --routes nats://nats-1:6222,nats://nats-3:6222
+      --http_port 8222
+      --store_dir /data
+    ports:
+      - "4223:4222"
+      - "8223:8222"
+    volumes:
+      - nats-2-data:/data
+
+  nats-3:
+    image: nats:2.10-alpine
+    command: >
+      -js
+      --name nats-3
+      --cluster_name workflow
+      --cluster nats://0.0.0.0:6222
+      --routes nats://nats-1:6222,nats://nats-2:6222
+      --http_port 8222
+      --store_dir /data
+    ports:
+      - "4224:4222"
+      - "8224:8222"
+    volumes:
+      - nats-3-data:/data
+
+volumes:
+  nats-1-data:
+  nats-2-data:
+  nats-3-data:

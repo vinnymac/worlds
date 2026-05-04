@@ -1,0 +1,86 @@
+{
+  "name": "@fantasticfour/world-mysql-upstash",
+  "version": "1.0.0",
+  "description": "World implementation using MySQL for storage and Upstash QStash for queue management - works with any MySQL provider (PlanetScale, AWS RDS, Aiven, etc.)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "world-mysql-upstash-setup": "./bin/setup.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "migrations"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-mysql-upstash"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./migrations/*.sql": "./migrations/*.sql"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "node dist/cli.js",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@upstash/qstash": "^2.7.38",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "cbor-x": "catalog:",
+    "drizzle-orm": "catalog:",
+    "mysql2": "catalog:",
+    "ulid": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/mysql": "catalog:",
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "dotenv": "catalog:",
+    "drizzle-kit": "catalog:",
+    "testcontainers": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "keywords": [
+    "workflow",
+    "mysql",
+    "upstash",
+    "qstash",
+    "planetscale",
+    "rds",
+    "aiven",
+    "durable-functions"
+  ],
+  "author": "vinnymac",
+  "packageManager": "pnpm@10.23.0",
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

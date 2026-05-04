@@ -36,6 +36,68 @@ Hybrid implementation using PostgreSQL for durable storage and Redis for queue m
 - Database migrations included
 - Best for applications already using Postgres
 
+### [@fantasticfour/world-postgres-upstash](./packages/world-postgres-upstash)
+
+PostgreSQL storage with Upstash QStash for serverless queue management.
+
+**Features:**
+- PostgreSQL storage via Drizzle ORM with CBOR serialization
+- Upstash QStash for HTTP-based queuing
+- NOTIFY/LISTEN for real-time streaming
+- Ideal for serverless deployments
+
+### [@fantasticfour/world-mysql-upstash](./packages/world-mysql-upstash)
+
+MySQL storage with Upstash QStash for serverless queue management.
+
+**Features:**
+- MySQL storage via Drizzle ORM with CBOR serialization
+- Upstash QStash for HTTP-based queuing
+- Polling-based streaming (100ms interval)
+- Compatible with PlanetScale, AWS RDS, Aiven
+
+### [@fantasticfour/world-azure](./packages/world-azure)
+
+Azure Cosmos DB storage with Service Bus queue management.
+
+**Features:**
+- Cosmos DB single-container model with type discriminators
+- Azure Service Bus for reliable queuing
+- Polling-based streaming (100ms interval)
+- Enterprise-ready cloud deployment
+- Cost: ~$25-1500/month depending on scale
+
+### [@fantasticfour/world-nats-jetstream](./packages/world-nats-jetstream)
+
+NATS JetStream for self-hosted, distributed workflow execution.
+
+**Features:**
+- JetStream KV Store for entity storage
+- Native JetStream streams for workflow streaming
+- Work queue consumers for job processing
+- Single binary deployment, trivial clustering
+- Ideal for self-hosted, on-premise deployments
+
+### [@fantasticfour/world-cloudflare](./packages/world-cloudflare)
+
+Cloudflare-native implementation using Durable Objects, D1, and Queues.
+
+**Features:**
+- Cloudflare Durable Objects for storage
+- Cloudflare Queues for job management
+- Edge-native deployment
+- Global distribution
+
+### [@fantasticfour/world-firestore-tasks](./packages/world-firestore-tasks)
+
+Google Cloud Firestore with Cloud Tasks for queue management.
+
+**Features:**
+- Firestore document storage
+- Cloud Tasks for reliable queuing
+- Real-time streaming via onSnapshot
+- Serverless GCP deployment
+
 ## Development
 
 ### Prerequisites

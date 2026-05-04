@@ -22,6 +22,8 @@ catalog:
   testcontainers: 11.14.0
   "@testcontainers/postgresql": ^11.8.1
   "@testcontainers/redis": ^11.8.1
+  "@testcontainers/mysql": ^11.8.1
+  mysql2: ^3.14.1
 
 onlyBuiltDependencies:
   - esbuild

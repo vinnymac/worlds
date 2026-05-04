@@ -22,6 +22,8 @@ jobs:
         package:
           - '@fantasticfour/world-cloudflare'
           - '@fantasticfour/world-firestore-tasks'
+          - '@fantasticfour/world-mysql-upstash'
+          - '@fantasticfour/world-nats-jetstream'
           - '@fantasticfour/world-postgres-redis'
           - '@fantasticfour/world-postgres-upstash'
           - '@fantasticfour/world-redis'
@@ -55,7 +57,44 @@ jobs:
           docker pull testcontainers/ryuk:0.8.1 || true
           docker pull public.ecr.aws/docker/library/postgres:15-alpine || true
           docker pull public.ecr.aws/docker/library/redis:7-alpine || true
+          docker pull public.ecr.aws/docker/library/mysql:8.0 || true
+          docker pull public.ecr.aws/docker/library/nats:2.10-alpine || true
           docker pull gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators || true
 
       - name: Run Unit Tests for ${{ matrix.package }}
         run: pnpm --filter "${{ matrix.package }}" test
+
+  azure-tests:
+    name: Azure Cosmos DB Tests
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Don't block on Azure failures - emulator is slow and can be flaky
+    timeout-minutes: 30  # Account for 5-minute emulator startup
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10.23.0
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "pnpm"
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Packages
+        run: pnpm build --force
+
+      - name: Pre-pull Cosmos DB Emulator
+        run: docker pull mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview || true
+
+      - name: Run Azure Tests
+        run: pnpm --filter "@fantasticfour/world-azure" test
