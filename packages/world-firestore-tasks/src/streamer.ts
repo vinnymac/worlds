@@ -100,17 +100,19 @@ export function createStreamer(config: StreamerConfig): Streamer {
       }
 
       // Helper: Flush ordered chunks from buffer
+      // Sequences are ULID-derived (monotonically increasing but not consecutive),
+      // so flush all chunks whose sequence >= nextExpectedSequence in order.
       function flushOrderedChunks(
         controller: ReadableStreamDefaultController<Uint8Array>
       ) {
         while (
           chunkBuffer.length > 0 &&
-          chunkBuffer[0].sequence === nextExpectedSequence
+          chunkBuffer[0].sequence >= nextExpectedSequence
         ) {
           const nextChunk = chunkBuffer.shift();
           if (nextChunk) {
             controller.enqueue(nextChunk.data);
-            nextExpectedSequence++;
+            nextExpectedSequence = nextChunk.sequence + 1;
           }
         }
       }
@@ -188,12 +190,12 @@ export function createStreamer(config: StreamerConfig): Streamer {
           // If we have buffered chunks ready, process them
           if (
             chunkBuffer.length > 0 &&
-            chunkBuffer[0].sequence === nextExpectedSequence
+            chunkBuffer[0].sequence >= nextExpectedSequence
           ) {
             const chunk = chunkBuffer.shift();
             if (chunk) {
               controller.enqueue(chunk.data);
-              nextExpectedSequence++;
+              nextExpectedSequence = chunk.sequence + 1;
             }
             return;
           }
