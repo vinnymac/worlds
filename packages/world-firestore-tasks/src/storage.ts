@@ -590,6 +590,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     data: { token: string; metadata?: unknown },
     specVersion: number
   ): Promise<Hook> {
+    console.log('[createHookFromEvent] Creating hook:', {
+      runId,
+      hookId,
+      token: data.token,
+    });
     const now = new Date();
 
     const hook = {
@@ -604,17 +609,27 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       metadata: serializeNestedArrays(data.metadata),
     };
 
-    await Promise.all([
-      firestore
-        .collection('workflow_runs')
-        .doc(runId)
-        .collection('hooks')
-        .doc(hookId)
-        .set(hook),
-      firestore.collection('hooks_by_token').doc(data.token).set(hook),
-    ]);
+    try {
+      await Promise.all([
+        firestore
+          .collection('workflow_runs')
+          .doc(runId)
+          .collection('hooks')
+          .doc(hookId)
+          .set(hook),
+        firestore.collection('hooks_by_token').doc(data.token).set(hook),
+      ]);
 
-    return HookSchema.parse(compact(hook));
+      const parsed = HookSchema.parse(compact(hook));
+      console.log(
+        '[createHookFromEvent] Hook created successfully:',
+        parsed.hookId
+      );
+      return parsed;
+    } catch (error) {
+      console.error('[createHookFromEvent] Error creating hook:', error);
+      throw error;
+    }
   }
 
   /**
@@ -780,12 +795,30 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           }
           case 'hook_created': {
             const correlationId = (data as any).correlationId;
+            const hookEventData = eventData as {
+              token: string;
+              metadata?: unknown;
+            };
+
+            // Debug logging for CI troubleshooting
+            if (!correlationId) {
+              console.error('[hook_created] Missing correlationId');
+            }
+            if (!hookEventData.token) {
+              console.error('[hook_created] Missing token in eventData');
+            }
+
             result.hook = await createHookFromEvent(
               effectiveRunId,
               correlationId,
-              eventData as { token: string; metadata?: unknown },
+              hookEventData,
               effectiveSpecVersion
             );
+
+            // Verify hook was created
+            if (!result.hook) {
+              console.error('[hook_created] Hook creation returned undefined');
+            }
             break;
           }
           // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
