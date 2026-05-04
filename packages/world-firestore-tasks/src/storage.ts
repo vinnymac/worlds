@@ -727,7 +727,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           runId: effectiveRunId,
           eventId,
           eventType: data.eventType,
-          eventData: data.eventData || {}, // EventSchema requires this to be an object, default to {}
+          eventData: (data as any).eventData || {}, // EventSchema requires this to be an object, default to {}
           specVersion: effectiveSpecVersion,
           createdAt: now,
         };

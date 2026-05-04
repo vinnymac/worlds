@@ -216,7 +216,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // Build event record - EventSchema requires eventData to be an object
         const eventRecord: Record<string, unknown> = {
           ...data,
-          eventData: data.eventData || {}, // EventSchema requires this to be an object, default to {}
+          eventData: (data as any).eventData || {}, // EventSchema requires this to be an object, default to {}
           runId: effectiveRunId,
           eventId,
           createdAt: now,
