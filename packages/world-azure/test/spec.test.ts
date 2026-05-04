@@ -15,20 +15,36 @@ if (process.platform === 'win32') {
     // Start Cosmos DB Linux emulator
     // Uses the official Microsoft Azure Cosmos DB emulator for Linux
     // Note: Using :vnext-preview tag for ARM64 support (Apple Silicon + newer CI runners)
+    // See: https://learn.microsoft.com/en-us/azure/cosmos-db/emulator
     container = await new GenericContainer(
-      'mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview'
+      'mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview',
     )
-      .withExposedPorts(8081, 10251, 10252, 10253, 10254)
+      .withExposedPorts(
+        8081, // Gateway endpoint (HTTPS)
+        10251, // Direct mode connectivity
+        10252, // Direct mode connectivity
+        10253, // Direct mode connectivity
+        10254, // Direct mode connectivity
+      )
       .withEnvironment({
         AZURE_COSMOS_EMULATOR_PARTITION_COUNT: '10',
         AZURE_COSMOS_EMULATOR_ENABLE_DATA_PERSISTENCE: 'false',
+        // Use IP address binding for better container networking
+        AZURE_COSMOS_EMULATOR_IP_ADDRESS_OVERRIDE: '0.0.0.0',
       })
-      .withWaitStrategy(Wait.forListeningPorts())
-      .withStartupTimeout(300_000) // 5 minutes for emulator startup
+      // Use health check on port 8080 instead of just waiting for listening ports
+      // This ensures the emulator is fully ready, not just ports are open
+      // See: https://devblogs.microsoft.com/ise/testing-with-testcontainers/
+      .withWaitStrategy(
+        Wait.forAll([
+          Wait.forListeningPorts(),
+          Wait.forHttp('/_explorer/emulator.pem', 8080)
+            .forStatusCode(200)
+            .withStartupTimeout(300_000), // 5 minutes for emulator startup
+        ]),
+      )
+      .withStartupTimeout(300_000)
       .start();
-
-    // Add 1-second delay for SSL initialization stability
-    await new Promise((resolve) => setTimeout(resolve, 1000));
 
     const endpoint = `https://${container.getHost()}:${container.getMappedPort(8081)}/`;
 

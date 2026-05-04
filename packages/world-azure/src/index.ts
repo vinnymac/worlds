@@ -76,8 +76,35 @@ export function createAzureWorld(
       const endpoint = process.env.COSMOS_ENDPOINT || 'https://localhost:8081';
       const key = process.env.COSMOS_KEY;
 
+      // Determine if using emulator (localhost or self-signed cert)
+      const isEmulator = endpoint.includes('localhost') || endpoint.includes('127.0.0.1');
+
+      // Configure connection policy with SSL handling for emulator
+      const connectionPolicy = isEmulator
+        ? {
+            requestTimeout: 30000,
+          }
+        : {
+            requestTimeout: 10000,
+          };
+
+      // Configure HTTPS agent for emulator's self-signed certificate
+      // See: https://learn.microsoft.com/en-us/azure/cosmos-db/local-emulator-export-ssl-certificates
+      let agent;
+      if (isEmulator) {
+        const https = require('https');
+        agent = new https.Agent({
+          rejectUnauthorized: false, // Accept self-signed certificates for emulator
+        });
+      }
+
       if (key) {
-        return new CosmosClientClass({ endpoint, key });
+        return new CosmosClientClass({
+          endpoint,
+          key,
+          connectionPolicy,
+          ...(agent && { agent }),
+        });
       }
 
       // For Azure AD authentication in production
@@ -86,12 +113,15 @@ export function createAzureWorld(
         return new CosmosClientClass({
           endpoint,
           aadCredentials: new DefaultAzureCredential(),
+          connectionPolicy,
         });
       } catch {
         // Fall back to emulator key for local development
         return new CosmosClientClass({
           endpoint,
           key: 'C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==',
+          connectionPolicy,
+          ...(agent && { agent }),
         });
       }
     })();

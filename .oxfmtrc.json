@@ -1,0 +1,13 @@
+{
+  "indentWidth": 2,
+  "lineWidth": 80,
+  "useTabs": false,
+  "semicolons": true,
+  "trailingComma": "es5",
+  "arrowParens": true,
+  "bracketSpacing": true,
+  "bracketSameLine": false,
+  "singleQuote": true,
+  "jsxSingleQuote": false,
+  "quoteProps": "asNeeded"
+}
