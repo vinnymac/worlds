@@ -753,9 +753,10 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             hookId: data.correlationId!,
             token: eventData.token,
             metadata: eventData.metadata as SerializedContent,
-            ownerId: '', // TODO: get from context
-            projectId: '', // TODO: get from context
-            environment: '', // TODO: get from context
+            // Multi-tenancy fields - not yet implemented, using empty strings as placeholders
+            ownerId: '',
+            projectId: '',
+            environment: '',
           })
           .onConflictDoNothing()
           .returning();

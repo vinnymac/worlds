@@ -22,7 +22,7 @@ import type {
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
-import { EventSchema, HookSchema } from '@workflow/world';
+import { EventSchema, HookSchema, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { compact } from './util.js';
 
@@ -220,7 +220,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           runId: effectiveRunId,
           eventId,
           createdAt: now,
-          specVersion: 1, // TODO: Add specVersion tracking
+          specVersion: SPEC_VERSION_CURRENT,
         };
 
         // Store the event in the DO
