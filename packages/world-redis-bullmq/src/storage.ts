@@ -80,6 +80,56 @@ function parseWithDates<T>(json: string): T {
 }
 
 /**
+ * JSON replacer function that converts Uint8Array to a special marker object.
+ * This ensures Uint8Array fields are preserved through JSON.stringify/parse.
+ */
+function uint8ArrayReplacer(key: string, value: any): any {
+  // Only process input, output, and executionContext fields
+  if (key === 'input' || key === 'output' || key === 'executionContext') {
+    if (value instanceof Uint8Array) {
+      return {
+        __uint8array: true,
+        data: Array.from(value),
+      };
+    }
+  }
+  return value;
+}
+
+/**
+ * JSON reviver function that converts marker objects back to Uint8Array.
+ */
+function uint8ArrayReviver(key: string, value: any): any {
+  // First apply date revival
+  const dateValue = dateReviver(key, value);
+
+  // Then check for Uint8Array marker
+  if (
+    dateValue &&
+    typeof dateValue === 'object' &&
+    dateValue.__uint8array === true
+  ) {
+    return new Uint8Array(dateValue.data);
+  }
+
+  return dateValue;
+}
+
+/**
+ * Stringify an object with Uint8Array support.
+ */
+function stringifyWithUint8Array(obj: any): string {
+  return JSON.stringify(obj, uint8ArrayReplacer);
+}
+
+/**
+ * Parse JSON with Uint8Array and Date support.
+ */
+function parseWithUint8Array<T>(json: string): T {
+  return JSON.parse(json, uint8ArrayReviver);
+}
+
+/**
  * Serialize a StructuredError object into a JSON string.
  * Stores error.message, error.stack, and error.code as a JSON string.
  * Handles both string errors (old interface) and StructuredError objects (new interface).
@@ -252,7 +302,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
       }
 
       const run: WorkflowRun = deserializeError(
-        parseWithDates<WorkflowRun>(result[1] as string)
+        parseWithUint8Array<WorkflowRun>(result[1] as string)
       );
 
       // Apply filters
@@ -276,7 +326,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
       if (!data) {
         throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
       }
-      const run = deserializeError(parseWithDates<WorkflowRun>(data));
+      const run = deserializeError(parseWithUint8Array<WorkflowRun>(data));
       const parsed = WorkflowRunSchema.parse(compact(run));
       const resolveData = params?.resolveData ?? 'all';
       return filterRunData(parsed, resolveData);
@@ -418,14 +468,14 @@ export function createEventsStorage(
         const now = new Date();
         const existingData = await redis.get(runKey(runId));
         if (existingData) {
-          const existing = parseWithDates<WorkflowRun>(existingData);
+          const existing = parseWithUint8Array<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'cancelled' as const,
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(runId), JSON.stringify(updatedRun));
+          await redis.set(runKey(runId), stringifyWithUint8Array(updatedRun));
 
           // Update status index
           const pipeline = redis.pipeline();
@@ -531,7 +581,7 @@ export function createEventsStorage(
       ) {
         const runData = await redis.get(runKey(effectiveRunId));
         if (runData) {
-          const parsed = parseWithDates<WorkflowRun>(runData);
+          const parsed = parseWithUint8Array<WorkflowRun>(runData);
           currentRun = {
             status: parsed.status,
             specVersion: parsed.specVersion,
@@ -596,7 +646,7 @@ export function createEventsStorage(
             event: filterEventData(parsed, resolveData),
             run: fullRunData
               ? (deserializeError(
-                  parseWithDates<WorkflowRun>(fullRunData)
+                  parseWithUint8Array<WorkflowRun>(fullRunData)
                 ) as WorkflowRun)
               : undefined,
           };
@@ -636,7 +686,7 @@ export function createEventsStorage(
           stepKey(effectiveRunId, data.correlationId)
         );
         if (stepData) {
-          const parsed = parseWithDates<Step>(stepData);
+          const parsed = parseWithUint8Array<Step>(stepData);
           validatedStep = {
             status: parsed.status,
             startedAt: parsed.startedAt,
@@ -714,7 +764,7 @@ export function createEventsStorage(
         // Use SET NX to ensure run doesn't already exist
         const existed = await redis.setnx(
           runKey(effectiveRunId),
-          JSON.stringify(newRun)
+          stringifyWithUint8Array(newRun)
         );
         if (existed) {
           const score = now.getTime();
@@ -732,14 +782,17 @@ export function createEventsStorage(
       if (data.eventType === 'run_started') {
         const existingData = await redis.get(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithDates<WorkflowRun>(existingData);
+          const existing = parseWithUint8Array<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'running' as const,
             startedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+          await redis.set(
+            runKey(effectiveRunId),
+            stringifyWithUint8Array(updatedRun)
+          );
 
           // Update status index
           const pipeline = redis.pipeline();
@@ -760,7 +813,7 @@ export function createEventsStorage(
         const eventData = (data as any).eventData as { output?: any };
         const existingData = await redis.get(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithDates<WorkflowRun>(existingData);
+          const existing = parseWithUint8Array<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'completed' as const,
@@ -768,7 +821,10 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+          await redis.set(
+            runKey(effectiveRunId),
+            stringifyWithUint8Array(updatedRun)
+          );
 
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
@@ -798,7 +854,7 @@ export function createEventsStorage(
 
         const existingData = await redis.get(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithDates<WorkflowRun>(existingData);
+          const existing = parseWithUint8Array<WorkflowRun>(existingData);
           const updatedRun = serializeError({
             ...existing,
             status: 'failed' as const,
@@ -810,7 +866,10 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           });
-          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+          await redis.set(
+            runKey(effectiveRunId),
+            stringifyWithUint8Array(updatedRun)
+          );
 
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
@@ -824,7 +883,9 @@ export function createEventsStorage(
           await cleanupHooks(effectiveRunId);
 
           run = deserializeError(
-            parseWithDates<WorkflowRun>(JSON.stringify(updatedRun))
+            parseWithUint8Array<WorkflowRun>(
+              stringifyWithUint8Array(updatedRun)
+            )
           );
           run = WorkflowRunSchema.parse(compact(run));
         }
@@ -834,14 +895,17 @@ export function createEventsStorage(
       if (data.eventType === 'run_cancelled') {
         const existingData = await redis.get(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithDates<WorkflowRun>(existingData);
+          const existing = parseWithUint8Array<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'cancelled' as const,
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), JSON.stringify(updatedRun));
+          await redis.set(
+            runKey(effectiveRunId),
+            stringifyWithUint8Array(updatedRun)
+          );
 
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
@@ -879,7 +943,7 @@ export function createEventsStorage(
 
         const existed = await redis.setnx(
           stepKey(effectiveRunId, data.correlationId!),
-          JSON.stringify(newStep)
+          stringifyWithUint8Array(newStep)
         );
         if (existed) {
           await redis.zadd(
@@ -898,7 +962,7 @@ export function createEventsStorage(
           stepKey(effectiveRunId, data.correlationId!)
         );
         if (existingData) {
-          const existing = parseWithDates<Step>(existingData);
+          const existing = parseWithUint8Array<Step>(existingData);
           const updatedStep = {
             ...existing,
             status: 'running' as const,
@@ -908,7 +972,7 @@ export function createEventsStorage(
           };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            JSON.stringify(updatedStep)
+            stringifyWithUint8Array(updatedStep)
           );
           step = StepSchema.parse(compact(updatedStep));
         }
@@ -921,7 +985,7 @@ export function createEventsStorage(
           stepKey(effectiveRunId, data.correlationId!)
         );
         if (existingData) {
-          const existing = parseWithDates<Step>(existingData);
+          const existing = parseWithUint8Array<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
@@ -937,7 +1001,7 @@ export function createEventsStorage(
           };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            JSON.stringify(updatedStep)
+            stringifyWithUint8Array(updatedStep)
           );
           step = StepSchema.parse(compact(updatedStep));
         } else {
@@ -963,7 +1027,7 @@ export function createEventsStorage(
           stepKey(effectiveRunId, data.correlationId!)
         );
         if (existingData) {
-          const existing = parseWithDates<Step>(existingData);
+          const existing = parseWithUint8Array<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
@@ -982,10 +1046,10 @@ export function createEventsStorage(
           });
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            JSON.stringify(updatedStep)
+            stringifyWithUint8Array(updatedStep)
           );
           step = deserializeError(
-            parseWithDates<Step>(JSON.stringify(updatedStep))
+            parseWithUint8Array<Step>(stringifyWithUint8Array(updatedStep))
           );
           step = StepSchema.parse(compact(step));
         } else {
@@ -1012,7 +1076,7 @@ export function createEventsStorage(
           stepKey(effectiveRunId, data.correlationId!)
         );
         if (existingData) {
-          const existing = parseWithDates<Step>(existingData);
+          const existing = parseWithUint8Array<Step>(existingData);
           const updatedStep = serializeError({
             ...existing,
             status: 'pending' as const,
@@ -1025,10 +1089,10 @@ export function createEventsStorage(
           });
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            JSON.stringify(updatedStep)
+            stringifyWithUint8Array(updatedStep)
           );
           step = deserializeError(
-            parseWithDates<Step>(JSON.stringify(updatedStep))
+            parseWithUint8Array<Step>(stringifyWithUint8Array(updatedStep))
           );
           step = StepSchema.parse(compact(step));
         }
@@ -1293,7 +1357,7 @@ export function createStepsStorage(
       });
     }
 
-    const step = deserializeError(parseWithDates<Step>(data));
+    const step = deserializeError(parseWithUint8Array<Step>(data));
     const parsed = StepSchema.parse(compact(step));
     const resolveData = params?.resolveData ?? 'all';
     return filterStepData(parsed, resolveData);
@@ -1350,7 +1414,7 @@ export function createStepsStorage(
       for (const result of results ?? []) {
         if (result?.[1]) {
           const step = deserializeError(
-            parseWithDates<Step>(result[1] as string)
+            parseWithUint8Array<Step>(result[1] as string)
           );
           const parsed = StepSchema.parse(compact(step));
           steps.push(filterStepData(parsed, resolveData));
