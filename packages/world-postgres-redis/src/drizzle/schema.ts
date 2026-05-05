@@ -29,13 +29,10 @@ export const schema = pgSchema('workflow');
 
 export const workflowRunStatus = pgEnum(
   'status',
-  mustBeMoreThanOne(WorkflowRunStatusSchema.options)
+  mustBeMoreThanOne(WorkflowRunStatusSchema.options),
 );
 
-export const stepStatus = pgEnum(
-  'step_status',
-  mustBeMoreThanOne(StepStatusSchema.options)
-);
+export const stepStatus = pgEnum('step_status', mustBeMoreThanOne(StepStatusSchema.options));
 
 /**
  * A mapped type that converts all properties of T to Drizzle ORM column definitions,
@@ -63,8 +60,7 @@ export const runs = schema.table(
     status: workflowRunStatus('status').notNull(),
     workflowName: varchar('name').notNull(),
     /** @deprecated */
-    executionContextJson:
-      jsonb('execution_context').$type<Record<string, any>>(),
+    executionContextJson: jsonb('execution_context').$type<Record<string, any>>(),
     executionContext: Cbor<Record<string, any>>()('execution_context_cbor'),
     /** @deprecated */
     inputJson: jsonb('input').$type<SerializedContent>(),
@@ -77,13 +73,15 @@ export const runs = schema.table(
       .notNull(),
     completedAt: timestamp('completed_at'),
     startedAt: timestamp('started_at'),
+    specVersion: integer('spec_version'),
+    expiredAt: timestamp('expired_at'),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
       'input' | 'output' | 'executionContext'
     >
   >,
-  (tb) => [index().on(tb.workflowName), index().on(tb.status)]
+  (tb) => [index().on(tb.workflowName), index().on(tb.status)],
 );
 
 export const events = schema.table(
@@ -97,10 +95,9 @@ export const events = schema.table(
     /** @deprecated */
     eventDataJson: jsonb('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
-  } satisfies DrizzlishOfType<
-    Cborized<Event & { eventData?: undefined }, 'eventData'>
-  >,
-  (tb) => [index().on(tb.runId), index().on(tb.correlationId)]
+    specVersion: integer('spec_version'),
+  } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
+  (tb) => [index().on(tb.runId), index().on(tb.correlationId)],
 );
 
 export const steps = schema.table(
@@ -126,8 +123,9 @@ export const steps = schema.table(
       .$onUpdateFn(() => new Date())
       .notNull(),
     retryAfter: timestamp('retry_after'),
+    specVersion: integer('spec_version'),
   } satisfies DrizzlishOfType<Cborized<Step, 'input' | 'output'>>,
-  (tb) => [index().on(tb.runId), index().on(tb.status)]
+  (tb) => [index().on(tb.runId), index().on(tb.status)],
 );
 
 export const hooks = schema.table(
@@ -143,8 +141,10 @@ export const hooks = schema.table(
     /** @deprecated */
     metadataJson: jsonb('metadata').$type<SerializedContent>(),
     metadata: Cbor<unknown>()('metadata_cbor'),
+    specVersion: integer('spec_version'),
+    isWebhook: boolean('is_webhook'),
   } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
-  (tb) => [index().on(tb.runId), index().on(tb.token)]
+  (tb) => [index().on(tb.runId), index().on(tb.token)],
 );
 
 const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
@@ -164,5 +164,5 @@ export const streams = schema.table(
   },
   (tb) => ({
     primaryKey: primaryKey({ columns: [tb.streamId, tb.chunkId] }),
-  })
+  }),
 );

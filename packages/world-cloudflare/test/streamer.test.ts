@@ -27,9 +27,7 @@ describe('Streamer (StreamDO integration)', () => {
           const lastSeq = Number(url.searchParams.get('lastSequence') || '-1');
           const limit = Number(url.searchParams.get('limit') || '10');
 
-          const newChunks = storedChunks
-            .filter((c) => c.sequence > lastSeq)
-            .slice(0, limit);
+          const newChunks = storedChunks.filter((c) => c.sequence > lastSeq).slice(0, limit);
 
           return new Response(JSON.stringify(newChunks), { status: 200 });
         }
@@ -154,9 +152,7 @@ describe('Streamer (StreamDO integration)', () => {
 
       const storedChunk = storedChunks[0];
       expect(storedChunk.createdAt).toBeDefined();
-      expect(new Date(storedChunk.createdAt).getTime()).toBeGreaterThan(
-        Date.now() - 1000
-      );
+      expect(new Date(storedChunk.createdAt).getTime()).toBeGreaterThan(Date.now() - 1000);
     });
 
     it('should get correct StreamDO by name', async () => {
@@ -165,9 +161,7 @@ describe('Streamer (StreamDO integration)', () => {
 
       await streamer.writeToStream(streamName, runId, 'data');
 
-      expect(mockEnv.WORKFLOW_STREAMS.idFromName).toHaveBeenCalledWith(
-        streamName
-      );
+      expect(mockEnv.WORKFLOW_STREAMS.idFromName).toHaveBeenCalledWith(streamName);
       expect(mockEnv.WORKFLOW_STREAMS.get).toHaveBeenCalled();
     });
 
@@ -179,10 +173,7 @@ describe('Streamer (StreamDO integration)', () => {
 
       expect(storedChunks).toHaveLength(1);
 
-      const decoded = Buffer.from(
-        storedChunks[0].chunkData,
-        'base64'
-      ).toString();
+      const decoded = Buffer.from(storedChunks[0].chunkData, 'base64').toString();
       expect(decoded).toBe('');
     });
 

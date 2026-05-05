@@ -2,8 +2,20 @@
   "name": "@fantasticfour/world-postgres-redis",
   "version": "1.0.3",
   "description": "Hybrid World implementation using PostgreSQL for durable storage with Redis Lists for queue management",
-  "type": "module",
-  "main": "dist/index.js",
+  "keywords": [
+    "durable-functions",
+    "postgres",
+    "postgresql",
+    "redis",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-postgres-redis"
+  },
   "bin": {
     "world-postgres-redis-setup": "./bin/setup.js"
   },
@@ -12,16 +24,8 @@
     "bin",
     "src/drizzle/migrations"
   ],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/vinnymac/worlds.git",
-    "directory": "packages/world-postgres-redis"
-  },
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -36,6 +40,10 @@
       "default": "./dist/cli.js"
     },
     "./drizzle/migrations/*.sql": "./src/drizzle/migrations/*.sql"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc && chmod +x bin/setup.js",
@@ -67,16 +75,8 @@
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "keywords": [
-    "workflow",
-    "postgres",
-    "postgresql",
-    "redis",
-    "durable-functions"
-  ],
-  "author": "",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

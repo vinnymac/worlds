@@ -79,6 +79,7 @@ const run = await world.runs.create({
 - `workflow_streams/{streamId}/chunks` - Stream chunks with listeners
 
 Composite indexes required:
+
 - `workflowName ASC, createdAt DESC`
 - `status ASC, createdAt DESC`
 
@@ -93,8 +94,8 @@ const unsubscribe = firestore
   .doc(streamId)
   .collection('chunks')
   .orderBy('sequence', 'asc')
-  .onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
+  .onSnapshot((snapshot) => {
+    snapshot.docChanges().forEach((change) => {
       if (change.type === 'added') {
         const chunk = change.doc.data();
         controller.enqueue(chunk.data);
@@ -104,6 +105,7 @@ const unsubscribe = firestore
 ```
 
 **Streaming Comparison:**
+
 - Firestore: <50ms latency, native listeners, excellent efficiency
 - Redis/Postgres: <100ms, pub/sub, good efficiency
 - Others: 100-200ms+, polling-based, fair efficiency
@@ -115,6 +117,7 @@ Tests run against the Firestore emulator.
 ### Setup
 
 Install Firebase CLI (includes emulator):
+
 ```bash
 npm install -g firebase-tools
 ```
@@ -122,6 +125,7 @@ npm install -g firebase-tools
 ### Run Tests
 
 1. **Start emulator** (separate terminal):
+
    ```bash
    firebase emulators:start --only firestore --project=test-project
    ```
@@ -142,15 +146,18 @@ Total: ~1,100 lines ensuring production reliability.
 ## Cost Estimate
 
 **Firestore:**
+
 - Document reads: $0.06 per 100K
 - Document writes: $0.18 per 100K
 - Storage: $0.18/GB-month
 
 **Cloud Tasks:**
+
 - First 1M tasks/month: Free
 - Additional: $0.40 per million
 
 **Estimated Monthly Cost:**
+
 - **Low usage** (100K workflows/month): $5-10
 - **Medium usage** (1M workflows/month): $15-30
 - **High usage** (10M workflows/month): $80-150
@@ -159,15 +166,15 @@ Typically 30-50% cheaper than AWS DynamoDB + SQS.
 
 ## Configuration Options
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `firestore` | `Firestore` | Firestore client instance |
-| `tasksClient` | `CloudTasksClient` | Cloud Tasks client instance |
-| `project` | `string` | GCP project ID |
-| `location` | `string` | Cloud Tasks location (e.g., 'us-central1') |
-| `queueName` | `string` | Cloud Tasks queue name |
-| `targetUrl` | `string` | HTTP endpoint for task delivery |
-| `deploymentId` | `string` | Deployment identifier |
+| Option         | Type               | Description                                |
+| -------------- | ------------------ | ------------------------------------------ |
+| `firestore`    | `Firestore`        | Firestore client instance                  |
+| `tasksClient`  | `CloudTasksClient` | Cloud Tasks client instance                |
+| `project`      | `string`           | GCP project ID                             |
+| `location`     | `string`           | Cloud Tasks location (e.g., 'us-central1') |
+| `queueName`    | `string`           | Cloud Tasks queue name                     |
+| `targetUrl`    | `string`           | HTTP endpoint for task delivery            |
+| `deploymentId` | `string`           | Deployment identifier                      |
 
 ## Environment Variables
 
@@ -185,6 +192,7 @@ export TARGET_URL="https://my-app.run.app"
 ## When to Choose This Package
 
 **Use world-firestore-tasks when:**
+
 - GCP-native architecture required
 - Real-time streaming is important
 - Cost optimization desired
@@ -192,6 +200,7 @@ export TARGET_URL="https://my-app.run.app"
 - Already using GCP ecosystem
 
 **Consider alternatives when:**
+
 - SQL queryability required → use @fantasticfour/world-postgres-redis
 - AWS ecosystem → use @fantasticfour/world-dynamodb-sqs
 - Multi-cloud strategy → use @fantasticfour/world-postgres-upstash

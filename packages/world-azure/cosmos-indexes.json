@@ -1,0 +1,68 @@
+{
+  "indexingMode": "consistent",
+  "automatic": true,
+  "includedPaths": [
+    {
+      "path": "/*"
+    }
+  ],
+  "excludedPaths": [
+    {
+      "path": "/\"_etag\"/?"
+    }
+  ],
+  "compositeIndexes": [
+    [
+      {
+        "path": "/type",
+        "order": "ascending"
+      },
+      {
+        "path": "/workflowName",
+        "order": "ascending"
+      },
+      {
+        "path": "/createdAt",
+        "order": "descending"
+      }
+    ],
+    [
+      {
+        "path": "/type",
+        "order": "ascending"
+      },
+      {
+        "path": "/status",
+        "order": "ascending"
+      },
+      {
+        "path": "/createdAt",
+        "order": "descending"
+      }
+    ],
+    [
+      {
+        "path": "/type",
+        "order": "ascending"
+      },
+      {
+        "path": "/createdAt",
+        "order": "descending"
+      }
+    ],
+    [
+      {
+        "path": "/type",
+        "order": "ascending"
+      },
+      {
+        "path": "/correlationId",
+        "order": "ascending"
+      },
+      {
+        "path": "/createdAt",
+        "order": "ascending"
+      }
+    ]
+  ]
+}

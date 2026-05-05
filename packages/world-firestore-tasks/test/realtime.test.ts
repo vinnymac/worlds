@@ -2,15 +2,7 @@ import { setTimeout } from 'node:timers/promises';
 import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
 
 describe('Firestore Real-time Listeners', () => {
@@ -24,6 +16,21 @@ describe('Firestore Real-time Listeners', () => {
   let firestore: Firestore;
   let storage: ReturnType<typeof createStorage>;
   let unsubscribeFns: (() => void)[] = [];
+
+  /**
+   * Helper: create a run via the event-sourced API.
+   */
+  async function createRun(opts: { deploymentId: string; workflowName: string; input: unknown }) {
+    const result = await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: opts.deploymentId,
+        workflowName: opts.workflowName,
+        input: opts.input,
+      },
+    });
+    return result.run!;
+  }
 
   async function clearFirestoreData() {
     const runsSnapshot = await firestore.collection('workflow_runs').get();
@@ -48,9 +55,7 @@ describe('Firestore Real-time Listeners', () => {
       batch.delete(doc.ref);
     }
 
-    const hooksTokenSnapshot = await firestore
-      .collection('hooks_by_token')
-      .get();
+    const hooksTokenSnapshot = await firestore.collection('hooks_by_token').get();
     for (const doc of hooksTokenSnapshot.docs) {
       batch.delete(doc.ref);
     }
@@ -61,7 +66,7 @@ describe('Firestore Real-time Listeners', () => {
   beforeAll(async () => {
     // Start Firestore emulator container
     container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
     ).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
@@ -138,7 +143,7 @@ describe('Firestore Real-time Listeners', () => {
       // Small delay to ensure listener is established
       await setTimeout(100);
 
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: uniqueWorkflowName,
         input: [],
@@ -154,7 +159,7 @@ describe('Firestore Real-time Listeners', () => {
     });
 
     it('should receive real-time updates when a run is modified', async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -175,12 +180,14 @@ describe('Firestore Real-time Listeners', () => {
       // Small delay to ensure listener is established
       await setTimeout(100);
 
-      await storage.runs.update(run.runId, { status: 'running' });
+      await storage.events.create(run.runId, {
+        eventType: 'run_started',
+      });
       await setTimeout(100);
 
-      await storage.runs.update(run.runId, {
-        status: 'completed',
-        output: [{ result: 42 }],
+      await storage.events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: [{ result: 42 }] },
       });
       await setTimeout(100);
 
@@ -198,7 +205,7 @@ describe('Firestore Real-time Listeners', () => {
 
   describe('events subcollection listeners', () => {
     it('should receive real-time updates when events are added', async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -224,7 +231,16 @@ describe('Firestore Real-time Listeners', () => {
       await setTimeout(100);
 
       await storage.events.create(run.runId, {
-        eventType: 'workflow_started',
+        eventType: 'run_started',
+      });
+
+      await setTimeout(100);
+
+      // Create step first so step_started/step_completed can find it
+      await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'step-1',
+        eventData: { stepName: 'test-step', input: [] },
       });
 
       await setTimeout(100);
@@ -244,17 +260,20 @@ describe('Firestore Real-time Listeners', () => {
 
       await setTimeout(100);
 
-      expect(events).toHaveLength(3);
-      expect(events[0].eventType).toBe('workflow_started');
-      expect(events[1].eventType).toBe('step_started');
-      expect(events[2].eventType).toBe('step_completed');
-      expect(events[2].eventData).toEqual({ result: 'success' });
+      // run_created (from createRun) + run_started + step_created + step_started + step_completed = 5 events
+      expect(events).toHaveLength(5);
+      expect(events[0].eventType).toBe('run_created');
+      expect(events[1].eventType).toBe('run_started');
+      expect(events[2].eventType).toBe('step_created');
+      expect(events[3].eventType).toBe('step_started');
+      expect(events[4].eventType).toBe('step_completed');
+      expect(events[4].eventData).toEqual({ result: 'success' });
     });
   });
 
   describe('steps subcollection listeners', () => {
     it('should receive real-time updates when steps are created and updated', async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -280,21 +299,28 @@ describe('Firestore Real-time Listeners', () => {
       // Small delay to ensure listener is established
       await setTimeout(100);
 
-      await storage.steps.create(run.runId, {
-        stepId: 'step-1',
-        stepName: 'test-step',
-        input: [],
+      await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'step-1',
+        eventData: {
+          stepName: 'test-step',
+          input: [],
+        },
       });
 
       await setTimeout(100);
 
-      await storage.steps.update(run.runId, 'step-1', { status: 'running' });
+      await storage.events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: 'step-1',
+      });
 
       await setTimeout(100);
 
-      await storage.steps.update(run.runId, 'step-1', {
-        status: 'completed',
-        output: ['result'],
+      await storage.events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: 'step-1',
+        eventData: { result: ['result'] },
       });
 
       await setTimeout(100);
@@ -314,13 +340,13 @@ describe('Firestore Real-time Listeners', () => {
 
   describe('collection group queries with listeners', () => {
     it('should listen to events across all runs using collection group', async () => {
-      const run1 = await storage.runs.create({
+      const run1 = await createRun({
         deploymentId: 'deployment-1',
         workflowName: 'workflow-1',
         input: [],
       });
 
-      const run2 = await storage.runs.create({
+      const run2 = await createRun({
         deploymentId: 'deployment-2',
         workflowName: 'workflow-2',
         input: [],
@@ -351,6 +377,9 @@ describe('Firestore Real-time Listeners', () => {
       await storage.events.create(run1.runId, {
         eventType: 'hook_created',
         correlationId,
+        eventData: {
+          token: `token-${correlationId}-1`,
+        },
       });
 
       await setTimeout(100);
@@ -398,7 +427,7 @@ describe('Firestore Real-time Listeners', () => {
       // Small delay to ensure listener is established
       await setTimeout(100);
 
-      await storage.runs.create({
+      await createRun({
         deploymentId: 'deployment-1',
         workflowName: 'unimportant-workflow',
         input: [],
@@ -406,7 +435,7 @@ describe('Firestore Real-time Listeners', () => {
 
       await setTimeout(100);
 
-      await storage.runs.create({
+      await createRun({
         deploymentId: 'deployment-2',
         workflowName: 'important-workflow',
         input: [],
@@ -414,7 +443,7 @@ describe('Firestore Real-time Listeners', () => {
 
       await setTimeout(100);
 
-      await storage.runs.create({
+      await createRun({
         deploymentId: 'deployment-3',
         workflowName: 'important-workflow',
         input: [],
@@ -424,15 +453,13 @@ describe('Firestore Real-time Listeners', () => {
 
       // Should only have received updates for the 2 "important-workflow" runs
       expect(updates).toHaveLength(2);
-      expect(
-        updates.every((u) => u.workflowName === 'important-workflow')
-      ).toBe(true);
+      expect(updates.every((u) => u.workflowName === 'important-workflow')).toBe(true);
     });
   });
 
   describe('listener error handling', () => {
     it('should handle listener cleanup gracefully', async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -452,7 +479,9 @@ describe('Firestore Real-time Listeners', () => {
 
       await setTimeout(100);
 
-      await storage.runs.update(run.runId, { status: 'running' });
+      await storage.events.create(run.runId, {
+        eventType: 'run_started',
+      });
       await setTimeout(100);
 
       // Unsubscribe before next update
@@ -462,9 +491,9 @@ describe('Firestore Real-time Listeners', () => {
 
       const updatesBefore = updates.length;
 
-      await storage.runs.update(run.runId, {
-        status: 'completed',
-        output: [{ result: 42 }],
+      await storage.events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: [{ result: 42 }] },
       });
       await setTimeout(100);
 
@@ -475,19 +504,21 @@ describe('Firestore Real-time Listeners', () => {
 
   describe('composite index queries', () => {
     it('should query with multiple filters', async () => {
-      await storage.runs.create({
+      await createRun({
         deploymentId: 'deployment-1',
         workflowName: 'workflow-a',
         input: [],
       });
 
-      const run2 = await storage.runs.create({
+      const run2 = await createRun({
         deploymentId: 'deployment-1',
         workflowName: 'workflow-b',
         input: [],
       });
 
-      await storage.runs.update(run2.runId, { status: 'running' });
+      await storage.events.create(run2.runId, {
+        eventType: 'run_started',
+      });
 
       // Query with both workflowName and status filters
       const snapshot = await firestore
@@ -503,7 +534,7 @@ describe('Firestore Real-time Listeners', () => {
 
   describe('transaction guarantees', () => {
     it('should ensure atomic updates across documents', async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -542,12 +573,14 @@ describe('Firestore Real-time Listeners', () => {
         runId: run.runId,
         pagination: {},
       });
-      expect(events.data).toHaveLength(1);
-      expect(events.data[0].eventType).toBe('workflow_started');
+      // run_created (from createRun) + workflow_started (from transaction) = 2 events
+      expect(events.data).toHaveLength(2);
+      expect(events.data[0].eventType).toBe('run_created');
+      expect(events.data[1].eventType).toBe('workflow_started');
     });
 
     it('should rollback transaction on error', async () => {
-      const run = await storage.runs.create({
+      const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],

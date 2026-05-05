@@ -22,24 +22,16 @@ function createStorage(redis: Redis, keyPrefix: string): Storage {
 
 export function createWorld(
   config: RedisWorldConfig = {
-    redis:
-      process.env.WORKFLOW_REDIS_URL ||
-      process.env.REDIS_URL ||
-      'redis://localhost:6379',
+    redis: process.env.WORKFLOW_REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379',
     jobPrefix: process.env.WORKFLOW_REDIS_JOB_PREFIX,
     queueConcurrency:
-      Number.parseInt(
-        process.env.WORKFLOW_REDIS_WORKER_CONCURRENCY || '10',
-        10
-      ) || 10,
+      Number.parseInt(process.env.WORKFLOW_REDIS_WORKER_CONCURRENCY || '10', 10) || 10,
     keyPrefix: process.env.WORKFLOW_REDIS_KEY_PREFIX || 'workflow:',
-  }
+  },
 ): World & { start(): Promise<void> } {
   // Create Redis client
   const redis =
-    typeof config.redis === 'string'
-      ? new Redis(config.redis)
-      : new Redis(config.redis);
+    typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
 
   const keyPrefix = config.keyPrefix || 'workflow:';
 

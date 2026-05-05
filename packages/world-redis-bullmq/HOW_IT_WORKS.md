@@ -20,21 +20,25 @@ The Redis world consists of four main components:
 ### Data Structures
 
 **Workflow Runs**
+
 - Hash: `workflow:run:{runId}` - Stores run data as JSON
 - Sorted Set: `workflow:runs:index` - All runs ordered by ULID
 - Sorted Set: `workflow:runs:by_name:{workflowName}` - Index by workflow name
 - Sorted Set: `workflow:runs:by_status:{status}` - Index by status
 
 **Steps**
+
 - Hash: `workflow:step:{runId}:{stepId}` - Stores step data as JSON
 - Sorted Set: `workflow:steps:by_run:{runId}` - Steps for a run, ordered by ULID
 
 **Events**
+
 - Hash: `workflow:event:{eventId}` - Stores event data as JSON
 - Sorted Set: `workflow:events:by_run:{runId}` - Events for a run, ordered by ULID
 - Sorted Set: `workflow:events:by_correlation:{correlationId}` - Events by correlation ID
 
 **Hooks**
+
 - Hash: `workflow:hook:{hookId}` - Stores hook data as JSON
 - String: `workflow:hooks:by_token:{token}` - Maps token to hookId
 - Sorted Set: `workflow:hooks:by_run:{runId}` - Hooks for a run
@@ -42,6 +46,7 @@ The Redis world consists of four main components:
 ### ULID-based Ordering
 
 All IDs use ULID (Universally Unique Lexicographically Sortable Identifier):
+
 - Monotonically increasing
 - Time-ordered
 - Used as scores in sorted sets for efficient range queries
@@ -125,8 +130,8 @@ In **Next.js**, the `world.start()` function needs to be added to `instrumentati
 ```ts
 // instrumentation.ts
 
-if (process.env.NEXT_RUNTIME !== "edge") {
-  import("workflow/api").then(async ({ getWorld }) => {
+if (process.env.NEXT_RUNTIME !== 'edge') {
+  import('workflow/api').then(async ({ getWorld }) => {
     // start listening to the jobs
     await getWorld().start?.();
   });
@@ -213,6 +218,7 @@ workflow-redis-setup
 ```
 
 Shows:
+
 - Connection status
 - Redis version
 - Existing workflow keys count
@@ -221,6 +227,7 @@ Shows:
 ### RedisInsight
 
 Use RedisInsight (included in docker-compose) to:
+
 - Browse keys and data structures
 - Monitor memory usage
 - View BullMQ queue metrics

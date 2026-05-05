@@ -3,20 +3,21 @@
   "version": "1.0.0",
   "private": true,
   "description": "Monorepo for @fantasticfour workflow worlds",
+  "license": "Apache-2.0",
+  "author": "vinnymac",
   "repository": {
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git"
   },
-  "license": "Apache-2.0",
-  "author": "vinnymac",
   "scripts": {
     "build": "turbo build",
     "dev": "turbo dev",
     "test": "turbo test",
     "typecheck": "turbo typecheck",
     "clean": "turbo clean",
-    "format": "biome format --write .",
-    "lint": "biome lint .",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint --deny-warnings .",
     "changeset": "changeset",
     "version": "changeset version",
     "publish-packages": "pnpm build && changeset publish",
@@ -25,23 +26,25 @@
     "ci:publish": "pnpm build && changeset publish"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.3.7",
     "@changesets/cli": "^2.29.7",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "turbo": "^2.6.1",
-    "typescript": "^5.9.3"
+    "oxfmt": "0.47.0",
+    "oxlint": "1.62.0",
+    "turbo": "^2.9.9",
+    "typescript": "6.0.3"
   },
   "lint-staged": {
-    "**/*": "biome format --write --no-errors-on-unmatched"
+    "**/*.{js,jsx,ts,tsx,mjs,mts,json}": "npx oxfmt",
+    "**/*.{js,jsx,ts,tsx,mjs,mts}": "npx oxlint --deny-warnings"
   },
-  "packageManager": "pnpm@10.23.0",
   "engines": {
     "node": "^18.0.0 || ^20.0.0 || ^22.0.0 || ^24.0.0",
     "pnpm": ">=10.0.0"
   },
   "volta": {
-    "node": "22.21.1",
+    "node": "24.15.0",
     "pnpm": "10.23.0"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

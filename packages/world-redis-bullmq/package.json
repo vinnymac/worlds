@@ -2,8 +2,19 @@
   "name": "@fantasticfour/world-redis-bullmq",
   "version": "1.0.3",
   "description": "Production-grade Redis World implementation using BullMQ for robust job queue management",
-  "type": "module",
-  "main": "dist/index.js",
+  "keywords": [
+    "bullmq",
+    "durable-functions",
+    "redis",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-redis-bullmq"
+  },
   "bin": {
     "fantasticfour-redis-bullmq-setup": "./bin/setup.js"
   },
@@ -11,16 +22,8 @@
     "dist",
     "bin"
   ],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/vinnymac/worlds.git",
-    "directory": "packages/world-redis-bullmq"
-  },
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -30,6 +33,10 @@
       "types": "./dist/cli.d.ts",
       "default": "./dist/cli.js"
     }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",
@@ -56,15 +63,8 @@
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "keywords": [
-    "workflow",
-    "redis",
-    "bullmq",
-    "durable-functions"
-  ],
-  "author": "",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

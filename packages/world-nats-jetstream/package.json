@@ -1,0 +1,61 @@
+{
+  "name": "@fantasticfour/world-nats-jetstream",
+  "version": "1.0.0",
+  "description": "NATS JetStream-based World implementation for self-hosted workflow execution with built-in clustering",
+  "keywords": [
+    "durable-functions",
+    "jetstream",
+    "nats",
+    "self-hosted",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-nats-jetstream"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vercel/queue": "catalog:",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "nats": "^2.28.2",
+    "ulid": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "testcontainers": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  },
+  "packageManager": "pnpm@10.23.0"
+}

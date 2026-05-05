@@ -1,0 +1,36 @@
+name: Mirror Upstash QStash to GHCR
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Weekly on Sunday
+  workflow_dispatch: # Allow manual trigger
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/mirror-upstash-qstash.yml'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Pull from ECR Public
+        run: docker pull public.ecr.aws/upstash/qstash:latest
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push to GHCR
+        run: |
+          docker tag public.ecr.aws/upstash/qstash:latest ghcr.io/vinnymac/qstash:latest
+          docker push ghcr.io/vinnymac/qstash:latest
+
+      - name: Verify push
+        run: docker pull ghcr.io/vinnymac/qstash:latest

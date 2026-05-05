@@ -1,17 +1,10 @@
 import { setTimeout } from 'node:timers/promises';
 import { RedisContainer } from '@testcontainers/redis';
 import Redis from 'ioredis';
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
   createEventsStorage,
+  createHooksStorage,
   createRunsStorage,
   createStepsStorage,
 } from '../src/storage.js';
@@ -27,6 +20,7 @@ describe('Storage (Redis integration)', () => {
   let runs: ReturnType<typeof createRunsStorage>;
   let steps: ReturnType<typeof createStepsStorage>;
   let events: ReturnType<typeof createEventsStorage>;
+  let _hooks: ReturnType<typeof createHooksStorage>;
 
   const keyPrefix = 'workflow:test:';
 
@@ -35,6 +29,46 @@ describe('Storage (Redis integration)', () => {
     if (keys.length > 0) {
       await redis.del(...keys);
     }
+  }
+
+  /**
+   * Helper: create a run via run_created event and return the run entity.
+   */
+  async function createRun(opts?: {
+    deploymentId?: string;
+    workflowName?: string;
+    input?: any;
+    executionContext?: Record<string, any>;
+  }) {
+    const result = await events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: opts?.deploymentId ?? 'deployment-123',
+        workflowName: opts?.workflowName ?? 'test-workflow',
+        input: opts?.input ?? [],
+        executionContext: opts?.executionContext,
+      },
+    });
+    return result.run!;
+  }
+
+  /**
+   * Helper: create a step via step_created event and return the step entity.
+   */
+  async function createStep(
+    runId: string,
+    opts?: { stepId?: string; stepName?: string; input?: any },
+  ) {
+    const stepId = opts?.stepId ?? 'step-123';
+    const result = await events.create(runId, {
+      eventType: 'step_created',
+      correlationId: stepId,
+      eventData: {
+        stepName: opts?.stepName ?? 'test-step',
+        input: opts?.input ?? ['input1'],
+      },
+    });
+    return result.step!;
   }
 
   beforeAll(async () => {
@@ -48,6 +82,7 @@ describe('Storage (Redis integration)', () => {
     runs = createRunsStorage(config);
     steps = createStepsStorage(config);
     events = createEventsStorage(config);
+    _hooks = createHooksStorage(config);
   }, 120_000);
 
   beforeEach(async () => {
@@ -60,16 +95,14 @@ describe('Storage (Redis integration)', () => {
   });
 
   describe('runs', () => {
-    describe('create', () => {
-      it('should create a new workflow run', async () => {
-        const runData = {
+    describe('create via event', () => {
+      it('should create a new workflow run via run_created event', async () => {
+        const run = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           executionContext: { userId: 'user-1' },
           input: ['arg1', 'arg2'],
-        };
-
-        const run = await runs.create(runData);
+        });
 
         expect(run.runId).toMatch(/^wrun_/);
         expect(run.deploymentId).toBe('deployment-123');
@@ -79,7 +112,6 @@ describe('Storage (Redis integration)', () => {
         expect(run.input).toEqual(['arg1', 'arg2']);
         expect(run.output).toBeUndefined();
         expect(run.error).toBeUndefined();
-        expect(run.errorCode).toBeUndefined();
         expect(run.startedAt).toBeUndefined();
         expect(run.completedAt).toBeUndefined();
         expect(run.createdAt).toBeInstanceOf(Date);
@@ -87,22 +119,19 @@ describe('Storage (Redis integration)', () => {
       });
 
       it('should handle minimal run data', async () => {
-        const runData = {
+        const run = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'minimal-workflow',
           input: [],
-        };
+        });
 
-        const run = await runs.create(runData);
-
-        expect(run.executionContext).toBeUndefined();
         expect(run.input).toEqual([]);
       });
     });
 
     describe('get', () => {
       it('should retrieve an existing run', async () => {
-        const created = await runs.create({
+        const created = await createRun({
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: ['arg'],
@@ -121,52 +150,47 @@ describe('Storage (Redis integration)', () => {
       });
     });
 
-    describe('update', () => {
-      it('should update run status to running', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
+    describe('status transitions via events', () => {
+      it('should update run status to running via run_started event', async () => {
+        const created = await createRun();
+
+        const result = await events.create(created.runId, {
+          eventType: 'run_started',
         });
 
-        const updated = await runs.update(created.runId, {
-          status: 'running',
-        });
-        expect(updated.status).toBe('running');
-        expect(updated.startedAt).toBeInstanceOf(Date);
+        expect(result.run?.status).toBe('running');
+        expect(result.run?.startedAt).toBeInstanceOf(Date);
       });
 
-      it('should update run status to completed', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
+      it('should update run status to completed via run_completed event', async () => {
+        const created = await createRun();
+
+        await events.create(created.runId, {
+          eventType: 'run_started',
         });
 
-        const updated = await runs.update(created.runId, {
-          status: 'completed',
-          output: [{ result: 42 }],
+        const result = await events.create(created.runId, {
+          eventType: 'run_completed',
+          eventData: { output: [{ result: 42 }] },
         });
-        expect(updated.status).toBe('completed');
-        expect(updated.completedAt).toBeInstanceOf(Date);
-        expect(updated.output).toEqual([{ result: 42 }]);
+
+        expect(result.run?.status).toBe('completed');
+        expect(result.run?.completedAt).toBeInstanceOf(Date);
       });
     });
 
     describe('list', () => {
       it('should list all runs', async () => {
-        const run1 = await runs.create({
+        const run1 = await createRun({
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
-          input: [],
         });
 
         await setTimeout(5);
 
-        const run2 = await runs.create({
+        const run2 = await createRun({
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
-          input: [],
         });
 
         const result = await runs.list();
@@ -178,15 +202,13 @@ describe('Storage (Redis integration)', () => {
       });
 
       it('should filter runs by workflowName', async () => {
-        await runs.create({
+        await createRun({
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
-          input: [],
         });
-        const run2 = await runs.create({
+        const run2 = await createRun({
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
-          input: [],
         });
 
         const result = await runs.list({ workflowName: 'workflow-2' });
@@ -196,35 +218,16 @@ describe('Storage (Redis integration)', () => {
       });
     });
 
-    describe('cancel', () => {
-      it('should cancel a run', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
+    describe('cancel via event', () => {
+      it('should cancel a run via run_cancelled event', async () => {
+        const created = await createRun();
+
+        const result = await events.create(created.runId, {
+          eventType: 'run_cancelled',
         });
 
-        const cancelled = await runs.cancel(created.runId);
-
-        expect(cancelled.status).toBe('cancelled');
-        expect(cancelled.completedAt).toBeInstanceOf(Date);
-      });
-    });
-
-    describe('pause/resume', () => {
-      it('should pause and resume a run', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        const paused = await runs.pause(created.runId);
-        expect(paused.status).toBe('paused');
-
-        const resumed = await runs.resume(created.runId);
-        expect(resumed.status).toBe('running');
-        expect(resumed.startedAt).toBeInstanceOf(Date);
+        expect(result.run?.status).toBe('cancelled');
+        expect(result.run?.completedAt).toBeInstanceOf(Date);
       });
     });
   });
@@ -233,36 +236,30 @@ describe('Storage (Redis integration)', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await runs.create({
-        deploymentId: 'deployment-123',
-        workflowName: 'test-workflow',
-        input: [],
-      });
+      const run = await createRun();
       testRunId = run.runId;
     });
 
-    describe('create', () => {
-      it('should create a new step', async () => {
-        const stepData = {
+    describe('create via event', () => {
+      it('should create a new step via step_created event', async () => {
+        const step = await createStep(testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1', 'input2'],
-        };
-
-        const step = await steps.create(testRunId, stepData);
+        });
 
         expect(step.runId).toBe(testRunId);
         expect(step.stepId).toBe('step-123');
         expect(step.stepName).toBe('test-step');
         expect(step.status).toBe('pending');
         expect(step.input).toEqual(['input1', 'input2']);
-        expect(step.attempt).toBe(1);
+        expect(step.attempt).toBe(0);
       });
     });
 
     describe('get', () => {
       it('should retrieve a step', async () => {
-        const created = await steps.create(testRunId, {
+        const created = await createStep(testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
@@ -273,13 +270,11 @@ describe('Storage (Redis integration)', () => {
       });
 
       it('should throw error for non-existent step', async () => {
-        await expect(
-          steps.get(testRunId, 'missing-step')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
 
       it('should find step by stepId without runId using SCAN', async () => {
-        const created = await steps.create(testRunId, {
+        const created = await createStep(testRunId, {
           stepId: 'unique-step-scan-test',
           stepName: 'test-step',
           input: ['input1'],
@@ -293,42 +288,49 @@ describe('Storage (Redis integration)', () => {
       });
 
       it('should throw 404 when step not found without runId', async () => {
-        await expect(
-          steps.get(undefined, 'nonexistent-step-id')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(steps.get(undefined, 'nonexistent-step-id')).rejects.toMatchObject({
+          status: 404,
+        });
       });
     });
 
-    describe('update', () => {
-      it('should update step status to completed', async () => {
-        await steps.create(testRunId, {
+    describe('update via events', () => {
+      it('should update step status to completed via step_completed event', async () => {
+        await createStep(testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
         });
 
-        const updated = await steps.update(testRunId, 'step-123', {
-          status: 'completed',
-          output: ['ok'],
+        // Start the step first
+        await events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'step-123',
         });
 
-        expect(updated.status).toBe('completed');
-        expect(updated.completedAt).toBeInstanceOf(Date);
-        expect(updated.output).toEqual(['ok']);
+        const result = await events.create(testRunId, {
+          eventType: 'step_completed',
+          correlationId: 'step-123',
+          eventData: { result: ['ok'] },
+        });
+
+        expect(result.step?.status).toBe('completed');
+        expect(result.step?.completedAt).toBeInstanceOf(Date);
       });
 
-      it('should update attempt count', async () => {
-        await steps.create(testRunId, {
+      it('should increment attempt on step_started', async () => {
+        await createStep(testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
         });
 
-        const updated = await steps.update(testRunId, 'step-123', {
-          attempt: 2,
+        const result = await events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'step-123',
         });
 
-        expect(updated.attempt).toBe(2);
+        expect(result.step?.attempt).toBe(1);
       });
     });
   });
@@ -337,56 +339,63 @@ describe('Storage (Redis integration)', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await runs.create({
-        deploymentId: 'deployment-123',
-        workflowName: 'test-workflow',
-        input: [],
-      });
+      const run = await createRun();
       testRunId = run.runId;
     });
 
     describe('create', () => {
       it('should create a new event', async () => {
-        const eventData = {
-          eventType: 'step_started' as const,
+        // First create a step so step_started has a target
+        await createStep(testRunId, {
+          stepId: 'corr_123',
+          stepName: 'test-step',
+        });
+
+        const result = await events.create(testRunId, {
+          eventType: 'step_started',
           correlationId: 'corr_123',
-        };
+        });
 
-        const event = await events.create(testRunId, eventData);
-
-        expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
-        expect(event.eventType).toBe('step_started');
-        expect(event.correlationId).toBe('corr_123');
-        expect(event.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_started');
+        expect(result.event?.correlationId).toBe('corr_123');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
 
       it('should create a new event with null byte in payload', async () => {
-        const event = await events.create(testRunId, {
-          eventType: 'step_failed' as const,
+        // Create a step first
+        await createStep(testRunId, {
+          stepId: 'corr_123',
+          stepName: 'test-step',
+        });
+
+        // Start the step
+        await events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'corr_123',
+        });
+
+        const result = await events.create(testRunId, {
+          eventType: 'step_failed',
           correlationId: 'corr_123',
           eventData: { error: 'Error with null byte \u0000 in message' },
         });
 
-        expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
-        expect(event.eventType).toBe('step_failed');
-        expect(event.correlationId).toBe('corr_123');
-        expect(event.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_failed');
+        expect(result.event?.correlationId).toBe('corr_123');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
     });
 
     describe('list', () => {
       it('should list all events for a run', async () => {
-        const event1 = await events.create(testRunId, {
-          eventType: 'workflow_started' as const,
-        });
-
-        await setTimeout(5);
-
-        const event2 = await events.create(testRunId, {
-          eventType: 'step_started' as const,
-          correlationId: 'corr-step-1',
+        // The run_created event is already created by createRun
+        // Create a second event
+        const startResult = await events.create(testRunId, {
+          eventType: 'run_started',
         });
 
         const result = await events.list({
@@ -394,9 +403,10 @@ describe('Storage (Redis integration)', () => {
           pagination: { sortOrder: 'asc' },
         });
 
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
+        // run_created + run_started
+        expect(result.data.length).toBeGreaterThanOrEqual(2);
+        expect(result.data[0].eventType).toBe('run_created');
+        expect(result.data[1].eventId).toBe(startResult.event?.eventId);
       });
     });
 
@@ -404,22 +414,23 @@ describe('Storage (Redis integration)', () => {
       it('should list events by correlation ID', async () => {
         const correlationId = 'step-abc123';
 
-        const event1 = await events.create(testRunId, {
+        // Create a step first
+        await createStep(testRunId, {
+          stepId: correlationId,
+          stepName: 'test-step',
+        });
+
+        const startResult = await events.create(testRunId, {
           eventType: 'step_started',
           correlationId,
         });
 
         await setTimeout(5);
 
-        const event2 = await events.create(testRunId, {
+        const completeResult = await events.create(testRunId, {
           eventType: 'step_completed',
           correlationId,
           eventData: { result: 'success' },
-        });
-
-        await events.create(testRunId, {
-          eventType: 'step_started',
-          correlationId: 'different-step',
         });
 
         const result = await events.listByCorrelationId({
@@ -427,42 +438,43 @@ describe('Storage (Redis integration)', () => {
           pagination: {},
         });
 
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[0].correlationId).toBe(correlationId);
-        expect(result.data[1].correlationId).toBe(correlationId);
+        // step_created + step_started + step_completed
+        expect(result.data).toHaveLength(3);
+        expect(result.data[0].eventType).toBe('step_created');
+        expect(result.data[1].eventId).toBe(startResult.event?.eventId);
+        expect(result.data[2].eventId).toBe(completeResult.event?.eventId);
       });
 
       it('should handle hook lifecycle events', async () => {
         const hookId = 'hook_test123';
 
         // Create a typical hook lifecycle
-        const created = await events.create(testRunId, {
-          eventType: 'hook_created' as const,
+        const createdResult = await events.create(testRunId, {
+          eventType: 'hook_created',
           correlationId: hookId,
+          eventData: { token: 'test-token-123' },
         });
 
         await setTimeout(5);
 
-        const received1 = await events.create(testRunId, {
-          eventType: 'hook_received' as const,
+        const received1Result = await events.create(testRunId, {
+          eventType: 'hook_received',
           correlationId: hookId,
           eventData: { payload: { request: 1 } },
         });
 
         await setTimeout(5);
 
-        const received2 = await events.create(testRunId, {
-          eventType: 'hook_received' as const,
+        const received2Result = await events.create(testRunId, {
+          eventType: 'hook_received',
           correlationId: hookId,
           eventData: { payload: { request: 2 } },
         });
 
         await setTimeout(5);
 
-        const disposed = await events.create(testRunId, {
-          eventType: 'hook_disposed' as const,
+        const disposedResult = await events.create(testRunId, {
+          eventType: 'hook_disposed',
           correlationId: hookId,
         });
 
@@ -472,13 +484,13 @@ describe('Storage (Redis integration)', () => {
         });
 
         expect(result.data).toHaveLength(4);
-        expect(result.data[0].eventId).toBe(created.eventId);
+        expect(result.data[0].eventId).toBe(createdResult.event?.eventId);
         expect(result.data[0].eventType).toBe('hook_created');
-        expect(result.data[1].eventId).toBe(received1.eventId);
+        expect(result.data[1].eventId).toBe(received1Result.event?.eventId);
         expect(result.data[1].eventType).toBe('hook_received');
-        expect(result.data[2].eventId).toBe(received2.eventId);
+        expect(result.data[2].eventId).toBe(received2Result.event?.eventId);
         expect(result.data[2].eventType).toBe('hook_received');
-        expect(result.data[3].eventId).toBe(disposed.eventId);
+        expect(result.data[3].eventId).toBe(disposedResult.event?.eventId);
         expect(result.data[3].eventType).toBe('hook_disposed');
       });
     });

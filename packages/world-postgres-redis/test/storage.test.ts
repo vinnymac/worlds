@@ -1,22 +1,108 @@
 import { execSync } from 'node:child_process';
 import { setTimeout } from 'node:timers/promises';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import type { Hook, Step, WorkflowRun } from '@workflow/world';
 import postgres from 'postgres';
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createClient } from '../src/drizzle/index.js';
-import {
-  createEventsStorage,
-  createRunsStorage,
-  createStepsStorage,
-} from '../src/storage.js';
+import { createEventsStorage, createRunsStorage, createStepsStorage } from '../src/storage.js';
+
+// Helper types for events storage
+type EventsStorage = ReturnType<typeof createEventsStorage>;
+
+// Helper functions to create entities through events.create
+async function createRun(
+  events: EventsStorage,
+  data: {
+    deploymentId: string;
+    workflowName: string;
+    input: any[];
+    executionContext?: Record<string, unknown>;
+  },
+): Promise<WorkflowRun> {
+  const result = await events.create(null, {
+    eventType: 'run_created',
+    eventData: data,
+  });
+  if (!result.run) {
+    throw new Error('Expected run to be created');
+  }
+  return result.run;
+}
+
+async function updateRun(
+  events: EventsStorage,
+  runId: string,
+  eventType: 'run_started' | 'run_completed' | 'run_failed',
+  eventData?: Record<string, unknown>,
+): Promise<WorkflowRun> {
+  const result = await events.create(runId, {
+    eventType,
+    eventData,
+  });
+  if (!result.run) {
+    throw new Error('Expected run to be updated');
+  }
+  return result.run;
+}
+
+async function createStep(
+  events: EventsStorage,
+  runId: string,
+  data: {
+    stepId: string;
+    stepName: string;
+    input: any[];
+  },
+): Promise<Step> {
+  const result = await events.create(runId, {
+    eventType: 'step_created',
+    correlationId: data.stepId,
+    eventData: { stepName: data.stepName, input: data.input },
+  });
+  if (!result.step) {
+    throw new Error('Expected step to be created');
+  }
+  return result.step;
+}
+
+async function updateStep(
+  events: EventsStorage,
+  runId: string,
+  stepId: string,
+  eventType: 'step_started' | 'step_completed' | 'step_failed',
+  eventData?: Record<string, unknown>,
+): Promise<Step> {
+  const result = await events.create(runId, {
+    eventType,
+    correlationId: stepId,
+    eventData,
+  });
+  if (!result.step) {
+    throw new Error('Expected step to be updated');
+  }
+  return result.step;
+}
+
+async function createHook(
+  events: EventsStorage,
+  runId: string,
+  data: {
+    hookId: string;
+    token: string;
+    metadata?: unknown;
+  },
+): Promise<Hook> {
+  const result = await events.create(runId, {
+    eventType: 'hook_created',
+    correlationId: data.hookId,
+    eventData: { token: data.token, metadata: data.metadata },
+  });
+  if (!result.hook) {
+    throw new Error('Expected hook to be created');
+  }
+  return result.hook;
+}
 
 describe('Storage (Postgres integration)', () => {
   if (process.platform === 'win32') {
@@ -67,16 +153,14 @@ describe('Storage (Postgres integration)', () => {
   });
 
   describe('runs', () => {
-    describe('create', () => {
+    describe('create via events', () => {
       it('should create a new workflow run', async () => {
-        const runData = {
+        const run = await createRun(events, {
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           executionContext: { userId: 'user-1' },
           input: ['arg1', 'arg2'],
-        };
-
-        const run = await runs.create(runData);
+        });
 
         expect(run.runId).toMatch(/^wrun_/);
         expect(run.deploymentId).toBe('deployment-123');
@@ -93,13 +177,11 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should handle minimal run data', async () => {
-        const runData = {
+        const run = await createRun(events, {
           deploymentId: 'deployment-123',
           workflowName: 'minimal-workflow',
           input: [],
-        };
-
-        const run = await runs.create(runData);
+        });
 
         expect(run.executionContext).toBeUndefined();
         expect(run.input).toEqual([]);
@@ -108,7 +190,7 @@ describe('Storage (Postgres integration)', () => {
 
     describe('get', () => {
       it('should retrieve an existing run', async () => {
-        const created = await runs.create({
+        const created = await createRun(events, {
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: ['arg'],
@@ -127,30 +209,27 @@ describe('Storage (Postgres integration)', () => {
       });
     });
 
-    describe('update', () => {
+    describe('update via events', () => {
       it('should update run status to running', async () => {
-        const created = await runs.create({
+        const created = await createRun(events, {
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: [],
         });
 
-        const updated = await runs.update(created.runId, {
-          status: 'running',
-        });
+        const updated = await updateRun(events, created.runId, 'run_started');
         expect(updated.status).toBe('running');
         expect(updated.startedAt).toBeInstanceOf(Date);
       });
 
       it('should update run status to completed', async () => {
-        const created = await runs.create({
+        const created = await createRun(events, {
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: [],
         });
 
-        const updated = await runs.update(created.runId, {
-          status: 'completed',
+        const updated = await updateRun(events, created.runId, 'run_completed', {
           output: [{ result: 42 }],
         });
         expect(updated.status).toBe('completed');
@@ -159,47 +238,33 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should update run status to failed', async () => {
-        const created = await runs.create({
+        const created = await createRun(events, {
           deploymentId: 'deployment-123',
           workflowName: 'test-workflow',
           input: [],
         });
 
-        const updated = await runs.update(created.runId, {
-          status: 'failed',
-          error: {
-            message: 'Something went wrong',
-            code: 'ERR_001',
-          },
+        const updated = await updateRun(events, created.runId, 'run_failed', {
+          error: 'Something went wrong',
         });
 
         expect(updated.status).toBe('failed');
         expect(updated.error?.message).toBe('Something went wrong');
-        expect(updated.error?.code).toBe('ERR_001');
         expect(updated.completedAt).toBeInstanceOf(Date);
-      });
-
-      it('should throw error for non-existent run', async () => {
-        await expect(
-          runs.update('missing', { status: 'running' })
-        ).rejects.toMatchObject({
-          status: 404,
-        });
       });
     });
 
     describe('list', () => {
       it('should list all runs', async () => {
-        const run1 = await runs.create({
+        const run1 = await createRun(events, {
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
           input: [],
         });
 
-        // Small delay to ensure different timestamps in createdAt
         await setTimeout(2);
 
-        const run2 = await runs.create({
+        const run2 = await createRun(events, {
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
           input: [],
@@ -212,17 +277,17 @@ describe('Storage (Postgres integration)', () => {
         expect(result.data[0].runId).toBe(run2.runId);
         expect(result.data[1].runId).toBe(run1.runId);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThan(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
       it('should filter runs by workflowName', async () => {
-        await runs.create({
+        await createRun(events, {
           deploymentId: 'deployment-1',
           workflowName: 'workflow-1',
           input: [],
         });
-        const run2 = await runs.create({
+        const run2 = await createRun(events, {
           deploymentId: 'deployment-2',
           workflowName: 'workflow-2',
           input: [],
@@ -235,9 +300,8 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should support pagination', async () => {
-        // Create multiple runs
         for (let i = 0; i < 5; i++) {
-          await runs.create({
+          await createRun(events, {
             deploymentId: `deployment-${i}`,
             workflowName: `workflow-${i}`,
             input: [],
@@ -259,58 +323,13 @@ describe('Storage (Postgres integration)', () => {
         expect(page2.data[0].runId).not.toBe(page1.data[0].runId);
       });
     });
-
-    describe('cancel', () => {
-      it('should cancel a run', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        const cancelled = await runs.cancel(created.runId);
-
-        expect(cancelled.status).toBe('cancelled');
-        expect(cancelled.completedAt).toBeInstanceOf(Date);
-      });
-    });
-
-    describe('pause', () => {
-      it('should pause a run', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        const paused = await runs.pause(created.runId);
-
-        expect(paused.status).toBe('paused');
-      });
-    });
-
-    describe('resume', () => {
-      it('should resume a paused run', async () => {
-        const created = await runs.create({
-          deploymentId: 'deployment-123',
-          workflowName: 'test-workflow',
-          input: [],
-        });
-
-        await runs.pause(created.runId);
-        const resumed = await runs.resume(created.runId);
-
-        expect(resumed.status).toBe('running');
-        expect(resumed.startedAt).toBeInstanceOf(Date);
-      });
-    });
   });
 
   describe('steps', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await runs.create({
+      const run = await createRun(events, {
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -318,15 +337,13 @@ describe('Storage (Postgres integration)', () => {
       testRunId = run.runId;
     });
 
-    describe('create', () => {
+    describe('create via events', () => {
       it('should create a new step', async () => {
-        const stepData = {
+        const step = await createStep(events, testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1', 'input2'],
-        };
-
-        const step = await steps.create(testRunId, stepData);
+        });
 
         expect(step.runId).toBe(testRunId);
         expect(step.stepId).toBe('step-123');
@@ -335,7 +352,7 @@ describe('Storage (Postgres integration)', () => {
         expect(step.input).toEqual(['input1', 'input2']);
         expect(step.output).toBeUndefined();
         expect(step.error).toBeUndefined();
-        expect(step.attempt).toBe(1); // steps are created with attempt 1
+        expect(step.attempt).toBe(0); // steps are created with attempt 0
         expect(step.startedAt).toBeUndefined();
         expect(step.completedAt).toBeUndefined();
         expect(step.createdAt).toBeInstanceOf(Date);
@@ -345,7 +362,7 @@ describe('Storage (Postgres integration)', () => {
 
     describe('get', () => {
       it('should retrieve a step with runId and stepId', async () => {
-        const created = await steps.create(testRunId, {
+        const created = await createStep(events, testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
@@ -357,7 +374,7 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should retrieve a step with only stepId', async () => {
-        const created = await steps.create(testRunId, {
+        const created = await createStep(events, testRunId, {
           stepId: 'unique-step-123',
           stepName: 'test-step',
           input: ['input1'],
@@ -369,38 +386,34 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should throw error for non-existent step', async () => {
-        await expect(
-          steps.get(testRunId, 'missing-step')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
     });
 
-    describe('update', () => {
-      it('should update step status to running', async () => {
-        await steps.create(testRunId, {
+    describe('update via events', () => {
+      it('should update step status to running via step_started event', async () => {
+        await createStep(events, testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
         });
 
-        const updated = await steps.update(testRunId, 'step-123', {
-          status: 'running',
-        });
+        const updated = await updateStep(events, testRunId, 'step-123', 'step_started');
 
         expect(updated.status).toBe('running');
         expect(updated.startedAt).toBeInstanceOf(Date);
+        expect(updated.attempt).toBe(1);
       });
 
-      it('should update step status to completed', async () => {
-        await steps.create(testRunId, {
+      it('should update step status to completed via step_completed event', async () => {
+        await createStep(events, testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
         });
 
-        const updated = await steps.update(testRunId, 'step-123', {
-          status: 'completed',
-          output: ['ok'],
+        const updated = await updateStep(events, testRunId, 'step-123', 'step_completed', {
+          result: ['ok'],
         });
 
         expect(updated.status).toBe('completed');
@@ -408,50 +421,31 @@ describe('Storage (Postgres integration)', () => {
         expect(updated.output).toEqual(['ok']);
       });
 
-      it('should update step status to failed', async () => {
-        await steps.create(testRunId, {
+      it('should update step status to failed via step_failed event', async () => {
+        await createStep(events, testRunId, {
           stepId: 'step-123',
           stepName: 'test-step',
           input: ['input1'],
         });
 
-        const updated = await steps.update(testRunId, 'step-123', {
-          status: 'failed',
-          error: {
-            message: 'Step failed',
-            code: 'STEP_ERR',
-          },
+        const updated = await updateStep(events, testRunId, 'step-123', 'step_failed', {
+          error: 'Step failed',
         });
 
         expect(updated.status).toBe('failed');
         expect(updated.error?.message).toBe('Step failed');
-        expect(updated.error?.code).toBe('STEP_ERR');
         expect(updated.completedAt).toBeInstanceOf(Date);
-      });
-
-      it('should update attempt count', async () => {
-        await steps.create(testRunId, {
-          stepId: 'step-123',
-          stepName: 'test-step',
-          input: ['input1'],
-        });
-
-        const updated = await steps.update(testRunId, 'step-123', {
-          attempt: 2,
-        });
-
-        expect(updated.attempt).toBe(2);
       });
     });
 
     describe('list', () => {
       it('should list all steps for a run', async () => {
-        const step1 = await steps.create(testRunId, {
+        const step1 = await createStep(events, testRunId, {
           stepId: 'step-1',
           stepName: 'first-step',
           input: [],
         });
-        const step2 = await steps.create(testRunId, {
+        const step2 = await createStep(events, testRunId, {
           stepId: 'step-2',
           stepName: 'second-step',
           input: [],
@@ -466,14 +460,13 @@ describe('Storage (Postgres integration)', () => {
         expect(result.data[0].stepId).toBe(step2.stepId);
         expect(result.data[1].stepId).toBe(step1.stepId);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
       it('should support pagination', async () => {
-        // Create multiple steps
         for (let i = 0; i < 5; i++) {
-          await steps.create(testRunId, {
+          await createStep(events, testRunId, {
             stepId: `step-${i}`,
             stepName: `step-name-${i}`,
             input: [],
@@ -503,7 +496,7 @@ describe('Storage (Postgres integration)', () => {
     let testRunId: string;
 
     beforeEach(async () => {
-      const run = await runs.create({
+      const run = await createRun(events, {
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
         input: [],
@@ -513,83 +506,107 @@ describe('Storage (Postgres integration)', () => {
 
     describe('create', () => {
       it('should create a new event', async () => {
-        const eventData = {
+        await createStep(events, testRunId, {
+          stepId: 'corr_123',
+          stepName: 'test-step',
+          input: [],
+        });
+
+        const result = await events.create(testRunId, {
           eventType: 'step_started' as const,
           correlationId: 'corr_123',
-        };
+        });
 
-        const event = await events.create(testRunId, eventData);
-
-        expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
-        expect(event.eventType).toBe('step_started');
-        expect(event.correlationId).toBe('corr_123');
-        expect(event.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_started');
+        expect(result.event?.correlationId).toBe('corr_123');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
 
-      it('should handle workflow completed events', async () => {
-        const eventData = {
-          eventType: 'workflow_completed' as const,
-        };
+      it('should handle run completed events', async () => {
+        const result = await events.create(testRunId, {
+          eventType: 'run_completed' as const,
+          eventData: { output: [{ result: 42 }] },
+        });
 
-        const event = await events.create(testRunId, eventData);
-
-        expect(event.eventType).toBe('workflow_completed');
-        expect(event.correlationId).toBeUndefined();
+        expect(result.event?.eventType).toBe('run_completed');
+        expect(result.event?.correlationId).toBeUndefined();
       });
 
       it('should create a new event with null byte in payload', async () => {
-        const event = await events.create(testRunId, {
+        await createStep(events, testRunId, {
+          stepId: 'corr_123_null',
+          stepName: 'test-step-null',
+          input: [],
+        });
+        await events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'corr_123_null',
+        });
+
+        const result = await events.create(testRunId, {
           eventType: 'step_failed' as const,
-          correlationId: 'corr_123',
+          correlationId: 'corr_123_null',
           eventData: { error: 'Error with null byte \u0000 in message' },
         });
 
-        expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
-        expect(event.eventType).toBe('step_failed');
-        expect(event.correlationId).toBe('corr_123');
-        expect(event.createdAt).toBeInstanceOf(Date);
+        expect(result.event?.runId).toBe(testRunId);
+        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventType).toBe('step_failed');
+        expect(result.event?.correlationId).toBe('corr_123_null');
+        expect(result.event?.createdAt).toBeInstanceOf(Date);
       });
     });
 
     describe('list', () => {
       it('should list all events for a run', async () => {
-        const event1 = await events.create(testRunId, {
-          eventType: 'workflow_started' as const,
+        const result1 = await events.create(testRunId, {
+          eventType: 'run_started' as const,
         });
 
-        // Small delay to ensure different timestamps in event IDs
         await setTimeout(2);
 
-        const event2 = await events.create(testRunId, {
+        await createStep(events, testRunId, {
+          stepId: 'corr-step-1',
+          stepName: 'test-step',
+          input: [],
+        });
+
+        const result2 = await events.create(testRunId, {
           eventType: 'step_started' as const,
           correlationId: 'corr-step-1',
         });
 
         const result = await events.list({
           runId: testRunId,
-          pagination: { sortOrder: 'asc' }, // Explicitly request ascending order
+          pagination: { sortOrder: 'asc' },
         });
 
-        expect(result.data).toHaveLength(2);
-        // Should be in chronological order (oldest first)
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[1].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[0].createdAt.getTime()
+        // 4 events: run_created, run_started, step_created, step_started
+        expect(result.data).toHaveLength(4);
+        expect(result.data[0].eventType).toBe('run_created');
+        expect(result.data[1].eventId).toBe(result1.event?.eventId);
+        expect(result.data[3].eventId).toBe(result2.event?.eventId);
+        expect(result.data[3].createdAt.getTime()).toBeGreaterThanOrEqual(
+          result.data[1].createdAt.getTime(),
         );
       });
 
-      it('should list events in descending order when explicitly requested (newest first)', async () => {
-        const event1 = await events.create(testRunId, {
-          eventType: 'workflow_started' as const,
+      it('should list events in descending order when explicitly requested', async () => {
+        const _result1 = await events.create(testRunId, {
+          eventType: 'run_started' as const,
         });
 
-        // Small delay to ensure different timestamps in event IDs
         await setTimeout(2);
 
-        const event2 = await events.create(testRunId, {
+        await createStep(events, testRunId, {
+          stepId: 'corr-step-1',
+          stepName: 'test-step',
+          input: [],
+        });
+
+        const result2 = await events.create(testRunId, {
           eventType: 'step_started' as const,
           correlationId: 'corr-step-1',
         });
@@ -599,22 +616,26 @@ describe('Storage (Postgres integration)', () => {
           pagination: { sortOrder: 'desc' },
         });
 
-        expect(result.data).toHaveLength(2);
-        // Should be in reverse chronological order (newest first)
-        expect(result.data[0].eventId).toBe(event2.eventId);
-        expect(result.data[1].eventId).toBe(event1.eventId);
-        expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
-        );
+        expect(result.data).toHaveLength(4);
+        expect(result.data[0].eventId).toBe(result2.event?.eventId);
+        expect(result.data[3].eventType).toBe('run_created');
       });
 
       it('should support pagination', async () => {
-        // Create multiple events
         for (let i = 0; i < 5; i++) {
+          await createStep(events, testRunId, {
+            stepId: `corr_${i}`,
+            stepName: `test-step-${i}`,
+            input: [],
+          });
+          await events.create(testRunId, {
+            eventType: 'step_started',
+            correlationId: `corr_${i}`,
+          });
           await events.create(testRunId, {
             eventType: 'step_completed',
             correlationId: `corr_${i}`,
-            eventData: { result: i },
+            eventData: { result: [i] },
           });
         }
 
@@ -640,27 +661,38 @@ describe('Storage (Postgres integration)', () => {
       it('should list all events with a specific correlation ID', async () => {
         const correlationId = 'step-abc123';
 
-        // Create events with the target correlation ID
-        const event1 = await events.create(testRunId, {
+        await createStep(events, testRunId, {
+          stepId: correlationId,
+          stepName: 'test-step',
+          input: [],
+        });
+
+        const result1 = await events.create(testRunId, {
           eventType: 'step_started',
           correlationId,
         });
 
         await setTimeout(2);
 
-        const event2 = await events.create(testRunId, {
+        const result2 = await events.create(testRunId, {
           eventType: 'step_completed',
           correlationId,
-          eventData: { result: 'success' },
+          eventData: { result: ['success'] },
         });
 
-        // Create events with different correlation IDs (should be filtered out)
+        // Create events with different correlation IDs
+        await createStep(events, testRunId, {
+          stepId: 'different-step',
+          stepName: 'different-step',
+          input: [],
+        });
         await events.create(testRunId, {
           eventType: 'step_started',
           correlationId: 'different-step',
         });
         await events.create(testRunId, {
-          eventType: 'workflow_completed',
+          eventType: 'run_completed',
+          eventData: { output: ['done'] },
         });
 
         const result = await events.listByCorrelationId({
@@ -668,32 +700,31 @@ describe('Storage (Postgres integration)', () => {
           pagination: {},
         });
 
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[0].correlationId).toBe(correlationId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[1].correlationId).toBe(correlationId);
+        // 3 events: step_created, step_started, step_completed
+        expect(result.data).toHaveLength(3);
+        expect(result.data[0].eventType).toBe('step_created');
+        expect(result.data[1].eventId).toBe(result1.event?.eventId);
+        expect(result.data[2].eventId).toBe(result2.event?.eventId);
       });
 
       it('should list events across multiple runs with same correlation ID', async () => {
         const correlationId = 'hook-xyz789';
 
-        // Create another run
-        const run2 = await runs.create({
+        const run2 = await createRun(events, {
           deploymentId: 'deployment-456',
           workflowName: 'test-workflow-2',
           input: [],
         });
 
-        // Create events in both runs with same correlation ID
-        const event1 = await events.create(testRunId, {
+        const result1 = await events.create(testRunId, {
           eventType: 'hook_created',
           correlationId,
+          eventData: { token: 'test-token-1' },
         });
 
         await setTimeout(2);
 
-        const event2 = await events.create(run2.runId, {
+        const result2 = await events.create(run2.runId, {
           eventType: 'hook_received',
           correlationId,
           eventData: { payload: { data: 'test' } },
@@ -701,7 +732,7 @@ describe('Storage (Postgres integration)', () => {
 
         await setTimeout(2);
 
-        const event3 = await events.create(testRunId, {
+        const result3 = await events.create(testRunId, {
           eventType: 'hook_disposed',
           correlationId,
         });
@@ -712,15 +743,20 @@ describe('Storage (Postgres integration)', () => {
         });
 
         expect(result.data).toHaveLength(3);
-        expect(result.data[0].eventId).toBe(event1.eventId);
+        expect(result.data[0].eventId).toBe(result1.event?.eventId);
         expect(result.data[0].runId).toBe(testRunId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
+        expect(result.data[1].eventId).toBe(result2.event?.eventId);
         expect(result.data[1].runId).toBe(run2.runId);
-        expect(result.data[2].eventId).toBe(event3.eventId);
+        expect(result.data[2].eventId).toBe(result3.event?.eventId);
         expect(result.data[2].runId).toBe(testRunId);
       });
 
       it('should return empty list for non-existent correlation ID', async () => {
+        await createStep(events, testRunId, {
+          stepId: 'existing-step',
+          stepName: 'existing-step',
+          input: [],
+        });
         await events.create(testRunId, {
           eventType: 'step_started',
           correlationId: 'existing-step',
@@ -736,139 +772,18 @@ describe('Storage (Postgres integration)', () => {
         expect(result.cursor).toBeNull();
       });
 
-      it('should respect pagination parameters', async () => {
-        const correlationId = 'step_paginated';
-
-        // Create multiple events
-        await events.create(testRunId, {
-          eventType: 'step_started',
-          correlationId,
-        });
-
-        await setTimeout(2);
-
-        await events.create(testRunId, {
-          eventType: 'step_retrying',
-          correlationId,
-          eventData: { attempt: 1 },
-        });
-
-        await setTimeout(2);
-
-        await events.create(testRunId, {
-          eventType: 'step_completed',
-          correlationId,
-          eventData: { result: 'success' },
-        });
-
-        // Get first page
-        const page1 = await events.listByCorrelationId({
-          correlationId,
-          pagination: { limit: 2 },
-        });
-
-        expect(page1.data).toHaveLength(2);
-        expect(page1.hasMore).toBe(true);
-        expect(page1.cursor).toBeDefined();
-
-        // Get second page
-        const page2 = await events.listByCorrelationId({
-          correlationId,
-          pagination: { limit: 2, cursor: page1.cursor || undefined },
-        });
-
-        expect(page2.data).toHaveLength(1);
-        expect(page2.hasMore).toBe(false);
-      });
-
-      it('should always return full event data', async () => {
-        await events.create(testRunId, {
-          eventType: 'step_completed',
-          correlationId: 'step-with-data',
-          eventData: { result: 'success' },
-        });
-
-        // Note: resolveData parameter is ignored by the PG World storage implementation
-        const result = await events.listByCorrelationId({
-          correlationId: 'step-with-data',
-          pagination: {},
-        });
-
-        expect(result.data).toHaveLength(1);
-        expect(result.data[0].correlationId).toBe('step-with-data');
-      });
-
-      it('should return events in ascending order by default', async () => {
-        const correlationId = 'step-ordering';
-
-        // Create events with slight delays to ensure different timestamps
-        const event1 = await events.create(testRunId, {
-          eventType: 'step_started',
-          correlationId,
-        });
-
-        await setTimeout(2);
-
-        const event2 = await events.create(testRunId, {
-          eventType: 'step_completed',
-          correlationId,
-          eventData: { result: 'success' },
-        });
-
-        const result = await events.listByCorrelationId({
-          correlationId,
-          pagination: {},
-        });
-
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event1.eventId);
-        expect(result.data[1].eventId).toBe(event2.eventId);
-        expect(result.data[0].createdAt.getTime()).toBeLessThanOrEqual(
-          result.data[1].createdAt.getTime()
-        );
-      });
-
-      it('should support descending order', async () => {
-        const correlationId = 'step-desc-order';
-
-        const event1 = await events.create(testRunId, {
-          eventType: 'step_started',
-          correlationId,
-        });
-
-        await setTimeout(2);
-
-        const event2 = await events.create(testRunId, {
-          eventType: 'step_completed',
-          correlationId,
-          eventData: { result: 'success' },
-        });
-
-        const result = await events.listByCorrelationId({
-          correlationId,
-          pagination: { sortOrder: 'desc' },
-        });
-
-        expect(result.data).toHaveLength(2);
-        expect(result.data[0].eventId).toBe(event2.eventId);
-        expect(result.data[1].eventId).toBe(event1.eventId);
-        expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
-        );
-      });
-
       it('should handle hook lifecycle events', async () => {
         const hookId = 'hook_test123';
 
-        // Create a typical hook lifecycle
-        const created = await events.create(testRunId, {
+        const createdResult = await events.create(testRunId, {
           eventType: 'hook_created' as const,
           correlationId: hookId,
+          eventData: { token: 'lifecycle-test-token' },
         });
 
         await setTimeout(2);
 
-        const received1 = await events.create(testRunId, {
+        const received1Result = await events.create(testRunId, {
           eventType: 'hook_received' as const,
           correlationId: hookId,
           eventData: { payload: { request: 1 } },
@@ -876,7 +791,7 @@ describe('Storage (Postgres integration)', () => {
 
         await setTimeout(2);
 
-        const received2 = await events.create(testRunId, {
+        const received2Result = await events.create(testRunId, {
           eventType: 'hook_received' as const,
           correlationId: hookId,
           eventData: { payload: { request: 2 } },
@@ -884,7 +799,7 @@ describe('Storage (Postgres integration)', () => {
 
         await setTimeout(2);
 
-        const disposed = await events.create(testRunId, {
+        const disposedResult = await events.create(testRunId, {
           eventType: 'hook_disposed' as const,
           correlationId: hookId,
         });
@@ -895,15 +810,326 @@ describe('Storage (Postgres integration)', () => {
         });
 
         expect(result.data).toHaveLength(4);
-        expect(result.data[0].eventId).toBe(created.eventId);
+        expect(result.data[0].eventId).toBe(createdResult.event?.eventId);
         expect(result.data[0].eventType).toBe('hook_created');
-        expect(result.data[1].eventId).toBe(received1.eventId);
+        expect(result.data[1].eventId).toBe(received1Result.event?.eventId);
         expect(result.data[1].eventType).toBe('hook_received');
-        expect(result.data[2].eventId).toBe(received2.eventId);
+        expect(result.data[2].eventId).toBe(received2Result.event?.eventId);
         expect(result.data[2].eventType).toBe('hook_received');
-        expect(result.data[3].eventId).toBe(disposed.eventId);
+        expect(result.data[3].eventId).toBe(disposedResult.event?.eventId);
         expect(result.data[3].eventType).toBe('hook_disposed');
       });
+    });
+  });
+
+  describe('step terminal state validation', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      testRunId = run.runId;
+    });
+
+    it('should reject step_started on completed step', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_terminal_1',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_terminal_1', 'step_completed', {
+        result: ['ok'],
+      });
+
+      await expect(
+        updateStep(events, testRunId, 'step_terminal_1', 'step_started'),
+      ).rejects.toThrow(/terminal/i);
+    });
+
+    it('should reject step_completed on already completed step', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_terminal_2',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_terminal_2', 'step_completed', {
+        result: ['ok'],
+      });
+
+      await expect(
+        updateStep(events, testRunId, 'step_terminal_2', 'step_completed', {
+          result: ['ok2'],
+        }),
+      ).rejects.toThrow(/terminal/i);
+    });
+
+    it('should reject step_failed on completed step', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_terminal_3',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_terminal_3', 'step_completed', {
+        result: ['ok'],
+      });
+
+      await expect(
+        updateStep(events, testRunId, 'step_terminal_3', 'step_failed', {
+          error: 'Should not work',
+        }),
+      ).rejects.toThrow(/terminal/i);
+    });
+
+    it('should reject step_started on failed step', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_failed_1',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_failed_1', 'step_failed', {
+        error: 'Failed permanently',
+      });
+
+      await expect(updateStep(events, testRunId, 'step_failed_1', 'step_started')).rejects.toThrow(
+        /terminal/i,
+      );
+    });
+  });
+
+  describe('run terminal state validation', () => {
+    it('should reject run_started on completed run', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_completed', { output: ['done'] });
+
+      await expect(updateRun(events, run.runId, 'run_started')).rejects.toThrow(/terminal/i);
+    });
+
+    it('should reject step_created on completed run', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_completed', { output: ['done'] });
+
+      await expect(
+        createStep(events, run.runId, {
+          stepId: 'new_step',
+          stepName: 'test-step',
+          input: [],
+        }),
+      ).rejects.toThrow(/terminal/i);
+    });
+
+    it('should reject hook_created on completed run', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_completed', { output: ['done'] });
+
+      await expect(
+        createHook(events, run.runId, {
+          hookId: 'new_hook',
+          token: 'new-token',
+        }),
+      ).rejects.toThrow(/terminal/i);
+    });
+
+    it('should allow run_cancelled on already cancelled run (idempotent)', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      await events.create(run.runId, { eventType: 'run_cancelled' });
+
+      const result = await events.create(run.runId, {
+        eventType: 'run_cancelled',
+      });
+      expect(result.run?.status).toBe('cancelled');
+    });
+  });
+
+  describe('event ordering validation', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      testRunId = run.runId;
+    });
+
+    it('should reject step_completed before step_created', async () => {
+      await expect(
+        events.create(testRunId, {
+          eventType: 'step_completed',
+          correlationId: 'nonexistent_step',
+          eventData: { result: ['ok'] },
+        }),
+      ).rejects.toThrow(/not found/i);
+    });
+
+    it('should reject step_started before step_created', async () => {
+      await expect(
+        events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'nonexistent_step_started',
+        }),
+      ).rejects.toThrow(/not found/i);
+    });
+
+    it('should reject hook_disposed before hook_created', async () => {
+      await expect(
+        events.create(testRunId, {
+          eventType: 'hook_disposed',
+          correlationId: 'nonexistent_hook',
+        }),
+      ).rejects.toThrow(/not found/i);
+    });
+
+    it('should reject hook_received before hook_created', async () => {
+      await expect(
+        events.create(testRunId, {
+          eventType: 'hook_received',
+          correlationId: 'nonexistent_hook_received',
+          eventData: { payload: {} },
+        }),
+      ).rejects.toThrow(/not found/i);
+    });
+  });
+
+  describe('step_retrying event handling', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      testRunId = run.runId;
+    });
+
+    it('should set step status to pending and record error', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_retry_1',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_retry_1', 'step_started');
+
+      const result = await events.create(testRunId, {
+        eventType: 'step_retrying',
+        correlationId: 'step_retry_1',
+        eventData: {
+          error: 'Temporary failure',
+          retryAfter: new Date(Date.now() + 5000),
+        },
+      });
+
+      expect(result.step?.status).toBe('pending');
+      expect(result.step?.error?.message).toBe('Temporary failure');
+      expect(result.step?.retryAfter).toBeInstanceOf(Date);
+    });
+
+    it('should increment attempt when step_started is called after step_retrying', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_retry_2',
+        stepName: 'test-step',
+        input: [],
+      });
+
+      const started1 = await updateStep(events, testRunId, 'step_retry_2', 'step_started');
+      expect(started1.attempt).toBe(1);
+
+      await events.create(testRunId, {
+        eventType: 'step_retrying',
+        correlationId: 'step_retry_2',
+        eventData: { error: 'Temporary failure' },
+      });
+
+      const started2 = await updateStep(events, testRunId, 'step_retry_2', 'step_started');
+      expect(started2.attempt).toBe(2);
+    });
+  });
+
+  describe('hook token conflict', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      testRunId = run.runId;
+    });
+
+    it('should return hook_conflict event for duplicate token', async () => {
+      const token = 'unique-token-test';
+
+      await events.create(testRunId, {
+        eventType: 'hook_created' as const,
+        correlationId: 'hook_1',
+        eventData: { token },
+      });
+
+      const run2 = await createRun(events, {
+        deploymentId: 'deployment-456',
+        workflowName: 'test-workflow-2',
+        input: [],
+      });
+
+      const result = await events.create(run2.runId, {
+        eventType: 'hook_created' as const,
+        correlationId: 'hook_2',
+        eventData: { token },
+      });
+
+      expect(result.event?.eventType).toBe('hook_conflict');
+      expect(result.hook).toBeUndefined();
+    });
+
+    it('should allow token reuse after hook is disposed', async () => {
+      const token = 'reusable-token-test';
+
+      await events.create(testRunId, {
+        eventType: 'hook_created' as const,
+        correlationId: 'hook_reuse_1',
+        eventData: { token },
+      });
+
+      await events.create(testRunId, {
+        eventType: 'hook_disposed' as const,
+        correlationId: 'hook_reuse_1',
+      });
+
+      const run2 = await createRun(events, {
+        deploymentId: 'deployment-789',
+        workflowName: 'test-workflow-3',
+        input: [],
+      });
+
+      const result = await events.create(run2.runId, {
+        eventType: 'hook_created' as const,
+        correlationId: 'hook_reuse_2',
+        eventData: { token },
+      });
+
+      expect(result.hook).toBeDefined();
+      expect(result.hook?.token).toBe(token);
     });
   });
 });

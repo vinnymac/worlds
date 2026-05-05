@@ -2,23 +2,32 @@
   "name": "@fantasticfour/world-cloudflare",
   "version": "1.0.3",
   "description": "Cloudflare Durable Objects World implementation with edge-native SQLite storage and global <10ms latency",
-  "type": "module",
-  "main": "dist/index.js",
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
+  "keywords": [
+    "cloudflare",
+    "durable-functions",
+    "durable-objects",
+    "edge",
+    "serverless",
+    "workflow"
+  ],
   "license": "Apache-2.0",
+  "author": "vinnymac",
   "repository": {
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git",
     "directory": "packages/world-cloudflare"
   },
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",
@@ -46,17 +55,8 @@
     "vitest": "catalog:",
     "wrangler": "^3.91.0"
   },
-  "keywords": [
-    "workflow",
-    "cloudflare",
-    "durable-objects",
-    "edge",
-    "serverless",
-    "durable-functions"
-  ],
-  "author": "vinnymac",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

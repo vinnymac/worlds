@@ -1,6 +1,6 @@
 import type { Queue, ValidQueueName } from '@workflow/world';
 import { MessageId } from '@workflow/world';
-import { createEmbeddedWorld } from '@workflow/world-local';
+import { createLocalWorld } from '@workflow/world-local';
 import { monotonicFactory } from 'ulid';
 
 export interface CloudflareQueueConfig {
@@ -15,26 +15,22 @@ interface CloudflareQueue {
   sendBatch(messages: Array<{ body: unknown }>): Promise<void>;
 }
 
-export function createQueue(
-  config: CloudflareQueueConfig
-): Queue & { start(): Promise<void> } {
+export function createQueue(config: CloudflareQueueConfig): Queue & { start(): Promise<void> } {
   const { env, deploymentId } = config;
 
   // Create embedded world for test orchestration (like upstream world-postgres)
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createEmbeddedWorld({ dataDir: undefined, port });
+  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   // Detect test mode
-  const isTest =
-    process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
+  const isTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
 
   const _generateMessageId = monotonicFactory();
 
   return {
     async queue(queueName, message, opts) {
       // Re-check test mode on each call (for tests that set env after createQueue)
-      const currentIsTest =
-        process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
+      const currentIsTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
       if (currentIsTest) {
         // In tests: forward directly to embedded world for orchestration
         return await embeddedWorld.queue(queueName, message as any, opts);
@@ -50,9 +46,7 @@ export function createQueue(
 
       await env.WORKFLOW_QUEUE.send(wrappedMessage);
 
-      const messageId = MessageId.parse(
-        `msg_${opts?.idempotencyKey || Date.now().toString()}`
-      );
+      const messageId = MessageId.parse(`msg_${opts?.idempotencyKey || Date.now().toString()}`);
 
       return { messageId };
     },
@@ -97,8 +91,7 @@ export function createQueue(
 
           // Generate or extract message ID
           const messageIdStr =
-            req.headers.get('CF-Queue-Message-Id') ||
-            `msg_${idempotencyKey || Date.now()}`;
+            req.headers.get('CF-Queue-Message-Id') || `msg_${idempotencyKey || Date.now()}`;
 
           // Invoke the handler with the message
           await handler(message, {

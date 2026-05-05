@@ -111,7 +111,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
       expect(mockQueue.send).toHaveBeenCalledWith(
         expect.objectContaining({
           message,
-        })
+        }),
       );
     });
   });
@@ -138,7 +138,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
       // Attempt to queue - embedded world will handle it
       try {
         await queue.queue(queueName, message);
-      } catch (_err) {
+      } catch {
         // Embedded world may throw if no handler, that's OK for this test
         // We're just verifying Cloudflare Queue wasn't called
       }
@@ -161,7 +161,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
 
       try {
         await queue.queue('test:queue' as ValidQueueName, { data: 'test' });
-      } catch (_err) {
+      } catch {
         // Ignore errors from embedded world
       }
 
@@ -210,7 +210,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
           queueName: 'workflow:test-queue',
           attempt: 1,
           messageId: expect.stringMatching(/^msg_/),
-        })
+        }),
       );
     });
 
@@ -235,7 +235,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         expect.anything(),
         expect.objectContaining({
           attempt: 3, // Retry count 2 + 1 = attempt 3
-        })
+        }),
       );
     });
 
@@ -260,7 +260,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         expect.anything(),
         expect.objectContaining({
           messageId: 'msg_cloudflare_123',
-        })
+        }),
       );
     });
 
@@ -283,7 +283,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         expect.anything(),
         expect.objectContaining({
           messageId: 'msg_custom-key',
-        })
+        }),
       );
     });
 

@@ -28,41 +28,51 @@ pnpm add @fantasticfour/world-postgres-redis
 This package works with any PostgreSQL 13+ database:
 
 ### Neon (Serverless PostgreSQL)
+
 ```bash
 export WORKFLOW_POSTGRES_URL="postgresql://user:pass@ep-xxx.neon.tech/dbname"
 ```
+
 - **Best for**: Cost optimization, variable traffic, branching workflows
 - **Benefits**: Scales to zero, instant provisioning, database branches
 - **Pricing**: Free tier available, $0.16/compute hour when active
 
 ### Supabase (PostgreSQL + Auth)
+
 ```bash
 export WORKFLOW_POSTGRES_URL="postgresql://postgres:pass@db.xxx.supabase.co:5432/postgres"
 ```
+
 - **Best for**: Apps needing auth + workflows, realtime features
 - **Benefits**: Built-in authentication, storage, edge functions
 - **Pricing**: Free tier available, $25/month pro tier
 
 ### AWS RDS (Managed PostgreSQL)
+
 ```bash
 export WORKFLOW_POSTGRES_URL="postgresql://user:pass@xxx.rds.amazonaws.com:5432/dbname"
 ```
+
 - **Best for**: Enterprise deployments, compliance requirements
 - **Benefits**: High availability, automated backups, VPC isolation
 - **Pricing**: Starts at ~$15/month for small instances
 
 ### Railway (Developer-Friendly PostgreSQL)
+
 ```bash
 export WORKFLOW_POSTGRES_URL="postgresql://user:pass@xxx.railway.app:5432/dbname"
 ```
+
 - **Best for**: Quick prototyping, developer convenience
 - **Benefits**: One-click deploy, automatic migrations, fair pricing
 - **Pricing**: $5/month for 8GB storage
 
 ### Self-Hosted PostgreSQL
+
 ```bash
 export WORKFLOW_POSTGRES_URL="postgresql://user:pass@your-host:5432/dbname"
 ```
+
 - **Best for**: Complete control, on-premises requirements
 - **Benefits**: Full control, no vendor lock-in, cost predictability
 
@@ -134,12 +144,12 @@ All tables use ULID-based primary keys for monotonic ordering and include timest
 
 ## Configuration Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `connectionString` | `string` | Required | PostgreSQL connection URL |
-| `redis` | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
-| `jobPrefix` | `string` | `workflow_` | Prefix for Redis job queue keys |
-| `queueConcurrency` | `number` | `10` | Number of concurrent queue workers |
+| Option             | Type                     | Default                  | Description                             |
+| ------------------ | ------------------------ | ------------------------ | --------------------------------------- |
+| `connectionString` | `string`                 | Required                 | PostgreSQL connection URL               |
+| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
+| `jobPrefix`        | `string`                 | `workflow_`              | Prefix for Redis job queue keys         |
+| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers      |
 
 ## Querying Workflow Data
 
@@ -183,6 +193,7 @@ pnpm db:push
 ## When to Choose This Package
 
 **Use world-postgres-redis when:**
+
 - You need SQL queryability for workflow data
 - Maximum durability and ACID guarantees required
 - Integration with existing PostgreSQL databases
@@ -190,6 +201,7 @@ pnpm db:push
 - Audit trails and compliance requirements
 
 **Consider alternatives when:**
+
 - Pure in-memory speed is priority → use @fantasticfour/world-redis
 - You need advanced queue features → use @fantasticfour/world-redis-bullmq
 - You're on serverless platforms → use @fantasticfour/world-postgres-upstash

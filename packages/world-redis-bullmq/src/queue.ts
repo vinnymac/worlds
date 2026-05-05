@@ -7,7 +7,7 @@ import {
   type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
-import { createEmbeddedWorld } from '@workflow/world-local';
+import { createLocalWorld } from '@workflow/world-local';
 import { Queue, Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
@@ -33,10 +33,10 @@ interface MessageData {
  */
 export function createQueue(
   redis: Redis,
-  config: RedisWorldConfig
+  config: RedisWorldConfig,
 ): QueueInterface & { start(): Promise<void> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createEmbeddedWorld({ dataDir: undefined, port });
+  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   const transport = new JsonTransport();
   const generateMessageId = monotonicFactory();
@@ -55,9 +55,13 @@ export function createQueue(
     db: redis.options.db,
   };
 
-  // Create BullMQ queues
+  // Create BullMQ queues eagerly to avoid cold-start delays on first job add
   const bullQueues = new Map<string, Queue>();
   const workers = new Map<string, Worker>();
+
+  for (const queueName of Object.values(Queues)) {
+    bullQueues.set(queueName, new Queue(queueName, { connection: connectionOptions }));
+  }
 
   function getQueue(name: string): Queue {
     let queue = bullQueues.get(name);
@@ -79,7 +83,7 @@ export function createQueue(
   const queue: QueueInterface['queue'] = async (
     queueName: ValidQueueName,
     message: unknown,
-    opts?: { idempotencyKey?: string }
+    opts?: { idempotencyKey?: string },
   ) => {
     const [queuePrefix, queueId] = parseQueueName(queueName);
     const jobName = Queues[queuePrefix] as string;
@@ -108,7 +112,7 @@ export function createQueue(
         attempts: 3,
         removeOnComplete: 100, // Keep last 100 completed jobs
         removeOnFail: 1000, // Keep last 1000 failed jobs
-      }
+      },
     );
 
     return { messageId };
@@ -125,12 +129,8 @@ export function createQueue(
           data: Buffer.from(job.data.data as string, 'base64'),
         } as MessageData;
 
-        const bodyStream = Stream.Readable.toWeb(
-          Stream.Readable.from([messageData.data])
-        );
-        const body = await transport.deserialize(
-          bodyStream as ReadableStream<Uint8Array>
-        );
+        const bodyStream = Stream.Readable.toWeb(Stream.Readable.from([messageData.data]));
+        const body = await transport.deserialize(bodyStream as ReadableStream<Uint8Array>);
         const message = QueuePayloadSchema.parse(body);
         const queueName = `${queuePrefix}${messageData.id}` as const;
         await embeddedWorld.queue(queueName, message, {
@@ -140,7 +140,11 @@ export function createQueue(
       {
         connection: connectionOptions,
         concurrency,
-      }
+        // Use a low drainDelay to ensure fast job pickup when the queue is idle.
+        // The default of 5000ms causes unnecessary latency for health checks and
+        // other time-sensitive operations.
+        drainDelay: 300,
+      },
     );
 
     workers.set(jobName, worker);
@@ -156,10 +160,7 @@ export function createQueue(
   }
 
   async function setupListeners() {
-    for (const [queuePrefix, jobName] of Object.entries(Queues) as [
-      QueuePrefix,
-      string,
-    ][]) {
+    for (const [queuePrefix, jobName] of Object.entries(Queues) as [QueuePrefix, string][]) {
       await setupListener(queuePrefix, jobName);
     }
   }

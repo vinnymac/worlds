@@ -1,17 +1,16 @@
 import { EventEmitter } from 'node:events';
 import type { Streamer } from '@workflow/world';
 import type { Redis } from 'ioredis';
-import { monotonicFactory } from 'ulid';
 import * as z from 'zod';
 import { Mutex, Rc } from './util.js';
 
 const StreamPublishMessage = z.object({
   streamId: z.string(),
-  chunkId: z.templateLiteral(['chnk_', z.string()]),
+  entryId: z.string(),
 });
 
 interface StreamChunkEvent {
-  id: `chnk_${string}`;
+  id: string;
   data: Uint8Array;
   eof: boolean;
 }
@@ -22,15 +21,17 @@ interface StreamerConfig {
 }
 
 /**
- * Create a streamer implementation using Redis Streams
+ * Create a streamer implementation using Redis Streams.
+ *
+ * Uses Redis auto-generated stream entry IDs (timestamp-sequence format)
+ * instead of custom IDs, since Redis Streams require IDs in
+ * `<millisecondsTime>-<sequenceNumber>` format.
  */
 export function createStreamer(config: StreamerConfig): Streamer {
   const { redis, keyPrefix } = config;
-  const ulid = monotonicFactory();
   const events = new EventEmitter<{
     [key: `strm:${string}`]: [StreamChunkEvent];
   }>();
-  const genChunkId = () => `chnk_${ulid()}` as const;
   const mutexes = new Map<string, Rc>();
 
   const getMutex = (key: string) => {
@@ -56,8 +57,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
 
   // CRITICAL: Must await subscribe() to avoid race condition where PUBLISH happens before SUBSCRIBE is ready
   // This was causing workflows to hang because completion events were published but never received
-  let subscriptionReady: Promise<void>;
-  subscriptionReady = subscriber.subscribe(STREAM_CHANNEL).then(() => {});
+  const subscriptionReady: Promise<void> = subscriber.subscribe(STREAM_CHANNEL).then(() => {});
 
   subscriber.on('message', async (channel, message) => {
     if (channel !== STREAM_CHANNEL) return;
@@ -74,21 +74,21 @@ export function createStreamer(config: StreamerConfig): Streamer {
 
       const resource = getMutex(key);
       await resource.mutex.andThen(async () => {
-        // Read the specific chunk from the stream
+        // Read the specific entry from the stream using its auto-generated ID
         const results = await redis.xrange(
           streamKey(parsed.streamId),
-          parsed.chunkId,
-          parsed.chunkId
+          parsed.entryId,
+          parsed.entryId,
         );
 
         if (results.length === 0) return;
 
-        const [_id, fields] = results[0];
+        const [id, fields] = results[0];
         const data = Buffer.from(fields[1] as string, 'base64');
         const eof = fields[3] === 'true';
 
         events.emit(key, {
-          id: parsed.chunkId,
+          id,
           data,
           eof,
         });
@@ -105,85 +105,74 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
-      const chunkId = genChunkId();
       const data = !Buffer.isBuffer(chunk) ? Buffer.from(chunk) : chunk;
 
-      // Add chunk to Redis Stream
-      // Redis Streams use XADD to append entries
-      // We use the chunkId as the stream entry ID for ordering
-      await redis.xadd(
+      // Add chunk to Redis Stream with auto-generated ID
+      const entryId = (await redis.xadd(
         streamKey(name),
-        chunkId,
+        '*',
         'data',
         data.toString('base64'),
         'eof',
-        'false'
-      );
+        'false',
+      ))!;
 
       // CRITICAL: Wait for subscription to be ready before publishing
       // Otherwise the message might be published before anyone is subscribed
       await subscriptionReady;
 
-      // Notify subscribers
+      // Notify subscribers with the auto-generated entry ID
       await redis.publish(
         STREAM_CHANNEL,
         JSON.stringify(
           StreamPublishMessage.encode({
-            chunkId,
+            entryId,
             streamId: name,
-          })
-        )
+          }),
+        ),
       );
     },
 
-    async closeStream(
-      name: string,
-      _runId: string | Promise<string>
-    ): Promise<void> {
+    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
-      const chunkId = genChunkId();
-
-      // Add final chunk with eof=true
-      await redis.xadd(streamKey(name), chunkId, 'data', '', 'eof', 'true');
+      // Add final chunk with eof=true, using auto-generated ID
+      const entryId = (await redis.xadd(streamKey(name), '*', 'data', '', 'eof', 'true'))!;
 
       // CRITICAL: Wait for subscription to be ready before publishing
       // Otherwise the message might be published before anyone is subscribed
       await subscriptionReady;
 
-      // Notify subscribers
+      // Notify subscribers with the auto-generated entry ID
       await redis.publish(
         STREAM_CHANNEL,
         JSON.stringify(
           StreamPublishMessage.encode({
             streamId: name,
-            chunkId,
-          })
-        )
+            entryId,
+          }),
+        ),
       );
     },
 
-    async readFromStream(
-      name: string,
-      startIndex?: number
-    ): Promise<ReadableStream<Uint8Array>> {
+    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
       const cleanups: (() => void)[] = [];
 
       return new ReadableStream<Uint8Array>({
         async start(controller) {
-          // Track last chunk ID for ordering
-          let lastChunkId = '';
+          // Track last entry ID for ordering
+          let lastEntryId = '';
           let offset = startIndex ?? 0;
           let buffer = [] as StreamChunkEvent[] | null;
 
-          const shouldSkipChunk = (chunkId: string): boolean => {
-            return lastChunkId >= chunkId;
+          const shouldSkipChunk = (entryId: string): boolean => {
+            return lastEntryId >= entryId;
           };
 
           const shouldApplyOffset = (): boolean => {
@@ -194,25 +183,17 @@ export function createStreamer(config: StreamerConfig): Streamer {
             return false;
           };
 
-          const enqueueChunkData = (msg: {
-            id: string;
-            data: Uint8Array;
-            eof: boolean;
-          }): void => {
+          const enqueueChunkData = (msg: { id: string; data: Uint8Array; eof: boolean }): void => {
             if (msg.data.byteLength) {
               controller.enqueue(new Uint8Array(msg.data));
             }
             if (msg.eof) {
               controller.close();
             }
-            lastChunkId = msg.id;
+            lastEntryId = msg.id;
           };
 
-          function enqueue(msg: {
-            id: string;
-            data: Uint8Array;
-            eof: boolean;
-          }) {
+          function enqueue(msg: { id: string; data: Uint8Array; eof: boolean }) {
             if (shouldSkipChunk(msg.id)) return;
             if (shouldApplyOffset()) return;
             enqueueChunkData(msg);
@@ -240,7 +221,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
             const data = Buffer.from(fields[1] as string, 'base64');
             const eof = fields[3] === 'true';
             parsedChunks.push({
-              id: id as `chnk_${string}`,
+              id,
               data,
               eof,
             });

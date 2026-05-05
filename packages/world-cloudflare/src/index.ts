@@ -23,14 +23,12 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
   if (!env) {
     throw new Error(
       'Cloudflare environment not configured. ' +
-        'Must provide config.env with WORKFLOW_DB, WORKFLOW_INDEX, WORKFLOW_QUEUE, WORKFLOW_STREAMS'
+        'Must provide config.env with WORKFLOW_DB, WORKFLOW_INDEX, WORKFLOW_QUEUE, WORKFLOW_STREAMS',
     );
   }
 
   const deploymentId =
-    config?.deploymentId ||
-    process.env.CLOUDFLARE_DEPLOYMENT_ID ||
-    'cloudflare-default';
+    config?.deploymentId || process.env.CLOUDFLARE_DEPLOYMENT_ID || 'cloudflare-default';
 
   const storage = createStorage({
     env: {

@@ -1,0 +1,84 @@
+{
+  "name": "@fantasticfour/world-mysql",
+  "version": "1.0.0",
+  "description": "World implementation using pure MySQL for storage, queueing, and streaming - no external dependencies (no Redis, no QStash)",
+  "keywords": [
+    "aiven",
+    "durable-functions",
+    "mysql",
+    "planetscale",
+    "rds",
+    "self-hosted",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "vinnymac",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-mysql"
+  },
+  "bin": {
+    "world-mysql-setup": "./bin/setup.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "migrations"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./migrations/*.sql": "./migrations/*.sql"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "node dist/cli.js",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "@workflow/world-local": "catalog:",
+    "cbor-x": "catalog:",
+    "drizzle-orm": "catalog:",
+    "mysql2": "catalog:",
+    "ulid": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/mysql": "catalog:",
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "dotenv": "catalog:",
+    "drizzle-kit": "catalog:",
+    "testcontainers": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  },
+  "packageManager": "pnpm@10.23.0"
+}
