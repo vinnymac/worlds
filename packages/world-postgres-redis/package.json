@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-postgres-redis",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Hybrid World implementation using PostgreSQL for durable storage with Redis Lists for queue management",
   "keywords": [
     "durable-functions",
