@@ -2,16 +2,7 @@ import { setTimeout } from 'node:timers/promises';
 import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
 
 describe('Firestore Real-time Listeners', () => {
@@ -29,11 +20,7 @@ describe('Firestore Real-time Listeners', () => {
   /**
    * Helper: create a run via the event-sourced API.
    */
-  async function createRun(opts: {
-    deploymentId: string;
-    workflowName: string;
-    input: unknown;
-  }) {
+  async function createRun(opts: { deploymentId: string; workflowName: string; input: unknown }) {
     const result = await storage.events.create(null, {
       eventType: 'run_created',
       eventData: {
@@ -68,9 +55,7 @@ describe('Firestore Real-time Listeners', () => {
       batch.delete(doc.ref);
     }
 
-    const hooksTokenSnapshot = await firestore
-      .collection('hooks_by_token')
-      .get();
+    const hooksTokenSnapshot = await firestore.collection('hooks_by_token').get();
     for (const doc of hooksTokenSnapshot.docs) {
       batch.delete(doc.ref);
     }
@@ -81,7 +66,7 @@ describe('Firestore Real-time Listeners', () => {
   beforeAll(async () => {
     // Start Firestore emulator container
     container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
     ).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
@@ -468,9 +453,7 @@ describe('Firestore Real-time Listeners', () => {
 
       // Should only have received updates for the 2 "important-workflow" runs
       expect(updates).toHaveLength(2);
-      expect(
-        updates.every((u) => u.workflowName === 'important-workflow')
-      ).toBe(true);
+      expect(updates.every((u) => u.workflowName === 'important-workflow')).toBe(true);
     });
   });
 

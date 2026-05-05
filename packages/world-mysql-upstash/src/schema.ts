@@ -57,8 +57,7 @@ export const runs = schema.table(
     status: mysqlEnum('status', runStatusValues).notNull(),
     workflowName: varchar('name', { length: 255 }).notNull(),
     /** @deprecated */
-    executionContextJson:
-      json('execution_context').$type<Record<string, any>>(),
+    executionContextJson: json('execution_context').$type<Record<string, any>>(),
     executionContext: Cbor<Record<string, any>>()('execution_context_cbor'),
     /** @deprecated */
     inputJson: json('input').$type<SerializedContent>(),
@@ -82,16 +81,14 @@ export const runs = schema.table(
   (tb) => [
     index('idx_workflow_runs_name').on(tb.workflowName),
     index('idx_workflow_runs_status').on(tb.status),
-  ]
+  ],
 );
 
 export const events = schema.table(
   'workflow_events',
   {
     eventId: varchar('id', { length: 255 }).primaryKey(),
-    eventType: varchar('type', { length: 255 })
-      .$type<Event['eventType']>()
-      .notNull(),
+    eventType: varchar('type', { length: 255 }).$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id', { length: 255 }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     runId: varchar('run_id', { length: 255 }).notNull(),
@@ -99,13 +96,11 @@ export const events = schema.table(
     eventDataJson: json('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
     specVersion: int('spec_version'),
-  } satisfies DrizzlishOfType<
-    Cborized<Event & { eventData?: undefined }, 'eventData'>
-  >,
+  } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
   (tb) => [
     index('idx_workflow_events_run_id').on(tb.runId),
     index('idx_workflow_events_correlation_id').on(tb.correlationId),
-  ]
+  ],
 );
 
 export const steps = schema.table(
@@ -138,7 +133,7 @@ export const steps = schema.table(
   (tb) => [
     index('idx_workflow_steps_run_id').on(tb.runId),
     index('idx_workflow_steps_status').on(tb.status),
-  ]
+  ],
 );
 
 export const hooks = schema.table(
@@ -160,7 +155,7 @@ export const hooks = schema.table(
   (tb) => [
     index('idx_workflow_hooks_run_id').on(tb.runId),
     index('idx_workflow_hooks_token').on(tb.token),
-  ]
+  ],
 );
 
 const blob = customType<{ data: Buffer; notNull: false; default: false }>({
@@ -182,5 +177,5 @@ export const streams = schema.table(
   (tb) => [
     primaryKey({ columns: [tb.streamId, tb.chunkId] }),
     index('idx_stream_chunks_sequence').on(tb.streamId, tb.sequence),
-  ]
+  ],
 );

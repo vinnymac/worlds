@@ -19,7 +19,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
@@ -80,7 +80,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
       // Helper: Process a new chunk and return action to take
       function handleNewChunk(
         chunk: any,
-        controller: ReadableStreamDefaultController<Uint8Array>
+        controller: ReadableStreamDefaultController<Uint8Array>,
       ): 'eof' | 'continue' {
         if (chunk.eof) {
           closed = true;
@@ -102,13 +102,8 @@ export function createStreamer(config: StreamerConfig): Streamer {
       // Helper: Flush ordered chunks from buffer
       // Sequences are ULID-derived (monotonically increasing but not consecutive),
       // so flush all chunks whose sequence >= nextExpectedSequence in order.
-      function flushOrderedChunks(
-        controller: ReadableStreamDefaultController<Uint8Array>
-      ) {
-        while (
-          chunkBuffer.length > 0 &&
-          chunkBuffer[0].sequence >= nextExpectedSequence
-        ) {
+      function flushOrderedChunks(controller: ReadableStreamDefaultController<Uint8Array>) {
+        while (chunkBuffer.length > 0 && chunkBuffer[0].sequence >= nextExpectedSequence) {
           const nextChunk = chunkBuffer.shift();
           if (nextChunk) {
             controller.enqueue(nextChunk.data);
@@ -188,10 +183,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
           }
 
           // If we have buffered chunks ready, process them
-          if (
-            chunkBuffer.length > 0 &&
-            chunkBuffer[0].sequence >= nextExpectedSequence
-          ) {
+          if (chunkBuffer.length > 0 && chunkBuffer[0].sequence >= nextExpectedSequence) {
             const chunk = chunkBuffer.shift();
             if (chunk) {
               controller.enqueue(chunk.data);
@@ -225,16 +217,13 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async getStreamChunks(
       _name: string,
       _runId: string,
-      _options?: GetChunksOptions
+      _options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
       // Not implemented for Firestore
       return { data: [], hasMore: false, cursor: null, done: true };
     },
 
-    async getStreamInfo(
-      _name: string,
-      _runId: string
-    ): Promise<StreamInfoResponse> {
+    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
       // Not implemented for Firestore
       return { tailIndex: -1, done: false };
     },

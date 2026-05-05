@@ -42,20 +42,14 @@ export interface MysqlUpstashWorldConfig {
 
 export function createMysqlUpstashWorld(
   config: MysqlUpstashWorldConfig = {
-    databaseUrl:
-      process.env.DATABASE_URL ||
-      'mysql://root:root@localhost:3306/mysql_upstash_test',
+    databaseUrl: process.env.DATABASE_URL || 'mysql://root:root@localhost:3306/mysql_upstash_test',
     qstash: {
       token: process.env.QSTASH_TOKEN || '',
       targetUrl: process.env.QSTASH_URL || 'http://localhost:8080',
     },
-  }
+  },
 ): World {
-  const {
-    databaseUrl,
-    qstash,
-    deploymentId = 'mysql-upstash-default',
-  } = config;
+  const { databaseUrl, qstash, deploymentId = 'mysql-upstash-default' } = config;
 
   // Create MySQL connection pool
   const pool = mysql.createPool(databaseUrl);

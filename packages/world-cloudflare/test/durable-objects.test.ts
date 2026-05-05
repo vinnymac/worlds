@@ -26,11 +26,7 @@ describe('Cloudflare Durable Objects Features', () => {
   /**
    * Helper: create a run via the event-sourced API.
    */
-  async function createRun(opts: {
-    deploymentId: string;
-    workflowName: string;
-    input: unknown;
-  }) {
+  async function createRun(opts: { deploymentId: string; workflowName: string; input: unknown }) {
     const result = await storage.events.create(null, {
       eventType: 'run_created',
       eventData: {
@@ -190,9 +186,7 @@ describe('Cloudflare Durable Objects Features', () => {
       });
 
       expect(result.keys.length).toBe(2);
-      expect(
-        result.keys.every((k: any) => k.name.startsWith('run:workflow-a:'))
-      ).toBe(true);
+      expect(result.keys.every((k: any) => k.name.startsWith('run:workflow-a:'))).toBe(true);
     });
 
     it('should handle KV pagination for large result sets', async () => {
@@ -314,7 +308,7 @@ describe('Cloudflare Durable Objects Features', () => {
 
       // Perform many reads
       const reads = await Promise.all(
-        Array.from({ length: 100 }, () => storage.runs.get(run.runId))
+        Array.from({ length: 100 }, () => storage.runs.get(run.runId)),
       );
 
       const duration = Date.now() - startTime;
@@ -341,8 +335,8 @@ describe('Cloudflare Durable Objects Features', () => {
             eventType: 'step_created',
             correlationId: `step-${i}`,
             eventData: { stepName: `step-${i}`, input: [i] },
-          })
-        )
+          }),
+        ),
       );
 
       const duration = Date.now() - startTime;
@@ -431,7 +425,7 @@ describe('Cloudflare Durable Objects Features', () => {
       await expect(
         storage.events.create('wrun_nonexistent', {
           eventType: 'run_started',
-        })
+        }),
       ).rejects.toThrow();
     });
   });

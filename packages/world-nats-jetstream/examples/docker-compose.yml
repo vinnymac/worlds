@@ -19,8 +19,8 @@ services:
       --http_port 8222
       --store_dir /data
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - '4222:4222'
+      - '8222:8222'
     volumes:
       - nats-1-data:/data
 
@@ -35,8 +35,8 @@ services:
       --http_port 8222
       --store_dir /data
     ports:
-      - "4223:4222"
-      - "8223:8222"
+      - '4223:4222'
+      - '8223:8222'
     volumes:
       - nats-2-data:/data
 
@@ -51,8 +51,8 @@ services:
       --http_port 8222
       --store_dir /data
     ports:
-      - "4224:4222"
-      - "8224:8222"
+      - '4224:4222'
+      - '8224:8222'
     volumes:
       - nats-3-data:/data
 

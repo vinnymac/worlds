@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "description": "Monorepo for @fantasticfour workflow worlds",
+  "license": "Apache-2.0",
+  "author": "vinnymac",
   "repository": {
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git"
   },
-  "license": "Apache-2.0",
-  "author": "vinnymac",
   "scripts": {
     "build": "turbo build",
     "dev": "turbo dev",
@@ -17,7 +17,7 @@
     "clean": "turbo clean",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
-    "lint": "oxlint .",
+    "lint": "oxlint --deny-warnings .",
     "changeset": "changeset",
     "version": "changeset version",
     "publish-packages": "pnpm build && changeset publish",
@@ -31,16 +31,15 @@
     "lint-staged": "^16.2.7",
     "oxfmt": "0.47.0",
     "oxlint": "1.62.0",
-    "turbo": "^2.6.1",
-    "typescript": "^5.9.3"
+    "turbo": "^2.9.9",
+    "typescript": "6.0.3"
   },
   "lint-staged": {
     "**/*.{js,jsx,ts,tsx,mjs,mts,json}": [
       "npx oxfmt",
-      "npx oxlint"
+      "npx oxlint --deny-warnings"
     ]
   },
-  "packageManager": "pnpm@10.23.0",
   "engines": {
     "node": "^18.0.0 || ^20.0.0 || ^22.0.0 || ^24.0.0",
     "pnpm": ">=10.0.0"
@@ -48,5 +47,6 @@
   "volta": {
     "node": "22.21.1",
     "pnpm": "10.23.0"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

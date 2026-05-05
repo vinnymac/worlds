@@ -11,6 +11,7 @@ This monorepo contains various packages representing worlds published under the 
 Pure Redis-based World implementation using Redis Lists for queue management. Lightweight and simple, ideal for development and smaller-scale deployments.
 
 **Features:**
+
 - Custom Redis Lists queue (LPUSH/BRPOP)
 - Minimal dependencies
 - CLI setup tool included
@@ -21,6 +22,7 @@ Pure Redis-based World implementation using Redis Lists for queue management. Li
 Production-grade Redis World implementation using BullMQ for robust job queue management.
 
 **Features:**
+
 - BullMQ for reliable job processing
 - Advanced queue features (delayed jobs, priority, etc.)
 - Production-ready with persistence
@@ -31,6 +33,7 @@ Production-grade Redis World implementation using BullMQ for robust job queue ma
 Hybrid implementation using PostgreSQL for durable storage and Redis for queue management.
 
 **Features:**
+
 - PostgreSQL storage via Drizzle ORM
 - Redis Lists for queue
 - Database migrations included
@@ -41,6 +44,7 @@ Hybrid implementation using PostgreSQL for durable storage and Redis for queue m
 PostgreSQL storage with Upstash QStash for serverless queue management.
 
 **Features:**
+
 - PostgreSQL storage via Drizzle ORM with CBOR serialization
 - Upstash QStash for HTTP-based queuing
 - NOTIFY/LISTEN for real-time streaming
@@ -51,6 +55,7 @@ PostgreSQL storage with Upstash QStash for serverless queue management.
 MySQL storage with Upstash QStash for serverless queue management.
 
 **Features:**
+
 - MySQL storage via Drizzle ORM with CBOR serialization
 - Upstash QStash for HTTP-based queuing
 - Polling-based streaming (100ms interval)
@@ -61,6 +66,7 @@ MySQL storage with Upstash QStash for serverless queue management.
 Azure Cosmos DB storage with Service Bus queue management.
 
 **Features:**
+
 - Cosmos DB single-container model with type discriminators
 - Azure Service Bus for reliable queuing
 - Polling-based streaming (100ms interval)
@@ -72,6 +78,7 @@ Azure Cosmos DB storage with Service Bus queue management.
 NATS JetStream for self-hosted, distributed workflow execution.
 
 **Features:**
+
 - JetStream KV Store for entity storage
 - Native JetStream streams for workflow streaming
 - Work queue consumers for job processing
@@ -83,6 +90,7 @@ NATS JetStream for self-hosted, distributed workflow execution.
 Cloudflare-native implementation using Durable Objects, D1, and Queues.
 
 **Features:**
+
 - Cloudflare Durable Objects for storage
 - Cloudflare Queues for job management
 - Edge-native deployment
@@ -93,6 +101,7 @@ Cloudflare-native implementation using Durable Objects, D1, and Queues.
 Google Cloud Firestore with Cloud Tasks for queue management.
 
 **Features:**
+
 - Firestore document storage
 - Cloud Tasks for reliable queuing
 - Real-time streaming via onSnapshot

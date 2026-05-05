@@ -16,16 +16,14 @@ export function createQueue(config: CloudTasksConfig): Queue & {
   start(): Promise<void>;
   processAllQueuedTasks?: () => Promise<void>;
 } {
-  const { client, project, location, queueName, targetUrl, deploymentId } =
-    config;
+  const { client, project, location, queueName, targetUrl, deploymentId } = config;
 
   // Create embedded world for test orchestration (like world-redis and world-cloudflare)
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   // Detect test mode
-  const isTest =
-    process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
+  const isTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
 
   const parent = client?.queuePath(project, location, queueName);
 
@@ -51,8 +49,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
             // Cloud Tasks sends task info in headers
             const taskName = req.headers.get('X-CloudTasks-TaskName') || '';
             const taskId = taskName.split('/').pop() || Date.now().toString();
-            const attemptStr =
-              req.headers.get('X-CloudTasks-TaskExecutionCount') || '0';
+            const attemptStr = req.headers.get('X-CloudTasks-TaskExecutionCount') || '0';
             const attempt = Number.parseInt(attemptStr, 10) + 1;
 
             await handler(message, {
@@ -74,9 +71,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
     async queue(queueName, message, opts) {
       // Re-check test mode on each call (for tests that set env after createQueue)
       const currentIsTest =
-        process.env.VITEST === 'true' ||
-        process.env.NODE_ENV === 'test' ||
-        !client;
+        process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
       if (currentIsTest) {
         // In tests: forward directly to embedded world for orchestration
         return await embeddedWorld.queue(queueName, message as any, opts);

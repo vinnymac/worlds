@@ -6,6 +6,7 @@ import type { World } from '@workflow/world';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
+import https from 'https';
 
 export interface AzureWorldConfig {
   cosmosClient?: CosmosClient;
@@ -33,7 +34,7 @@ const CONTAINER_WORKFLOW_STREAMS = 'workflow_streams';
  */
 async function ensureInfrastructure(
   cosmosClient: CosmosClient,
-  databaseName: string
+  databaseName: string,
 ): Promise<Database> {
   const { database } = await cosmosClient.databases.createIfNotExists({
     id: databaseName,
@@ -58,16 +59,11 @@ async function ensureInfrastructure(
 }
 
 export function createAzureWorld(
-  config: AzureWorldConfig = {}
+  config: AzureWorldConfig = {},
 ): World & { start(): Promise<void> } {
-  const databaseName =
-    config.databaseName || process.env.COSMOS_DATABASE || 'workflow';
-  const queueName =
-    config.queueName || process.env.SERVICE_BUS_QUEUE || 'workflow-queue';
-  const deploymentId =
-    config.deploymentId ||
-    process.env.WORKFLOW_DEPLOYMENT_ID ||
-    'azure-default';
+  const databaseName = config.databaseName || process.env.COSMOS_DATABASE || 'workflow';
+  const queueName = config.queueName || process.env.SERVICE_BUS_QUEUE || 'workflow-queue';
+  const deploymentId = config.deploymentId || process.env.WORKFLOW_DEPLOYMENT_ID || 'azure-default';
 
   // Initialize Cosmos DB client if not provided
   const cosmosClient =
@@ -76,10 +72,11 @@ export function createAzureWorld(
       const endpoint = process.env.COSMOS_ENDPOINT || 'https://localhost:8081';
       const key = process.env.COSMOS_KEY;
 
-      // Determine if using emulator (localhost or self-signed cert)
+      // Determine if using emulator (localhost addresses)
       const isEmulator = endpoint.includes('localhost') || endpoint.includes('127.0.0.1');
+      const isHttp = endpoint.startsWith('http://');
 
-      // Configure connection policy with SSL handling for emulator
+      // Configure connection policy with timeouts for emulator
       const connectionPolicy = isEmulator
         ? {
             requestTimeout: 30000,
@@ -91,11 +88,23 @@ export function createAzureWorld(
       // Configure HTTPS agent for emulator's self-signed certificate
       // See: https://learn.microsoft.com/en-us/azure/cosmos-db/local-emulator-export-ssl-certificates
       let agent;
+      let allowInsecureConnection = false;
+
       if (isEmulator) {
-        const https = require('https');
-        agent = new https.Agent({
-          rejectUnauthorized: false, // Accept self-signed certificates for emulator
-        });
+        if (isHttp) {
+          // HTTP mode - allow insecure connection
+          // See: https://learn.microsoft.com/en-us/azure/cosmos-db/emulator-linux
+          allowInsecureConnection = true;
+        } else {
+          // HTTPS mode with self-signed cert
+          agent = new https.Agent({
+            rejectUnauthorized: false, // Accept self-signed certificates for emulator
+            keepAlive: true,
+            // Allow older TLS versions for emulator compatibility
+            minVersion: 'TLSv1',
+            maxVersion: 'TLSv1.3',
+          });
+        }
       }
 
       if (key) {
@@ -103,6 +112,7 @@ export function createAzureWorld(
           endpoint,
           key,
           connectionPolicy,
+          ...(allowInsecureConnection && { allowInsecureConnection }),
           ...(agent && { agent }),
         });
       }
@@ -114,6 +124,7 @@ export function createAzureWorld(
           endpoint,
           aadCredentials: new DefaultAzureCredential(),
           connectionPolicy,
+          ...(allowInsecureConnection && { allowInsecureConnection }),
         });
       } catch {
         // Fall back to emulator key for local development
@@ -121,6 +132,7 @@ export function createAzureWorld(
           endpoint,
           key: 'C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==',
           connectionPolicy,
+          ...(allowInsecureConnection && { allowInsecureConnection }),
           ...(agent && { agent }),
         });
       }
@@ -129,9 +141,7 @@ export function createAzureWorld(
   // Service Bus client (optional for test mode)
   let serviceBusClient: ServiceBusClient | undefined = config.serviceBusClient;
   if (!serviceBusClient && process.env.SERVICE_BUS_CONNECTION_STRING) {
-    serviceBusClient = new ServiceBusClientClass(
-      process.env.SERVICE_BUS_CONNECTION_STRING
-    );
+    serviceBusClient = new ServiceBusClientClass(process.env.SERVICE_BUS_CONNECTION_STRING);
   }
 
   // Lazy-initialized database reference

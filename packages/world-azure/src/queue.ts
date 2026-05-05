@@ -20,8 +20,7 @@ export function createQueue(config: ServiceBusConfig): Queue & {
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   // Detect test mode
-  const isTest =
-    process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
+  const isTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
 
   let sender: ServiceBusSender | undefined;
   if (client && !isTest) {
@@ -47,12 +46,9 @@ export function createQueue(config: ServiceBusConfig): Queue & {
             const message = await req.json();
 
             // Service Bus provides delivery count in broker properties
-            const deliveryCount =
-              req.headers.get('X-ServiceBus-DeliveryCount') || '0';
+            const deliveryCount = req.headers.get('X-ServiceBus-DeliveryCount') || '0';
             const attempt = Number.parseInt(deliveryCount, 10) + 1;
-            const messageId =
-              req.headers.get('X-ServiceBus-MessageId') ||
-              Date.now().toString();
+            const messageId = req.headers.get('X-ServiceBus-MessageId') || Date.now().toString();
 
             await handler(message, {
               attempt,
@@ -73,9 +69,7 @@ export function createQueue(config: ServiceBusConfig): Queue & {
     async queue(queueName, message, opts) {
       // Re-check test mode on each call
       const currentIsTest =
-        process.env.VITEST === 'true' ||
-        process.env.NODE_ENV === 'test' ||
-        !client;
+        process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
       if (currentIsTest) {
         return await embeddedWorld.queue(queueName, message as any, opts);
       }

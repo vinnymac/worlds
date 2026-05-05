@@ -20,12 +20,12 @@ import type {
   Step,
   StepWithoutData,
   Storage,
-  UpdateStepRequest,
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import { EventSchema, HookSchema, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
+import { encodeCbor, decodeCbor } from './cbor.js';
 import { compact } from './util.js';
 
 /**
@@ -49,9 +49,7 @@ interface SerializedError {
   code?: string;
 }
 
-function isValidData(
-  data: unknown
-): data is Record<string, unknown> & { error?: unknown } {
+function isValidData(data: unknown): data is Record<string, unknown> & { error?: unknown } {
   return typeof data === 'object' && data !== null;
 }
 
@@ -126,7 +124,7 @@ function convertBuffersToUint8Array(value: unknown): unknown {
     return new Uint8Array(
       (value as Uint8Array).buffer,
       (value as Uint8Array).byteOffset,
-      (value as Uint8Array).byteLength
+      (value as Uint8Array).byteLength,
     );
   }
 
@@ -162,7 +160,7 @@ function convertBuffersToUint8Array(value: unknown): unknown {
 function filterData<T extends object>(
   data: T,
   resolveData: ResolveData | undefined,
-  keysToStrip: (keyof T)[]
+  keysToStrip: (keyof T)[],
 ): T {
   if (resolveData === 'none') {
     const newData = { ...data };
@@ -204,10 +202,8 @@ function serializeError(error: unknown): SerializedError | undefined {
  * Strip Cosmos DB system properties (_rid, _self, _etag, _attachments, _ts, type, id)
  * from a document before returning it to callers.
  */
-function stripCosmosMetadata(
-  doc: Record<string, unknown>
-): Record<string, unknown> {
-  const { _rid, _self, _etag, _attachments, _ts, type, id, ...rest } = doc;
+function stripCosmosMetadata(doc: Record<string, unknown>): Record<string, unknown> {
+  const { _rid, _self, _etag, _attachments, _ts, type: _type, id: _id, ...rest } = doc;
   return rest;
 }
 
@@ -218,8 +214,8 @@ function deserializeRun(doc: Record<string, unknown>): WorkflowRun {
   const data = stripCosmosMetadata(doc);
   return deserializeRunError({
     ...data,
-    input: convertBuffersToUint8Array(data.input),
-    output: convertBuffersToUint8Array(data.output),
+    input: data.input ? decodeCbor(convertBuffersToUint8Array(data.input)) : undefined,
+    output: data.output ? decodeCbor(convertBuffersToUint8Array(data.output)) : undefined,
     createdAt: fromCosmosTimestamp(data.createdAt),
     updatedAt: fromCosmosTimestamp(data.updatedAt),
     startedAt: fromCosmosTimestamp(data.startedAt),
@@ -234,8 +230,8 @@ function deserializeStep(doc: Record<string, unknown>): Step {
   const data = stripCosmosMetadata(doc);
   return deserializeStepError({
     ...data,
-    input: convertBuffersToUint8Array(data.input),
-    output: convertBuffersToUint8Array(data.output),
+    input: data.input ? decodeCbor(convertBuffersToUint8Array(data.input)) : undefined,
+    output: data.output ? decodeCbor(convertBuffersToUint8Array(data.output)) : undefined,
     createdAt: fromCosmosTimestamp(data.createdAt),
     updatedAt: fromCosmosTimestamp(data.updatedAt),
     startedAt: fromCosmosTimestamp(data.startedAt),
@@ -251,7 +247,7 @@ function deserializeEvent(doc: Record<string, unknown>): Event {
   const data = stripCosmosMetadata(doc);
   return {
     ...data,
-    eventData: convertBuffersToUint8Array(data.eventData),
+    eventData: data.eventData ? decodeCbor(convertBuffersToUint8Array(data.eventData)) : undefined,
     createdAt: fromCosmosTimestamp(data.createdAt),
   } as Event;
 }
@@ -270,7 +266,7 @@ function deserializeHook(doc: Record<string, unknown>): Hook {
     environment: data.environment || '',
     specVersion: data.specVersion,
     createdAt: fromCosmosTimestamp(data.createdAt) || new Date(),
-    metadata: convertBuffersToUint8Array(data.metadata),
+    metadata: data.metadata ? decodeCbor(convertBuffersToUint8Array(data.metadata)) : undefined,
   });
 }
 
@@ -305,8 +301,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
    */
   async function getStep(runId: string, stepId: string): Promise<Step> {
     const querySpec: SqlQuerySpec = {
-      query:
-        'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId AND c.runId = @runId',
+      query: 'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId AND c.runId = @runId',
       parameters: [
         { name: '@stepId', value: stepId },
         { name: '@runId', value: runId },
@@ -331,7 +326,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
    */
   async function createRunFromEvent(
     runId: string,
-    data: RunCreatedEventRequest['eventData']
+    data: RunCreatedEventRequest['eventData'],
   ): Promise<WorkflowRun> {
     // Check if run already exists (defensive idempotency)
     try {
@@ -349,22 +344,28 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       workflowName: data.workflowName,
       specVersion: SPEC_VERSION_CURRENT,
       status: 'pending',
-      input: data.input,
-      executionContext: data.executionContext as
-        | Record<string, unknown>
-        | undefined,
+      input: encodeCbor(data.input),
+      executionContext: data.executionContext as Record<string, unknown> | undefined,
       deploymentId: data.deploymentId,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
 
-    await container.items.create(run);
-
-    return {
-      ...run,
-      createdAt: now,
-      updatedAt: now,
-    } as unknown as WorkflowRun;
+    try {
+      await container.items.create(run);
+      return {
+        ...run,
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as WorkflowRun;
+    } catch (error: any) {
+      // Handle concurrent creation attempts (409 Conflict)
+      // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
+      if (error?.code === 409) {
+        return await getRun(runId);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -373,7 +374,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   async function updateRunFromEvent(
     runId: string,
     eventType: string,
-    eventData?: Record<string, unknown>
+    eventData?: Record<string, unknown>,
   ): Promise<WorkflowRun> {
     // Fetch current run document (we need the Cosmos id and full doc for replace)
     const querySpec: SqlQuerySpec = {
@@ -400,7 +401,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           doc.startedAt = now.toISOString();
         }
         if (eventData?.input !== undefined) {
-          doc.input = eventData.input;
+          doc.input = encodeCbor(eventData.input);
         }
         if (eventData?.deploymentId !== undefined) {
           doc.deploymentId = eventData.deploymentId;
@@ -411,7 +412,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         doc.status = 'completed';
         doc.completedAt = now.toISOString();
         if (eventData?.output !== undefined) {
-          doc.output = eventData.output;
+          doc.output = encodeCbor(eventData.output);
         }
         break;
       }
@@ -450,7 +451,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   async function createStepFromEvent(
     runId: string,
     stepId: string,
-    data: { stepName: string; input: unknown }
+    data: { stepName: string; input: unknown },
   ): Promise<Step> {
     // Check if step already exists (idempotency)
     try {
@@ -468,19 +469,27 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       stepId,
       stepName: data.stepName,
       status: 'pending',
-      input: data.input,
+      input: encodeCbor(data.input),
       attempt: 1,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
 
-    await container.items.create(step);
-
-    return {
-      ...step,
-      createdAt: now,
-      updatedAt: now,
-    } as unknown as Step;
+    try {
+      await container.items.create(step);
+      return {
+        ...step,
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as Step;
+    } catch (error: any) {
+      // Handle concurrent creation attempts (409 Conflict)
+      // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
+      if (error?.code === 409) {
+        return await getStep(runId, stepId);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -490,14 +499,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     runId: string,
     stepId: string,
     eventType: string,
-    eventData?: Record<string, unknown>
+    eventData?: Record<string, unknown>,
   ): Promise<Step> {
     const currentStep = await getStep(runId, stepId);
 
     // Fetch the raw Cosmos document for replace
     const querySpec: SqlQuerySpec = {
-      query:
-        'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId AND c.runId = @runId',
+      query: 'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId AND c.runId = @runId',
       parameters: [
         { name: '@stepId', value: stepId },
         { name: '@runId', value: runId },
@@ -527,7 +535,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         doc.status = 'completed';
         doc.completedAt = now.toISOString();
         if (eventData?.result !== undefined) {
-          doc.output = eventData.result;
+          doc.output = encodeCbor(eventData.result);
         }
         break;
       }
@@ -545,9 +553,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           doc.error = serializeError(eventData.error);
         }
         if (eventData?.retryAfter !== undefined) {
-          doc.retryAfter = new Date(
-            eventData.retryAfter as string
-          ).toISOString();
+          doc.retryAfter = new Date(eventData.retryAfter as string).toISOString();
         }
         doc.attempt = (currentStep.attempt || 1) + 1;
         break;
@@ -566,7 +572,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     runId: string,
     hookId: string,
     data: { token: string; metadata?: unknown },
-    specVersion: number
+    specVersion: number,
   ): Promise<Hook> {
     const now = new Date();
 
@@ -581,7 +587,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       environment: '',
       specVersion,
       createdAt: now.toISOString(),
-      metadata: data.metadata,
+      metadata: encodeCbor(data.metadata),
     };
 
     const tokenDoc: Record<string, unknown> = {
@@ -594,13 +600,24 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       environment: '',
       specVersion,
       createdAt: now.toISOString(),
-      metadata: data.metadata,
+      metadata: encodeCbor(data.metadata),
     };
 
-    await Promise.all([
-      container.items.create(hookDoc),
-      hooksByTokenContainer.items.create(tokenDoc),
-    ]);
+    try {
+      await Promise.all([
+        container.items.create(hookDoc),
+        hooksByTokenContainer.items.create(tokenDoc),
+      ]);
+    } catch (error: any) {
+      // Handle concurrent creation attempts (409 Conflict)
+      // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
+      if (error?.code === 409) {
+        const { resource: doc } = await container.item(`hook:${runId}:${hookId}`, runId).read();
+        if (!doc) throw error;
+        return deserializeHook(doc);
+      }
+      throw error;
+    }
 
     const parsed = HookSchema.parse(
       compact({
@@ -613,7 +630,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         specVersion,
         createdAt: now,
         metadata: data.metadata,
-      })
+      }),
     );
     return parsed;
   }
@@ -641,7 +658,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             .delete()
             .catch(() => {
               // Token doc may already be deleted
-            })
+            }),
         );
       }
     }
@@ -656,7 +673,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       },
 
       async list(
-        params?: ListWorkflowRunsParams
+        params?: ListWorkflowRunsParams,
       ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
         const limit = params?.pagination?.limit ?? 20;
         const conditions: string[] = ['c.type = "run"'];
@@ -700,8 +717,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           }),
           cursor:
             values.length > 0
-              ? ((values[values.length - 1] as Record<string, unknown>)
-                  .createdAt as string)
+              ? ((values[values.length - 1] as Record<string, unknown>).createdAt as string)
               : null,
           hasMore,
         };
@@ -712,14 +728,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams
+        _params?: CreateEventParams,
       ): Promise<EventResult> {
         const eventId = `wevt_${ulid()}`;
         const now = new Date();
 
         // For run_created events, generate a runId if null
-        const effectiveRunId =
-          runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
+        const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
 
         const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
 
@@ -729,16 +744,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           runId: effectiveRunId,
           eventId,
           eventType: data.eventType,
-          eventData: (data as any).eventData || {},
+          eventData: encodeCbor((data as any).eventData || {}),
           specVersion: effectiveSpecVersion,
           createdAt: now.toISOString(),
         };
 
         // Add optional correlationId if present
-        if (
-          'correlationId' in data &&
-          (data as any).correlationId !== undefined
-        ) {
+        if ('correlationId' in data && (data as any).correlationId !== undefined) {
           eventDoc.correlationId = (data as any).correlationId;
         }
 
@@ -746,8 +758,10 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         await container.items.create(eventDoc);
 
         // Parse and validate using EventSchema
+        // Note: Use original eventData (not encoded) for validation
         const parsed = EventSchema.parse({
           ...eventDoc,
+          eventData: (data as any).eventData || {},
           createdAt: now,
         });
         const result: EventResult = { event: parsed };
@@ -759,7 +773,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           case 'run_created': {
             result.run = await createRunFromEvent(
               effectiveRunId,
-              eventData as RunCreatedEventRequest['eventData']
+              eventData as RunCreatedEventRequest['eventData'],
             );
             break;
           }
@@ -767,11 +781,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           case 'run_completed':
           case 'run_failed':
           case 'run_cancelled': {
-            result.run = await updateRunFromEvent(
-              effectiveRunId,
-              data.eventType,
-              eventData
-            );
+            result.run = await updateRunFromEvent(effectiveRunId, data.eventType, eventData);
             break;
           }
           case 'step_created': {
@@ -779,7 +789,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             result.step = await createStepFromEvent(
               effectiveRunId,
               correlationId,
-              eventData as { stepName: string; input: unknown }
+              eventData as { stepName: string; input: unknown },
             );
             break;
           }
@@ -792,7 +802,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               effectiveRunId,
               correlationId,
               data.eventType,
-              eventData
+              eventData,
             );
             break;
           }
@@ -814,7 +824,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               effectiveRunId,
               correlationId,
               hookEventData,
-              effectiveSpecVersion
+              effectiveSpecVersion,
             );
             break;
           }
@@ -825,11 +835,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         return result;
       },
 
-      async get(
-        runId: string,
-        eventId: string,
-        _params?: GetEventParams
-      ): Promise<Event> {
+      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
         const querySpec: SqlQuerySpec = {
           query:
             'SELECT * FROM c WHERE c.type = "event" AND c.eventId = @eventId AND c.runId = @runId',
@@ -859,9 +865,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
 
         const conditions: string[] = ['c.type = "event"', 'c.runId = @runId'];
-        const parameters: { name: string; value: any }[] = [
-          { name: '@runId', value: runId },
-        ];
+        const parameters: { name: string; value: any }[] = [{ name: '@runId', value: runId }];
 
         if (params?.pagination?.cursor) {
           const op = sortOrder === 'asc' ? '>' : '<';
@@ -882,13 +886,10 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const hasMore = resources.length > limit;
 
         return {
-          data: values.map((doc: Record<string, unknown>) =>
-            deserializeEvent(doc)
-          ),
+          data: values.map((doc: Record<string, unknown>) => deserializeEvent(doc)),
           cursor:
             values.length > 0
-              ? ((values[values.length - 1] as Record<string, unknown>)
-                  .createdAt as string)
+              ? ((values[values.length - 1] as Record<string, unknown>).createdAt as string)
               : null,
           hasMore,
         };
@@ -900,10 +901,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const sortOrder = params.pagination?.sortOrder || 'asc';
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
 
-        const conditions: string[] = [
-          'c.type = "event"',
-          'c.correlationId = @correlationId',
-        ];
+        const conditions: string[] = ['c.type = "event"', 'c.correlationId = @correlationId'];
         const parameters: { name: string; value: any }[] = [
           { name: '@correlationId', value: correlationId },
         ];
@@ -928,13 +926,10 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const hasMore = resources.length > limit;
 
         return {
-          data: values.map((doc: Record<string, unknown>) =>
-            deserializeEvent(doc)
-          ),
+          data: values.map((doc: Record<string, unknown>) => deserializeEvent(doc)),
           cursor:
             values.length > 0
-              ? ((values[values.length - 1] as Record<string, unknown>)
-                  .createdAt as string)
+              ? ((values[values.length - 1] as Record<string, unknown>).createdAt as string)
               : null,
           hasMore,
         };
@@ -942,31 +937,24 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     },
 
     steps: {
-      async get(
-        runId: string | undefined,
-        stepId: string,
-        params?: GetStepParams
-      ) {
+      async get(runId: string | undefined, stepId: string, params?: GetStepParams) {
         if (!runId) {
-          throw new WorkflowWorldError(
-            'runId is required for Cosmos DB step lookup',
-            { status: 400 }
-          );
+          throw new WorkflowWorldError('runId is required for Cosmos DB step lookup', {
+            status: 400,
+          });
         }
         const step = await getStep(runId, stepId);
         return filterData(step, params?.resolveData, ['input', 'output']);
       },
 
       async list(
-        params: ListWorkflowRunStepsParams
+        params: ListWorkflowRunStepsParams,
       ): Promise<PaginatedResponse<Step | StepWithoutData>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 20;
 
         const conditions: string[] = ['c.type = "step"', 'c.runId = @runId'];
-        const parameters: { name: string; value: any }[] = [
-          { name: '@runId', value: runId },
-        ];
+        const parameters: { name: string; value: any }[] = [{ name: '@runId', value: runId }];
 
         if (params?.pagination?.cursor) {
           conditions.push('c.createdAt < @cursor');
@@ -992,8 +980,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           }),
           cursor:
             values.length > 0
-              ? ((values[values.length - 1] as Record<string, unknown>)
-                  .createdAt as string)
+              ? ((values[values.length - 1] as Record<string, unknown>).createdAt as string)
               : null,
           hasMore,
         };
@@ -1023,9 +1010,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
       async getByToken(token: string, params?: GetHookParams) {
         try {
-          const { resource } = await hooksByTokenContainer
-            .item(token, token)
-            .read();
+          const { resource } = await hooksByTokenContainer.item(token, token).read();
 
           if (!resource) {
             throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
@@ -1037,10 +1022,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           const resolveData = params?.resolveData ?? 'all';
           return filterHookData(hook, resolveData);
         } catch (error: unknown) {
-          if (
-            error instanceof WorkflowWorldError ||
-            (error as { code?: number })?.code === 404
-          ) {
+          if (error instanceof WorkflowWorldError || (error as { code?: number })?.code === 404) {
             throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
               status: 404,
             });
@@ -1059,9 +1041,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
 
         const conditions: string[] = ['c.type = "hook"', 'c.runId = @runId'];
-        const parameters: { name: string; value: any }[] = [
-          { name: '@runId', value: runId },
-        ];
+        const parameters: { name: string; value: any }[] = [{ name: '@runId', value: runId }];
 
         if (params?.pagination?.cursor) {
           conditions.push('c.createdAt < @cursor');
@@ -1087,8 +1067,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           }),
           cursor:
             values.length > 0
-              ? ((values[values.length - 1] as Record<string, unknown>)
-                  .createdAt as string)
+              ? ((values[values.length - 1] as Record<string, unknown>).createdAt as string)
               : null,
           hasMore,
         };

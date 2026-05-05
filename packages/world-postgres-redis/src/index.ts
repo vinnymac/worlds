@@ -24,25 +24,16 @@ function createStorage(drizzle: Drizzle): Storage {
 export function createWorld(
   config: PostgresWorldConfig = {
     connectionString:
-      process.env.WORKFLOW_POSTGRES_URL ||
-      'postgres://world:world@localhost:5432/world',
-    redis:
-      process.env.WORKFLOW_REDIS_URL ||
-      process.env.REDIS_URL ||
-      'redis://localhost:6379',
+      process.env.WORKFLOW_POSTGRES_URL || 'postgres://world:world@localhost:5432/world',
+    redis: process.env.WORKFLOW_REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379',
     jobPrefix: process.env.WORKFLOW_POSTGRES_JOB_PREFIX,
     queueConcurrency:
-      Number.parseInt(
-        process.env.WORKFLOW_POSTGRES_WORKER_CONCURRENCY || '10',
-        10
-      ) || 10,
-  }
+      Number.parseInt(process.env.WORKFLOW_POSTGRES_WORKER_CONCURRENCY || '10', 10) || 10,
+  },
 ): World & { start(): Promise<void> } {
   // Create Redis client for queue
   const redis =
-    typeof config.redis === 'string'
-      ? new Redis(config.redis)
-      : new Redis(config.redis);
+    typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
 
   const postgres = createPostgres(config.connectionString);
   const drizzle = createClient(postgres);

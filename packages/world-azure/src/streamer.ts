@@ -1,4 +1,4 @@
-import type { Container, ChangeFeedIteratorOptions } from '@azure/cosmos';
+import type { Container } from '@azure/cosmos';
 import type {
   GetChunksOptions,
   StreamChunksResponse,
@@ -20,7 +20,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
@@ -73,7 +73,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
       // Helper: Process a new chunk
       function handleNewChunk(
         chunk: Record<string, unknown>,
-        controller: ReadableStreamDefaultController<Uint8Array>
+        controller: ReadableStreamDefaultController<Uint8Array>,
       ): 'eof' | 'continue' {
         if (chunk.eof) {
           closed = true;
@@ -93,13 +93,8 @@ export function createStreamer(config: StreamerConfig): Streamer {
       }
 
       // Helper: Flush ordered chunks from buffer
-      function flushOrderedChunks(
-        controller: ReadableStreamDefaultController<Uint8Array>
-      ) {
-        while (
-          chunkBuffer.length > 0 &&
-          chunkBuffer[0].sequence >= nextExpectedSequence
-        ) {
+      function flushOrderedChunks(controller: ReadableStreamDefaultController<Uint8Array>) {
+        while (chunkBuffer.length > 0 && chunkBuffer[0].sequence >= nextExpectedSequence) {
           const nextChunk = chunkBuffer.shift();
           if (nextChunk) {
             controller.enqueue(nextChunk.data);
@@ -122,11 +117,10 @@ export function createStreamer(config: StreamerConfig): Streamer {
           const { resources: historicalChunks } = await streamsContainer.items
             .query(
               {
-                query:
-                  'SELECT * FROM c WHERE c.streamId = @streamId ORDER BY c.sequence ASC',
+                query: 'SELECT * FROM c WHERE c.streamId = @streamId ORDER BY c.sequence ASC',
                 parameters: [{ name: '@streamId', value: streamName }],
               },
-              { partitionKey: streamName }
+              { partitionKey: streamName },
             )
             .fetchAll();
 
@@ -161,7 +155,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
                     { name: '@seq', value: nextExpectedSequence },
                   ],
                 },
-                { partitionKey: streamName }
+                { partitionKey: streamName },
               )
               .fetchAll()
               .then(({ resources }) => {
@@ -199,10 +193,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
           }
 
           // If we have buffered chunks ready, process them
-          if (
-            chunkBuffer.length > 0 &&
-            chunkBuffer[0].sequence >= nextExpectedSequence
-          ) {
+          if (chunkBuffer.length > 0 && chunkBuffer[0].sequence >= nextExpectedSequence) {
             const chunk = chunkBuffer.shift();
             if (chunk) {
               controller.enqueue(chunk.data);
@@ -236,16 +227,13 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async getStreamChunks(
       _name: string,
       _runId: string,
-      _options?: GetChunksOptions
+      _options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
       // Not implemented for Cosmos DB
       return { data: [], hasMore: false, cursor: null, done: true };
     },
 
-    async getStreamInfo(
-      _name: string,
-      _runId: string
-    ): Promise<StreamInfoResponse> {
+    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
       // Not implemented for Cosmos DB
       return { tailIndex: -1, done: false };
     },

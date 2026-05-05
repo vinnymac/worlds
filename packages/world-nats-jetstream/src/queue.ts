@@ -30,7 +30,7 @@ interface MessageData {
  */
 export function createQueue(
   getJetStream: () => Promise<JetStreamClient>,
-  config: NatsJetStreamWorldConfig
+  config: NatsJetStreamWorldConfig,
 ): Queue & { start(): Promise<void> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
@@ -149,11 +149,10 @@ export function createQueue(
                 controller.enqueue(body);
                 controller.close();
               },
-            })
+            }),
           );
           const message = QueuePayloadSchema.parse(decoded);
-          const queueName =
-            `${workerQueuePrefix}${parsed.id}` as ValidQueueName;
+          const queueName = `${workerQueuePrefix}${parsed.id}` as ValidQueueName;
 
           // Process via embedded world
           await embeddedWorld.queue(queueName, message, {
@@ -165,7 +164,7 @@ export function createQueue(
         } catch (error) {
           console.error(
             `[world-nats-jetstream worker] Error processing message from ${streamName}:`,
-            error
+            error,
           );
 
           // Negative acknowledge to trigger redelivery
@@ -173,10 +172,7 @@ export function createQueue(
         }
       }
     } catch (error) {
-      console.error(
-        `[world-nats-jetstream worker] Error in worker for ${streamName}:`,
-        error
-      );
+      console.error(`[world-nats-jetstream worker] Error in worker for ${streamName}:`, error);
 
       // Wait before retrying
       await setTimeout(5000);

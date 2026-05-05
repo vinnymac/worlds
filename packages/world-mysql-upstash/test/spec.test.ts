@@ -1,10 +1,6 @@
 import { MySqlContainer } from '@testcontainers/mysql';
 import { createTestSuite } from '@workflow/world-testing';
-import {
-  GenericContainer,
-  type StartedTestContainer,
-  Wait,
-} from 'testcontainers';
+import { GenericContainer, type StartedTestContainer, Wait } from 'testcontainers';
 import { afterAll, beforeAll, test } from 'vitest';
 import mysql from 'mysql2/promise';
 
@@ -132,9 +128,7 @@ if (shouldSkipTests) {
     console.log('[test beforeAll] MySQL schema applied');
 
     // Start QStash dev server container
-    qstashContainer = await new GenericContainer(
-      'ghcr.io/vinnymac/qstash:latest'
-    )
+    qstashContainer = await new GenericContainer('ghcr.io/vinnymac/qstash:latest')
       .withCommand(['qstash', 'dev'])
       .withExposedPorts(8080)
       .withWaitStrategy(Wait.forListeningPorts())

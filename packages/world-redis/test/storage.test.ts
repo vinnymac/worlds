@@ -1,15 +1,7 @@
 import { setTimeout } from 'node:timers/promises';
 import { RedisContainer } from '@testcontainers/redis';
 import Redis from 'ioredis';
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
   createEventsStorage,
   createHooksStorage,
@@ -65,7 +57,7 @@ describe('Storage (Redis integration)', () => {
    */
   async function createStep(
     runId: string,
-    opts?: { stepId?: string; stepName?: string; input?: any }
+    opts?: { stepId?: string; stepName?: string; input?: any },
   ) {
     const stepId = opts?.stepId ?? 'step-123';
     const result = await events.create(runId, {
@@ -278,9 +270,7 @@ describe('Storage (Redis integration)', () => {
       });
 
       it('should throw error for non-existent step', async () => {
-        await expect(
-          steps.get(testRunId, 'missing-step')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
 
       it('should find step by stepId without runId using SCAN', async () => {
@@ -298,9 +288,9 @@ describe('Storage (Redis integration)', () => {
       });
 
       it('should throw 404 when step not found without runId', async () => {
-        await expect(
-          steps.get(undefined, 'nonexistent-step-id')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(steps.get(undefined, 'nonexistent-step-id')).rejects.toMatchObject({
+          status: 404,
+        });
       });
     });
 

@@ -4,11 +4,11 @@ Azure Cosmos DB + Service Bus World implementation for the @fantasticfour/workfl
 
 ## Architecture
 
-| Component | Service | Notes |
-|-----------|---------|-------|
-| Storage | Azure Cosmos DB (SQL API) | Single-container model with type discriminators |
-| Queue | Azure Service Bus | FIFO, deduplication, sessions; embedded world-local in tests |
-| Streaming | Cosmos DB polling | Sequence-based chunk ordering with polling for real-time updates |
+| Component | Service                   | Notes                                                            |
+| --------- | ------------------------- | ---------------------------------------------------------------- |
+| Storage   | Azure Cosmos DB (SQL API) | Single-container model with type discriminators                  |
+| Queue     | Azure Service Bus         | FIFO, deduplication, sessions; embedded world-local in tests     |
+| Streaming | Cosmos DB polling         | Sequence-based chunk ordering with polling for real-time updates |
 
 ### Container Strategy
 
@@ -90,14 +90,14 @@ await world.start();
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `COSMOS_ENDPOINT` | Cosmos DB endpoint URL | `https://localhost:8081` |
-| `COSMOS_KEY` | Cosmos DB account key | Emulator key |
-| `COSMOS_DATABASE` | Database name | `workflow` |
-| `SERVICE_BUS_CONNECTION_STRING` | Service Bus connection string | (none, uses embedded) |
-| `SERVICE_BUS_QUEUE` | Service Bus queue name | `workflow-queue` |
-| `WORKFLOW_DEPLOYMENT_ID` | Deployment identifier | `azure-default` |
+| Variable                        | Description                   | Default                  |
+| ------------------------------- | ----------------------------- | ------------------------ |
+| `COSMOS_ENDPOINT`               | Cosmos DB endpoint URL        | `https://localhost:8081` |
+| `COSMOS_KEY`                    | Cosmos DB account key         | Emulator key             |
+| `COSMOS_DATABASE`               | Database name                 | `workflow`               |
+| `SERVICE_BUS_CONNECTION_STRING` | Service Bus connection string | (none, uses embedded)    |
+| `SERVICE_BUS_QUEUE`             | Service Bus queue name        | `workflow-queue`         |
+| `WORKFLOW_DEPLOYMENT_ID`        | Deployment identifier         | `azure-default`          |
 
 ## Indexing
 
@@ -122,13 +122,14 @@ az cosmosdb sql container update \
 
 Autoscale 100-1000 RU/s, single region:
 
-| Workload | Monthly Cost |
-|----------|-------------|
-| Low (100K workflows/month) | $25-50 |
-| Medium (1M workflows/month) | $150-300 |
-| High (10M workflows/month) | $800-1,500 |
+| Workload                    | Monthly Cost |
+| --------------------------- | ------------ |
+| Low (100K workflows/month)  | $25-50       |
+| Medium (1M workflows/month) | $150-300     |
+| High (10M workflows/month)  | $800-1,500   |
 
 Tips to reduce costs:
+
 - Use autoscale to avoid paying for idle capacity
 - Set appropriate TTL on completed runs
 - Use `resolveData: 'none'` for list queries to reduce bandwidth
@@ -137,16 +138,18 @@ Tips to reduce costs:
 ## When to Use This World
 
 **Choose world-azure when:**
+
 - Your infrastructure runs on Azure
 - You need Azure AD / Managed Identity integration
 - You want a fully managed document database with global distribution
 - You need enterprise compliance features (encryption, VNET, private endpoints)
 
 **Consider alternatives when:**
-- You need the lowest possible cost (use world-redis or world-postgres-*)
+
+- You need the lowest possible cost (use world-redis or world-postgres-\*)
 - You want self-hosted with no cloud dependencies (use world-nats-jetstream)
 - Your team is on GCP (use world-firestore-tasks)
-- Your team is on AWS (use world-postgres-* with RDS)
+- Your team is on AWS (use world-postgres-\* with RDS)
 
 ## Testing
 

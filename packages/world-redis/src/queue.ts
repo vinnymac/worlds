@@ -30,7 +30,7 @@ interface MessageData {
  */
 export function createQueue(
   redis: Redis,
-  config: RedisWorldConfig
+  config: RedisWorldConfig,
 ): Queue & { start(): Promise<void> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
@@ -81,11 +81,7 @@ export function createQueue(
     const payload = JSON.stringify(messageData);
 
     // Use pipeline for better performance
-    await redis
-      .multi()
-      .lpush(listKey, payload)
-      .publish(`chan:${listKey}`, 'new')
-      .exec();
+    await redis.multi().lpush(listKey, payload).publish(`chan:${listKey}`, 'new').exec();
 
     return { messageId };
   };
@@ -104,10 +100,7 @@ export function createQueue(
           result = await workerRedis.brpop(listKey, 0);
         } catch (error) {
           // Handle brpop errors gracefully
-          console.error(
-            `[world-redis worker] Error calling brpop on ${listKey}:`,
-            error
-          );
+          console.error(`[world-redis worker] Error calling brpop on ${listKey}:`, error);
 
           // Wait 1 second before retrying
           await setTimeout(1000);
@@ -130,7 +123,7 @@ export function createQueue(
                 controller.enqueue(body);
                 controller.close();
               },
-            })
+            }),
           );
           const message = QueuePayloadSchema.parse(decoded);
           const queueName = `${queuePrefix}${parsed.id}` as const;
@@ -142,17 +135,11 @@ export function createQueue(
 
           // After successful processing, remove the idempotency key
           if (parsed.idempotencyKey) {
-            await workerRedis.srem(
-              `${listKey}:idempotent`,
-              parsed.idempotencyKey
-            );
+            await workerRedis.srem(`${listKey}:idempotent`, parsed.idempotencyKey);
           }
         } catch (error) {
           // Log parsing/deserialization errors but continue processing
-          console.error(
-            `[world-redis worker] Error processing message from ${listKey}:`,
-            error
-          );
+          console.error(`[world-redis worker] Error processing message from ${listKey}:`, error);
         }
       }
     } finally {
@@ -167,8 +154,8 @@ export function createQueue(
     // Start all workers without awaiting (they run forever)
     await Promise.all(
       entries.flatMap(([queuePrefix, listKey]) =>
-        Array.from({ length: concurrency }, () => worker(queuePrefix, listKey))
-      )
+        Array.from({ length: concurrency }, () => worker(queuePrefix, listKey)),
+      ),
     );
   }
 

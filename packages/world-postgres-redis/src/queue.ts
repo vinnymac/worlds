@@ -29,7 +29,7 @@ interface MessageData {
  */
 export function createQueue(
   redis: Redis,
-  config: { jobPrefix?: string; queueConcurrency?: number }
+  config: { jobPrefix?: string; queueConcurrency?: number },
 ): Queue & { start(): Promise<void> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
@@ -80,11 +80,7 @@ export function createQueue(
     const payload = JSON.stringify(messageData);
 
     // Use pipeline for better performance
-    await redis
-      .multi()
-      .lpush(listKey, payload)
-      .publish(`chan:${listKey}`, 'new')
-      .exec();
+    await redis.multi().lpush(listKey, payload).publish(`chan:${listKey}`, 'new').exec();
 
     return { messageId };
   };
@@ -93,15 +89,12 @@ export function createQueue(
   async function fetchMessage(
     workerRedis: Redis,
     listKey: string,
-    processingListKey: string
+    processingListKey: string,
   ): Promise<string | null> {
     try {
       return await workerRedis.brpoplpush(listKey, processingListKey, 0);
     } catch (error) {
-      console.error(
-        `[world-postgres-redis worker] Error calling brpoplpush on ${listKey}:`,
-        error
-      );
+      console.error(`[world-postgres-redis worker] Error calling brpoplpush on ${listKey}:`, error);
       await setTimeout(1000);
       return null;
     }
@@ -110,7 +103,7 @@ export function createQueue(
   // Helper: Parse and decode message
   async function parseMessage(
     item: string,
-    queuePrefix: QueuePrefix
+    queuePrefix: QueuePrefix,
   ): Promise<{
     parsed: MessageData;
     message: ReturnType<typeof QueuePayloadSchema.parse>;
@@ -124,7 +117,7 @@ export function createQueue(
           controller.enqueue(body);
           controller.close();
         },
-      })
+      }),
     );
     const message = QueuePayloadSchema.parse(decoded);
     const queueName = `${queuePrefix}${parsed.id}` as ValidQueueName;
@@ -137,7 +130,7 @@ export function createQueue(
     listKey: string,
     processingListKey: string,
     item: string,
-    idempotencyKey?: string
+    idempotencyKey?: string,
   ) {
     await workerRedis.lrem(processingListKey, 1, item);
     if (idempotencyKey) {
@@ -152,12 +145,9 @@ export function createQueue(
     processingListKey: string,
     item: string,
     errorType: string,
-    error: any
+    error: any,
   ) {
-    console.error(
-      `[world-postgres-redis worker] ${errorType} error on ${listKey}:`,
-      error
-    );
+    console.error(`[world-postgres-redis worker] ${errorType} error on ${listKey}:`, error);
     await workerRedis.lrem(processingListKey, 1, item);
     await workerRedis.rpush(listKey, item);
     await setTimeout(1000);
@@ -169,13 +159,10 @@ export function createQueue(
     listKey: string,
     processingListKey: string,
     item: string,
-    queuePrefix: QueuePrefix
+    queuePrefix: QueuePrefix,
   ): Promise<void> {
     try {
-      const { parsed, message, queueName } = await parseMessage(
-        item,
-        queuePrefix
-      );
+      const { parsed, message, queueName } = await parseMessage(item, queuePrefix);
 
       try {
         await embeddedWorld.queue(queueName, message, {
@@ -186,7 +173,7 @@ export function createQueue(
           listKey,
           processingListKey,
           item,
-          parsed.idempotencyKey
+          parsed.idempotencyKey,
         );
       } catch (httpError) {
         await requeueMessage(
@@ -195,7 +182,7 @@ export function createQueue(
           processingListKey,
           item,
           'HTTP request failed',
-          httpError
+          httpError,
         );
       }
     } catch (parseError) {
@@ -205,7 +192,7 @@ export function createQueue(
         processingListKey,
         item,
         'Error processing message',
-        parseError
+        parseError,
       );
     }
   }
@@ -216,20 +203,10 @@ export function createQueue(
 
     try {
       while (true) {
-        const item = await fetchMessage(
-          workerRedis,
-          listKey,
-          processingListKey
-        );
+        const item = await fetchMessage(workerRedis, listKey, processingListKey);
 
         if (item) {
-          await processSingleMessage(
-            workerRedis,
-            listKey,
-            processingListKey,
-            item,
-            queuePrefix
-          );
+          await processSingleMessage(workerRedis, listKey, processingListKey, item, queuePrefix);
         }
       }
     } finally {
@@ -246,10 +223,7 @@ export function createQueue(
       for (let i = 0; i < concurrency; i++) {
         // Start worker in background (don't await)
         worker(queuePrefix, listKey).catch((error) => {
-          console.error(
-            `[world-postgres-redis] Worker for ${listKey} crashed:`,
-            error
-          );
+          console.error(`[world-postgres-redis] Worker for ${listKey} crashed:`, error);
         });
       }
     });

@@ -2,8 +2,23 @@
   "name": "@fantasticfour/world-mysql-upstash",
   "version": "1.0.0",
   "description": "World implementation using MySQL for storage and Upstash QStash for queue management - works with any MySQL provider (PlanetScale, AWS RDS, Aiven, etc.)",
-  "type": "module",
-  "main": "dist/index.js",
+  "keywords": [
+    "aiven",
+    "durable-functions",
+    "mysql",
+    "planetscale",
+    "qstash",
+    "rds",
+    "upstash",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "vinnymac",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-mysql-upstash"
+  },
   "bin": {
     "world-mysql-upstash-setup": "./bin/setup.js"
   },
@@ -12,16 +27,8 @@
     "bin",
     "migrations"
   ],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/vinnymac/worlds.git",
-    "directory": "packages/world-mysql-upstash"
-  },
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -36,6 +43,10 @@
       "default": "./dist/cli.js"
     },
     "./migrations/*.sql": "./migrations/*.sql"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",
@@ -68,19 +79,8 @@
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "keywords": [
-    "workflow",
-    "mysql",
-    "upstash",
-    "qstash",
-    "planetscale",
-    "rds",
-    "aiven",
-    "durable-functions"
-  ],
-  "author": "vinnymac",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

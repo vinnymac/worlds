@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [durable_objects]
 bindings = [
   { name = "WORKFLOW_DB", class_name = "WorkflowRunDO" },
-  { name = "WORKFLOW_STREAMS", class_name = "StreamDO" }
+  { name = "WORKFLOW_STREAMS", class_name = "StreamDO" },
 ]
 
 [[migrations]]
@@ -28,9 +28,9 @@ dead_letter_queue = "workflow-dlq"
 # KV namespace for global indexing
 [[kv_namespaces]]
 binding = "WORKFLOW_INDEX"
-id = "preview_id"  # Replace with actual KV namespace ID in production
+id = "preview_id" # Replace with actual KV namespace ID in production
 
 [env.production]
 kv_namespaces = [
-  { binding = "WORKFLOW_INDEX", id = "production_id" }  # Replace with production KV ID
+  { binding = "WORKFLOW_INDEX", id = "production_id" }, # Replace with production KV ID
 ]

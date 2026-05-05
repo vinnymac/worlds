@@ -14,16 +14,14 @@ describe('Firestore Container Smoke Test', () => {
 
     // Use official FirestoreEmulatorContainer API with Docker image
     container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
     ).start();
 
     startupTime = Date.now() - startTime;
     console.log(
-      `[Smoke Test] Container started in ${startupTime}ms (${(startupTime / 1000).toFixed(2)}s)`
+      `[Smoke Test] Container started in ${startupTime}ms (${(startupTime / 1000).toFixed(2)}s)`,
     );
-    console.log(
-      `[Smoke Test] Emulator endpoint: ${container.getEmulatorEndpoint()}`
-    );
+    console.log(`[Smoke Test] Emulator endpoint: ${container.getEmulatorEndpoint()}`);
 
     // Create Firestore client using container's endpoint
     firestore = new Firestore({
@@ -59,9 +57,7 @@ describe('Firestore Container Smoke Test', () => {
     // Try to list collections (should be empty initially)
     const collections = await firestore.listCollections();
     expect(collections).toBeInstanceOf(Array);
-    console.log(
-      `[Smoke Test] ✓ Connected to Firestore, found ${collections.length} collections`
-    );
+    console.log(`[Smoke Test] ✓ Connected to Firestore, found ${collections.length} collections`);
   });
 
   it('should perform basic CRUD operations', async () => {
@@ -86,19 +82,13 @@ describe('Firestore Container Smoke Test', () => {
       value: 100,
     });
 
-    const updatedDoc = await firestore
-      .collection(collectionName)
-      .doc(docId)
-      .get();
+    const updatedDoc = await firestore.collection(collectionName).doc(docId).get();
     expect(updatedDoc.data()?.value).toBe(100);
 
     // Delete the document
     await firestore.collection(collectionName).doc(docId).delete();
 
-    const deletedDoc = await firestore
-      .collection(collectionName)
-      .doc(docId)
-      .get();
+    const deletedDoc = await firestore.collection(collectionName).doc(docId).get();
     expect(deletedDoc.exists).toBe(false);
 
     console.log('[Smoke Test] ✓ CRUD operations successful');
@@ -115,10 +105,7 @@ describe('Firestore Container Smoke Test', () => {
     });
 
     // Read from subcollection
-    const childDoc = await parentDoc
-      .collection('children')
-      .doc('child-1')
-      .get();
+    const childDoc = await parentDoc.collection('children').doc('child-1').get();
     expect(childDoc.exists).toBe(true);
     expect(childDoc.data()?.name).toBe('Child Document');
 
@@ -127,25 +114,15 @@ describe('Firestore Container Smoke Test', () => {
 
   it('should support collection group queries', async () => {
     // Create documents in multiple parent paths with same subcollection name
-    await firestore
-      .collection('users')
-      .doc('user1')
-      .collection('items')
-      .doc('item1')
-      .set({
-        type: 'global-item',
-        value: 1,
-      });
+    await firestore.collection('users').doc('user1').collection('items').doc('item1').set({
+      type: 'global-item',
+      value: 1,
+    });
 
-    await firestore
-      .collection('users')
-      .doc('user2')
-      .collection('items')
-      .doc('item2')
-      .set({
-        type: 'global-item',
-        value: 2,
-      });
+    await firestore.collection('users').doc('user2').collection('items').doc('item2').set({
+      type: 'global-item',
+      value: 2,
+    });
 
     // Query across all 'items' subcollections
     const snapshot = await firestore

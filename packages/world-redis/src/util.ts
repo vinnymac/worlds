@@ -3,7 +3,7 @@ export class Mutex {
   andThen<T>(fn: () => Promise<T> | T): Promise<T> {
     this.promise = this.promise.then(
       () => fn(),
-      () => fn()
+      () => fn(),
     );
     return this.promise as Promise<T>;
   }
@@ -11,9 +11,7 @@ export class Mutex {
 
 export function compact<T extends object>(obj: T) {
   const value = {} as {
-    [key in keyof T]: null extends T[key]
-      ? undefined | NonNullable<T[key]>
-      : T[key];
+    [key in keyof T]: null extends T[key] ? undefined | NonNullable<T[key]> : T[key];
   };
   for (const key in obj) {
     if (obj[key] !== null) {

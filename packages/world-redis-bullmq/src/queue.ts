@@ -33,7 +33,7 @@ interface MessageData {
  */
 export function createQueue(
   redis: Redis,
-  config: RedisWorldConfig
+  config: RedisWorldConfig,
 ): QueueInterface & { start(): Promise<void> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
@@ -79,7 +79,7 @@ export function createQueue(
   const queue: QueueInterface['queue'] = async (
     queueName: ValidQueueName,
     message: unknown,
-    opts?: { idempotencyKey?: string }
+    opts?: { idempotencyKey?: string },
   ) => {
     const [queuePrefix, queueId] = parseQueueName(queueName);
     const jobName = Queues[queuePrefix] as string;
@@ -108,7 +108,7 @@ export function createQueue(
         attempts: 3,
         removeOnComplete: 100, // Keep last 100 completed jobs
         removeOnFail: 1000, // Keep last 1000 failed jobs
-      }
+      },
     );
 
     return { messageId };
@@ -125,12 +125,8 @@ export function createQueue(
           data: Buffer.from(job.data.data as string, 'base64'),
         } as MessageData;
 
-        const bodyStream = Stream.Readable.toWeb(
-          Stream.Readable.from([messageData.data])
-        );
-        const body = await transport.deserialize(
-          bodyStream as ReadableStream<Uint8Array>
-        );
+        const bodyStream = Stream.Readable.toWeb(Stream.Readable.from([messageData.data]));
+        const body = await transport.deserialize(bodyStream as ReadableStream<Uint8Array>);
         const message = QueuePayloadSchema.parse(body);
         const queueName = `${queuePrefix}${messageData.id}` as const;
         await embeddedWorld.queue(queueName, message, {
@@ -140,7 +136,7 @@ export function createQueue(
       {
         connection: connectionOptions,
         concurrency,
-      }
+      },
     );
 
     workers.set(jobName, worker);
@@ -156,10 +152,7 @@ export function createQueue(
   }
 
   async function setupListeners() {
-    for (const [queuePrefix, jobName] of Object.entries(Queues) as [
-      QueuePrefix,
-      string,
-    ][]) {
+    for (const [queuePrefix, jobName] of Object.entries(Queues) as [QueuePrefix, string][]) {
       await setupListener(queuePrefix, jobName);
     }
   }

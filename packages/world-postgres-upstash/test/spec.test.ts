@@ -1,11 +1,7 @@
 import { execSync } from 'node:child_process';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { createTestSuite } from '@workflow/world-testing';
-import {
-  GenericContainer,
-  type StartedTestContainer,
-  Wait,
-} from 'testcontainers';
+import { GenericContainer, type StartedTestContainer, Wait } from 'testcontainers';
 import { afterAll, beforeAll, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on docker containers
@@ -20,14 +16,12 @@ if (shouldSkipTests) {
   beforeAll(async () => {
     // Start PostgreSQL container with explicit wait for database readiness
     postgresContainer = await new PostgreSqlContainer(
-      'public.ecr.aws/docker/library/postgres:15-alpine'
+      'public.ecr.aws/docker/library/postgres:15-alpine',
     )
       .withDatabase('main')
       .withUsername('postgres')
       .withPassword('postgres')
-      .withWaitStrategy(
-        Wait.forLogMessage('database system is ready to accept connections', 2)
-      )
+      .withWaitStrategy(Wait.forLogMessage('database system is ready to accept connections', 2))
       .start();
 
     console.log('[test beforeAll] PostgreSQL container started');
@@ -44,9 +38,7 @@ if (shouldSkipTests) {
     });
 
     // Start QStash dev server container
-    qstashContainer = await new GenericContainer(
-      'ghcr.io/vinnymac/qstash:latest'
-    )
+    qstashContainer = await new GenericContainer('ghcr.io/vinnymac/qstash:latest')
       .withCommand(['qstash', 'dev'])
       .withExposedPorts(8080)
       .withWaitStrategy(Wait.forListeningPorts())

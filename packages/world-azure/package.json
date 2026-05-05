@@ -2,23 +2,32 @@
   "name": "@fantasticfour/world-azure",
   "version": "1.0.0",
   "description": "Azure Cosmos DB + Service Bus World implementation with Change Feed streaming",
-  "type": "module",
-  "main": "dist/index.js",
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
+  "keywords": [
+    "azure",
+    "cosmos-db",
+    "durable-functions",
+    "real-time",
+    "service-bus",
+    "workflow"
+  ],
   "license": "Apache-2.0",
+  "author": "vinnymac",
   "repository": {
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git",
     "directory": "packages/world-azure"
   },
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",
@@ -34,26 +43,19 @@
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "@workflow/world-local": "catalog:",
+    "cbor-x": "^1.6.0",
     "ulid": "catalog:"
   },
   "devDependencies": {
+    "@testcontainers/azure-cosmosdb-emulator": "11.14.0",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "testcontainers": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "keywords": [
-    "workflow",
-    "azure",
-    "cosmos-db",
-    "service-bus",
-    "durable-functions",
-    "real-time"
-  ],
-  "author": "vinnymac",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

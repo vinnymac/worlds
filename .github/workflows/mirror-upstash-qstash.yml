@@ -2,8 +2,8 @@ name: Mirror Upstash QStash to GHCR
 
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Weekly on Sunday
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 0 * * 0' # Weekly on Sunday
+  workflow_dispatch: # Allow manual trigger
   push:
     branches:
       - main

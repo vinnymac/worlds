@@ -43,9 +43,7 @@ type SerializedStepUpdate = Omit<UpdateStepRequest, 'error'> & {
   error?: SerializedError;
 };
 
-function isValidRunData(
-  data: unknown
-): data is Record<string, unknown> & { error?: unknown } {
+function isValidRunData(data: unknown): data is Record<string, unknown> & { error?: unknown } {
   return typeof data === 'object' && data !== null;
 }
 
@@ -93,9 +91,7 @@ function _serializeStepError(data: UpdateStepRequest): SerializedStepUpdate {
   };
 }
 
-function isValidStepData(
-  data: unknown
-): data is Record<string, unknown> & { error?: unknown } {
+function isValidStepData(data: unknown): data is Record<string, unknown> & { error?: unknown } {
   return typeof data === 'object' && data !== null;
 }
 
@@ -239,11 +235,7 @@ function deserializeNestedArrays(value: unknown): unknown {
   if (typeof value === 'string') {
     try {
       const parsed = JSON.parse(value);
-      if (
-        parsed &&
-        typeof parsed === 'object' &&
-        '__nested_array__' in parsed
-      ) {
+      if (parsed && typeof parsed === 'object' && '__nested_array__' in parsed) {
         return convertBuffersToUint8Array(parsed.__nested_array__);
       }
     } catch {
@@ -262,7 +254,7 @@ function deserializeNestedArrays(value: unknown): unknown {
 function filterData<T extends object>(
   data: T,
   resolveData: ResolveData | undefined,
-  keysToStrip: (keyof T)[]
+  keysToStrip: (keyof T)[],
 ): T {
   if (resolveData === 'none') {
     const newData = { ...data };
@@ -363,7 +355,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
    */
   async function createRunFromEvent(
     runId: string,
-    data: RunCreatedEventRequest['eventData']
+    data: RunCreatedEventRequest['eventData'],
   ): Promise<WorkflowRun> {
     const runRef = firestore.collection('workflow_runs').doc(runId);
 
@@ -389,9 +381,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       specVersion: SPEC_VERSION_CURRENT,
       status: 'pending',
       input: serializeNestedArrays(data.input),
-      executionContext: data.executionContext as
-        | Record<string, unknown>
-        | undefined,
+      executionContext: data.executionContext as Record<string, unknown> | undefined,
       deploymentId: data.deploymentId,
       createdAt: now,
       updatedAt: now,
@@ -411,7 +401,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
   async function updateRunFromEvent(
     runId: string,
     eventType: string,
-    eventData?: Record<string, unknown>
+    eventData?: Record<string, unknown>,
   ): Promise<WorkflowRun> {
     const currentRun = await getRun(runId);
     const now = new Date();
@@ -474,7 +464,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
   async function createStepFromEvent(
     runId: string,
     stepId: string,
-    data: { stepName: string; input: unknown }
+    data: { stepName: string; input: unknown },
   ): Promise<Step> {
     const stepRef = firestore
       .collection('workflow_runs')
@@ -525,7 +515,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     runId: string,
     stepId: string,
     eventType: string,
-    eventData?: Record<string, unknown>
+    eventData?: Record<string, unknown>,
   ): Promise<Step> {
     const currentStep = await getStep(runId, stepId);
     const now = new Date();
@@ -588,7 +578,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     runId: string,
     hookId: string,
     data: { token: string; metadata?: unknown },
-    specVersion: number
+    specVersion: number,
   ): Promise<Hook> {
     const now = new Date();
 
@@ -606,12 +596,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
     try {
       await Promise.all([
-        firestore
-          .collection('workflow_runs')
-          .doc(runId)
-          .collection('hooks')
-          .doc(hookId)
-          .set(hook),
+        firestore.collection('workflow_runs').doc(runId).collection('hooks').doc(hookId).set(hook),
         firestore.collection('hooks_by_token').doc(data.token).set(hook),
       ]);
 
@@ -640,9 +625,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       batch.delete(doc.ref);
       // Delete from hooks_by_token index
       if (hookData.token) {
-        batch.delete(
-          firestore.collection('hooks_by_token').doc(hookData.token)
-        );
+        batch.delete(firestore.collection('hooks_by_token').doc(hookData.token));
       }
     }
     await batch.commit();
@@ -656,7 +639,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       },
 
       async list(
-        params?: ListWorkflowRunsParams
+        params?: ListWorkflowRunsParams,
       ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
         const limit = params?.pagination?.limit ?? 20;
         let query: Query = firestore.collection('workflow_runs');
@@ -710,14 +693,13 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams
+        _params?: CreateEventParams,
       ): Promise<EventResult> {
         const eventId = `wevt_${ulid()}`;
         const now = new Date();
 
         // For run_created events, generate a runId if null
-        const effectiveRunId =
-          runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
+        const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
 
         const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
 
@@ -733,10 +715,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         };
 
         // Add optional correlationId if present
-        if (
-          'correlationId' in data &&
-          (data as any).correlationId !== undefined
-        ) {
+        if ('correlationId' in data && (data as any).correlationId !== undefined) {
           eventRecord.correlationId = (data as any).correlationId;
         }
 
@@ -759,7 +738,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           case 'run_created': {
             result.run = await createRunFromEvent(
               effectiveRunId,
-              eventData as RunCreatedEventRequest['eventData']
+              eventData as RunCreatedEventRequest['eventData'],
             );
             break;
           }
@@ -767,11 +746,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           case 'run_completed':
           case 'run_failed':
           case 'run_cancelled': {
-            result.run = await updateRunFromEvent(
-              effectiveRunId,
-              data.eventType,
-              eventData
-            );
+            result.run = await updateRunFromEvent(effectiveRunId, data.eventType, eventData);
             break;
           }
           case 'step_created': {
@@ -779,7 +754,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             result.step = await createStepFromEvent(
               effectiveRunId,
               correlationId,
-              eventData as { stepName: string; input: unknown }
+              eventData as { stepName: string; input: unknown },
             );
             break;
           }
@@ -792,7 +767,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               effectiveRunId,
               correlationId,
               data.eventType,
-              eventData
+              eventData,
             );
             break;
           }
@@ -815,7 +790,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               effectiveRunId,
               correlationId,
               hookEventData,
-              effectiveSpecVersion
+              effectiveSpecVersion,
             );
 
             // Verify hook was created
@@ -831,11 +806,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         return result;
       },
 
-      async get(
-        runId: string,
-        eventId: string,
-        _params?: GetEventParams
-      ): Promise<Event> {
+      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
         const doc = await firestore
           .collection('workflow_runs')
           .doc(runId)
@@ -934,31 +905,25 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             } as Event;
           }),
           // Use the createdAt timestamp as cursor for collection group queries
-          cursor:
-            values.at(-1)?.data().createdAt?.toDate().toISOString() ?? null,
+          cursor: values.at(-1)?.data().createdAt?.toDate().toISOString() ?? null,
           hasMore,
         };
       },
     },
 
     steps: {
-      async get(
-        runId: string | undefined,
-        stepId: string,
-        params?: GetStepParams
-      ) {
+      async get(runId: string | undefined, stepId: string, params?: GetStepParams) {
         if (!runId) {
-          throw new WorkflowWorldError(
-            'runId is required for Firestore step lookup',
-            { status: 400 }
-          );
+          throw new WorkflowWorldError('runId is required for Firestore step lookup', {
+            status: 400,
+          });
         }
         const step = await getStep(runId, stepId);
         return filterData(step, params?.resolveData, ['input', 'output']);
       },
 
       async list(
-        params: ListWorkflowRunStepsParams
+        params: ListWorkflowRunStepsParams,
       ): Promise<PaginatedResponse<Step | StepWithoutData>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 20;
@@ -1052,10 +1017,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       },
 
       async getByToken(token: string, params?: GetHookParams) {
-        const doc = await firestore
-          .collection('hooks_by_token')
-          .doc(token)
-          .get();
+        const doc = await firestore.collection('hooks_by_token').doc(token).get();
 
         if (!doc.exists) {
           throw new WorkflowWorldError(`Hook not found for token: ${token}`, {

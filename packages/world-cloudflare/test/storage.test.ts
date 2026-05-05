@@ -293,9 +293,9 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       });
 
       it('should throw error for non-existent step', async () => {
-        await expect(
-          storage.steps.get(testRunId, 'missing-step')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(storage.steps.get(testRunId, 'missing-step')).rejects.toMatchObject({
+          status: 404,
+        });
       });
     });
 

@@ -44,13 +44,7 @@ interface NatsStorageConfig {
  * Date fields that need to be converted from ISO strings back to Date objects
  * when deserializing from NATS JetStream KV storage.
  */
-const DATE_FIELDS = new Set([
-  'createdAt',
-  'updatedAt',
-  'startedAt',
-  'completedAt',
-  'retryAfter',
-]);
+const DATE_FIELDS = new Set(['createdAt', 'updatedAt', 'startedAt', 'completedAt', 'retryAfter']);
 
 /**
  * Reviver function for JSON.parse() that converts ISO date strings to Date objects.
@@ -82,11 +76,7 @@ function uint8ArrayReplacer(_key: string, value: any): any {
 function uint8ArrayReviver(key: string, value: any): any {
   const dateValue = dateReviver(key, value);
 
-  if (
-    dateValue &&
-    typeof dateValue === 'object' &&
-    dateValue.__uint8array === true
-  ) {
+  if (dateValue && typeof dateValue === 'object' && dateValue.__uint8array === true) {
     return new Uint8Array(dateValue.data);
   }
 
@@ -128,14 +118,8 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 
 function filterStepData(step: Step, resolveData: 'none'): StepWithoutData;
 function filterStepData(step: Step, resolveData: 'all'): Step;
-function filterStepData(
-  step: Step,
-  resolveData: ResolveData
-): Step | StepWithoutData;
-function filterStepData(
-  step: Step,
-  resolveData: ResolveData
-): Step | StepWithoutData {
+function filterStepData(step: Step, resolveData: ResolveData): Step | StepWithoutData;
+function filterStepData(step: Step, resolveData: ResolveData): Step | StepWithoutData {
   if (resolveData === 'none') {
     const { input: _, output: __, ...rest } = step;
     return { input: undefined, output: undefined, ...rest };
@@ -143,18 +127,15 @@ function filterStepData(
   return step;
 }
 
-function filterRunData(
-  run: WorkflowRun,
-  resolveData: 'none'
-): WorkflowRunWithoutData;
+function filterRunData(run: WorkflowRun, resolveData: 'none'): WorkflowRunWithoutData;
 function filterRunData(run: WorkflowRun, resolveData: 'all'): WorkflowRun;
 function filterRunData(
   run: WorkflowRun,
-  resolveData: ResolveData
+  resolveData: ResolveData,
 ): WorkflowRun | WorkflowRunWithoutData;
 function filterRunData(
   run: WorkflowRun,
-  resolveData: ResolveData
+  resolveData: ResolveData,
 ): WorkflowRun | WorkflowRunWithoutData {
   if (resolveData === 'none') {
     const { input: _, output: __, ...rest } = run;
@@ -220,8 +201,7 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
 
         // Apply filters
         const statusMatches = !params?.status || run.status === params.status;
-        const nameMatches =
-          !params?.workflowName || run.workflowName === params.workflowName;
+        const nameMatches = !params?.workflowName || run.workflowName === params.workflowName;
 
         if (statusMatches && nameMatches) {
           const parsed = WorkflowRunSchema.parse(compact(run));
@@ -235,9 +215,7 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
       // Apply cursor-based pagination
       let startIdx = 0;
       if (params?.pagination?.cursor) {
-        const cursorIdx = runs.findIndex(
-          (r) => r.runId === params.pagination!.cursor
-        );
+        const cursorIdx = runs.findIndex((r) => r.runId === params.pagination!.cursor);
         if (cursorIdx !== -1) {
           startIdx = cursorIdx + 1;
         }
@@ -258,9 +236,7 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
 /**
  * Create storage for workflow events using JetStream KV Store
  */
-export function createEventsStorage(
-  config: NatsStorageConfig
-): Storage['events'] {
+export function createEventsStorage(config: NatsStorageConfig): Storage['events'] {
   const { getJetStream, keyPrefix } = config;
   const ulid = monotonicFactory();
 
@@ -285,12 +261,9 @@ export function createEventsStorage(
       hooksBucket = await jetstream.views.kv(`${keyPrefix}hooks`, {
         history: 10,
       });
-      hooksTokenBucket = await jetstream.views.kv(
-        `${keyPrefix}hooks_by_token`,
-        {
-          history: 1,
-        }
-      );
+      hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
+        history: 1,
+      });
     }
   };
 
@@ -320,7 +293,7 @@ export function createEventsStorage(
     eventId: string,
     data: any,
     currentRun: { status: string; specVersion?: number },
-    params?: { resolveData?: ResolveData }
+    params?: { resolveData?: ResolveData },
   ): Promise<EventResult> {
     await initBuckets();
     const resolveData = params?.resolveData ?? 'all';
@@ -369,7 +342,7 @@ export function createEventsStorage(
         throw new Error(
           `Event type '${data.eventType}' not supported for legacy runs ` +
             `(specVersion: ${currentRun.specVersion || 'undefined'}). ` +
-            `Please upgrade @workflow packages.`
+            `Please upgrade @workflow packages.`,
         );
     }
   }
@@ -378,7 +351,7 @@ export function createEventsStorage(
     async create(
       runId: string | null,
       data: CreateEventRequest | RunCreatedEventRequest,
-      params?: CreateEventParams
+      params?: CreateEventParams,
     ): Promise<EventResult> {
       await initBuckets();
 
@@ -404,8 +377,7 @@ export function createEventsStorage(
       const isRunTerminal = (status: string) =>
         ['completed', 'failed', 'cancelled'].includes(status);
 
-      const isStepTerminal = (status: string) =>
-        ['completed', 'failed'].includes(status);
+      const isStepTerminal = (status: string) => ['completed', 'failed'].includes(status);
 
       // Validation
       let currentRun: {
@@ -414,10 +386,7 @@ export function createEventsStorage(
       } | null = null;
 
       const skipRunValidationEvents = ['step_completed', 'step_retrying'];
-      if (
-        data.eventType !== 'run_created' &&
-        !skipRunValidationEvents.includes(data.eventType)
-      ) {
+      if (data.eventType !== 'run_created' && !skipRunValidationEvents.includes(data.eventType)) {
         const runEntry = await runsBucket.get(effectiveRunId);
         if (runEntry) {
           const runData = kvValueToString(runEntry.value);
@@ -434,34 +403,21 @@ export function createEventsStorage(
         if (requiresNewerWorld(currentRun.specVersion)) {
           throw new (await import('@workflow/errors')).RunNotSupportedError(
             currentRun.specVersion!,
-            SPEC_VERSION_CURRENT
+            SPEC_VERSION_CURRENT,
           );
         }
 
         if (isLegacySpecVersion(currentRun.specVersion)) {
-          return handleLegacyEvent(
-            effectiveRunId,
-            eventId,
-            data,
-            currentRun,
-            params
-          );
+          return handleLegacyEvent(effectiveRunId, eventId, data, currentRun, params);
         }
       }
 
       // Run terminal state validation
       if (currentRun && isRunTerminal(currentRun.status)) {
-        const runTerminalEvents = [
-          'run_started',
-          'run_completed',
-          'run_failed',
-        ];
+        const runTerminalEvents = ['run_started', 'run_completed', 'run_failed'];
 
         // Idempotent operation
-        if (
-          data.eventType === 'run_cancelled' &&
-          currentRun.status === 'cancelled'
-        ) {
+        if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
           const fullRunEntry = await runsBucket.get(effectiveRunId);
           const createdAt = new Date();
           const event = {
@@ -479,29 +435,23 @@ export function createEventsStorage(
             event: filterEventData(parsed, resolveData),
             run: fullRunEntry
               ? (parseWithUint8Array<WorkflowRun>(
-                  kvValueToString(fullRunEntry.value)
+                  kvValueToString(fullRunEntry.value),
                 ) as WorkflowRun)
               : undefined,
           };
         }
 
-        if (
-          runTerminalEvents.includes(data.eventType) ||
-          data.eventType === 'run_cancelled'
-        ) {
+        if (runTerminalEvents.includes(data.eventType) || data.eventType === 'run_cancelled') {
           throw new WorkflowWorldError(
             `Cannot transition run from terminal state "${currentRun.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
 
-        if (
-          data.eventType === 'step_created' ||
-          data.eventType === 'hook_created'
-        ) {
+        if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
           throw new WorkflowWorldError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
       }
@@ -509,10 +459,7 @@ export function createEventsStorage(
       // Step validation
       let validatedStep: { status: string; startedAt?: Date } | null = null;
       const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
-      if (
-        stepEventsNeedingValidation.includes(data.eventType) &&
-        data.correlationId
-      ) {
+      if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
         const stepEntry = await stepsBucket.get(stepKey);
         if (stepEntry) {
@@ -525,16 +472,13 @@ export function createEventsStorage(
         }
 
         if (!validatedStep) {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
 
         if (isStepTerminal(validatedStep.status)) {
           throw new WorkflowWorldError(
             `Cannot modify step in terminal state "${validatedStep.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
 
@@ -542,7 +486,7 @@ export function createEventsStorage(
           if (validatedStep.status !== 'running') {
             throw new WorkflowWorldError(
               `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
         }
@@ -550,16 +494,10 @@ export function createEventsStorage(
 
       // Hook validation
       const hookEventsRequiringExistence = ['hook_disposed', 'hook_received'];
-      if (
-        hookEventsRequiringExistence.includes(data.eventType) &&
-        data.correlationId
-      ) {
+      if (hookEventsRequiringExistence.includes(data.eventType) && data.correlationId) {
         const existingHook = await hooksBucket.get(data.correlationId);
         if (!existingHook) {
-          throw new WorkflowWorldError(
-            `Hook "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Hook "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -607,10 +545,7 @@ export function createEventsStorage(
             startedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(
-            effectiveRunId,
-            stringifyWithUint8Array(updatedRun)
-          );
+          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
       }
@@ -628,10 +563,7 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(
-            effectiveRunId,
-            stringifyWithUint8Array(updatedRun)
-          );
+          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
           await cleanupHooks(effectiveRunId);
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
@@ -662,10 +594,7 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(
-            effectiveRunId,
-            stringifyWithUint8Array(updatedRun)
-          );
+          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
           await cleanupHooks(effectiveRunId);
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
@@ -682,10 +611,7 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(
-            effectiveRunId,
-            stringifyWithUint8Array(updatedRun)
-          );
+          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
           await cleanupHooks(effectiveRunId);
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
@@ -746,7 +672,7 @@ export function createEventsStorage(
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
           const updatedStep = {
@@ -759,10 +685,7 @@ export function createEventsStorage(
           await stepsBucket.put(stepKey, stringifyWithUint8Array(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         } else {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -784,7 +707,7 @@ export function createEventsStorage(
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
           const updatedStep = {
@@ -800,10 +723,7 @@ export function createEventsStorage(
           await stepsBucket.put(stepKey, stringifyWithUint8Array(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         } else {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -859,10 +779,7 @@ export function createEventsStorage(
             specVersion: effectiveSpecVersion,
           };
 
-          await eventsBucket.put(
-            eventId,
-            stringifyWithUint8Array(conflictEvent)
-          );
+          await eventsBucket.put(eventId, stringifyWithUint8Array(conflictEvent));
 
           const parsedConflict = EventSchema.parse(conflictEvent);
           const resolveData = params?.resolveData ?? 'all';
@@ -888,10 +805,7 @@ export function createEventsStorage(
 
         const existing = await hooksBucket.get(data.correlationId!);
         if (!existing) {
-          await hooksBucket.put(
-            data.correlationId!,
-            stringifyWithUint8Array(newHook)
-          );
+          await hooksBucket.put(data.correlationId!, stringifyWithUint8Array(newHook));
           await hooksTokenBucket.put(eventData.token, data.correlationId!);
           hook = HookSchema.parse(compact(newHook));
         }
@@ -970,9 +884,7 @@ export function createEventsStorage(
       // Apply cursor
       let startIdx = 0;
       if (params?.pagination?.cursor) {
-        const cursorIdx = events.findIndex(
-          (e) => e.eventId === params.pagination!.cursor
-        );
+        const cursorIdx = events.findIndex((e) => e.eventId === params.pagination!.cursor);
         if (cursorIdx !== -1) {
           startIdx = cursorIdx + 1;
         }
@@ -992,7 +904,7 @@ export function createEventsStorage(
     },
 
     async listByCorrelationId(
-      params: ListEventsByCorrelationIdParams
+      params: ListEventsByCorrelationIdParams,
     ): Promise<PaginatedResponse<Event>> {
       await initBuckets();
       const limit = params?.pagination?.limit ?? 100;
@@ -1022,9 +934,7 @@ export function createEventsStorage(
       // Apply cursor
       let startIdx = 0;
       if (params?.pagination?.cursor) {
-        const cursorIdx = events.findIndex(
-          (e) => e.eventId === params.pagination!.cursor
-        );
+        const cursorIdx = events.findIndex((e) => e.eventId === params.pagination!.cursor);
         if (cursorIdx !== -1) {
           startIdx = cursorIdx + 1;
         }
@@ -1048,9 +958,7 @@ export function createEventsStorage(
 /**
  * Create storage for workflow steps using JetStream KV Store
  */
-export function createStepsStorage(
-  config: NatsStorageConfig
-): Storage['steps'] {
+export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] {
   const { getJetStream, keyPrefix } = config;
   let stepsBucket: KV;
 
@@ -1064,11 +972,7 @@ export function createStepsStorage(
   };
 
   return {
-    get: (async (
-      runId: string | undefined,
-      stepId: string,
-      params?: GetStepParams
-    ) => {
+    get: (async (runId: string | undefined, stepId: string, params?: GetStepParams) => {
       await initBuckets();
 
       // If runId provided, use direct lookup
@@ -1131,9 +1035,7 @@ export function createStepsStorage(
       // Apply cursor
       let startIdx = 0;
       if (params?.pagination?.cursor) {
-        const cursorIdx = steps.findIndex(
-          (s) => s.stepId === params.pagination!.cursor
-        );
+        const cursorIdx = steps.findIndex((s) => s.stepId === params.pagination!.cursor);
         if (cursorIdx !== -1) {
           startIdx = cursorIdx + 1;
         }
@@ -1154,9 +1056,7 @@ export function createStepsStorage(
 /**
  * Create storage for hooks using JetStream KV Store
  */
-export function createHooksStorage(
-  config: NatsStorageConfig
-): Storage['hooks'] {
+export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] {
   const { getJetStream, keyPrefix } = config;
   let hooksBucket: KV;
   let hooksTokenBucket: KV;
@@ -1167,12 +1067,9 @@ export function createHooksStorage(
       hooksBucket = await jetstream.views.kv(`${keyPrefix}hooks`, {
         history: 10,
       });
-      hooksTokenBucket = await jetstream.views.kv(
-        `${keyPrefix}hooks_by_token`,
-        {
-          history: 1,
-        }
-      );
+      hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
+        history: 1,
+      });
     }
   };
 
@@ -1233,9 +1130,7 @@ export function createHooksStorage(
       // Apply cursor
       let startIdx = 0;
       if (params?.pagination?.cursor) {
-        const cursorIdx = hooks.findIndex(
-          (h) => h.hookId === params.pagination!.cursor
-        );
+        const cursorIdx = hooks.findIndex((h) => h.hookId === params.pagination!.cursor);
         if (cursorIdx !== -1) {
           startIdx = cursorIdx + 1;
         }

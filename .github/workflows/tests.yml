@@ -5,7 +5,7 @@ on:
     branches:
       - main
     tags:
-      - "!*"
+      - '!*'
   pull_request:
 
 concurrency:
@@ -44,7 +44,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: "pnpm"
+          cache: 'pnpm'
 
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
@@ -67,8 +67,8 @@ jobs:
   azure-tests:
     name: Azure Cosmos DB Tests
     runs-on: ubuntu-latest
-    continue-on-error: true  # Don't block on Azure failures - emulator is slow and can be flaky
-    timeout-minutes: 30  # Account for 5-minute emulator startup
+    continue-on-error: true # Don't block on Azure failures - emulator is slow and can be flaky
+    timeout-minutes: 30 # Account for 5-minute emulator startup
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
@@ -85,7 +85,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: "pnpm"
+          cache: 'pnpm'
 
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile

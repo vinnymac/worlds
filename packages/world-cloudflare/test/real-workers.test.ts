@@ -259,7 +259,7 @@ describe('Real Cloudflare Durable Objects', () => {
           eventId: `evt-${i}`,
           eventType: 'test_event',
           createdAt: new Date(),
-        })
+        }),
       );
 
       await Promise.all(creates);
@@ -418,9 +418,7 @@ describe('Real Cloudflare Durable Objects', () => {
 
     it('should handle rapid concurrent chunk writes', async () => {
       // Store many chunks concurrently
-      const stores = Array.from({ length: 20 }, (_, i) =>
-        streamStub.storeChunk(i, `Chunk ${i}`)
-      );
+      const stores = Array.from({ length: 20 }, (_, i) => streamStub.storeChunk(i, `Chunk ${i}`));
 
       await Promise.all(stores);
 

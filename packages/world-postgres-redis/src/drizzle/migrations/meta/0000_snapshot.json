@@ -523,14 +523,7 @@
     "public.status": {
       "name": "status",
       "schema": "public",
-      "values": [
-        "pending",
-        "running",
-        "completed",
-        "failed",
-        "paused",
-        "cancelled"
-      ]
+      "values": ["pending", "running", "completed", "failed", "paused", "cancelled"]
     }
   },
   "schemas": {

@@ -28,46 +28,56 @@ pnpm add @fantasticfour/world-mysql-upstash
 This package works with any MySQL 8.0+ database:
 
 ### PlanetScale (Serverless MySQL)
+
 ```bash
 # Serverless MySQL with branching and automatic scaling
 export DATABASE_URL="mysql://user:pass@aws.connect.psdb.cloud/dbname?ssl={\"rejectUnauthorized\":true}"
 ```
+
 - **Best for**: Serverless deployments, branching workflows, developer velocity
 - **Benefits**: Scales to zero, git-like branching, instant schema changes
 - **Pricing**: Free tier available, $29/month for production
 
 ### AWS RDS (Managed MySQL)
+
 ```bash
 # Enterprise-grade managed MySQL
 export DATABASE_URL="mysql://user:pass@xxx.rds.amazonaws.com:3306/dbname"
 ```
+
 - **Best for**: Enterprise deployments, compliance requirements
 - **Benefits**: High availability, automated backups, VPC isolation
 - **Pricing**: Starts at ~$15/month for small instances
 
 ### Aiven (Multi-Cloud MySQL)
+
 ```bash
 # Managed MySQL across AWS, GCP, Azure
 export DATABASE_URL="mysql://user:pass@xxx.aivencloud.com:3306/dbname?ssl-mode=REQUIRED"
 ```
+
 - **Best for**: Multi-cloud deployments, open source stack
 - **Benefits**: Choose your cloud, transparent pricing, excellent support
 - **Pricing**: Starts at $30/month
 
 ### Railway (Developer-Friendly MySQL)
+
 ```bash
 # Simple MySQL hosting
 export DATABASE_URL="mysql://user:pass@xxx.railway.app:3306/dbname"
 ```
+
 - **Best for**: Quick prototyping, developer convenience
 - **Benefits**: One-click deploy, automatic migrations, fair pricing
 - **Pricing**: $5/month for 8GB storage
 
 ### Self-Hosted MySQL
+
 ```bash
 # Your own MySQL instance
 export DATABASE_URL="mysql://user:pass@your-host:3306/dbname"
 ```
+
 - **Best for**: Complete control, on-premises requirements
 - **Benefits**: Full control, no vendor lock-in, cost predictability
 
@@ -92,7 +102,7 @@ await world.events.create('run_id', {
     workflowName: 'my-workflow',
     deploymentId: 'production',
     input: ['arg1', 'arg2'],
-  }
+  },
 });
 ```
 
@@ -129,6 +139,7 @@ app.post('/queue/:queueName', async (req, res) => {
 ```
 
 **QStash Benefits:**
+
 - Push-based (no polling required)
 - Built-in retries (3 attempts)
 - Deduplication via idempotency
@@ -165,6 +176,7 @@ export DEPLOYMENT_ID="production"
 ## When to Choose This Package
 
 **Use world-mysql-upstash when:**
+
 - You need MySQL compatibility (existing MySQL infrastructure)
 - Serverless deployment (Vercel, Netlify, Cloudflare Pages)
 - Multi-cloud strategy desired
@@ -172,6 +184,7 @@ export DEPLOYMENT_ID="production"
 - HTTP-based queue is acceptable
 
 **Consider alternatives when:**
+
 - You prefer PostgreSQL → use @fantasticfour/world-postgres-upstash
 - Sub-100ms latency required → use @fantasticfour/world-cloudflare
 - Need Redis Lists queue → use @fantasticfour/world-postgres-redis
@@ -194,26 +207,31 @@ export DEPLOYMENT_ID="production"
 Costs vary significantly by provider:
 
 **PlanetScale (Serverless):**
+
 - Free tier: 5 GB storage, 1 billion row reads/month
 - Scaler plan: $29/month
 - Best for: Variable traffic, development, serverless apps
 
 **AWS RDS:**
+
 - Provisioned instances start at ~$15/month
 - Reserved instances for discounts
 - Best for: Predictable enterprise workloads
 
 **Aiven:**
+
 - Starts at $30/month
 - Transparent pricing, no surprises
 - Best for: Multi-cloud, open source preference
 
 **Railway:**
+
 - $5/month for 8GB storage
 - Usage-based compute pricing
 - Best for: Prototypes, small apps
 
 **Upstash QStash (constant across all options):**
+
 - Free tier: 100 requests/day
 - Paid: $1.00 per million messages
 

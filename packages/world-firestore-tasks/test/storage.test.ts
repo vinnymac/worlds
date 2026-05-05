@@ -2,15 +2,7 @@ import { setTimeout } from 'node:timers/promises';
 import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
 
 describe('Storage (Firestore integration)', () => {
@@ -51,9 +43,7 @@ describe('Storage (Firestore integration)', () => {
     }
 
     // Clear hooks_by_token collection
-    const hooksTokenSnapshot = await firestore
-      .collection('hooks_by_token')
-      .get();
+    const hooksTokenSnapshot = await firestore.collection('hooks_by_token').get();
     for (const doc of hooksTokenSnapshot.docs) {
       batch.delete(doc.ref);
     }
@@ -85,7 +75,7 @@ describe('Storage (Firestore integration)', () => {
   beforeAll(async () => {
     // Start Firestore emulator container
     container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
     ).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
@@ -289,7 +279,7 @@ describe('Storage (Firestore integration)', () => {
         expect(result.data[0].runId).toBe(run2.runId);
         expect(result.data[1].runId).toBe(run1.runId);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThan(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
@@ -420,9 +410,9 @@ describe('Storage (Firestore integration)', () => {
       });
 
       it('should throw error for non-existent step', async () => {
-        await expect(
-          storage.steps.get(testRunId, 'missing-step')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(storage.steps.get(testRunId, 'missing-step')).rejects.toMatchObject({
+          status: 404,
+        });
       });
     });
 
@@ -529,7 +519,7 @@ describe('Storage (Firestore integration)', () => {
         expect(result.data[0].stepId).toBe('step-2');
         expect(result.data[1].stepId).toBe('step-1');
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
@@ -842,7 +832,7 @@ describe('Storage (Firestore integration)', () => {
         // step_created + step_started + step_completed = 3
         expect(result.data).toHaveLength(3);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
     });
@@ -896,9 +886,7 @@ describe('Storage (Firestore integration)', () => {
       });
 
       it('should throw error for non-existent token', async () => {
-        await expect(
-          storage.hooks.getByToken('missing-token')
-        ).rejects.toMatchObject({
+        await expect(storage.hooks.getByToken('missing-token')).rejects.toMatchObject({
           status: 404,
         });
       });

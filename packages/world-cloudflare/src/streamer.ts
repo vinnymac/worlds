@@ -38,7 +38,7 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
@@ -65,7 +65,7 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
             eof: false,
             createdAt: new Date().toISOString(),
           }),
-        })
+        }),
       );
     },
 
@@ -87,7 +87,7 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
             eof: true,
             createdAt: new Date().toISOString(),
           }),
-        })
+        }),
       );
     },
 
@@ -103,7 +103,7 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
           eof: boolean;
           chunkData: string;
         }>,
-        controller: ReadableStreamDefaultController<Uint8Array>
+        controller: ReadableStreamDefaultController<Uint8Array>,
       ): boolean => {
         for (const chunk of chunks) {
           lastSequence = chunk.sequence;
@@ -112,9 +112,7 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
             controller.close();
             return true;
           }
-          controller.enqueue(
-            new Uint8Array(Buffer.from(chunk.chunkData, 'base64'))
-          );
+          controller.enqueue(new Uint8Array(Buffer.from(chunk.chunkData, 'base64')));
         }
         return false;
       };
@@ -127,9 +125,7 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
           }
 
           const response = await stub.fetch(
-            new Request(
-              `http://do/chunks?lastSequence=${lastSequence}&limit=10`
-            )
+            new Request(`http://do/chunks?lastSequence=${lastSequence}&limit=10`),
           );
 
           if (!response.ok) {
@@ -162,16 +158,13 @@ export function createStreamer(config: CloudflareStreamerConfig): Streamer {
     async getStreamChunks(
       _name: string,
       _runId: string,
-      _options?: GetChunksOptions
+      _options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
       // Not implemented for Cloudflare Durable Objects
       return { data: [], hasMore: false, cursor: null, done: true };
     },
 
-    async getStreamInfo(
-      _name: string,
-      _runId: string
-    ): Promise<StreamInfoResponse> {
+    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
       // Not implemented for Cloudflare Durable Objects
       return { tailIndex: 0, done: false };
     },

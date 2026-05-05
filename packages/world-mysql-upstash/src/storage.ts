@@ -14,12 +14,7 @@ import type {
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
-import {
-  EventSchema,
-  HookSchema,
-  StepSchema,
-  WorkflowRunSchema,
-} from '@workflow/world';
+import { EventSchema, HookSchema, StepSchema, WorkflowRunSchema } from '@workflow/world';
 import { and, desc, eq, gt, lt, notInArray, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { monotonicFactory } from 'ulid';
@@ -126,11 +121,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
 
   return {
     get: (async (id: string, params?: any) => {
-      const [value] = await drizzle
-        .select()
-        .from(runs)
-        .where(eq(runs.runId, id))
-        .limit(1);
+      const [value] = await drizzle.select().from(runs).where(eq(runs.runId, id)).limit(1);
       if (!value) {
         throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
       }
@@ -151,11 +142,9 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
         .where(
           and(
             map(fromCursor, (c: string) => lt(runs.runId, c)),
-            map(params?.workflowName, (wf: string) =>
-              eq(runs.workflowName, wf)
-            ),
-            map(params?.status, (s) => eq(runs.status, s as any))
-          )
+            map(params?.workflowName, (wf: string) => eq(runs.workflowName, wf)),
+            map(params?.status, (s) => eq(runs.status, s as any)),
+          ),
         )
         .orderBy(desc(runs.runId))
         .limit(limit + 1);
@@ -211,8 +200,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         ['completed', 'failed', 'cancelled'].includes(status);
 
       // Helper to check if step is in terminal state
-      const isStepTerminal = (status: string) =>
-        ['completed', 'failed'].includes(status);
+      const isStepTerminal = (status: string) => ['completed', 'failed'].includes(status);
 
       // ============================================================
       // VALIDATION: Terminal state checks
@@ -222,10 +210,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
       // Skip run validation for step_completed and step_retrying
       let currentRun: { status: string } | null = null;
       const skipRunValidationEvents = ['step_completed', 'step_retrying'];
-      if (
-        data.eventType !== 'run_created' &&
-        !skipRunValidationEvents.includes(data.eventType)
-      ) {
+      if (data.eventType !== 'run_created' && !skipRunValidationEvents.includes(data.eventType)) {
         const [runValue] = await drizzle
           .select({ status: schema.runs.status })
           .from(schema.runs)
@@ -236,17 +221,10 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
 
       // Run terminal state validation
       if (currentRun && isRunTerminal(currentRun.status)) {
-        const runTerminalEvents = [
-          'run_started',
-          'run_completed',
-          'run_failed',
-        ];
+        const runTerminalEvents = ['run_started', 'run_completed', 'run_failed'];
 
         // Idempotent operation: run_cancelled on already cancelled run is allowed
-        if (
-          data.eventType === 'run_cancelled' &&
-          currentRun.status === 'cancelled'
-        ) {
+        if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
           // Get full run for return value
           const [fullRun] = await drizzle
             .select()
@@ -291,36 +269,26 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         }
 
         // Run state transitions are not allowed on terminal runs
-        if (
-          runTerminalEvents.includes(data.eventType) ||
-          data.eventType === 'run_cancelled'
-        ) {
+        if (runTerminalEvents.includes(data.eventType) || data.eventType === 'run_cancelled') {
           throw new WorkflowWorldError(
             `Cannot transition run from terminal state "${currentRun.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
 
         // Creating new entities on terminal runs is not allowed
-        if (
-          data.eventType === 'step_created' ||
-          data.eventType === 'hook_created'
-        ) {
+        if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
           throw new WorkflowWorldError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
       }
 
       // Step-related event validation
-      let validatedStep: { status: string; startedAt: Date | null } | null =
-        null;
+      let validatedStep: { status: string; startedAt: Date | null } | null = null;
       const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
-      if (
-        stepEventsNeedingValidation.includes(data.eventType) &&
-        data.correlationId
-      ) {
+      if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
         const [existingStep] = await drizzle
           .select({
             status: schema.steps.status,
@@ -330,24 +298,21 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .where(
             and(
               eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId)
-            )
+              eq(schema.steps.stepId, data.correlationId),
+            ),
           )
           .limit(1);
 
         validatedStep = existingStep ?? null;
 
         if (!validatedStep) {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
 
         if (isStepTerminal(validatedStep.status)) {
           throw new WorkflowWorldError(
             `Cannot modify step in terminal state "${validatedStep.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
 
@@ -356,7 +321,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           if (validatedStep.status !== 'running') {
             throw new WorkflowWorldError(
               `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
         }
@@ -364,10 +329,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
 
       // Hook-related event validation (ordering)
       const hookEventsRequiringExistence = ['hook_disposed', 'hook_received'];
-      if (
-        hookEventsRequiringExistence.includes(data.eventType) &&
-        data.correlationId
-      ) {
+      if (hookEventsRequiringExistence.includes(data.eventType) && data.correlationId) {
         const [existingHook] = await drizzle
           .select({ hookId: schema.hooks.hookId })
           .from(schema.hooks)
@@ -375,10 +337,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .limit(1);
 
         if (!existingHook) {
-          throw new WorkflowWorldError(
-            `Hook "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Hook "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -401,9 +360,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             deploymentId: eventData.deploymentId,
             workflowName: eventData.workflowName,
             input: eventData.input as SerializedContent,
-            executionContext: eventData.executionContext as
-              | SerializedContent
-              | undefined,
+            executionContext: eventData.executionContext as SerializedContent | undefined,
             status: 'pending',
           })
           .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
@@ -467,9 +424,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           run = deserializeRunError(compact(runValue));
         }
         // Delete all hooks for this run to allow token reuse
-        await drizzle
-          .delete(schema.hooks)
-          .where(eq(schema.hooks.runId, effectiveRunId));
+        await drizzle.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
       }
 
       // Handle run_failed event: update run status and cleanup hooks
@@ -508,9 +463,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           run = deserializeRunError(compact(runValue));
         }
         // Delete all hooks for this run to allow token reuse
-        await drizzle
-          .delete(schema.hooks)
-          .where(eq(schema.hooks.runId, effectiveRunId));
+        await drizzle.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
       }
 
       // Handle run_cancelled event: update run status and cleanup hooks
@@ -535,9 +488,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           run = deserializeRunError(compact(runValue));
         }
         // Delete all hooks for this run to allow token reuse
-        await drizzle
-          .delete(schema.hooks)
-          .where(eq(schema.hooks.runId, effectiveRunId));
+        await drizzle.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
       }
 
       // Handle step_created event: create step entity
@@ -584,8 +535,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .where(
             and(
               eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!)
-            )
+              eq(schema.steps.stepId, data.correlationId!),
+            ),
           );
 
         const [stepValue] = await drizzle
@@ -594,8 +545,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .where(
             and(
               eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!)
-            )
+              eq(schema.steps.stepId, data.correlationId!),
+            ),
           )
           .limit(1);
         if (stepValue) {
@@ -619,8 +570,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             and(
               eq(schema.steps.runId, effectiveRunId),
               eq(schema.steps.stepId, data.correlationId!),
-              notInArray(schema.steps.status, ['completed', 'failed'])
-            )
+              notInArray(schema.steps.status, ['completed', 'failed']),
+            ),
           );
 
         if (result[0].affectedRows > 0) {
@@ -630,8 +581,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             .where(
               and(
                 eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!)
-              )
+                eq(schema.steps.stepId, data.correlationId!),
+              ),
             )
             .limit(1);
           if (stepValue) {
@@ -649,20 +600,17 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             .where(
               and(
                 eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!)
-              )
+                eq(schema.steps.stepId, data.correlationId!),
+              ),
             )
             .limit(1);
           if (!existing) {
-            throw new WorkflowWorldError(
-              `Step "${data.correlationId}" not found`,
-              { status: 404 }
-            );
+            throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
           }
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
         }
@@ -693,8 +641,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             and(
               eq(schema.steps.runId, effectiveRunId),
               eq(schema.steps.stepId, data.correlationId!),
-              notInArray(schema.steps.status, ['completed', 'failed'])
-            )
+              notInArray(schema.steps.status, ['completed', 'failed']),
+            ),
           );
 
         if (result[0].affectedRows > 0) {
@@ -704,8 +652,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             .where(
               and(
                 eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!)
-              )
+                eq(schema.steps.stepId, data.correlationId!),
+              ),
             )
             .limit(1);
           if (stepValue) {
@@ -723,20 +671,17 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             .where(
               and(
                 eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!)
-              )
+                eq(schema.steps.stepId, data.correlationId!),
+              ),
             )
             .limit(1);
           if (!existing) {
-            throw new WorkflowWorldError(
-              `Step "${data.correlationId}" not found`,
-              { status: 404 }
-            );
+            throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
           }
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
         }
@@ -767,8 +712,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .where(
             and(
               eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!)
-            )
+              eq(schema.steps.stepId, data.correlationId!),
+            ),
           );
 
         const [stepValue] = await drizzle
@@ -777,8 +722,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .where(
             and(
               eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!)
-            )
+              eq(schema.steps.stepId, data.correlationId!),
+            ),
           )
           .limit(1);
         if (stepValue) {
@@ -821,10 +766,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             .limit(1);
 
           if (!conflictValue) {
-            throw new WorkflowWorldError(
-              `Event ${eventId} could not be created`,
-              { status: 409 }
-            );
+            throw new WorkflowWorldError(`Event ${eventId} could not be created`, { status: 409 });
           }
 
           const conflictResult = {
@@ -872,9 +814,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
 
       // Handle hook_disposed event: delete hook entity
       if (data.eventType === 'hook_disposed' && data.correlationId) {
-        await drizzle
-          .delete(schema.hooks)
-          .where(eq(schema.hooks.hookId, data.correlationId));
+        await drizzle.delete(schema.hooks).where(eq(schema.hooks.hookId, data.correlationId));
       }
 
       await drizzle.insert(events).values({
@@ -929,10 +869,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         .where(
           and(
             eq(events.runId, params.runId),
-            map(params.pagination?.cursor, (c: string) =>
-              order.compare(events.eventId, c)
-            )
-          )
+            map(params.pagination?.cursor, (c: string) => order.compare(events.eventId, c)),
+          ),
         )
         .orderBy(order.by)
         .limit(limit + 1);
@@ -963,10 +901,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         .where(
           and(
             eq(events.correlationId, params.correlationId),
-            map(params.pagination?.cursor, (c: string) =>
-              order.compare(events.eventId, c)
-            )
-          )
+            map(params.pagination?.cursor, (c: string) => order.compare(events.eventId, c)),
+          ),
         )
         .orderBy(order.by)
         .limit(limit + 1);
@@ -992,11 +928,7 @@ export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
 
   return {
     async get(hookId, params) {
-      const [value] = await drizzle
-        .select()
-        .from(hooks)
-        .where(eq(hooks.hookId, hookId))
-        .limit(1);
+      const [value] = await drizzle.select().from(hooks).where(eq(hooks.hookId, hookId)).limit(1);
       if (!value) {
         throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
           status: 404,
@@ -1008,11 +940,7 @@ export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
       return filterHookData(parsed, resolveData);
     },
     async getByToken(token, params) {
-      const [value] = await drizzle
-        .select()
-        .from(hooks)
-        .where(eq(hooks.token, token))
-        .limit(1);
+      const [value] = await drizzle.select().from(hooks).where(eq(hooks.token, token)).limit(1);
       if (!value) {
         throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
           status: 404,
@@ -1032,8 +960,8 @@ export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
         .where(
           and(
             map(params.runId, (id: string) => eq(hooks.runId, id)),
-            map(fromCursor, (c: string) => lt(hooks.hookId, c))
-          )
+            map(fromCursor, (c: string) => lt(hooks.hookId, c)),
+          ),
         )
         .orderBy(desc(hooks.hookId))
         .limit(limit + 1);
@@ -1064,11 +992,7 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
         ? and(eq(steps.stepId, stepId), eq(steps.runId, runId))
         : eq(steps.stepId, stepId);
 
-      const [value] = await drizzle
-        .select()
-        .from(steps)
-        .where(whereClause)
-        .limit(1);
+      const [value] = await drizzle.select().from(steps).where(whereClause).limit(1);
 
       if (!value) {
         throw new WorkflowWorldError(`Step not found: ${stepId}`, {
@@ -1092,8 +1016,8 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
         .where(
           and(
             eq(steps.runId, params.runId),
-            map(fromCursor, (c: string) => lt(steps.stepId, c))
-          )
+            map(fromCursor, (c: string) => lt(steps.stepId, c)),
+          ),
         )
         .orderBy(desc(steps.stepId))
         .limit(limit + 1);
@@ -1127,14 +1051,8 @@ export function createStorage(drizzle: Drizzle): Storage {
 
 function filterStepData(step: Step, resolveData: 'none'): StepWithoutData;
 function filterStepData(step: Step, resolveData: 'all'): Step;
-function filterStepData(
-  step: Step,
-  resolveData: ResolveData
-): Step | StepWithoutData;
-function filterStepData(
-  step: Step,
-  resolveData: ResolveData
-): Step | StepWithoutData {
+function filterStepData(step: Step, resolveData: ResolveData): Step | StepWithoutData;
+function filterStepData(step: Step, resolveData: ResolveData): Step | StepWithoutData {
   if (resolveData === 'none') {
     const { input: _, output: __, ...rest } = step;
 
@@ -1143,18 +1061,15 @@ function filterStepData(
   return step;
 }
 
-function filterRunData(
-  run: WorkflowRun,
-  resolveData: 'none'
-): WorkflowRunWithoutData;
+function filterRunData(run: WorkflowRun, resolveData: 'none'): WorkflowRunWithoutData;
 function filterRunData(run: WorkflowRun, resolveData: 'all'): WorkflowRun;
 function filterRunData(
   run: WorkflowRun,
-  resolveData: ResolveData
+  resolveData: ResolveData,
 ): WorkflowRun | WorkflowRunWithoutData;
 function filterRunData(
   run: WorkflowRun,
-  resolveData: ResolveData
+  resolveData: ResolveData,
 ): WorkflowRun | WorkflowRunWithoutData {
   if (resolveData === 'none') {
     const { input: _, output: __, ...rest } = run;

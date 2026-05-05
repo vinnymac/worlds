@@ -9,7 +9,7 @@ export interface QStashConfig {
 
 export function createQueue(
   config: QStashConfig,
-  deploymentId: string
+  deploymentId: string,
 ): Queue & { start(): Promise<void> } {
   // Create embedded world for test orchestration
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
@@ -20,8 +20,7 @@ export function createQueue(
     process.env.VITEST === 'true' ||
     process.env.NODE_ENV === 'test' ||
     !config.token ||
-    config.token ===
-      'eyJVc2VySUQiOiJkZWZhdWx0VXNlciIsIlBhc3N3b3JkIjoiZGVmYXVsdFBhc3N3b3JkIn0=';
+    config.token === 'eyJVc2VySUQiOiJkZWZhdWx0VXNlciIsIlBhc3N3b3JkIjoiZGVmYXVsdFBhc3N3b3JkIn0=';
 
   const client = isTest ? undefined : new Client({ token: config.token });
 
@@ -78,8 +77,7 @@ export function createQueue(
           });
 
           // QStash returns an object with messageId, extract and parse as branded type
-          const rawId =
-            typeof response === 'string' ? response : response.messageId;
+          const rawId = typeof response === 'string' ? response : response.messageId;
           const messageId = MessageId.parse(`msg_${rawId}`);
 
           return { messageId };

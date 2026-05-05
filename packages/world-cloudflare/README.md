@@ -47,7 +47,7 @@ export default {
     });
 
     return new Response(JSON.stringify(run));
-  }
+  },
 };
 ```
 
@@ -94,12 +94,14 @@ Total: ~1,350 lines of test coverage ensuring production reliability.
 ## Cost Estimate
 
 **Cloudflare Pricing:**
+
 - Durable Objects: $0.15/million requests
 - Queues: $0.40/million operations
 - Workers KV: $0.50/million reads
 - Workers: Included with paid plan ($5/month)
 
 **Estimated Monthly Cost:**
+
 - **Low usage** (100K workflows/month): $5-10
 - **Medium usage** (1M workflows/month): $10-20
 - **High usage** (10M workflows/month): $50-100
@@ -124,6 +126,7 @@ pnpm wrangler deploy
 ## When to Choose This Package
 
 **Use world-cloudflare when:**
+
 - Global sub-10ms latency required
 - Already using Cloudflare Workers
 - Edge computing benefits needed
@@ -131,6 +134,7 @@ pnpm wrangler deploy
 - Vendor lock-in acceptable
 
 **Consider alternatives when:**
+
 - Multi-cloud strategy required → use @fantasticfour/world-postgres-upstash
 - Traditional infrastructure preferred → use @fantasticfour/world-postgres-redis
 - Cost optimization priority → use @fantasticfour/world-redis

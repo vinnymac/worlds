@@ -42,9 +42,9 @@ const world = createWorld({
   // or use RedisOptions object:
   // redis: { host: 'localhost', port: 6379, password: 'secret' },
 
-  keyPrefix: 'workflow:',       // optional, for storage keys
-  jobPrefix: 'workflow_',       // optional, for BullMQ queue names
-  queueConcurrency: 10,          // optional, worker concurrency
+  keyPrefix: 'workflow:', // optional, for storage keys
+  jobPrefix: 'workflow_', // optional, for BullMQ queue names
+  queueConcurrency: 10, // optional, worker concurrency
 });
 
 await world.start();
@@ -71,20 +71,22 @@ This package provides advanced queue capabilities through BullMQ:
 
 ## Configuration Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `redis` | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
-| `keyPrefix` | `string` | `workflow:` | Prefix for storage keys |
-| `jobPrefix` | `string` | `workflow_` | Prefix for BullMQ queue names |
-| `queueConcurrency` | `number` | `10` | Number of concurrent queue workers |
+| Option             | Type                     | Default                  | Description                             |
+| ------------------ | ------------------------ | ------------------------ | --------------------------------------- |
+| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
+| `keyPrefix`        | `string`                 | `workflow:`              | Prefix for storage keys                 |
+| `jobPrefix`        | `string`                 | `workflow_`              | Prefix for BullMQ queue names           |
+| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers      |
 
 ## Redis Data Structures
 
 **Storage (same as world-redis):**
+
 - Hashes: `workflow:run:{runId}`, `workflow:step:{runId}:{stepId}`
 - Sorted Sets: `workflow:runs:index`, `workflow:runs:by_status:{status}`
 
 **BullMQ Queues:**
+
 - `{jobPrefix}flows` - Workflow invocations
 - `{jobPrefix}steps` - Step executions
 - Plus BullMQ internal structures for job management
@@ -98,7 +100,7 @@ import { Queue } from 'bullmq';
 
 // Access queue metrics
 const flowQueue = new Queue('workflow_flows', {
-  connection: { host: 'localhost', port: 6379 }
+  connection: { host: 'localhost', port: 6379 },
 });
 
 const counts = await flowQueue.getJobCounts();
@@ -106,6 +108,7 @@ console.log(counts); // { waiting, active, completed, failed, delayed }
 ```
 
 Use tools like:
+
 - **Bull Board**: Web UI for monitoring BullMQ queues
 - **BullMQ Metrics**: Prometheus metrics exporter
 - **Redis Commander**: View queue data structures
@@ -125,6 +128,7 @@ export WORKFLOW_REDIS_URL="redis://localhost:6379"
 ## When to Choose This Package
 
 **Use world-redis-bullmq when:**
+
 - Production deployments requiring reliability
 - You need job priorities, delays, or retries
 - Observability and monitoring are important
@@ -132,6 +136,7 @@ export WORKFLOW_REDIS_URL="redis://localhost:6379"
 - Advanced queue features justify the complexity
 
 **Consider alternatives when:**
+
 - You need simplicity over features → use @fantasticfour/world-redis
 - You need SQL queryability → use @fantasticfour/world-postgres-redis
 - You're on serverless platforms → use @fantasticfour/world-postgres-upstash

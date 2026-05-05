@@ -1,11 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import type {
-  CreateWorkflowRunRequest,
-  Event,
-  Hook,
-  Step,
-  WorkflowRun,
-} from '@workflow/world';
+import type { CreateWorkflowRunRequest, Event, Hook, Step, WorkflowRun } from '@workflow/world';
 
 /**
  * Durable Object for managing a single workflow run's state
@@ -15,9 +9,7 @@ export class WorkflowRunDO extends DurableObject {
   /**
    * Create a workflow run
    */
-  async createRun(
-    data: CreateWorkflowRunRequest & { runId: string }
-  ): Promise<WorkflowRun> {
+  async createRun(data: CreateWorkflowRunRequest & { runId: string }): Promise<WorkflowRun> {
     const now = new Date();
     const run: WorkflowRun = {
       runId: data.runId,
@@ -31,9 +23,7 @@ export class WorkflowRunDO extends DurableObject {
       completedAt: undefined,
       output: undefined,
       error: undefined,
-      executionContext: data.executionContext as
-        | Record<string, any>
-        | undefined,
+      executionContext: data.executionContext as Record<string, any> | undefined,
     };
 
     await this.ctx.storage.put('run', run);
@@ -98,8 +88,7 @@ export class WorkflowRunDO extends DurableObject {
    * Create a step
    */
   async createStep(stepData: Step): Promise<Step> {
-    const stepsMap =
-      (await this.ctx.storage.get<Map<string, Step>>('steps')) || new Map();
+    const stepsMap = (await this.ctx.storage.get<Map<string, Step>>('steps')) || new Map();
     stepsMap.set(stepData.stepId, stepData);
     await this.ctx.storage.put('steps', stepsMap);
     return stepData;
@@ -120,12 +109,8 @@ export class WorkflowRunDO extends DurableObject {
    * Update a step with automatic timestamp handling.
    * Uses Record<string, unknown> to avoid discriminated union type conflicts.
    */
-  async updateStep(
-    stepId: string,
-    updates: Record<string, unknown>
-  ): Promise<Step> {
-    const stepsMap =
-      (await this.ctx.storage.get<Map<string, Step>>('steps')) || new Map();
+  async updateStep(stepId: string, updates: Record<string, unknown>): Promise<Step> {
+    const stepsMap = (await this.ctx.storage.get<Map<string, Step>>('steps')) || new Map();
     const current = stepsMap.get(stepId);
 
     if (!current) {
@@ -145,10 +130,7 @@ export class WorkflowRunDO extends DurableObject {
     }
 
     // Set completedAt when transitioning to terminal states
-    if (
-      (updates.status === 'completed' || updates.status === 'failed') &&
-      !current.completedAt
-    ) {
+    if ((updates.status === 'completed' || updates.status === 'failed') && !current.completedAt) {
       updated.completedAt = now;
     }
 
@@ -203,8 +185,7 @@ export class WorkflowRunDO extends DurableObject {
    * Create a hook
    */
   async createHook(hookData: Hook): Promise<Hook> {
-    const hooksMap =
-      (await this.ctx.storage.get<Map<string, Hook>>('hooks')) || new Map();
+    const hooksMap = (await this.ctx.storage.get<Map<string, Hook>>('hooks')) || new Map();
     hooksMap.set(hookData.hookId, hookData);
     await this.ctx.storage.put('hooks', hooksMap);
     return hookData;

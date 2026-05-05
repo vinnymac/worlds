@@ -42,20 +42,14 @@ export interface PostgresUpstashWorldConfig {
 
 export function createPostgresUpstashWorld(
   config: PostgresUpstashWorldConfig = {
-    databaseUrl:
-      process.env.DATABASE_URL ||
-      'postgresql://localhost:5432/postgres_upstash_test',
+    databaseUrl: process.env.DATABASE_URL || 'postgresql://localhost:5432/postgres_upstash_test',
     qstash: {
       token: process.env.QSTASH_TOKEN || '',
       targetUrl: process.env.QSTASH_URL || 'http://localhost:8080',
     },
-  }
+  },
 ): World {
-  const {
-    databaseUrl,
-    qstash,
-    deploymentId = 'postgres-upstash-default',
-  } = config;
+  const { databaseUrl, qstash, deploymentId = 'postgres-upstash-default' } = config;
 
   // Create PostgreSQL client using standard wire protocol
   const postgres = createPostgres(databaseUrl);

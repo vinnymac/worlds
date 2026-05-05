@@ -58,7 +58,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ): Promise<void> {
       // Await runId if it's a promise
       await _runId;
@@ -68,8 +68,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
       const streamName = `${keyPrefix}stream_${name}`;
       const subject = `${streamName}.data`;
 
-      const data =
-        chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk);
+      const data = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk);
 
       // Publish chunk to JetStream with headers
       const h = createHeaders();
@@ -79,10 +78,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
       await jetstream.publish(subject, data, { headers: h });
     },
 
-    async closeStream(
-      name: string,
-      _runId: string | Promise<string>
-    ): Promise<void> {
+    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise
       await _runId;
 
@@ -99,10 +95,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
       await jetstream.publish(subject, new Uint8Array(0), { headers: h });
     },
 
-    async readFromStream(
-      name: string,
-      startIndex?: number
-    ): Promise<ReadableStream<Uint8Array>> {
+    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
       await ensureStream(name);
 
       const streamName = `${keyPrefix}stream_${name}`;
@@ -119,20 +112,14 @@ export function createStreamer(config: StreamerConfig): Streamer {
               name: consumerName,
               ack_policy: AckPolicy.Explicit,
               deliver_policy:
-                startIndex && startIndex > 0
-                  ? DeliverPolicy.StartSequence
-                  : DeliverPolicy.All,
-              opt_start_seq:
-                startIndex && startIndex > 0 ? startIndex : undefined,
+                startIndex && startIndex > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
+              opt_start_seq: startIndex && startIndex > 0 ? startIndex : undefined,
               filter_subject: `${streamName}.data`,
               inactive_threshold: 30 * 1_000_000_000, // 30 seconds
             });
 
             // Get the consumer via JetStreamClient.consumers API
-            const consumer = await jetstream.consumers.get(
-              streamName,
-              consumerInfo.name
-            );
+            const consumer = await jetstream.consumers.get(streamName, consumerInfo.name);
             const messages = await consumer.consume();
 
             let chunkIndex = 0;
@@ -164,10 +151,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
                 chunkIndex++;
                 msg.ack();
               } catch (error) {
-                console.error(
-                  '[world-nats-jetstream streamer] Error processing chunk:',
-                  error
-                );
+                console.error('[world-nats-jetstream streamer] Error processing chunk:', error);
                 msg.nak();
               }
             }

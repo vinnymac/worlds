@@ -16,9 +16,7 @@ async function setupDatabase() {
     'postgres://world:world@localhost:5432/world';
 
   console.log('🔧 Setting up database schema...');
-  console.log(
-    `📍 Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`
-  );
+  console.log(`📍 Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`);
 
   try {
     const sql = postgres(connectionString);
@@ -29,10 +27,7 @@ async function setupDatabase() {
     const migrationsDir = join(__dirname, '..', 'src', 'drizzle', 'migrations');
 
     // Read migration files in order
-    const migrationFiles = [
-      '0000_cheerful_kylun.sql',
-      '0001_sudden_wilson_fisk.sql',
-    ];
+    const migrationFiles = ['0000_cheerful_kylun.sql', '0001_sudden_wilson_fisk.sql'];
 
     for (const file of migrationFiles) {
       const migrationPath = join(migrationsDir, file);

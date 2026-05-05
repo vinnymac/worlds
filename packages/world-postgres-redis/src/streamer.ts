@@ -65,9 +65,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
 
   const STREAM_TOPIC = 'workflow_event_chunk';
   postgres.listen(STREAM_TOPIC, async (msg) => {
-    const parsed = await Promise.resolve(msg)
-      .then(JSON.parse)
-      .then(StreamPublishMessage.parse);
+    const parsed = await Promise.resolve(msg).then(JSON.parse).then(StreamPublishMessage.parse);
 
     const key = `strm:${parsed.streamId}` as const;
     if (!events.listenerCount(key)) {
@@ -79,12 +77,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
       const [value] = await drizzle
         .select({ eof: streams.eof, data: streams.chunkData })
         .from(streams)
-        .where(
-          and(
-            eq(streams.streamId, parsed.streamId),
-            eq(streams.chunkId, parsed.chunkId)
-          )
-        )
+        .where(and(eq(streams.streamId, parsed.streamId), eq(streams.chunkId, parsed.chunkId)))
         .limit(1);
       if (!value) return;
       const { data, eof } = value;
@@ -96,7 +89,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
@@ -114,14 +107,11 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
           StreamPublishMessage.encode({
             chunkId,
             streamId: name,
-          })
-        )
+          }),
+        ),
       );
     },
-    async closeStream(
-      name: string,
-      _runId: string | Promise<string>
-    ): Promise<void> {
+    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
@@ -138,14 +128,11 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
           StreamPublishMessage.encode({
             streamId: name,
             chunkId,
-          })
-        )
+          }),
+        ),
       );
     },
-    async readFromStream(
-      name: string,
-      startIndex?: number
-    ): Promise<ReadableStream<Uint8Array>> {
+    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
       const cleanups: (() => void)[] = [];
 
       return new ReadableStream<Uint8Array>({
@@ -168,11 +155,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
             return false;
           };
 
-          const enqueueChunkData = (msg: {
-            id: string;
-            data: Uint8Array;
-            eof: boolean;
-          }): void => {
+          const enqueueChunkData = (msg: { id: string; data: Uint8Array; eof: boolean }): void => {
             if (msg.data.byteLength) {
               controller.enqueue(new Uint8Array(msg.data));
             }
@@ -182,11 +165,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
             lastChunkId = msg.id;
           };
 
-          function enqueue(msg: {
-            id: string;
-            data: Uint8Array;
-            eof: boolean;
-          }) {
+          function enqueue(msg: { id: string; data: Uint8Array; eof: boolean }) {
             if (shouldSkipChunk(msg.id)) return;
             if (shouldApplyOffset()) return;
             enqueueChunkData(msg);
@@ -235,16 +214,13 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
     async getStreamChunks(
       _name: string,
       _runId: string,
-      _options?: GetChunksOptions
+      _options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
       // Not implemented for Postgres-Redis
       return { data: [], hasMore: false, cursor: null, done: true };
     },
 
-    async getStreamInfo(
-      _name: string,
-      _runId: string
-    ): Promise<StreamInfoResponse> {
+    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
       // Not implemented for Postgres-Redis
       return { tailIndex: -1, done: false };
     },

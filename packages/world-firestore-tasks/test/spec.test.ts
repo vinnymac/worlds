@@ -14,7 +14,7 @@ if (process.platform === 'win32') {
   beforeAll(async () => {
     // Use official FirestoreEmulatorContainer API
     container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
     ).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
@@ -59,6 +59,6 @@ if (process.platform === 'win32') {
     () => {
       createTestSuite('@fantasticfour/world-firestore-tasks');
     },
-    { timeout: 120_000 }
+    { timeout: 120_000 },
   );
 }

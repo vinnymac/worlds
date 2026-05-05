@@ -49,13 +49,7 @@ interface RedisStorageConfig {
  * This breaks the TypeScript contract which expects Date objects.
  * PostgreSQL's Drizzle ORM handles this automatically, but Redis requires manual conversion.
  */
-const DATE_FIELDS = new Set([
-  'createdAt',
-  'updatedAt',
-  'startedAt',
-  'completedAt',
-  'retryAfter',
-]);
+const DATE_FIELDS = new Set(['createdAt', 'updatedAt', 'startedAt', 'completedAt', 'retryAfter']);
 
 /**
  * Reviver function for JSON.parse() that converts ISO date strings to Date objects.
@@ -97,11 +91,7 @@ function uint8ArrayReviver(key: string, value: any): any {
   const dateValue = dateReviver(key, value);
 
   // Then check for Uint8Array marker
-  if (
-    dateValue &&
-    typeof dateValue === 'object' &&
-    dateValue.__uint8array === true
-  ) {
+  if (dateValue && typeof dateValue === 'object' && dateValue.__uint8array === true) {
     return new Uint8Array(dateValue.data);
   }
 
@@ -135,14 +125,8 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 
 function filterStepData(step: Step, resolveData: 'none'): StepWithoutData;
 function filterStepData(step: Step, resolveData: 'all'): Step;
-function filterStepData(
-  step: Step,
-  resolveData: ResolveData
-): Step | StepWithoutData;
-function filterStepData(
-  step: Step,
-  resolveData: ResolveData
-): Step | StepWithoutData {
+function filterStepData(step: Step, resolveData: ResolveData): Step | StepWithoutData;
+function filterStepData(step: Step, resolveData: ResolveData): Step | StepWithoutData {
   if (resolveData === 'none') {
     const { input: _, output: __, ...rest } = step;
     return { input: undefined, output: undefined, ...rest };
@@ -150,18 +134,15 @@ function filterStepData(
   return step;
 }
 
-function filterRunData(
-  run: WorkflowRun,
-  resolveData: 'none'
-): WorkflowRunWithoutData;
+function filterRunData(run: WorkflowRun, resolveData: 'none'): WorkflowRunWithoutData;
 function filterRunData(run: WorkflowRun, resolveData: 'all'): WorkflowRun;
 function filterRunData(
   run: WorkflowRun,
-  resolveData: ResolveData
+  resolveData: ResolveData,
 ): WorkflowRun | WorkflowRunWithoutData;
 function filterRunData(
   run: WorkflowRun,
-  resolveData: ResolveData
+  resolveData: ResolveData,
 ): WorkflowRun | WorkflowRunWithoutData {
   if (resolveData === 'none') {
     const { input: _, output: __, ...rest } = run;
@@ -187,8 +168,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
   const runKey = (id: string) => `${keyPrefix}run:${id}`;
   const runsIndexKey = () => `${keyPrefix}runs:index`;
   const runsByNameKey = (name: string) => `${keyPrefix}runs:by_name:${name}`;
-  const runsByStatusKey = (status: string) =>
-    `${keyPrefix}runs:by_status:${status}`;
+  const runsByStatusKey = (status: string) => `${keyPrefix}runs:by_status:${status}`;
 
   // Helper: Select appropriate index key based on filters
   function selectIndexKey(params?: ListWorkflowRunsParams): string {
@@ -208,7 +188,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
   // Helper: Calculate start position from cursor
   async function calculateStartPosition(
     indexKey: string,
-    cursor: string | undefined
+    cursor: string | undefined,
   ): Promise<number> {
     if (!cursor) {
       return 0;
@@ -220,7 +200,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
   // Helper: Fetch and parse runs from pipeline results
   function parseRunsFromPipeline(
     results: any[] | null,
-    params?: ListWorkflowRunsParams
+    params?: ListWorkflowRunsParams,
   ): (WorkflowRun | WorkflowRunWithoutData)[] {
     const runs: (WorkflowRun | WorkflowRunWithoutData)[] = [];
 
@@ -229,14 +209,11 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
         continue;
       }
 
-      const run: WorkflowRun = parseWithUint8Array<WorkflowRun>(
-        result[1] as string
-      );
+      const run: WorkflowRun = parseWithUint8Array<WorkflowRun>(result[1] as string);
 
       // Apply filters
       const statusMatches = !params?.status || run.status === params.status;
-      const nameMatches =
-        !params?.workflowName || run.workflowName === params.workflowName;
+      const nameMatches = !params?.workflowName || run.workflowName === params.workflowName;
 
       if (statusMatches && nameMatches) {
         const resolveData = params?.resolveData ?? 'all';
@@ -291,15 +268,12 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
 /**
  * Create storage for workflow events using Redis hashes and sorted sets
  */
-export function createEventsStorage(
-  config: RedisStorageConfig
-): Storage['events'] {
+export function createEventsStorage(config: RedisStorageConfig): Storage['events'] {
   const { redis, keyPrefix } = config;
   const ulid = monotonicFactory();
 
   const eventKey = (id: string) => `${keyPrefix}event:${id}`;
-  const eventsIndexKey = (runId: string) =>
-    `${keyPrefix}events:by_run:${runId}`;
+  const eventsIndexKey = (runId: string) => `${keyPrefix}events:by_run:${runId}`;
   const eventsByCorrelationKey = (correlationId: string) =>
     `${keyPrefix}events:by_correlation:${correlationId}`;
 
@@ -307,18 +281,15 @@ export function createEventsStorage(
   const runKey = (id: string) => `${keyPrefix}run:${id}`;
   const runsIndexKey = () => `${keyPrefix}runs:index`;
   const runsByNameKey = (name: string) => `${keyPrefix}runs:by_name:${name}`;
-  const runsByStatusKey = (status: string) =>
-    `${keyPrefix}runs:by_status:${status}`;
+  const runsByStatusKey = (status: string) => `${keyPrefix}runs:by_status:${status}`;
 
   // Step key helpers
-  const stepKey = (runId: string, stepId: string) =>
-    `${keyPrefix}step:${runId}:${stepId}`;
+  const stepKey = (runId: string, stepId: string) => `${keyPrefix}step:${runId}:${stepId}`;
   const stepsIndexKey = (runId: string) => `${keyPrefix}steps:by_run:${runId}`;
 
   // Hook key helpers
   const hookKey = (hookId: string) => `${keyPrefix}hook:${hookId}`;
-  const hooksByTokenKey = (token: string) =>
-    `${keyPrefix}hooks:by_token:${token}`;
+  const hooksByTokenKey = (token: string) => `${keyPrefix}hooks:by_token:${token}`;
   const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
 
   // Helper: Clean up hooks when run reaches terminal status
@@ -343,7 +314,7 @@ export function createEventsStorage(
   async function calculateEventStartPosition(
     indexKey: string,
     cursor: string | undefined,
-    sortOrder: 'asc' | 'desc'
+    sortOrder: 'asc' | 'desc',
   ): Promise<number> {
     if (!cursor) {
       return 0;
@@ -358,7 +329,7 @@ export function createEventsStorage(
     indexKey: string,
     start: number,
     limit: number,
-    sortOrder: 'asc' | 'desc'
+    sortOrder: 'asc' | 'desc',
   ): Promise<string[]> {
     const rangeFn = sortOrder === 'desc' ? 'zrevrange' : 'zrange';
     return redis[rangeFn](indexKey, start, start + limit);
@@ -386,7 +357,7 @@ export function createEventsStorage(
     eventId: string,
     data: any,
     currentRun: { status: string; specVersion?: number },
-    params?: { resolveData?: ResolveData }
+    params?: { resolveData?: ResolveData },
   ): Promise<EventResult> {
     const resolveData = params?.resolveData ?? 'all';
 
@@ -439,11 +410,7 @@ export function createEventsStorage(
         const pipeline = redis.pipeline();
         pipeline.zadd(eventsIndexKey(runId), score, eventId);
         if (data.correlationId) {
-          pipeline.zadd(
-            eventsByCorrelationKey(data.correlationId),
-            score,
-            eventId
-          );
+          pipeline.zadd(eventsByCorrelationKey(data.correlationId), score, eventId);
         }
         await pipeline.exec();
 
@@ -455,7 +422,7 @@ export function createEventsStorage(
         throw new Error(
           `Event type '${data.eventType}' not supported for legacy runs ` +
             `(specVersion: ${currentRun.specVersion || 'undefined'}). ` +
-            `Please upgrade @workflow packages.`
+            `Please upgrade @workflow packages.`,
         );
     }
   }
@@ -464,7 +431,7 @@ export function createEventsStorage(
     async create(
       runId: string | null,
       data: CreateEventRequest | RunCreatedEventRequest,
-      params?: CreateEventParams
+      params?: CreateEventParams,
     ): Promise<EventResult> {
       const eventId = `wevt_${ulid()}`;
       const now = new Date();
@@ -491,8 +458,7 @@ export function createEventsStorage(
         ['completed', 'failed', 'cancelled'].includes(status);
 
       // Helper to check if step is in terminal state
-      const isStepTerminal = (status: string) =>
-        ['completed', 'failed'].includes(status);
+      const isStepTerminal = (status: string) => ['completed', 'failed'].includes(status);
 
       // ============================================================
       // VALIDATION: Terminal state and event ordering checks
@@ -503,10 +469,7 @@ export function createEventsStorage(
         specVersion?: number;
       } | null = null;
       const skipRunValidationEvents = ['step_completed', 'step_retrying'];
-      if (
-        data.eventType !== 'run_created' &&
-        !skipRunValidationEvents.includes(data.eventType)
-      ) {
+      if (data.eventType !== 'run_created' && !skipRunValidationEvents.includes(data.eventType)) {
         const runData = await redis.get(runKey(effectiveRunId));
         if (runData) {
           const parsed = parseWithUint8Array<WorkflowRun>(runData);
@@ -524,34 +487,21 @@ export function createEventsStorage(
         if (requiresNewerWorld(currentRun.specVersion)) {
           throw new (await import('@workflow/errors')).RunNotSupportedError(
             currentRun.specVersion!,
-            SPEC_VERSION_CURRENT
+            SPEC_VERSION_CURRENT,
           );
         }
 
         if (isLegacySpecVersion(currentRun.specVersion)) {
-          return handleLegacyEvent(
-            effectiveRunId,
-            eventId,
-            data,
-            currentRun,
-            params
-          );
+          return handleLegacyEvent(effectiveRunId, eventId, data, currentRun, params);
         }
       }
 
       // Run terminal state validation
       if (currentRun && isRunTerminal(currentRun.status)) {
-        const runTerminalEvents = [
-          'run_started',
-          'run_completed',
-          'run_failed',
-        ];
+        const runTerminalEvents = ['run_started', 'run_completed', 'run_failed'];
 
         // Idempotent operation: run_cancelled on already cancelled run is allowed
-        if (
-          data.eventType === 'run_cancelled' &&
-          currentRun.status === 'cancelled'
-        ) {
+        if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
           // Get full run for return value
           const fullRunData = await redis.get(runKey(effectiveRunId));
 
@@ -579,24 +529,18 @@ export function createEventsStorage(
         }
 
         // Run state transitions are not allowed on terminal runs
-        if (
-          runTerminalEvents.includes(data.eventType) ||
-          data.eventType === 'run_cancelled'
-        ) {
+        if (runTerminalEvents.includes(data.eventType) || data.eventType === 'run_cancelled') {
           throw new WorkflowWorldError(
             `Cannot transition run from terminal state "${currentRun.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
 
         // Creating new entities on terminal runs is not allowed
-        if (
-          data.eventType === 'step_created' ||
-          data.eventType === 'hook_created'
-        ) {
+        if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
           throw new WorkflowWorldError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
       }
@@ -604,13 +548,8 @@ export function createEventsStorage(
       // Step-related event validation
       let validatedStep: { status: string; startedAt?: Date } | null = null;
       const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
-      if (
-        stepEventsNeedingValidation.includes(data.eventType) &&
-        data.correlationId
-      ) {
-        const stepData = await redis.get(
-          stepKey(effectiveRunId, data.correlationId)
-        );
+      if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
+        const stepData = await redis.get(stepKey(effectiveRunId, data.correlationId));
         if (stepData) {
           const parsed = parseWithUint8Array<Step>(stepData);
           validatedStep = {
@@ -620,16 +559,13 @@ export function createEventsStorage(
         }
 
         if (!validatedStep) {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
 
         if (isStepTerminal(validatedStep.status)) {
           throw new WorkflowWorldError(
             `Cannot modify step in terminal state "${validatedStep.status}"`,
-            { status: 410 }
+            { status: 410 },
           );
         }
 
@@ -637,7 +573,7 @@ export function createEventsStorage(
           if (validatedStep.status !== 'running') {
             throw new WorkflowWorldError(
               `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
         }
@@ -645,16 +581,10 @@ export function createEventsStorage(
 
       // Hook-related event validation
       const hookEventsRequiringExistence = ['hook_disposed', 'hook_received'];
-      if (
-        hookEventsRequiringExistence.includes(data.eventType) &&
-        data.correlationId
-      ) {
+      if (hookEventsRequiringExistence.includes(data.eventType) && data.correlationId) {
         const existingHook = await redis.get(hookKey(data.correlationId));
         if (!existingHook) {
-          throw new WorkflowWorldError(
-            `Hook "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Hook "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -688,10 +618,7 @@ export function createEventsStorage(
         };
 
         // Use SET NX to ensure run doesn't already exist
-        const existed = await redis.setnx(
-          runKey(effectiveRunId),
-          stringifyWithUint8Array(newRun)
-        );
+        const existed = await redis.setnx(runKey(effectiveRunId), stringifyWithUint8Array(newRun));
         if (existed) {
           const score = now.getTime();
           await redis
@@ -715,19 +642,12 @@ export function createEventsStorage(
             startedAt: now,
             updatedAt: now,
           };
-          await redis.set(
-            runKey(effectiveRunId),
-            stringifyWithUint8Array(updatedRun)
-          );
+          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
 
           // Update status index
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
-          pipeline.zadd(
-            runsByStatusKey('running'),
-            now.getTime(),
-            effectiveRunId
-          );
+          pipeline.zadd(runsByStatusKey('running'), now.getTime(), effectiveRunId);
           await pipeline.exec();
 
           run = WorkflowRunSchema.parse(compact(updatedRun));
@@ -747,18 +667,11 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(
-            runKey(effectiveRunId),
-            stringifyWithUint8Array(updatedRun)
-          );
+          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
 
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
-          pipeline.zadd(
-            runsByStatusKey('completed'),
-            now.getTime(),
-            effectiveRunId
-          );
+          pipeline.zadd(runsByStatusKey('completed'), now.getTime(), effectiveRunId);
           await pipeline.exec();
 
           await cleanupHooks(effectiveRunId);
@@ -792,18 +705,11 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(
-            runKey(effectiveRunId),
-            stringifyWithUint8Array(updatedRun)
-          );
+          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
 
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
-          pipeline.zadd(
-            runsByStatusKey('failed'),
-            now.getTime(),
-            effectiveRunId
-          );
+          pipeline.zadd(runsByStatusKey('failed'), now.getTime(), effectiveRunId);
           await pipeline.exec();
 
           await cleanupHooks(effectiveRunId);
@@ -823,18 +729,11 @@ export function createEventsStorage(
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(
-            runKey(effectiveRunId),
-            stringifyWithUint8Array(updatedRun)
-          );
+          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
 
           const pipeline = redis.pipeline();
           pipeline.zrem(runsByStatusKey(existing.status), effectiveRunId);
-          pipeline.zadd(
-            runsByStatusKey('cancelled'),
-            now.getTime(),
-            effectiveRunId
-          );
+          pipeline.zadd(runsByStatusKey('cancelled'), now.getTime(), effectiveRunId);
           await pipeline.exec();
 
           await cleanupHooks(effectiveRunId);
@@ -864,14 +763,10 @@ export function createEventsStorage(
 
         const existed = await redis.setnx(
           stepKey(effectiveRunId, data.correlationId!),
-          stringifyWithUint8Array(newStep)
+          stringifyWithUint8Array(newStep),
         );
         if (existed) {
-          await redis.zadd(
-            stepsIndexKey(effectiveRunId),
-            now.getTime(),
-            data.correlationId!
-          );
+          await redis.zadd(stepsIndexKey(effectiveRunId), now.getTime(), data.correlationId!);
           step = StepSchema.parse(compact(newStep));
         }
       }
@@ -879,9 +774,7 @@ export function createEventsStorage(
       // Handle step_started event: increment attempt, set status to 'running'
       if (data.eventType === 'step_started') {
         const isFirstStart = !validatedStep?.startedAt;
-        const existingData = await redis.get(
-          stepKey(effectiveRunId, data.correlationId!)
-        );
+        const existingData = await redis.get(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
           const existing = parseWithUint8Array<Step>(existingData);
           const updatedStep = {
@@ -893,7 +786,7 @@ export function createEventsStorage(
           };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep)
+            stringifyWithUint8Array(updatedStep),
           );
           step = StepSchema.parse(compact(updatedStep));
         }
@@ -902,15 +795,13 @@ export function createEventsStorage(
       // Handle step_completed event: update step status
       if (data.eventType === 'step_completed') {
         const eventData = (data as any).eventData as { result?: any };
-        const existingData = await redis.get(
-          stepKey(effectiveRunId, data.correlationId!)
-        );
+        const existingData = await redis.get(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
           const existing = parseWithUint8Array<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
           const updatedStep = {
@@ -922,14 +813,11 @@ export function createEventsStorage(
           };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep)
+            stringifyWithUint8Array(updatedStep),
           );
           step = StepSchema.parse(compact(updatedStep));
         } else {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -944,15 +832,13 @@ export function createEventsStorage(
             ? eventData.error
             : (eventData.error?.message ?? 'Unknown error');
 
-        const existingData = await redis.get(
-          stepKey(effectiveRunId, data.correlationId!)
-        );
+        const existingData = await redis.get(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
           const existing = parseWithUint8Array<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 }
+              { status: 410 },
             );
           }
           const updatedStep = {
@@ -967,14 +853,11 @@ export function createEventsStorage(
           };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep)
+            stringifyWithUint8Array(updatedStep),
           );
           step = StepSchema.parse(compact(updatedStep));
         } else {
-          throw new WorkflowWorldError(
-            `Step "${data.correlationId}" not found`,
-            { status: 404 }
-          );
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
       }
 
@@ -990,9 +873,7 @@ export function createEventsStorage(
             ? eventData.error
             : (eventData.error?.message ?? 'Unknown error');
 
-        const existingData = await redis.get(
-          stepKey(effectiveRunId, data.correlationId!)
-        );
+        const existingData = await redis.get(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
           const existing = parseWithUint8Array<Step>(existingData);
           const updatedStep = {
@@ -1007,7 +888,7 @@ export function createEventsStorage(
           };
           await redis.set(
             stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep)
+            stringifyWithUint8Array(updatedStep),
           );
           step = StepSchema.parse(compact(updatedStep));
         }
@@ -1021,9 +902,7 @@ export function createEventsStorage(
         };
 
         // Check for duplicate token
-        const existingHookId = await redis.get(
-          hooksByTokenKey(eventData.token)
-        );
+        const existingHookId = await redis.get(hooksByTokenKey(eventData.token));
         if (existingHookId) {
           // Create hook_conflict event instead of throwing 409
           const conflictEventData = { token: eventData.token };
@@ -1038,19 +917,12 @@ export function createEventsStorage(
             specVersion: effectiveSpecVersion,
           };
 
-          await redis.set(
-            eventKey(eventId),
-            stringifyWithUint8Array(conflictEvent)
-          );
+          await redis.set(eventKey(eventId), stringifyWithUint8Array(conflictEvent));
           const score = createdAt.getTime();
           const pipeline = redis.pipeline();
           pipeline.zadd(eventsIndexKey(effectiveRunId), score, eventId);
           if (data.correlationId) {
-            pipeline.zadd(
-              eventsByCorrelationKey(data.correlationId),
-              score,
-              eventId
-            );
+            pipeline.zadd(eventsByCorrelationKey(data.correlationId), score, eventId);
           }
           await pipeline.exec();
 
@@ -1078,17 +950,13 @@ export function createEventsStorage(
 
         const existed = await redis.setnx(
           hookKey(data.correlationId!),
-          stringifyWithUint8Array(newHook)
+          stringifyWithUint8Array(newHook),
         );
         if (existed) {
           await redis
             .pipeline()
             .set(hooksByTokenKey(eventData.token), data.correlationId!)
-            .zadd(
-              hooksIndexKey(effectiveRunId),
-              now.getTime(),
-              data.correlationId!
-            )
+            .zadd(hooksIndexKey(effectiveRunId), now.getTime(), data.correlationId!)
             .exec();
           hook = HookSchema.parse(compact(newHook));
         }
@@ -1124,11 +992,7 @@ export function createEventsStorage(
       const pipeline = redis.pipeline();
       pipeline.zadd(eventsIndexKey(effectiveRunId), score, eventId);
       if (data.correlationId) {
-        pipeline.zadd(
-          eventsByCorrelationKey(data.correlationId),
-          score,
-          eventId
-        );
+        pipeline.zadd(eventsByCorrelationKey(data.correlationId), score, eventId);
       }
       await pipeline.exec();
 
@@ -1158,11 +1022,7 @@ export function createEventsStorage(
       const fromCursor = params?.pagination?.cursor;
 
       const indexKey = eventsIndexKey(params.runId);
-      const start = await calculateEventStartPosition(
-        indexKey,
-        fromCursor,
-        sortOrder
-      );
+      const start = await calculateEventStartPosition(indexKey, fromCursor, sortOrder);
       const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
       // Fetch events via pipeline
@@ -1188,18 +1048,14 @@ export function createEventsStorage(
     },
 
     async listByCorrelationId(
-      params: ListEventsByCorrelationIdParams
+      params: ListEventsByCorrelationIdParams,
     ): Promise<PaginatedResponse<Event>> {
       const limit = params?.pagination?.limit ?? 100;
       const sortOrder = params.pagination?.sortOrder || 'asc';
       const fromCursor = params?.pagination?.cursor;
 
       const indexKey = eventsByCorrelationKey(params.correlationId);
-      const start = await calculateEventStartPosition(
-        indexKey,
-        fromCursor,
-        sortOrder
-      );
+      const start = await calculateEventStartPosition(indexKey, fromCursor, sortOrder);
       const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
       // Fetch events via pipeline
@@ -1229,13 +1085,10 @@ export function createEventsStorage(
 /**
  * Create storage for workflow steps using Redis hashes and sorted sets
  */
-export function createStepsStorage(
-  config: RedisStorageConfig
-): Storage['steps'] {
+export function createStepsStorage(config: RedisStorageConfig): Storage['steps'] {
   const { redis, keyPrefix } = config;
 
-  const stepKey = (runId: string, stepId: string) =>
-    `${keyPrefix}step:${runId}:${stepId}`;
+  const stepKey = (runId: string, stepId: string) => `${keyPrefix}step:${runId}:${stepId}`;
   const stepsIndexKey = (runId: string) => `${keyPrefix}steps:by_run:${runId}`;
 
   // Helper: Scan Redis for a key matching pattern
@@ -1243,13 +1096,7 @@ export function createStepsStorage(
     let cursor = '0';
 
     do {
-      const [nextCursor, keys] = await redis.scan(
-        cursor,
-        'MATCH',
-        pattern,
-        'COUNT',
-        100
-      );
+      const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
 
       if (keys.length > 0) {
         return keys[0];
@@ -1265,7 +1112,7 @@ export function createStepsStorage(
   async function getStepData(
     key: string,
     stepId: string,
-    params?: GetStepParams
+    params?: GetStepParams,
   ): Promise<Step | StepWithoutData> {
     const data = await redis.get(key);
 
@@ -1282,11 +1129,7 @@ export function createStepsStorage(
   }
 
   return {
-    get: (async (
-      runId: string | undefined,
-      stepId: string,
-      params?: GetStepParams
-    ) => {
+    get: (async (runId: string | undefined, stepId: string, params?: GetStepParams) => {
       // If runId not provided, scan for the step (slower but necessary)
       if (!runId) {
         const pattern = `${keyPrefix}step:*:${stepId}`;
@@ -1313,9 +1156,7 @@ export function createStepsStorage(
 
       // ZREVRANGE for descending order
       const start = fromCursor
-        ? await redis
-            .zrevrank(indexKey, fromCursor)
-            .then((rank) => (rank ?? 0) + 1)
+        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
         : 0;
 
       const stepIds = await redis.zrevrange(indexKey, start, start + limit);
@@ -1352,14 +1193,11 @@ export function createStepsStorage(
 /**
  * Create storage for hooks using Redis hashes and sorted sets
  */
-export function createHooksStorage(
-  config: RedisStorageConfig
-): Storage['hooks'] {
+export function createHooksStorage(config: RedisStorageConfig): Storage['hooks'] {
   const { redis, keyPrefix } = config;
 
   const hookKeyFn = (hookId: string) => `${keyPrefix}hook:${hookId}`;
-  const hooksByTokenKey = (token: string) =>
-    `${keyPrefix}hooks:by_token:${token}`;
+  const hooksByTokenKey = (token: string) => `${keyPrefix}hooks:by_token:${token}`;
   const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
 
   return {
@@ -1398,9 +1236,7 @@ export function createHooksStorage(
 
       // ZREVRANGE for descending order
       const start = fromCursor
-        ? await redis
-            .zrevrank(indexKey, fromCursor)
-            .then((rank) => (rank ?? 0) + 1)
+        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
         : 0;
 
       const hookIds = await redis.zrevrange(indexKey, start, start + limit);

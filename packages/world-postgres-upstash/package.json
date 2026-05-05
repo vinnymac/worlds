@@ -2,8 +2,23 @@
   "name": "@fantasticfour/world-postgres-upstash",
   "version": "1.0.2",
   "description": "World implementation using PostgreSQL for storage and Upstash QStash for queue management - works with any PostgreSQL provider (Neon, Supabase, RDS, etc.)",
-  "type": "module",
-  "main": "dist/index.js",
+  "keywords": [
+    "durable-functions",
+    "neon",
+    "postgres",
+    "postgresql",
+    "qstash",
+    "supabase",
+    "upstash",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "vinnymac",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-postgres-upstash"
+  },
   "bin": {
     "world-postgres-upstash-setup": "./bin/setup.js"
   },
@@ -12,16 +27,8 @@
     "bin",
     "migrations"
   ],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/vinnymac/worlds.git",
-    "directory": "packages/world-postgres-upstash"
-  },
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -36,6 +43,10 @@
       "default": "./dist/cli.js"
     },
     "./migrations/*.sql": "./migrations/*.sql"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc && chmod +x bin/setup.js",
@@ -68,19 +79,8 @@
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "keywords": [
-    "workflow",
-    "postgres",
-    "postgresql",
-    "upstash",
-    "qstash",
-    "neon",
-    "supabase",
-    "durable-functions"
-  ],
-  "author": "vinnymac",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

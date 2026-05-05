@@ -10,10 +10,7 @@ import {
 } from './storage.js';
 import { createStreamer } from './streamer.js';
 
-function createStorage(
-  getJetStream: () => Promise<JetStreamClient>,
-  keyPrefix: string
-): Storage {
+function createStorage(getJetStream: () => Promise<JetStreamClient>, keyPrefix: string): Storage {
   const config = { getJetStream, keyPrefix };
   return {
     runs: createRunsStorage(config),
@@ -25,18 +22,12 @@ function createStorage(
 
 export function createWorld(
   config: NatsJetStreamWorldConfig = {
-    nats:
-      process.env.WORKFLOW_NATS_URL ||
-      process.env.NATS_URL ||
-      'nats://localhost:4222',
+    nats: process.env.WORKFLOW_NATS_URL || process.env.NATS_URL || 'nats://localhost:4222',
     jobPrefix: process.env.WORKFLOW_NATS_JOB_PREFIX,
     queueConcurrency:
-      Number.parseInt(
-        process.env.WORKFLOW_NATS_WORKER_CONCURRENCY || '10',
-        10
-      ) || 10,
+      Number.parseInt(process.env.WORKFLOW_NATS_WORKER_CONCURRENCY || '10', 10) || 10,
     keyPrefix: process.env.WORKFLOW_NATS_KEY_PREFIX || 'workflow_',
-  }
+  },
 ): World & { start(): Promise<void>; close(): Promise<void> } {
   let nc: NatsConnection | undefined;
   let jetstream: JetStreamClient | undefined;

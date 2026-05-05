@@ -18,26 +18,16 @@ export interface FirestoreTasksWorldConfig {
 }
 
 export function createFirestoreTasksWorld(
-  config: FirestoreTasksWorldConfig = {}
+  config: FirestoreTasksWorldConfig = {},
 ): World & { start(): Promise<void> } {
   // Use provided config or fall back to environment variables
   const projectId =
-    config.project ||
-    process.env.FIRESTORE_PROJECT_ID ||
-    process.env.GCP_PROJECT ||
-    'test-project';
-  const locationId =
-    config.location || process.env.CLOUD_TASKS_LOCATION || 'us-central1';
-  const queueId =
-    config.queueName || process.env.CLOUD_TASKS_QUEUE || 'workflow-queue';
-  const target =
-    config.targetUrl ||
-    process.env.CLOUD_TASKS_TARGET_URL ||
-    'http://localhost:3000';
+    config.project || process.env.FIRESTORE_PROJECT_ID || process.env.GCP_PROJECT || 'test-project';
+  const locationId = config.location || process.env.CLOUD_TASKS_LOCATION || 'us-central1';
+  const queueId = config.queueName || process.env.CLOUD_TASKS_QUEUE || 'workflow-queue';
+  const target = config.targetUrl || process.env.CLOUD_TASKS_TARGET_URL || 'http://localhost:3000';
   const deploymentId =
-    config.deploymentId ||
-    process.env.WORKFLOW_DEPLOYMENT_ID ||
-    'firestore-tasks-default';
+    config.deploymentId || process.env.WORKFLOW_DEPLOYMENT_ID || 'firestore-tasks-default';
 
   // Initialize Firestore if not provided
   const firestoreInstance =

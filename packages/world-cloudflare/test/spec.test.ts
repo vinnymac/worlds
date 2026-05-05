@@ -58,5 +58,5 @@ createTestSuite(() =>
   createWorld({
     env: mockEnv,
     deploymentId: 'test-deployment',
-  })
+  }),
 );

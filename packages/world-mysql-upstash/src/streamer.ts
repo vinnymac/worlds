@@ -20,9 +20,7 @@ const { streams } = schema;
  * - Readers poll for chunks where sequence > lastSequence
  * - Poll interval of 100ms provides acceptable latency for most use cases
  */
-export function createStreamer(
-  drizzle: MySql2Database<typeof schema>
-): Streamer {
+export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer {
   const ulid = monotonicFactory();
 
   const genChunkId = () => `chnk_${ulid()}` as const;
@@ -33,7 +31,7 @@ export function createStreamer(
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
@@ -55,10 +53,7 @@ export function createStreamer(
       });
     },
 
-    async closeStream(
-      name: string,
-      _runId: string | Promise<string>
-    ): Promise<void> {
+    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
@@ -72,10 +67,7 @@ export function createStreamer(
       });
     },
 
-    async readFromStream(
-      name: string,
-      startIndex?: number
-    ): Promise<ReadableStream<Uint8Array>> {
+    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
       let closed = false;
       let lastSequence = startIndex ?? -1;
 
@@ -93,12 +85,7 @@ export function createStreamer(
                   data: streams.chunkData,
                 })
                 .from(streams)
-                .where(
-                  and(
-                    eq(streams.streamId, name),
-                    gt(streams.sequence, lastSequence)
-                  )
-                )
+                .where(and(eq(streams.streamId, name), gt(streams.sequence, lastSequence)))
                 .orderBy(streams.sequence)
                 .limit(10);
 
@@ -150,16 +137,13 @@ export function createStreamer(
     async getStreamChunks(
       _name: string,
       _runId: string,
-      _options?: GetChunksOptions
+      _options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
       // Not implemented for MySQL-Upstash
       return { data: [], hasMore: false, cursor: null, done: true };
     },
 
-    async getStreamInfo(
-      _name: string,
-      _runId: string
-    ): Promise<StreamInfoResponse> {
+    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
       // Not implemented for MySQL-Upstash
       return { tailIndex: -1, done: false };
     },

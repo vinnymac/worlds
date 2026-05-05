@@ -4,11 +4,5 @@
     "suspicious": "warn",
     "perf": "warn"
   },
-  "ignore_pattern": [
-    "**/node_modules",
-    "**/dist",
-    "**/.turbo",
-    "**/.changeset",
-    "**/coverage"
-  ]
+  "ignore_pattern": ["**/node_modules", "**/dist", "**/.turbo", "**/.changeset", "**/coverage"]
 }

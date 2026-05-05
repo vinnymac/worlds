@@ -3,13 +3,7 @@
  * Provides mock Durable Object stubs with RPC methods
  */
 
-import type {
-  CreateWorkflowRunRequest,
-  Event,
-  Hook,
-  Step,
-  WorkflowRun,
-} from '@workflow/world';
+import type { CreateWorkflowRunRequest, Event, Hook, Step, WorkflowRun } from '@workflow/world';
 
 // In-memory storage for mock Durable Objects
 const durableObjectData = new Map<string, Map<string, any>>();
@@ -29,9 +23,7 @@ const getDOStorage = (doId: string): Map<string, any> => {
 class MockWorkflowRunDOStub {
   constructor(private runId: string) {}
 
-  async createRun(
-    data: CreateWorkflowRunRequest & { runId: string }
-  ): Promise<WorkflowRun> {
+  async createRun(data: CreateWorkflowRunRequest & { runId: string }): Promise<WorkflowRun> {
     const storage = getDOStorage(this.runId);
     const run: WorkflowRun = {
       runId: data.runId,
@@ -45,9 +37,7 @@ class MockWorkflowRunDOStub {
       completedAt: undefined,
       output: undefined,
       error: undefined,
-      executionContext: data.executionContext as
-        | Record<string, any>
-        | undefined,
+      executionContext: data.executionContext as Record<string, any> | undefined,
     };
     storage.set('run', run);
     return run;
@@ -118,10 +108,7 @@ class MockWorkflowRunDOStub {
     if (updates.status === 'running' && !current.startedAt) {
       updated.startedAt = updates.updatedAt || new Date();
     }
-    if (
-      (updates.status === 'completed' || updates.status === 'failed') &&
-      !current.completedAt
-    ) {
+    if ((updates.status === 'completed' || updates.status === 'failed') && !current.completedAt) {
       updated.completedAt = updates.updatedAt || new Date();
     }
 
@@ -201,11 +188,7 @@ class MockKVNamespace {
     kvData.set(key, value);
   }
 
-  async list(options?: {
-    prefix?: string;
-    cursor?: string;
-    limit?: number;
-  }): Promise<{
+  async list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{
     keys: Array<{ name: string }>;
     list_complete: boolean;
     cursor?: string;

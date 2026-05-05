@@ -2,26 +2,34 @@
   "name": "@fantasticfour/world-nats-jetstream",
   "version": "1.0.0",
   "description": "NATS JetStream-based World implementation for self-hosted workflow execution with built-in clustering",
-  "type": "module",
-  "main": "dist/index.js",
-  "files": [
-    "dist"
+  "keywords": [
+    "durable-functions",
+    "jetstream",
+    "nats",
+    "self-hosted",
+    "workflow"
   ],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
   "license": "Apache-2.0",
+  "author": "",
   "repository": {
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git",
     "directory": "packages/world-nats-jetstream"
   },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",
@@ -46,16 +54,8 @@
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "keywords": [
-    "workflow",
-    "nats",
-    "jetstream",
-    "durable-functions",
-    "self-hosted"
-  ],
-  "author": "",
-  "packageManager": "pnpm@10.23.0",
   "volta": {
     "extends": "../../package.json"
-  }
+  },
+  "packageManager": "pnpm@10.23.0"
 }

@@ -11,13 +11,10 @@ async function setupDatabase() {
   config();
 
   const connectionString =
-    process.env.DATABASE_URL ||
-    'postgresql://localhost:5432/postgres_upstash_test';
+    process.env.DATABASE_URL || 'postgresql://localhost:5432/postgres_upstash_test';
 
   console.log('🔧 Setting up database schema...');
-  console.log(
-    `📍 Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`
-  );
+  console.log(`📍 Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`);
 
   try {
     const sql = postgres(connectionString);
@@ -28,10 +25,7 @@ async function setupDatabase() {
     const migrationsDir = join(__dirname, '..', 'migrations');
 
     // Read migration files in order
-    const migrationFiles = [
-      '0000_organic_whirlwind.sql',
-      '0001_cloudy_hiroim.sql',
-    ];
+    const migrationFiles = ['0000_organic_whirlwind.sql', '0001_cloudy_hiroim.sql'];
 
     for (const file of migrationFiles) {
       const migrationPath = join(migrationsDir, file);

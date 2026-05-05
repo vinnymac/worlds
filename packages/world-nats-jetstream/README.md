@@ -43,13 +43,13 @@ await world.start();
 interface NatsJetStreamWorldConfig {
   // NATS connection URL or connection options
   nats: string | ConnectionOptions;
-  
+
   // Optional prefix for job queue streams (default: 'workflow_')
   jobPrefix?: string;
-  
+
   // Number of concurrent workers (default: 10)
   queueConcurrency?: number;
-  
+
   // Optional key prefix for KV buckets and streams (default: 'workflow_')
   keyPrefix?: string;
 }
@@ -75,6 +75,7 @@ unzip nats-server.zip
 ### Production Cluster (3 Nodes)
 
 **Node 1:**
+
 ```bash
 nats-server \
   -js \
@@ -88,6 +89,7 @@ nats-server \
 ```
 
 **Node 2:**
+
 ```bash
 nats-server \
   -js \
@@ -101,6 +103,7 @@ nats-server \
 ```
 
 **Node 3:**
+
 ```bash
 nats-server \
   -js \
@@ -114,14 +117,11 @@ nats-server \
 ```
 
 **Application Connection:**
+
 ```typescript
 const world = await createWorld({
   nats: {
-    servers: [
-      'nats://node1:4222',
-      'nats://node2:4222',
-      'nats://node3:4222',
-    ],
+    servers: ['nats://node1:4222', 'nats://node2:4222', 'nats://node3:4222'],
   },
 });
 ```
@@ -135,6 +135,7 @@ docker compose -f examples/docker-compose.yml up
 ```
 
 Includes:
+
 - 3 NATS servers with JetStream
 - Cluster routing configured
 - Health monitoring on :8222, :8223, :8224
@@ -155,6 +156,7 @@ workflow_hooks_by_token: Token->hookId mapping
 ```
 
 **Benefits:**
+
 - Built-in versioning (10 revisions retained)
 - Atomic operations
 - Watch support for real-time updates
@@ -170,6 +172,7 @@ workflow_steps:  Step execution jobs
 ```
 
 **Features:**
+
 - Native deduplication via `Nats-Msg-Id` (2-minute window)
 - Exactly-once semantics with `AckPolicy.Explicit`
 - Automatic retry via `MaxDeliver=3`
@@ -187,6 +190,7 @@ Consumer: Ephemeral for real-time, durable for replay
 ```
 
 **Advantages over Redis:**
+
 - No EventEmitter coordination needed
 - No manual sequence queries
 - Built-in replay via `DeliverPolicy.StartSequence`
@@ -265,11 +269,13 @@ Based on NATS benchmarks and testing:
 ### Recommended Resource Limits
 
 **Development:**
+
 ```bash
 nats-server -js -m 512MB
 ```
 
 **Production (per node):**
+
 ```bash
 nats-server -js -m 8GB --store_dir /fast/ssd/path
 ```
@@ -277,6 +283,7 @@ nats-server -js -m 8GB --store_dir /fast/ssd/path
 ## When to Use This World
 
 **Choose NATS JetStream when you need:**
+
 - ✅ Self-hosted infrastructure with minimal operational complexity
 - ✅ Built-in clustering without external coordination (etcd, Consul)
 - ✅ Exceptional performance (500k+ msgs/sec)
@@ -285,6 +292,7 @@ nats-server -js -m 8GB --store_dir /fast/ssd/path
 - ✅ Zero cloud dependencies
 
 **Consider alternatives if you:**
+
 - ❌ Already use Redis/PostgreSQL and want to minimize infrastructure
 - ❌ Need managed cloud service (use Cloudflare, Firestore, or Upstash)
 - ❌ Require SQL query capabilities (use PostgreSQL worlds)
@@ -295,6 +303,7 @@ nats-server -js -m 8GB --store_dir /fast/ssd/path
 ### From Redis World
 
 Storage is similar (key-value), but NATS provides:
+
 - Built-in versioning (vs manual history)
 - Subject-based filtering (vs SCAN)
 - Simpler streaming (native vs Pub/Sub + EventEmitter)
@@ -302,6 +311,7 @@ Storage is similar (key-value), but NATS provides:
 ### From PostgreSQL Worlds
 
 Trade SQL queries for:
+
 - Faster writes (no relational overhead)
 - Simpler deployment (no schema migrations)
 - Better scalability (distributed by default)
@@ -341,6 +351,7 @@ nats-server -js -DV
 ```
 
 Logs include:
+
 - Client connections
 - Stream operations
 - Consumer activity

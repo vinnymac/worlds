@@ -14,7 +14,7 @@ if (process.platform === 'win32') {
   beforeAll(async () => {
     // Start PostgreSQL container
     postgresContainer = await new PostgreSqlContainer(
-      'public.ecr.aws/docker/library/postgres:15-alpine'
+      'public.ecr.aws/docker/library/postgres:15-alpine',
     ).start();
     const dbUrl = postgresContainer.getConnectionUri();
     process.env.WORKFLOW_POSTGRES_URL = dbUrl;
@@ -22,7 +22,7 @@ if (process.platform === 'win32') {
 
     // Start Redis container
     redisContainer = await new RedisContainer(
-      'public.ecr.aws/docker/library/redis:7-alpine'
+      'public.ecr.aws/docker/library/redis:7-alpine',
     ).start();
     const redisHost = redisContainer.getHost();
     const redisPort = redisContainer.getFirstMappedPort();

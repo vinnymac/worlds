@@ -4,15 +4,7 @@ import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import type { Hook, Step, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  test,
-} from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import * as schema from '../src/schema.js';
 import {
   createEventsStorage,
@@ -33,7 +25,7 @@ async function createRun(
     workflowName: string;
     input: any[];
     executionContext?: Record<string, unknown>;
-  }
+  },
 ): Promise<WorkflowRun> {
   const result = await events.create(null, {
     eventType: 'run_created',
@@ -49,7 +41,7 @@ async function updateRun(
   events: EventsStorage,
   runId: string,
   eventType: 'run_started' | 'run_completed' | 'run_failed',
-  eventData?: Record<string, unknown>
+  eventData?: Record<string, unknown>,
 ): Promise<WorkflowRun> {
   const result = await events.create(runId, {
     eventType,
@@ -68,7 +60,7 @@ async function createStep(
     stepId: string;
     stepName: string;
     input: any[];
-  }
+  },
 ): Promise<Step> {
   const result = await events.create(runId, {
     eventType: 'step_created',
@@ -86,7 +78,7 @@ async function updateStep(
   runId: string,
   stepId: string,
   eventType: 'step_started' | 'step_completed' | 'step_failed',
-  eventData?: Record<string, unknown>
+  eventData?: Record<string, unknown>,
 ): Promise<Step> {
   const result = await events.create(runId, {
     eventType,
@@ -106,7 +98,7 @@ async function createHook(
     hookId: string;
     token: string;
     metadata?: unknown;
-  }
+  },
 ): Promise<Hook> {
   const result = await events.create(runId, {
     eventType: 'hook_created',
@@ -249,12 +241,9 @@ describe('Storage (PostgreSQL integration)', () => {
           input: [],
         });
 
-        const updated = await updateRun(
-          events,
-          created.runId,
-          'run_completed',
-          { output: [{ result: 42 }] }
-        );
+        const updated = await updateRun(events, created.runId, 'run_completed', {
+          output: [{ result: 42 }],
+        });
         expect(updated.status).toBe('completed');
         expect(updated.completedAt).toBeInstanceOf(Date);
         expect(updated.output).toEqual([{ result: 42 }]);
@@ -300,7 +289,7 @@ describe('Storage (PostgreSQL integration)', () => {
         expect(result.data[0].runId).toBe(run2.runId);
         expect(result.data[1].runId).toBe(run1.runId);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThan(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
@@ -409,9 +398,7 @@ describe('Storage (PostgreSQL integration)', () => {
       });
 
       it('should throw error for non-existent step', async () => {
-        await expect(
-          steps.get(testRunId, 'missing-step')
-        ).rejects.toMatchObject({ status: 404 });
+        await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
     });
 
@@ -423,12 +410,7 @@ describe('Storage (PostgreSQL integration)', () => {
           input: ['input1'],
         });
 
-        const updated = await updateStep(
-          events,
-          testRunId,
-          'step-123',
-          'step_started'
-        );
+        const updated = await updateStep(events, testRunId, 'step-123', 'step_started');
 
         expect(updated.status).toBe('running');
         expect(updated.startedAt).toBeInstanceOf(Date);
@@ -442,13 +424,9 @@ describe('Storage (PostgreSQL integration)', () => {
           input: ['input1'],
         });
 
-        const updated = await updateStep(
-          events,
-          testRunId,
-          'step-123',
-          'step_completed',
-          { result: ['ok'] }
-        );
+        const updated = await updateStep(events, testRunId, 'step-123', 'step_completed', {
+          result: ['ok'],
+        });
 
         expect(updated.status).toBe('completed');
         expect(updated.completedAt).toBeInstanceOf(Date);
@@ -462,13 +440,9 @@ describe('Storage (PostgreSQL integration)', () => {
           input: ['input1'],
         });
 
-        const updated = await updateStep(
-          events,
-          testRunId,
-          'step-123',
-          'step_failed',
-          { error: 'Step failed' }
-        );
+        const updated = await updateStep(events, testRunId, 'step-123', 'step_failed', {
+          error: 'Step failed',
+        });
 
         expect(updated.status).toBe('failed');
         expect(updated.error?.message).toBe('Step failed');
@@ -498,7 +472,7 @@ describe('Storage (PostgreSQL integration)', () => {
         expect(result.data[0].stepId).toBe(step2.stepId);
         expect(result.data[1].stepId).toBe(step1.stepId);
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
@@ -627,7 +601,7 @@ describe('Storage (PostgreSQL integration)', () => {
         expect(result.data[1].eventId).toBe(result1.event?.eventId);
         expect(result.data[3].eventId).toBe(result2.event?.eventId);
         expect(result.data[3].createdAt.getTime()).toBeGreaterThanOrEqual(
-          result.data[1].createdAt.getTime()
+          result.data[1].createdAt.getTime(),
         );
       });
 
@@ -883,7 +857,7 @@ describe('Storage (PostgreSQL integration)', () => {
       });
 
       await expect(
-        updateStep(events, testRunId, 'step_terminal_1', 'step_started')
+        updateStep(events, testRunId, 'step_terminal_1', 'step_started'),
       ).rejects.toThrow(/terminal/i);
     });
 
@@ -900,7 +874,7 @@ describe('Storage (PostgreSQL integration)', () => {
       await expect(
         updateStep(events, testRunId, 'step_terminal_2', 'step_completed', {
           result: ['ok2'],
-        })
+        }),
       ).rejects.toThrow(/terminal/i);
     });
 
@@ -917,7 +891,7 @@ describe('Storage (PostgreSQL integration)', () => {
       await expect(
         updateStep(events, testRunId, 'step_terminal_3', 'step_failed', {
           error: 'Should not work',
-        })
+        }),
       ).rejects.toThrow(/terminal/i);
     });
 
@@ -931,9 +905,9 @@ describe('Storage (PostgreSQL integration)', () => {
         error: 'Failed permanently',
       });
 
-      await expect(
-        updateStep(events, testRunId, 'step_failed_1', 'step_started')
-      ).rejects.toThrow(/terminal/i);
+      await expect(updateStep(events, testRunId, 'step_failed_1', 'step_started')).rejects.toThrow(
+        /terminal/i,
+      );
     });
   });
 
@@ -946,9 +920,7 @@ describe('Storage (PostgreSQL integration)', () => {
       });
       await updateRun(events, run.runId, 'run_completed', { output: ['done'] });
 
-      await expect(updateRun(events, run.runId, 'run_started')).rejects.toThrow(
-        /terminal/i
-      );
+      await expect(updateRun(events, run.runId, 'run_started')).rejects.toThrow(/terminal/i);
     });
 
     it('should reject step_created on completed run', async () => {
@@ -964,7 +936,7 @@ describe('Storage (PostgreSQL integration)', () => {
           stepId: 'new_step',
           stepName: 'test-step',
           input: [],
-        })
+        }),
       ).rejects.toThrow(/terminal/i);
     });
 
@@ -980,7 +952,7 @@ describe('Storage (PostgreSQL integration)', () => {
         createHook(events, run.runId, {
           hookId: 'new_hook',
           token: 'new-token',
-        })
+        }),
       ).rejects.toThrow(/terminal/i);
     });
 
@@ -1017,7 +989,7 @@ describe('Storage (PostgreSQL integration)', () => {
           eventType: 'step_completed',
           correlationId: 'nonexistent_step',
           eventData: { result: ['ok'] },
-        })
+        }),
       ).rejects.toThrow(/not found/i);
     });
 
@@ -1026,7 +998,7 @@ describe('Storage (PostgreSQL integration)', () => {
         events.create(testRunId, {
           eventType: 'step_started',
           correlationId: 'nonexistent_step_started',
-        })
+        }),
       ).rejects.toThrow(/not found/i);
     });
 
@@ -1035,7 +1007,7 @@ describe('Storage (PostgreSQL integration)', () => {
         events.create(testRunId, {
           eventType: 'hook_disposed',
           correlationId: 'nonexistent_hook',
-        })
+        }),
       ).rejects.toThrow(/not found/i);
     });
 
@@ -1045,7 +1017,7 @@ describe('Storage (PostgreSQL integration)', () => {
           eventType: 'hook_received',
           correlationId: 'nonexistent_hook_received',
           eventData: { payload: {} },
-        })
+        }),
       ).rejects.toThrow(/not found/i);
     });
   });
@@ -1091,12 +1063,7 @@ describe('Storage (PostgreSQL integration)', () => {
         input: [],
       });
 
-      const started1 = await updateStep(
-        events,
-        testRunId,
-        'step_retry_2',
-        'step_started'
-      );
+      const started1 = await updateStep(events, testRunId, 'step_retry_2', 'step_started');
       expect(started1.attempt).toBe(1);
 
       await events.create(testRunId, {
@@ -1105,12 +1072,7 @@ describe('Storage (PostgreSQL integration)', () => {
         eventData: { error: 'Temporary failure' },
       });
 
-      const started2 = await updateStep(
-        events,
-        testRunId,
-        'step_retry_2',
-        'step_started'
-      );
+      const started2 = await updateStep(events, testRunId, 'step_retry_2', 'step_started');
       expect(started2.attempt).toBe(2);
     });
   });

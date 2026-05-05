@@ -37,11 +37,7 @@ export interface CloudflareStorageConfig {
 interface KVNamespace {
   get(key: string): Promise<string | null>;
   put(key: string, value: string): Promise<void>;
-  list(options?: {
-    prefix?: string;
-    cursor?: string;
-    limit?: number;
-  }): Promise<{
+  list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{
     keys: Array<{ name: string }>;
     list_complete: boolean;
     cursor?: string;
@@ -54,9 +50,7 @@ interface SerializedError {
   code?: string;
 }
 
-function isValidStepData(
-  data: unknown
-): data is Record<string, unknown> & { error?: unknown } {
+function isValidStepData(data: unknown): data is Record<string, unknown> & { error?: unknown } {
   return typeof data === 'object' && data !== null;
 }
 
@@ -91,7 +85,7 @@ function deserializeStepError(data: unknown): Step {
 function filterData<T extends object>(
   data: T,
   resolveData: ResolveData | undefined,
-  keysToStrip: (keyof T)[]
+  keysToStrip: (keyof T)[],
 ): T {
   if (resolveData === 'none') {
     const newData = { ...data };
@@ -155,12 +149,10 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       },
 
       async list(
-        params?: ListWorkflowRunsParams
+        params?: ListWorkflowRunsParams,
       ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
         const limit = params?.pagination?.limit ?? 20;
-        const prefix = params?.workflowName
-          ? `run:${params.workflowName}:`
-          : 'run:';
+        const prefix = params?.workflowName ? `run:${params.workflowName}:` : 'run:';
 
         const kvList = await env.WORKFLOW_INDEX.list({
           prefix,
@@ -183,7 +175,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             } catch {
               return null;
             }
-          })
+          }),
         );
 
         const filtered = runs.filter((r): r is WorkflowRun => r !== null);
@@ -204,14 +196,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams
+        _params?: CreateEventParams,
       ): Promise<EventResult> {
         const eventId = `wevt_${ulid()}`;
         const now = new Date();
 
         // For run_created events, generate a runId if null
-        const effectiveRunId =
-          runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
+        const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
 
         // Build event record - EventSchema requires eventData to be an object
         const eventRecord: Record<string, unknown> = {
@@ -240,9 +231,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               runId: effectiveRunId,
               workflowName: runData.workflowName,
               input: runData.input,
-              executionContext: runData.executionContext as
-                | Record<string, unknown>
-                | undefined,
+              executionContext: runData.executionContext as Record<string, unknown> | undefined,
               deploymentId: runData.deploymentId,
             });
 
@@ -253,7 +242,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
                 runId: effectiveRunId,
                 createdAt: run.createdAt.toISOString(),
                 status: 'pending',
-              })
+              }),
             );
 
             result.run = run;
@@ -342,15 +331,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               ...stepData,
               createdAt: new Date(stepData.createdAt),
               updatedAt: new Date(stepData.updatedAt),
-              startedAt: stepData.startedAt
-                ? new Date(stepData.startedAt)
-                : undefined,
-              completedAt: stepData.completedAt
-                ? new Date(stepData.completedAt)
-                : undefined,
-              retryAfter: stepData.retryAfter
-                ? new Date(stepData.retryAfter)
-                : undefined,
+              startedAt: stepData.startedAt ? new Date(stepData.startedAt) : undefined,
+              completedAt: stepData.completedAt ? new Date(stepData.completedAt) : undefined,
+              retryAfter: stepData.retryAfter ? new Date(stepData.retryAfter) : undefined,
             });
             break;
           }
@@ -370,15 +353,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               ...stepData,
               createdAt: new Date(stepData.createdAt),
               updatedAt: new Date(stepData.updatedAt),
-              startedAt: stepData.startedAt
-                ? new Date(stepData.startedAt)
-                : undefined,
-              completedAt: stepData.completedAt
-                ? new Date(stepData.completedAt)
-                : undefined,
-              retryAfter: stepData.retryAfter
-                ? new Date(stepData.retryAfter)
-                : undefined,
+              startedAt: stepData.startedAt ? new Date(stepData.startedAt) : undefined,
+              completedAt: stepData.completedAt ? new Date(stepData.completedAt) : undefined,
+              retryAfter: stepData.retryAfter ? new Date(stepData.retryAfter) : undefined,
             });
             break;
           }
@@ -398,15 +375,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               ...stepData,
               createdAt: new Date(stepData.createdAt),
               updatedAt: new Date(stepData.updatedAt),
-              startedAt: stepData.startedAt
-                ? new Date(stepData.startedAt)
-                : undefined,
-              completedAt: stepData.completedAt
-                ? new Date(stepData.completedAt)
-                : undefined,
-              retryAfter: stepData.retryAfter
-                ? new Date(stepData.retryAfter)
-                : undefined,
+              startedAt: stepData.startedAt ? new Date(stepData.startedAt) : undefined,
+              completedAt: stepData.completedAt ? new Date(stepData.completedAt) : undefined,
+              retryAfter: stepData.retryAfter ? new Date(stepData.retryAfter) : undefined,
             });
             break;
           }
@@ -430,15 +401,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               ...stepData,
               createdAt: new Date(stepData.createdAt),
               updatedAt: new Date(stepData.updatedAt),
-              startedAt: stepData.startedAt
-                ? new Date(stepData.startedAt)
-                : undefined,
-              completedAt: stepData.completedAt
-                ? new Date(stepData.completedAt)
-                : undefined,
-              retryAfter: stepData.retryAfter
-                ? new Date(stepData.retryAfter)
-                : undefined,
+              startedAt: stepData.startedAt ? new Date(stepData.startedAt) : undefined,
+              completedAt: stepData.completedAt ? new Date(stepData.completedAt) : undefined,
+              retryAfter: stepData.retryAfter ? new Date(stepData.retryAfter) : undefined,
             });
             break;
           }
@@ -460,10 +425,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             await stub.createHook(hook);
 
             // Index by token for lookup
-            await env.WORKFLOW_INDEX.put(
-              `hook:${eventData.token}`,
-              JSON.stringify(hook)
-            );
+            await env.WORKFLOW_INDEX.put(`hook:${eventData.token}`, JSON.stringify(hook));
 
             result.hook = HookSchema.parse(compact(hook));
             break;
@@ -475,11 +437,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         return result;
       },
 
-      async get(
-        runId: string,
-        eventId: string,
-        _params?: GetEventParams
-      ): Promise<Event> {
+      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
         const stub = getRunDO(runId);
         const result = await stub.listEvents({
           limit: 1000,
@@ -532,16 +490,11 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     },
 
     steps: {
-      async get(
-        runId: string | undefined,
-        stepId: string,
-        params?: GetStepParams
-      ) {
+      async get(runId: string | undefined, stepId: string, params?: GetStepParams) {
         if (!runId) {
-          throw new WorkflowWorldError(
-            'runId is required for Cloudflare step lookup',
-            { status: 400 }
-          );
+          throw new WorkflowWorldError('runId is required for Cloudflare step lookup', {
+            status: 400,
+          });
         }
         const stub = getRunDO(runId);
         const data = await stub.getStep(stepId);
@@ -557,9 +510,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           createdAt: new Date(data.createdAt),
           updatedAt: new Date(data.updatedAt),
           startedAt: data.startedAt ? new Date(data.startedAt) : undefined,
-          completedAt: data.completedAt
-            ? new Date(data.completedAt)
-            : undefined,
+          completedAt: data.completedAt ? new Date(data.completedAt) : undefined,
           retryAfter: data.retryAfter ? new Date(data.retryAfter) : undefined,
         });
 
@@ -567,7 +518,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       },
 
       async list(
-        params: ListWorkflowRunStepsParams
+        params: ListWorkflowRunStepsParams,
       ): Promise<PaginatedResponse<Step | StepWithoutData>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 20;
@@ -598,12 +549,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
     hooks: {
       async get(_hookId: string, _params?: GetHookParams) {
-        throw new WorkflowWorldError(
-          'Hook lookup by ID not implemented for Cloudflare',
-          {
-            status: 501,
-          }
-        );
+        throw new WorkflowWorldError('Hook lookup by ID not implemented for Cloudflare', {
+          status: 501,
+        });
       },
 
       async getByToken(token: string, params?: GetHookParams) {
@@ -634,11 +582,10 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
 
         const stub = getRunDO(runId);
-        const result: { data: Hook[]; cursor: null; hasMore: false } =
-          await stub.listHooks({
-            limit,
-            cursor: params?.pagination?.cursor || undefined,
-          });
+        const result: { data: Hook[]; cursor: null; hasMore: false } = await stub.listHooks({
+          limit,
+          cursor: params?.pagination?.cursor || undefined,
+        });
 
         return {
           data: result.data.map((h: Hook) => {

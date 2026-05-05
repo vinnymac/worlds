@@ -57,9 +57,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
 
   // CRITICAL: Must await subscribe() to avoid race condition where PUBLISH happens before SUBSCRIBE is ready
   // This was causing workflows to hang because completion events were published but never received
-  const subscriptionReady: Promise<void> = subscriber
-    .subscribe(STREAM_CHANNEL)
-    .then(() => {});
+  const subscriptionReady: Promise<void> = subscriber.subscribe(STREAM_CHANNEL).then(() => {});
 
   subscriber.on('message', async (channel, message) => {
     if (channel !== STREAM_CHANNEL) return;
@@ -80,7 +78,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
         const results = await redis.xrange(
           streamKey(parsed.streamId),
           parsed.entryId,
-          parsed.entryId
+          parsed.entryId,
         );
 
         if (results.length === 0) return;
@@ -107,7 +105,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
-      chunk: string | Uint8Array
+      chunk: string | Uint8Array,
     ): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
@@ -121,7 +119,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
         'data',
         data.toString('base64'),
         'eof',
-        'false'
+        'false',
       ))!;
 
       // CRITICAL: Wait for subscription to be ready before publishing
@@ -135,27 +133,17 @@ export function createStreamer(config: StreamerConfig): Streamer {
           StreamPublishMessage.encode({
             entryId,
             streamId: name,
-          })
-        )
+          }),
+        ),
       );
     },
 
-    async closeStream(
-      name: string,
-      _runId: string | Promise<string>
-    ): Promise<void> {
+    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
       await _runId;
 
       // Add final chunk with eof=true, using auto-generated ID
-      const entryId = (await redis.xadd(
-        streamKey(name),
-        '*',
-        'data',
-        '',
-        'eof',
-        'true'
-      ))!;
+      const entryId = (await redis.xadd(streamKey(name), '*', 'data', '', 'eof', 'true'))!;
 
       // CRITICAL: Wait for subscription to be ready before publishing
       // Otherwise the message might be published before anyone is subscribed
@@ -168,15 +156,12 @@ export function createStreamer(config: StreamerConfig): Streamer {
           StreamPublishMessage.encode({
             streamId: name,
             entryId,
-          })
-        )
+          }),
+        ),
       );
     },
 
-    async readFromStream(
-      name: string,
-      startIndex?: number
-    ): Promise<ReadableStream<Uint8Array>> {
+    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
       const cleanups: (() => void)[] = [];
 
       return new ReadableStream<Uint8Array>({
@@ -198,11 +183,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
             return false;
           };
 
-          const enqueueChunkData = (msg: {
-            id: string;
-            data: Uint8Array;
-            eof: boolean;
-          }): void => {
+          const enqueueChunkData = (msg: { id: string; data: Uint8Array; eof: boolean }): void => {
             if (msg.data.byteLength) {
               controller.enqueue(new Uint8Array(msg.data));
             }
@@ -212,11 +193,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
             lastEntryId = msg.id;
           };
 
-          function enqueue(msg: {
-            id: string;
-            data: Uint8Array;
-            eof: boolean;
-          }) {
+          function enqueue(msg: { id: string; data: Uint8Array; eof: boolean }) {
             if (shouldSkipChunk(msg.id)) return;
             if (shouldApplyOffset()) return;
             enqueueChunkData(msg);

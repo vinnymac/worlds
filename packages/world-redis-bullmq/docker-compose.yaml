@@ -3,7 +3,7 @@ services:
     image: redis:7-alpine
     container_name: world-redis
     ports:
-      - "6379:6379"
+      - '6379:6379'
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
@@ -12,7 +12,7 @@ services:
     image: redis/redisinsight:latest
     container_name: world-redis-insight
     ports:
-      - "5540:5540"
+      - '5540:5540'
     environment:
       - REDIS_HOSTS=local:redis:6379
     depends_on:
