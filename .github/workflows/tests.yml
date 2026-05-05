@@ -22,6 +22,8 @@ jobs:
         package:
           - '@fantasticfour/world-cloudflare'
           - '@fantasticfour/world-firestore-tasks'
+          - '@fantasticfour/world-mysql'
+          - '@fantasticfour/world-mysql-redis'
           - '@fantasticfour/world-nats-jetstream'
           - '@fantasticfour/world-postgres-redis'
           - '@fantasticfour/world-redis'
