@@ -16,7 +16,7 @@
 
   **Key Features:**
 
-  - 95% code reuse from proven world-mysql-upstash and world-postgres-redis
+  - 95% code reuse from proven world-upstash and world-postgres-redis
   - Full idempotency support via Redis Sets
   - FIFO job processing with concurrent workers
   - TestContainers-based integration tests

@@ -204,7 +204,7 @@ pnpm db:push
 
 - Pure in-memory speed is priority → use @fantasticfour/world-redis
 - You need advanced queue features → use @fantasticfour/world-redis-bullmq
-- You're on serverless platforms → use @fantasticfour/world-postgres-upstash
+- You're on serverless platforms → use @fantasticfour/world-upstash
 - You're on AWS → use @fantasticfour/world-dynamodb-sqs
 
 ## Performance Considerations
