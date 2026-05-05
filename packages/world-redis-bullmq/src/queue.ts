@@ -55,9 +55,13 @@ export function createQueue(
     db: redis.options.db,
   };
 
-  // Create BullMQ queues
+  // Create BullMQ queues eagerly to avoid cold-start delays on first job add
   const bullQueues = new Map<string, Queue>();
   const workers = new Map<string, Worker>();
+
+  for (const queueName of Object.values(Queues)) {
+    bullQueues.set(queueName, new Queue(queueName, { connection: connectionOptions }));
+  }
 
   function getQueue(name: string): Queue {
     let queue = bullQueues.get(name);
@@ -136,6 +140,10 @@ export function createQueue(
       {
         connection: connectionOptions,
         concurrency,
+        // Use a low drainDelay to ensure fast job pickup when the queue is idle.
+        // The default of 5000ms causes unnecessary latency for health checks and
+        // other time-sensitive operations.
+        drainDelay: 300,
       },
     );
 
