@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-redis",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "description": "Pure Redis-based World implementation using Redis Lists for lightweight and simple workflow execution",
   "keywords": [
     "durable-functions",
