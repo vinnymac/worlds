@@ -1,0 +1,63 @@
+{
+  "name": "@fantasticfour/world-upstash",
+  "version": "1.0.0",
+  "description": "Serverless World implementation using Upstash Redis and QStash for edge-ready durable workflows",
+  "keywords": [
+    "durable-functions",
+    "edge",
+    "qstash",
+    "serverless",
+    "upstash",
+    "workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "vinnymac",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/world-upstash"
+  },
+  "bin": {
+    "fantasticfour-upstash-setup": "./bin/setup.js"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@upstash/qstash": "^2.8.7",
+    "@upstash/redis": "^1.35.0",
+    "@workflow/errors": "catalog:",
+    "@workflow/world": "catalog:",
+    "ulid": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@workflow/world-testing": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  },
+  "packageManager": "pnpm@10.23.0"
+}
