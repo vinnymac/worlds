@@ -125,7 +125,7 @@ Compatible providers:
 
 ## Migration from Other Worlds
 
-### From world-mysql-upstash
+### From world-upstash
 
 Replace QStash HTTP queue with pure MySQL queue. Same MySQL schema for storage.
 

@@ -112,7 +112,7 @@ export PORT="3000"
 
 - You need advanced queue features (priorities, delays, retries) → use @fantasticfour/world-redis-bullmq
 - You need SQL queryability → use @fantasticfour/world-postgres-redis
-- You're on serverless platforms → use @fantasticfour/world-postgres-upstash
+- You're on serverless platforms → use @fantasticfour/world-upstash
 
 ## License
 

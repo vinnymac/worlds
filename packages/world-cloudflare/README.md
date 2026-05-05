@@ -135,7 +135,7 @@ pnpm wrangler deploy
 
 **Consider alternatives when:**
 
-- Multi-cloud strategy required → use @fantasticfour/world-postgres-upstash
+- Multi-cloud strategy required → use @fantasticfour/world-upstash
 - Traditional infrastructure preferred → use @fantasticfour/world-postgres-redis
 - Cost optimization priority → use @fantasticfour/world-redis
 - AWS ecosystem → use @fantasticfour/world-dynamodb-sqs

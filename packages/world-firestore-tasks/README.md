@@ -203,7 +203,7 @@ export TARGET_URL="https://my-app.run.app"
 
 - SQL queryability required → use @fantasticfour/world-postgres-redis
 - AWS ecosystem → use @fantasticfour/world-dynamodb-sqs
-- Multi-cloud strategy → use @fantasticfour/world-postgres-upstash
+- Multi-cloud strategy → use @fantasticfour/world-upstash
 - Edge deployment → use @fantasticfour/world-cloudflare
 
 ## Performance Characteristics

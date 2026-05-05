@@ -85,7 +85,7 @@ interface MysqlRedisWorldConfig {
 
 Replace PostgreSQL with MySQL - the queue layer is identical (Redis Lists).
 
-### From world-mysql-upstash
+### From world-upstash
 
 Replace QStash HTTP queue with Redis Lists for 10-20x lower latency.
 

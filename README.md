@@ -40,7 +40,7 @@ Hybrid implementation using PostgreSQL for durable storage and Redis for queue m
 - Best for applications already using Postgres
 
 
-### [@fantasticfour/world-mysql-upstash](./packages/world-mysql-upstash)
+### [@fantasticfour/world-upstash](./packages/world-upstash)
 
 MySQL storage with Upstash QStash for serverless queue management.
 
