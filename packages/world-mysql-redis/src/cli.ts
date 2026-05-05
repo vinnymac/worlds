@@ -10,8 +10,7 @@ async function setupDatabase() {
   // Load .env file if it exists
   config();
 
-  const connectionString =
-    process.env.DATABASE_URL || 'mysql://root:root@localhost:3306/world';
+  const connectionString = process.env.DATABASE_URL || 'mysql://root:root@localhost:3306/world';
 
   console.log('Setting up MySQL database schema...');
   console.log(`Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`);

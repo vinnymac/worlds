@@ -57,11 +57,11 @@ await world.start();
 
 ```typescript
 interface MysqlRedisWorldConfig {
-  databaseUrl: string;              // MySQL connection string
-  redis: string | RedisOptions;     // Redis connection string or options
-  jobPrefix?: string;               // Redis key prefix (default: 'workflow_')
-  queueConcurrency?: number;        // Workers per queue (default: 10)
-  deploymentId?: string;            // Optional deployment tracking ID
+  databaseUrl: string; // MySQL connection string
+  redis: string | RedisOptions; // Redis connection string or options
+  jobPrefix?: string; // Redis key prefix (default: 'workflow_')
+  queueConcurrency?: number; // Workers per queue (default: 10)
+  deploymentId?: string; // Optional deployment tracking ID
 }
 ```
 
@@ -82,14 +82,17 @@ interface MysqlRedisWorldConfig {
 ## Migration from Other Worlds
 
 ### From world-postgres-redis
+
 Replace PostgreSQL with MySQL - the queue layer is identical (Redis Lists).
 
 ### From world-mysql-upstash
+
 Replace QStash HTTP queue with Redis Lists for 10-20x lower latency.
 
 ## Database Schema
 
 The world creates the following tables:
+
 - `workflow.workflow_runs` - Workflow execution state
 - `workflow.workflow_events` - Event sourcing
 - `workflow.workflow_steps` - Step execution tracking

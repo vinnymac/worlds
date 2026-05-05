@@ -81,10 +81,17 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
 
     console.log('rawResult type:', typeof rawResult);
     console.log('rawResult is array:', Array.isArray(rawResult));
-    console.log('rawResult:', JSON.stringify(rawResult, (_, v) => {
-      if (v instanceof Buffer) return `<Buffer ${v.length} bytes>`;
-      return v;
-    }, 2).slice(0, 2000));
+    console.log(
+      'rawResult:',
+      JSON.stringify(
+        rawResult,
+        (_, v) => {
+          if (v instanceof Buffer) return `<Buffer ${v.length} bytes>`;
+          return v;
+        },
+        2,
+      ).slice(0, 2000),
+    );
 
     const outerArray = rawResult as any;
     console.log('outerArray[0] type:', typeof outerArray[0]);
@@ -134,7 +141,10 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
       console.log('TX rawResult[0] is array:', Array.isArray((rawResult as any)?.[0]));
       console.log('TX rawResult[0] length:', (rawResult as any)?.[0]?.length);
       if (Array.isArray((rawResult as any)?.[0])) {
-        console.log('TX rawResult[0][0] keys:', (rawResult as any)?.[0]?.[0] && Object.keys((rawResult as any)[0][0]));
+        console.log(
+          'TX rawResult[0][0] keys:',
+          (rawResult as any)?.[0]?.[0] && Object.keys((rawResult as any)[0][0]),
+        );
       }
 
       // Same structure as non-tx: [[rows], [fields]]

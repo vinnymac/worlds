@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "description": "World implementation using pure MySQL for storage, queueing, and streaming - no external dependencies (no Redis, no QStash)",
   "keywords": [
+    "aiven",
     "durable-functions",
     "mysql",
     "planetscale",
     "rds",
-    "aiven",
-    "workflow",
-    "self-hosted"
+    "self-hosted",
+    "workflow"
   ],
   "license": "Apache-2.0",
   "author": "vinnymac",

@@ -149,8 +149,7 @@ async function enqueueJob(
     // Handle duplicate key error as an idempotency hit (race condition between
     // SELECT and INSERT in concurrent requests with the same idempotencyKey)
     // Check both error.code and error.cause.code (Drizzle wraps the MySQL error)
-    const errorCode =
-      (error as any)?.code || (error as any)?.cause?.code;
+    const errorCode = (error as any)?.code || (error as any)?.cause?.code;
 
     if (errorCode === 'ER_DUP_ENTRY') {
       // Fetch the existing record to return its messageId
@@ -305,13 +304,7 @@ export function createQueue(
         `[world-mysql processJob] Error processing job ${job.job_id} (attempt ${job.attempt}/${job.max_attempts}):`,
         error instanceof Error ? error.message : error,
       );
-      await handleJobFailure(
-        db,
-        job.id,
-        error,
-        job.attempt ?? 1,
-        job.max_attempts ?? maxAttempts,
-      );
+      await handleJobFailure(db, job.id, error, job.attempt ?? 1, job.max_attempts ?? maxAttempts);
     }
   }
 
