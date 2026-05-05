@@ -129,9 +129,7 @@ if (shouldSkipTests) {
     console.log('[test beforeAll] MySQL schema applied');
 
     // Start Redis container
-    redisContainer = await new RedisContainer(
-      'public.ecr.aws/docker/library/redis:7-alpine',
-    ).start();
+    redisContainer = await new RedisContainer('redis:7-alpine').start();
     const redisHost = redisContainer.getHost();
     const redisPort = redisContainer.getFirstMappedPort();
     const redisUrl = `redis://${redisHost}:${redisPort}`;

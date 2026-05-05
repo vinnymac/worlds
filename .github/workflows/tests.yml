@@ -56,10 +56,10 @@ jobs:
       - name: Pre-pull Testcontainers images
         run: |
           docker pull testcontainers/ryuk:0.8.1 || true
-          docker pull public.ecr.aws/docker/library/postgres:15-alpine || true
-          docker pull public.ecr.aws/docker/library/redis:7-alpine || true
-          docker pull public.ecr.aws/docker/library/mysql:8.0 || true
-          docker pull public.ecr.aws/docker/library/nats:2.10-alpine || true
+          docker pull postgres:15-alpine || true
+          docker pull redis:7-alpine || true
+          docker pull mysql:8.0 || true
+          docker pull nats:2.10-alpine || true
           docker pull gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators || true
 
       - name: Run Unit Tests for ${{ matrix.package }}
