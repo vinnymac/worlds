@@ -30,8 +30,8 @@ This monorepo contains various World implementations published under the `@fanta
 
 ### Prerequisites
 
-- Node.js >= 18
-- pnpm >= 9
+- Node.js >= 22
+- pnpm >= 11
 - Docker (for running tests with testcontainers)
 
 ### Setup
