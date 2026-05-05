@@ -1,14 +1,7 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
-  "indentWidth": 2,
   "lineWidth": 80,
-  "semicolons": "always",
-  "trailingCommas": "es5",
-  "arrowParens": "always",
-  "bracketSpacing": true,
-  "bracketSameLine": false,
   "singleQuote": true,
-  "jsxQuotes": "double",
-  "quoteProps": "as-needed",
+  "formatJsDoc": true,
   "ignorePatterns": ["**/node_modules", "**/dist", "**/.turbo", "**/.changeset", "**/coverage"]
 }
