@@ -39,16 +39,6 @@ Hybrid implementation using PostgreSQL for durable storage and Redis for queue m
 - Database migrations included
 - Best for applications already using Postgres
 
-### [@fantasticfour/world-postgres-upstash](./packages/world-postgres-upstash)
-
-PostgreSQL storage with Upstash QStash for serverless queue management.
-
-**Features:**
-
-- PostgreSQL storage via Drizzle ORM with CBOR serialization
-- Upstash QStash for HTTP-based queuing
-- NOTIFY/LISTEN for real-time streaming
-- Ideal for serverless deployments
 
 ### [@fantasticfour/world-mysql-upstash](./packages/world-mysql-upstash)
 

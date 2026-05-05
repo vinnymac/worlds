@@ -2,7 +2,6 @@
 "@fantasticfour/world-redis": major
 "@fantasticfour/world-redis-bullmq": major
 "@fantasticfour/world-postgres-redis": major
-"@fantasticfour/world-postgres-upstash": major
 "@fantasticfour/world-firestore-tasks": major
 "@fantasticfour/world-cloudflare": major
 ---
@@ -111,6 +110,5 @@ const { hook, event } = await world.events.create(runId, {
 - world-redis: 21/21 storage tests passing
 - world-redis-bullmq: 21/21 storage tests passing
 - world-postgres-redis: TypeScript compiles, requires database migration
-- world-postgres-upstash: TypeScript compiles, requires database migration
 - world-firestore-tasks: 33/33 storage tests passing
 - world-cloudflare: 59/59 storage tests passing
