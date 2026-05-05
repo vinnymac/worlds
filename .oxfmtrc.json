@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "singleQuote": true,
+  "trailingCommas": "all",
   "formatJsDoc": true,
   "ignorePatterns": ["**/node_modules", "**/dist", "**/.turbo", "**/.changeset", "**/coverage"]
 }
