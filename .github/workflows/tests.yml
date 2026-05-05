@@ -22,12 +22,11 @@ jobs:
         package:
           - '@fantasticfour/world-cloudflare'
           - '@fantasticfour/world-firestore-tasks'
-          - '@fantasticfour/world-mysql-upstash'
           - '@fantasticfour/world-nats-jetstream'
           - '@fantasticfour/world-postgres-redis'
-          - '@fantasticfour/world-postgres-upstash'
           - '@fantasticfour/world-redis'
           - '@fantasticfour/world-redis-bullmq'
+          - '@fantasticfour/world-upstash'
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
