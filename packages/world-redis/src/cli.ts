@@ -57,7 +57,7 @@ async function setupRedis() {
     );
     console.log(`  - Sorted Sets: ${keyPrefix}runs:*, ${keyPrefix}steps:*, ${keyPrefix}events:*`);
     console.log(`  - Streams: ${keyPrefix}stream:*`);
-    console.log(`  - BullMQ Queues: workflow_flows, workflow_steps`);
+    console.log(`  - Lists (queues): workflow_flows, workflow_steps`);
 
     await redis.quit();
     process.exit(0);

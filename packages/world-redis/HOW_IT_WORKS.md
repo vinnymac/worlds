@@ -2,7 +2,7 @@
 
 This document explains the architecture and components of the Redis world implementation for workflow management.
 
-This implementation uses **pure Redis** for all storage and operations. It leverages Redis data structures (hashes, sorted sets, streams) for efficient workflow management, BullMQ for job queue processing, and Redis Streams for real-time data streaming.
+This implementation uses **pure Redis** for all storage and operations. It leverages Redis data structures (hashes, sorted sets, lists, streams) for efficient workflow management and real-time data streaming.
 
 If you want to use a different Redis client or customize the data structures, you should be able to fork this implementation and modify the storage patterns.
 
@@ -11,7 +11,7 @@ If you want to use a different Redis client or customize the data structures, yo
 The Redis world consists of four main components:
 
 1. **Storage Layer** - Redis hashes and sorted sets for workflow data
-2. **Queue System** - BullMQ for reliable job processing
+2. **Queue System** - Redis Lists (LPUSH/BRPOP) for job processing
 3. **Streaming** - Redis Streams for real-time data
 4. **Embedded World** - Reuses local world for execution
 
@@ -56,34 +56,35 @@ All IDs use ULID (Universally Unique Lexicographically Sortable Identifier):
 
 ```mermaid
 graph LR
-    Client --> BM[BullMQ Queue]
-    BM --> Worker[BullMQ Worker]
+    Client --> RL[Redis Lists]
+    RL --> Worker[BRPOP Worker]
     Worker --> EW[Embedded World]
     EW --> HTTP[HTTP fetch]
     HTTP --> API[Workflow API]
 
-    BM -.-> F["${prefix}flows<br/>(workflows)"]
-    BM -.-> S["${prefix}steps<br/>(steps)"]
+    RL -.-> F["${prefix}flows<br/>(workflows)"]
+    RL -.-> S["${prefix}steps<br/>(steps)"]
 ```
 
 ### Queue Implementation
 
-- **BullMQ Queues**: Two queues (`{prefix}flows`, `{prefix}steps`)
+- **Redis Lists**: Two lists (`{prefix}flows`, `{prefix}steps`)
 - **Workers**: Configurable concurrency (default: 10)
-- **Job Processing**: Workers deserialize messages and re-queue to embedded world
-- **Retry Logic**: 3 attempts with automatic retry
-- **Idempotency**: Uses BullMQ jobId for deduplication
-- **Job Cleanup**: Keeps last 100 completed, 1000 failed jobs
+- **Job Processing**: Workers use BRPOP to retrieve messages, deserialize, and re-queue to embedded world
+- **Idempotency**: Manual tracking using Redis Sets with 24-hour TTL
+- **Blocking**: BRPOP blocks until jobs are available (no polling)
 
 ### Message Flow
 
 1. Client calls `world.queue(queueName, message, opts)`
 2. Message serialized with JsonTransport
-3. Job added to BullMQ queue with jobId for idempotency
-4. Worker picks up job
-5. Worker deserializes message
-6. Worker re-queues to embedded world
-7. Embedded world makes HTTP fetch to execute workflow/step
+3. Idempotency key checked/added to Redis Set (SADD)
+4. Job added to Redis List via LPUSH
+5. Worker blocks on BRPOP until job available
+6. Worker deserializes message
+7. Worker re-queues to embedded world
+8. Embedded world makes HTTP fetch to execute workflow/step
+9. After success, idempotency key removed from Set
 
 ## Streaming
 
@@ -123,7 +124,7 @@ graph LR
 
 ## Setup
 
-Call `world.start()` to initialize BullMQ workers. When `.start()` is called, workers begin listening to BullMQ queues. When a job arrives, workers make HTTP fetch calls to the embedded world endpoints (`.well-known/workflow/v1/flow` or `.well-known/workflow/v1/step`) to execute the actual workflow logic.
+Call `world.start()` to initialize queue workers. When `.start()` is called, workers begin blocking on BRPOP for the Redis Lists. When a job arrives, workers make HTTP fetch calls to the embedded world endpoints (`.well-known/workflow/v1/flow` or `.well-known/workflow/v1/step`) to execute the actual workflow logic.
 
 In **Next.js**, the `world.start()` function needs to be added to `instrumentation.ts|js` to ensure workers start before request handling:
 
@@ -145,7 +146,7 @@ if (process.env.NEXT_RUNTIME !== 'edge') {
 - **Fast Reads**: Redis hashes provide O(1) lookups
 - **Efficient Pagination**: Sorted sets enable O(log N) range queries
 - **Real-time Streaming**: Redis Streams + Pub/Sub for low latency
-- **Scalable Queuing**: BullMQ handles high throughput
+- **Simple Queuing**: Redis Lists with BRPOP provide reliable FIFO processing
 - **Memory Efficient**: Compact binary serialization
 
 ### Considerations
@@ -193,7 +194,7 @@ closeStream (eof=true)
 
 The Redis world uses the **embedded world pattern**:
 
-1. BullMQ workers don't execute workflows directly
+1. BRPOP workers don't execute workflows directly
 2. Instead, they re-queue to an embedded local world
 3. Embedded world makes HTTP requests to workflow endpoints
 4. This enables:
@@ -205,9 +206,8 @@ The Redis world uses the **embedded world pattern**:
 
 - **WorkflowAPIError**: Thrown for not found (404) and conflict (409)
 - **Validation**: Entity existence checks before operations
-- **Idempotency**: Prevents duplicate runs/steps/hooks
-- **Retry Logic**: Built into BullMQ (3 attempts)
-- **Worker Errors**: Logged but don't crash worker process
+- **Idempotency**: Manual deduplication via Redis Sets with SADD
+- **Worker Errors**: Logged but don't crash worker process (workers retry BRPOP after 1s delay on error)
 
 ## Monitoring
 
@@ -230,7 +230,7 @@ Use RedisInsight (included in docker-compose) to:
 
 - Browse keys and data structures
 - Monitor memory usage
-- View BullMQ queue metrics
+- View Redis List lengths
 - Inspect stream entries
 
 ### Metrics to Monitor
@@ -238,8 +238,8 @@ Use RedisInsight (included in docker-compose) to:
 - **Memory Usage**: `INFO memory`
 - **Key Count**: `DBSIZE`
 - **Stream Length**: `XLEN workflow:stream:{name}`
-- **Queue Depth**: BullMQ queue.count()
-- **Worker Status**: BullMQ worker events
+- **Queue Depth**: `LLEN workflow_flows` / `LLEN workflow_steps`
+- **Worker Status**: Monitor logs for BRPOP worker activity
 
 ## Migration from world-postgres
 
