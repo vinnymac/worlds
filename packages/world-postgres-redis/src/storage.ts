@@ -363,6 +363,20 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           runValue.executionContext ||= runValue.executionContextJson;
           runValue.error = parseErrorJson(runValue.error);
           run = deserializeRunError(compact(runValue));
+        } else {
+          // Event replay: fetch existing run
+          const [existingRun] = await drizzle
+            .select()
+            .from(Schema.runs)
+            .where(eq(Schema.runs.runId, effectiveRunId))
+            .limit(1);
+          if (existingRun) {
+            existingRun.output ||= existingRun.outputJson;
+            existingRun.input ||= existingRun.inputJson;
+            existingRun.executionContext ||= existingRun.executionContextJson;
+            existingRun.error = parseErrorJson(existingRun.error);
+            run = deserializeRunError(compact(existingRun));
+          }
         }
       }
 
@@ -490,6 +504,23 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           applyCborFallbackStep(stepValue);
           stepValue.error = parseErrorJson(stepValue.error);
           step = deserializeStepError(compact(stepValue));
+        } else {
+          // Event replay: fetch existing step
+          const [existingStep] = await drizzle
+            .select()
+            .from(Schema.steps)
+            .where(
+              and(
+                eq(Schema.steps.runId, effectiveRunId),
+                eq(Schema.steps.stepId, data.correlationId!),
+              ),
+            )
+            .limit(1);
+          if (existingStep) {
+            applyCborFallbackStep(existingStep);
+            existingStep.error = parseErrorJson(existingStep.error);
+            step = deserializeStepError(compact(existingStep));
+          }
         }
       }
 
