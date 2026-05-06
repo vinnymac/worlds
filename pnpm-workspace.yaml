@@ -25,8 +25,9 @@ catalog:
   vitest: ^3.2.4
   zod: 4.3.6
 
-# pnpm v11: Allow build scripts for required native dependencies only
+# pnpm v11: Allow build scripts for required native dependencies
 # See: https://pnpm.io/11.x/migration#build-scripts-blocking
+# All packages listed here are transitively required by test/runtime dependencies
 allowBuilds:
   # Binary serialization (CBOR) - used by world-azure, world-mysql*, world-postgres-redis
   'cbor-extract': true
@@ -36,10 +37,14 @@ allowBuilds:
   'esbuild': true          # JavaScript bundler used by vitest and other dev tools
   '@swc/core': true        # TypeScript compiler used by test frameworks
 
-  # Testing infrastructure
-  'ssh2': true             # Required by testcontainers for Docker communication
+  # Testing infrastructure dependencies
+  'ssh2': true             # Testcontainers Docker communication
+  '@nestjs/core': true     # Used by testcontainers
+  'protobufjs': true       # Protocol buffers (gRPC/Azure/GCP SDKs)
+  'sharp': true            # Image processing (transitive from GCP/Azure SDKs)
+  'cpu-features': true     # CPU detection (required by sharp)
 
-  # Cloudflare Workers runtime - only needed for world-cloudflare tests
+  # Cloudflare Workers runtime - world-cloudflare tests
   'workerd': true
 
 pnpm:
