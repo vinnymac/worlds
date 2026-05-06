@@ -531,6 +531,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         if (!existing) {
           await runsBucket.put(effectiveRunId, stringifyWithUint8Array(newRun));
           run = WorkflowRunSchema.parse(compact(newRun));
+        } else {
+          // Event replay: return existing run
+          const existingData = kvValueToString(existing.value);
+          run = WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(existingData)));
         }
       }
 
@@ -640,6 +644,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         if (!existing) {
           await stepsBucket.put(stepKey, stringifyWithUint8Array(newStep));
           step = StepSchema.parse(compact(newStep));
+        } else {
+          // Event replay: return existing step
+          const existingData = kvValueToString(existing.value);
+          step = StepSchema.parse(compact(parseWithUint8Array<Step>(existingData)));
         }
       }
 
@@ -808,6 +816,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           await hooksBucket.put(data.correlationId!, stringifyWithUint8Array(newHook));
           await hooksTokenBucket.put(eventData.token, data.correlationId!);
           hook = HookSchema.parse(compact(newHook));
+        } else {
+          // Event replay: return existing hook
+          const existingData = kvValueToString(existing.value);
+          hook = HookSchema.parse(compact(parseWithUint8Array<Hook>(existingData)));
         }
       }
 
