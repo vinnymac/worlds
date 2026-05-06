@@ -8,10 +8,10 @@ catalog:
   '@testcontainers/redis': ^11.8.1
   '@types/node': ^22.19.0
   '@vercel/queue': 0.0.0-alpha.36
-  '@workflow/errors': 4.1.0-beta.20
-  '@workflow/world': 4.1.0-beta.17
-  '@workflow/world-local': 4.1.0-beta.51
-  '@workflow/world-testing': 4.1.0-beta.53
+  '@workflow/errors': 4.1.1
+  '@workflow/world': 4.1.1
+  '@workflow/world-local': 4.1.1
+  '@workflow/world-testing': 4.1.1
   cbor-x: ^1.6.0
   dotenv: ^17.2.3
   drizzle-kit: ^0.31.7
