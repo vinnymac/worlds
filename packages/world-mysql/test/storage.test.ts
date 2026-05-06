@@ -299,7 +299,7 @@ describe('Storage (MySQL integration)', () => {
       expect(run.deploymentId).toBe('test-deployment');
       expect(run.status).toBe('pending');
 
-      const retrieved = await runs.get({ runId: run.runId });
+      const retrieved = await runs.get(run.runId);
       expect(retrieved).toBeDefined();
       expect(retrieved.runId).toBe(run.runId);
     });
@@ -316,7 +316,7 @@ describe('Storage (MySQL integration)', () => {
       expect(step.stepName).toBe('test-step');
       expect(step.status).toBe('pending');
 
-      const retrieved = await steps.get({ runId: run.runId, stepId: step.stepId });
+      const retrieved = await steps.get(run.runId, step.stepId);
       expect(retrieved).toBeDefined();
       expect(retrieved.stepId).toBe(step.stepId);
     });

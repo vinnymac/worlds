@@ -187,7 +187,7 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(run.deploymentId).toBe('test-deployment');
       expect(run.status).toBe('pending');
 
-      const retrieved = await world.runs.get({ runId: run.runId });
+      const retrieved = await world.runs.get(run.runId);
       expect(retrieved).toBeDefined();
       expect(retrieved.runId).toBe(run.runId);
     });
@@ -204,7 +204,7 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(step.stepName).toBe('test-step');
       expect(step.status).toBe('pending');
 
-      const retrieved = await world.steps.get({ runId: run.runId, stepId: step.stepId });
+      const retrieved = await world.steps.get(run.runId, step.stepId);
       expect(retrieved).toBeDefined();
       expect(retrieved.stepId).toBe(step.stepId);
     });

@@ -36,17 +36,32 @@ describe('Storage (Azure Cosmos DB integration)', () => {
           return {
             fetchAll: vi.fn(async () => {
               const resources: any[] = [];
+              const query = querySpec.query;
+              const parameters = querySpec.parameters || [];
+
+              // Build parameter map
+              const paramMap: Record<string, any> = {};
+              for (const param of parameters) {
+                paramMap[param.name] = param.value;
+              }
+
               for (const [_id, doc] of mockData.entries()) {
-                // Simple filtering - in reality Cosmos DB would parse SQL
+                // Partition key filtering
                 if (options?.partitionKey && doc.runId !== options.partitionKey) {
                   continue;
                 }
-                // Simple type filtering
-                const query = querySpec.query;
+
+                // Type filtering
                 if (query.includes('c.type = "run"') && doc.type !== 'run') continue;
                 if (query.includes('c.type = "step"') && doc.type !== 'step') continue;
                 if (query.includes('c.type = "hook"') && doc.type !== 'hook') continue;
                 if (query.includes('c.type = "event"') && doc.type !== 'event') continue;
+
+                // Parameter-based filtering
+                if (paramMap['@runId'] && doc.runId !== paramMap['@runId']) continue;
+                if (paramMap['@stepId'] && doc.stepId !== paramMap['@stepId']) continue;
+                if (paramMap['@hookId'] && doc.hookId !== paramMap['@hookId']) continue;
+                if (paramMap['@eventId'] && doc.eventId !== paramMap['@eventId']) continue;
 
                 resources.push(doc);
               }
@@ -244,7 +259,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       expect(run.deploymentId).toBe('test-deployment');
       expect(run.status).toBe('pending');
 
-      const retrieved = await storage.runs.get({ runId: run.runId });
+      const retrieved = await storage.runs.get(run.runId);
       expect(retrieved).toBeDefined();
       expect(retrieved.runId).toBe(run.runId);
     });
@@ -261,7 +276,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       expect(step.stepName).toBe('test-step');
       expect(step.status).toBe('pending');
 
-      const retrieved = await storage.steps.get({ runId: run.runId, stepId: step.stepId });
+      const retrieved = await storage.steps.get(run.runId, step.stepId);
       expect(retrieved).toBeDefined();
       expect(retrieved.stepId).toBe(step.stepId);
     });
