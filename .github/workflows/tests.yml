@@ -39,7 +39,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 10.23.0
+          version: 11.0.5
 
       - name: Setup Node.js 24.x
         uses: actions/setup-node@v6
@@ -80,7 +80,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 10.23.0
+          version: 11.0.5
 
       - name: Setup Node.js 24.x
         uses: actions/setup-node@v6
