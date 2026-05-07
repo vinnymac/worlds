@@ -36,54 +36,30 @@ describe('Storage (MySQL integration)', () => {
     await connection.query('SET FOREIGN_KEY_CHECKS = 1');
   }
 
-  /**
-   * Helper: create a run via run_created event and return the run entity.
-   */
-  async function createRun(opts?: {
-    deploymentId?: string;
-    workflowName?: string;
-    input?: any;
-    executionContext?: Record<string, any>;
-  }): Promise<WorkflowRun> {
+  async function createRun(workflowName = 'test-workflow'): Promise<WorkflowRun> {
     const result = await events.create(null, {
       eventType: 'run_created',
       eventData: {
-        deploymentId: opts?.deploymentId ?? 'deployment-123',
-        workflowName: opts?.workflowName ?? 'test-workflow',
-        input: opts?.input ?? [],
-        executionContext: opts?.executionContext,
+        deploymentId: 'test-deployment',
+        workflowName,
+        input: [],
       },
     });
-    if (!result.run) {
-      throw new Error('Expected run to be created');
-    }
+    if (!result.run) throw new Error('Expected run to be created');
     return result.run;
   }
 
-  /**
-   * Helper: create a step via step_created event and return the step entity.
-   */
-  async function createStep(
-    runId: string,
-    opts?: { stepId?: string; stepName?: string; input?: any },
-  ): Promise<Step> {
-    const stepId = opts?.stepId ?? 'step-123';
+  async function createStep(runId: string, stepId = 'step-123'): Promise<Step> {
     const result = await events.create(runId, {
       eventType: 'step_created',
       correlationId: stepId,
-      eventData: {
-        stepName: opts?.stepName ?? 'test-step',
-        input: opts?.input ?? ['input1'],
-      },
+      eventData: { stepName: 'test-step', input: ['input1'] },
     });
-    if (!result.step) {
-      throw new Error('Expected step to be created');
-    }
+    if (!result.step) throw new Error('Expected step to be created');
     return result.step;
   }
 
   beforeAll(async () => {
-    // Start MySQL container
     container = await new MySqlContainer('mysql:8.0')
       .withDatabase('main')
       .withUsername('testuser')
@@ -92,98 +68,88 @@ describe('Storage (MySQL integration)', () => {
       .start();
 
     const dbUrl = `mysql://root:root@${container.getHost()}:${container.getPort()}/main`;
-    process.env.DATABASE_URL = dbUrl;
-
-    // Apply schema
     connection = await mysql.createConnection(dbUrl);
 
-    const setupStatements = [
-      'CREATE SCHEMA IF NOT EXISTS `workflow`',
-      `CREATE TABLE \`workflow\`.\`workflow_runs\` (
-        \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`output\` JSON,
-        \`output_cbor\` BLOB,
-        \`deployment_id\` VARCHAR(255) NOT NULL,
-        \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
-        \`name\` VARCHAR(255) NOT NULL,
-        \`execution_context\` JSON,
-        \`execution_context_cbor\` BLOB,
-        \`input\` JSON,
-        \`input_cbor\` BLOB,
-        \`error\` TEXT,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        \`completed_at\` TIMESTAMP NULL,
-        \`started_at\` TIMESTAMP NULL,
-        \`spec_version\` INT,
-        \`expired_at\` TIMESTAMP NULL,
-        INDEX \`idx_workflow_runs_name\` (\`name\`),
-        INDEX \`idx_workflow_runs_status\` (\`status\`)
-      )`,
-      `CREATE TABLE \`workflow\`.\`workflow_events\` (
-        \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`type\` VARCHAR(255) NOT NULL,
-        \`correlation_id\` VARCHAR(255),
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`run_id\` VARCHAR(255) NOT NULL,
-        \`payload\` JSON,
-        \`payload_cbor\` BLOB,
-        \`spec_version\` INT,
-        INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
-        INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
-      )`,
-      `CREATE TABLE \`workflow\`.\`workflow_steps\` (
-        \`run_id\` VARCHAR(255) NOT NULL,
-        \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`step_name\` VARCHAR(255) NOT NULL,
-        \`status\` ENUM('pending','running','completed','failed') NOT NULL,
-        \`input\` JSON,
-        \`input_cbor\` BLOB,
-        \`output\` JSON,
-        \`output_cbor\` BLOB,
-        \`error\` TEXT,
-        \`attempt\` INT NOT NULL,
-        \`started_at\` TIMESTAMP NULL,
-        \`completed_at\` TIMESTAMP NULL,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        \`retry_after\` TIMESTAMP NULL,
-        \`spec_version\` INT,
-        INDEX \`idx_workflow_steps_run_id\` (\`run_id\`),
-        INDEX \`idx_workflow_steps_status\` (\`status\`)
-      )`,
-      `CREATE TABLE \`workflow\`.\`workflow_hooks\` (
-        \`run_id\` VARCHAR(255) NOT NULL,
-        \`hook_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`token\` VARCHAR(255) NOT NULL,
-        \`owner_id\` VARCHAR(255) NOT NULL,
-        \`project_id\` VARCHAR(255) NOT NULL,
-        \`environment\` VARCHAR(255) NOT NULL,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`metadata\` JSON,
-        \`metadata_cbor\` BLOB,
-        \`spec_version\` INT,
-        \`is_webhook\` BOOLEAN,
-        INDEX \`idx_workflow_hooks_run_id\` (\`run_id\`),
-        INDEX \`idx_workflow_hooks_token\` (\`token\`)
-      )`,
-      `CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
-        \`id\` VARCHAR(255) NOT NULL,
-        \`stream_id\` VARCHAR(255) NOT NULL,
-        \`data\` BLOB NOT NULL,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`eof\` BOOLEAN NOT NULL,
-        \`sequence\` BIGINT NOT NULL,
-        PRIMARY KEY (\`stream_id\`, \`id\`),
-        INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`)
-      )`,
-    ];
+    await connection.query('CREATE SCHEMA IF NOT EXISTS `workflow`');
+    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_runs\` (
+      \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
+      \`output\` JSON,
+      \`output_cbor\` BLOB,
+      \`deployment_id\` VARCHAR(255) NOT NULL,
+      \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
+      \`name\` VARCHAR(255) NOT NULL,
+      \`execution_context\` JSON,
+      \`execution_context_cbor\` BLOB,
+      \`input\` JSON,
+      \`input_cbor\` BLOB,
+      \`error\` TEXT,
+      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      \`completed_at\` TIMESTAMP NULL,
+      \`started_at\` TIMESTAMP NULL,
+      \`spec_version\` INT,
+      \`expired_at\` TIMESTAMP NULL,
+      INDEX \`idx_workflow_runs_name\` (\`name\`),
+      INDEX \`idx_workflow_runs_status\` (\`status\`)
+    )`);
+    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_events\` (
+      \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
+      \`type\` VARCHAR(255) NOT NULL,
+      \`correlation_id\` VARCHAR(255),
+      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`run_id\` VARCHAR(255) NOT NULL,
+      \`payload\` JSON,
+      \`payload_cbor\` BLOB,
+      \`spec_version\` INT,
+      INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
+      INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
+    )`);
+    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_steps\` (
+      \`run_id\` VARCHAR(255) NOT NULL,
+      \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
+      \`step_name\` VARCHAR(255) NOT NULL,
+      \`status\` ENUM('pending','running','completed','failed') NOT NULL,
+      \`input\` JSON,
+      \`input_cbor\` BLOB,
+      \`output\` JSON,
+      \`output_cbor\` BLOB,
+      \`error\` TEXT,
+      \`attempt\` INT NOT NULL,
+      \`started_at\` TIMESTAMP NULL,
+      \`completed_at\` TIMESTAMP NULL,
+      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      \`retry_after\` TIMESTAMP NULL,
+      \`spec_version\` INT,
+      INDEX \`idx_workflow_steps_run_id\` (\`run_id\`),
+      INDEX \`idx_workflow_steps_status\` (\`status\`)
+    )`);
+    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_hooks\` (
+      \`run_id\` VARCHAR(255) NOT NULL,
+      \`hook_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
+      \`token\` VARCHAR(255) NOT NULL,
+      \`owner_id\` VARCHAR(255) NOT NULL,
+      \`project_id\` VARCHAR(255) NOT NULL,
+      \`environment\` VARCHAR(255) NOT NULL,
+      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`metadata\` JSON,
+      \`metadata_cbor\` BLOB,
+      \`spec_version\` INT,
+      \`is_webhook\` BOOLEAN,
+      INDEX \`idx_workflow_hooks_run_id\` (\`run_id\`),
+      INDEX \`idx_workflow_hooks_token\` (\`token\`)
+    )`);
+    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
+      \`id\` VARCHAR(255) NOT NULL,
+      \`stream_id\` VARCHAR(255) NOT NULL,
+      \`data\` BLOB NOT NULL,
+      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`eof\` BOOLEAN NOT NULL,
+      \`sequence\` BIGINT NOT NULL,
+      PRIMARY KEY (\`stream_id\`, \`id\`),
+      INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`)
+    )`);
 
-    for (const stmt of setupStatements) {
-      await connection.query(stmt);
-    }
-
-    // Initialize Drizzle and storage
     db = drizzle(connection, { schema, mode: 'default' });
     runs = createRunsStorage(db);
     steps = createStepsStorage(db);
@@ -191,9 +157,7 @@ describe('Storage (MySQL integration)', () => {
     events = createEventsStorage(db);
   }, 120_000);
 
-  beforeEach(async () => {
-    await truncateTables();
-  });
+  beforeEach(truncateTables);
 
   afterAll(async () => {
     await connection?.end();
@@ -201,69 +165,52 @@ describe('Storage (MySQL integration)', () => {
   });
 
   describe('Event idempotency', () => {
+    it('should handle duplicate run_created events', async () => {
+      const workflowName = 'test-workflow-idempotent';
+      const eventData = {
+        eventType: 'run_created' as const,
+        eventData: { deploymentId: 'test-deployment', workflowName, input: [] },
+      };
+
+      const result1 = await events.create(null, eventData);
+      expect(result1.run).toBeDefined();
+      const runId = result1.run!.runId;
+
+      const result2 = await events.create(runId, eventData);
+      expect(result2.run).toBeDefined();
+      expect(result2.run!.runId).toBe(runId);
+
+      const listResult = await runs.list({ workflowName });
+      expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+    });
+
     it('should handle duplicate step_created events', async () => {
       const run = await createRun();
-      const stepId = 'step-idempotent-test';
-
-      // First step_created event
-      const result1 = await events.create(run.runId, {
-        eventType: 'step_created',
+      const stepId = 'step-idempotent';
+      const eventData = {
+        eventType: 'step_created' as const,
         correlationId: stepId,
         eventData: { stepName: 'test-step', input: ['input1'] },
-      });
+      };
+
+      const result1 = await events.create(run.runId, eventData);
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario)
-      const result2 = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: stepId,
-        eventData: { stepName: 'test-step', input: ['input1'] },
-      });
+      const result2 = await events.create(run.runId, eventData);
       expect(result2.step).toBeDefined();
       expect(result2.step!.stepId).toBe(stepId);
 
-      // Verify step appears in list query (critical!)
       const listResult = await steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
     });
 
-    it('should handle duplicate run_created events', async () => {
-      // First run_created event
-      const result1 = await events.create(null, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-idempotent',
-          input: [],
-        },
-      });
-      expect(result1.run).toBeDefined();
-      const runId = result1.run!.runId;
-
-      // Duplicate run_created event (replay scenario)
-      const result2 = await events.create(runId, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-idempotent',
-          input: [],
-        },
-      });
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
-
-      const listResult = await runs.list({ workflowName: 'test-workflow-idempotent' });
-      expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
-    });
-
-    it('should handle duplicate hook_created events with different tokens', async () => {
+    it('should handle duplicate hook_created events', async () => {
       const run = await createRun();
-      const hookId1 = 'hook-idempotent-test-1';
-      const hookId2 = 'hook-idempotent-test-2';
+      const hookId1 = 'hook-idempotent-1';
+      const hookId2 = 'hook-idempotent-2';
 
-      // Test idempotency by creating two separate hooks
       const result1 = await events.create(run.runId, {
         eventType: 'hook_created',
         correlationId: hookId1,
@@ -278,7 +225,6 @@ describe('Storage (MySQL integration)', () => {
       });
       expect(result2.hook).toBeDefined();
 
-      // Both hooks should be in the index
       const listResult = await hooks.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(2);
       expect(listResult.data.some((h) => h.hookId === hookId1)).toBe(true);
@@ -286,39 +232,19 @@ describe('Storage (MySQL integration)', () => {
     });
   });
 
-  describe('Basic functionality', () => {
-    it('should create and retrieve a run', async () => {
-      const run = await createRun({
-        deploymentId: 'test-deployment',
-        workflowName: 'test-workflow',
-      });
+  it('should create and retrieve entities', async () => {
+    const run = await createRun();
+    expect(run.runId).toBeDefined();
+    expect(run.status).toBe('pending');
 
-      expect(run).toBeDefined();
-      expect(run.runId).toBeDefined();
-      expect(run.workflowName).toBe('test-workflow');
-      expect(run.deploymentId).toBe('test-deployment');
-      expect(run.status).toBe('pending');
+    const retrieved = await runs.get(run.runId);
+    expect(retrieved.runId).toBe(run.runId);
 
-      const retrieved = await runs.get(run.runId);
-      expect(retrieved).toBeDefined();
-      expect(retrieved.runId).toBe(run.runId);
-    });
+    const step = await createStep(run.runId, 'test-step-1');
+    expect(step.stepId).toBe('test-step-1');
+    expect(step.status).toBe('pending');
 
-    it('should create and retrieve a step', async () => {
-      const run = await createRun();
-      const step = await createStep(run.runId, {
-        stepId: 'test-step-1',
-        stepName: 'test-step',
-      });
-
-      expect(step).toBeDefined();
-      expect(step.stepId).toBe('test-step-1');
-      expect(step.stepName).toBe('test-step');
-      expect(step.status).toBe('pending');
-
-      const retrieved = await steps.get(run.runId, step.stepId);
-      expect(retrieved).toBeDefined();
-      expect(retrieved.stepId).toBe(step.stepId);
-    });
+    const retrievedStep = await steps.get(run.runId, step.stepId);
+    expect(retrievedStep.stepId).toBe(step.stepId);
   });
 });
