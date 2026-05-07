@@ -18,7 +18,6 @@
     "directory": "packages/world-azure"
   },
   "type": "module",
-  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -30,9 +29,9 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "clean": "tsc --build --clean && rm -rf dist",
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -47,10 +46,12 @@
     "ulid": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/utils": "workspace:*",
     "@testcontainers/azure-cosmosdb-emulator": "11.14.0",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "testcontainers": "catalog:",
+    "tsup": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

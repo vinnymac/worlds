@@ -6,6 +6,7 @@ import type {
   Streamer,
 } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
+import { debug, withCosmosRetry } from './util.js';
 
 interface StreamerConfig {
   /** Container for stream chunks (partition key: /streamId) */
@@ -35,15 +36,17 @@ export function createStreamer(config: StreamerConfig): Streamer {
             ? chunk
             : Buffer.from(chunk);
 
-      await streamsContainer.items.create({
-        id: chunkId,
-        streamId: name,
-        chunkId,
-        sequence,
-        chunkData: buffer.toString('base64'),
-        eof: false,
-        createdAt: new Date().toISOString(),
-      });
+      await withCosmosRetry(() =>
+        streamsContainer.items.create({
+          id: chunkId,
+          streamId: name,
+          chunkId,
+          sequence,
+          chunkData: buffer.toString('base64'),
+          eof: false,
+          createdAt: new Date().toISOString(),
+        }),
+      );
     },
 
     async closeStream(name: string, _runId: string | Promise<string>) {
@@ -52,15 +55,17 @@ export function createStreamer(config: StreamerConfig): Streamer {
       const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
       const sequence = Number.parseInt(ulid().substring(0, 10), 36);
 
-      await streamsContainer.items.create({
-        id: chunkId,
-        streamId: name,
-        chunkId,
-        sequence,
-        chunkData: '',
-        eof: true,
-        createdAt: new Date().toISOString(),
-      });
+      await withCosmosRetry(() =>
+        streamsContainer.items.create({
+          id: chunkId,
+          streamId: name,
+          chunkId,
+          sequence,
+          chunkData: '',
+          eof: true,
+          createdAt: new Date().toISOString(),
+        }),
+      );
     },
 
     async readFromStream(streamName: string) {
@@ -176,7 +181,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
               })
               .catch((err) => {
                 if (!closed) {
-                  console.error('[readFromStream] Poll error:', err);
+                  debug('[readFromStream] Poll error:', err);
                   pollTimer = setTimeout(poll, 500);
                 }
               });

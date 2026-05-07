@@ -1,14 +1,14 @@
 import type { Storage, World } from '@workflow/world';
 import { Redis } from 'ioredis';
 import type { RedisWorldConfig } from './config.js';
-import { createQueue } from './queue.js';
+import { createQueue, type QueueStats } from './queue.js';
 import {
   createEventsStorage,
   createHooksStorage,
   createRunsStorage,
   createStepsStorage,
 } from './storage.js';
-import { createStreamer } from './streamer.js';
+import { createStreamer, type StreamStats } from './streamer.js';
 
 function createStorage(redis: Redis, keyPrefix: string): Storage {
   const config = { redis, keyPrefix };
@@ -20,6 +20,15 @@ function createStorage(redis: Redis, keyPrefix: string): Storage {
   };
 }
 
+export interface RedisWorld extends World {
+  /** Start background queue workers */
+  start(): Promise<void>;
+  /** Get queue depth and health metrics for observability */
+  getQueueStats(): Promise<QueueStats>;
+  /** Get stream health metrics for a specific stream */
+  getStreamStats(name: string): Promise<StreamStats>;
+}
+
 export function createWorld(
   config: RedisWorldConfig = {
     redis: process.env.WORKFLOW_REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379',
@@ -28,7 +37,7 @@ export function createWorld(
       Number.parseInt(process.env.WORKFLOW_REDIS_WORKER_CONCURRENCY || '10', 10) || 10,
     keyPrefix: process.env.WORKFLOW_REDIS_KEY_PREFIX || 'workflow:',
   },
-): World & { start(): Promise<void> } {
+): RedisWorld {
   const redis =
     typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
 
@@ -49,5 +58,7 @@ export function createWorld(
   };
 }
 
-// Re-export config for users
+// Re-export config and stats types for users
 export type { RedisWorldConfig } from './config.js';
+export type { QueueStats } from './queue.js';
+export type { StreamStats } from './streamer.js';

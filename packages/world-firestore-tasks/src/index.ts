@@ -6,6 +6,7 @@ import type { World } from '@workflow/world';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
+export type { FirestoreStreamerConfig } from './streamer.js';
 
 export interface FirestoreTasksWorldConfig {
   firestore?: Firestore;
@@ -15,6 +16,16 @@ export interface FirestoreTasksWorldConfig {
   queueName?: string;
   targetUrl?: string;
   deploymentId?: string;
+  /**
+   * Streaming strategy for readFromStream:
+   * - 'listener' (default): Firestore real-time listeners (lowest latency, higher cost)
+   * - 'polling': Periodic polling (higher latency, lower cost)
+   */
+  streamerMode?: 'listener' | 'polling';
+  /**
+   * Polling interval (ms) when streamerMode is 'polling'. Default: 1000
+   */
+  streamerPollIntervalMs?: number;
 }
 
 export function createFirestoreTasksWorld(
@@ -64,6 +75,7 @@ export function createFirestoreTasksWorld(
 
   const queue = createQueue({
     client: tasksClientInstance,
+    firestore: firestoreInstance,
     project: projectId,
     location: locationId,
     queueName: queueId,
@@ -73,6 +85,8 @@ export function createFirestoreTasksWorld(
 
   const streamer = createStreamer({
     firestore: firestoreInstance,
+    mode: config.streamerMode,
+    pollIntervalMs: config.streamerPollIntervalMs,
   });
 
   return {

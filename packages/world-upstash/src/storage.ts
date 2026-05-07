@@ -33,74 +33,11 @@ import {
 } from '@workflow/world';
 import type { Redis } from '@upstash/redis';
 import { monotonicFactory } from 'ulid';
+import { compact, stringify, parse } from './util.js';
 
 interface UpstashStorageConfig {
   redis: Redis;
   keyPrefix: string;
-}
-
-/**
- * Date fields that need to be converted from ISO strings back to Date objects
- * when deserializing from Redis JSON storage.
- */
-const DATE_FIELDS = new Set(['createdAt', 'updatedAt', 'startedAt', 'completedAt', 'retryAfter']);
-
-/**
- * Reviver function for JSON.parse() that converts ISO date strings to Date objects.
- */
-function dateReviver(key: string, value: any): any {
-  if (DATE_FIELDS.has(key) && typeof value === 'string') {
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : date;
-  }
-  return value;
-}
-
-/**
- * JSON replacer function that converts Uint8Array to a special marker object.
- */
-function uint8ArrayReplacer(_key: string, value: any): any {
-  if (value instanceof Uint8Array) {
-    return {
-      __uint8array: true,
-      data: Array.from(value),
-    };
-  }
-  return value;
-}
-
-/**
- * JSON reviver function that converts marker objects back to Uint8Array.
- */
-function uint8ArrayReviver(key: string, value: any): any {
-  const dateValue = dateReviver(key, value);
-
-  if (dateValue && typeof dateValue === 'object' && dateValue.__uint8array === true) {
-    return new Uint8Array(dateValue.data);
-  }
-
-  return dateValue;
-}
-
-/**
- * Stringify an object with Uint8Array support.
- */
-function stringifyWithUint8Array(obj: any): string {
-  return JSON.stringify(obj, uint8ArrayReplacer);
-}
-
-/**
- * Parse JSON with Uint8Array and Date support.
- */
-function parseWithUint8Array<T>(json: string): T {
-  return JSON.parse(json, uint8ArrayReviver);
-}
-
-/**
- * Compact utility to remove undefined values
- */
-function compact<T>(obj: T): T {
-  return JSON.parse(JSON.stringify(obj)) as T;
 }
 
 /**
@@ -191,7 +128,7 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
       if (!data) {
         throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
       }
-      const run = parseWithUint8Array<WorkflowRun>(data);
+      const run = parse<WorkflowRun>(data);
       const parsed = WorkflowRunSchema.parse(compact(run));
       const resolveData = params?.resolveData ?? 'all';
       return filterRunData(parsed, resolveData);
@@ -213,7 +150,7 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
           continue;
         }
 
-        const run: WorkflowRun = parseWithUint8Array<WorkflowRun>(data);
+        const run: WorkflowRun = parse<WorkflowRun>(data);
         const statusMatches = !params?.status || run.status === params.status;
         const nameMatches = !params?.workflowName || run.workflowName === params.workflowName;
 
@@ -267,7 +204,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
     for (const hookId of hookIds) {
       const hookData = await redis.get<string>(hookKey(hookId));
       if (hookData) {
-        const hook = parseWithUint8Array<Hook>(hookData);
+        const hook = parse<Hook>(hookData);
         await redis.del(hookKey(hookId));
         await redis.del(hooksByTokenKey(hook.token));
       }
@@ -289,14 +226,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const now = new Date();
         const existingData = await redis.get<string>(runKey(runId));
         if (existingData) {
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'cancelled' as const,
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(runId), stringifyWithUint8Array(updatedRun));
+          await redis.set(runKey(runId), stringify(updatedRun));
 
           await redis.zrem(runsByStatusKey(existing.status), runId);
           await redis.zadd(runsByStatusKey('cancelled'), { score: now.getTime(), member: runId });
@@ -322,7 +259,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await redis.set(eventKey(eventId), stringifyWithUint8Array(event));
+        await redis.set(eventKey(eventId), stringify(event));
         const score = createdAt.getTime();
         await redis.zadd(eventsIndexKey(runId), { score, member: eventId });
         if (data.correlationId) {
@@ -378,7 +315,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType !== 'run_created' && !skipRunValidationEvents.includes(data.eventType)) {
         const runData = await redis.get<string>(runKey(effectiveRunId));
         if (runData) {
-          const parsed = parseWithUint8Array<WorkflowRun>(runData);
+          const parsed = parse<WorkflowRun>(runData);
           currentRun = {
             status: parsed.status,
             specVersion: parsed.specVersion,
@@ -413,7 +350,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          await redis.set(eventKey(eventId), stringifyWithUint8Array(event));
+          await redis.set(eventKey(eventId), stringify(event));
           const score = createdAt.getTime();
           await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
 
@@ -421,9 +358,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           const resolveData = params?.resolveData ?? 'all';
           return {
             event: filterEventData(parsed, resolveData),
-            run: fullRunData
-              ? (parseWithUint8Array<WorkflowRun>(fullRunData) as WorkflowRun)
-              : undefined,
+            run: fullRunData ? (parse<WorkflowRun>(fullRunData) as WorkflowRun) : undefined,
           };
         }
 
@@ -447,7 +382,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
         const stepData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId));
         if (stepData) {
-          const parsed = parseWithUint8Array<Step>(stepData);
+          const parsed = parse<Step>(stepData);
           validatedStep = {
             status: parsed.status,
             startedAt: parsed.startedAt,
@@ -507,10 +442,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           updatedAt: now,
         };
 
-        const wasCreated = await redis.setnx(
-          runKey(effectiveRunId),
-          stringifyWithUint8Array(newRun),
-        );
+        const wasCreated = await redis.setnx(runKey(effectiveRunId), stringify(newRun));
 
         // Always add to indexes (idempotent)
         const score = now.getTime();
@@ -527,7 +459,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           // Event replay: fetch existing run
           const existingData = await redis.get<string>(runKey(effectiveRunId));
           if (existingData) {
-            run = WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(existingData)));
+            run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
           }
         }
       }
@@ -535,14 +467,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType === 'run_started') {
         const existingData = await redis.get<string>(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'running' as const,
             startedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
+          await redis.set(runKey(effectiveRunId), stringify(updatedRun));
 
           await redis.zrem(runsByStatusKey(existing.status), existing.runId);
           await redis.zadd(runsByStatusKey('running'), {
@@ -558,7 +490,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const eventData = (data as any).eventData as { output?: any };
         const existingData = await redis.get<string>(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'completed' as const,
@@ -566,7 +498,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
+          await redis.set(runKey(effectiveRunId), stringify(updatedRun));
 
           await redis.zrem(runsByStatusKey(existing.status), existing.runId);
           await redis.zadd(runsByStatusKey('completed'), {
@@ -592,7 +524,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
         const existingData = await redis.get<string>(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'failed' as const,
@@ -604,7 +536,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
+          await redis.set(runKey(effectiveRunId), stringify(updatedRun));
 
           await redis.zrem(runsByStatusKey(existing.status), existing.runId);
           await redis.zadd(runsByStatusKey('failed'), {
@@ -621,14 +553,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType === 'run_cancelled') {
         const existingData = await redis.get<string>(runKey(effectiveRunId));
         if (existingData) {
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
           const updatedRun = {
             ...existing,
             status: 'cancelled' as const,
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(effectiveRunId), stringifyWithUint8Array(updatedRun));
+          await redis.set(runKey(effectiveRunId), stringify(updatedRun));
 
           await redis.zrem(runsByStatusKey(existing.status), existing.runId);
           await redis.zadd(runsByStatusKey('cancelled'), {
@@ -662,7 +594,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
         const wasCreated = await redis.setnx(
           stepKey(effectiveRunId, data.correlationId!),
-          stringifyWithUint8Array(newStep),
+          stringify(newStep),
         );
 
         // Always add to index (ZADD is idempotent)
@@ -679,7 +611,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             stepKey(effectiveRunId, data.correlationId!),
           );
           if (existingData) {
-            step = StepSchema.parse(compact(parseWithUint8Array<Step>(existingData)));
+            step = StepSchema.parse(compact(parse<Step>(existingData)));
           }
         }
       }
@@ -688,7 +620,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const isFirstStart = !validatedStep?.startedAt;
         const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           const updatedStep = {
             ...existing,
             status: 'running' as const,
@@ -696,10 +628,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             ...(isFirstStart ? { startedAt: now } : {}),
             updatedAt: now,
           };
-          await redis.set(
-            stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep),
-          );
+          await redis.set(stepKey(effectiveRunId, data.correlationId!), stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         }
       }
@@ -708,7 +637,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const eventData = (data as any).eventData as { result?: any };
         const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
@@ -722,10 +651,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(
-            stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep),
-          );
+          await redis.set(stepKey(effectiveRunId, data.correlationId!), stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         } else {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
@@ -744,7 +670,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
         const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
@@ -761,10 +687,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(
-            stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep),
-          );
+          await redis.set(stepKey(effectiveRunId, data.correlationId!), stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         } else {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
@@ -784,7 +707,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
         const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           const updatedStep = {
             ...existing,
             status: 'pending' as const,
@@ -795,10 +718,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             retryAfter: eventData.retryAfter,
             updatedAt: now,
           };
-          await redis.set(
-            stepKey(effectiveRunId, data.correlationId!),
-            stringifyWithUint8Array(updatedStep),
-          );
+          await redis.set(stepKey(effectiveRunId, data.correlationId!), stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         }
       }
@@ -823,7 +743,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             specVersion: effectiveSpecVersion,
           };
 
-          await redis.set(eventKey(eventId), stringifyWithUint8Array(conflictEvent));
+          await redis.set(eventKey(eventId), stringify(conflictEvent));
           const score = createdAt.getTime();
           await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
           if (data.correlationId) {
@@ -855,10 +775,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           createdAt: now,
         };
 
-        const wasCreated = await redis.setnx(
-          hookKey(data.correlationId!),
-          stringifyWithUint8Array(newHook),
-        );
+        const wasCreated = await redis.setnx(hookKey(data.correlationId!), stringify(newHook));
 
         // Always add to indexes (idempotent)
         await redis.set(hooksByTokenKey(eventData.token), data.correlationId!);
@@ -873,7 +790,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           // Event replay: fetch existing hook
           const existingData = await redis.get<string>(hookKey(data.correlationId!));
           if (existingData) {
-            hook = HookSchema.parse(compact(parseWithUint8Array<Hook>(existingData)));
+            hook = HookSchema.parse(compact(parse<Hook>(existingData)));
           }
         }
       }
@@ -881,7 +798,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType === 'hook_disposed' && data.correlationId) {
         const hookData = await redis.get<string>(hookKey(data.correlationId));
         if (hookData) {
-          const existingHook = parseWithUint8Array<Hook>(hookData);
+          const existingHook = parse<Hook>(hookData);
           await redis.del(hookKey(data.correlationId));
           await redis.del(hooksByTokenKey(existingHook.token));
           await redis.zrem(hooksIndexKey(effectiveRunId), data.correlationId);
@@ -897,7 +814,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         specVersion: effectiveSpecVersion,
       };
 
-      await redis.set(eventKey(eventId), stringifyWithUint8Array(event));
+      await redis.set(eventKey(eventId), stringify(event));
 
       const score = createdAt.getTime();
       await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
@@ -922,7 +839,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           status: 404,
         });
       }
-      return parseWithUint8Array<Event>(data);
+      return parse<Event>(data);
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -945,7 +862,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       for (const eid of eventIds) {
         const data = await redis.get<string>(eventKey(eid));
         if (data) {
-          const event = parseWithUint8Array<Event>(data);
+          const event = parse<Event>(data);
           events.push(event);
         }
       }
@@ -986,7 +903,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       for (const eid of eventIds) {
         const data = await redis.get<string>(eventKey(eid));
         if (data) {
-          const event = parseWithUint8Array<Event>(data);
+          const event = parse<Event>(data);
           events.push(event);
         }
       }
@@ -1029,7 +946,7 @@ export function createStepsStorage(config: UpstashStorageConfig): Storage['steps
       });
     }
 
-    const step = parseWithUint8Array<Step>(data);
+    const step = parse<Step>(data);
     const parsed = StepSchema.parse(compact(step));
     const resolveData = params?.resolveData ?? 'all';
     return filterStepData(parsed, resolveData);
@@ -1070,7 +987,7 @@ export function createStepsStorage(config: UpstashStorageConfig): Storage['steps
       for (const sid of stepIds) {
         const data = await redis.get<string>(stepKey(params.runId, sid));
         if (data) {
-          const step = parseWithUint8Array<Step>(data);
+          const step = parse<Step>(data);
           const parsed = StepSchema.parse(compact(step));
           steps.push(filterStepData(parsed, resolveData));
         }
@@ -1106,7 +1023,7 @@ export function createHooksStorage(config: UpstashStorageConfig): Storage['hooks
           status: 404,
         });
       }
-      const hook = parseWithUint8Array<Hook>(data);
+      const hook = parse<Hook>(data);
       const parsed = HookSchema.parse(compact(hook));
       const resolveData = params?.resolveData ?? 'all';
       return filterHookData(parsed, resolveData);
@@ -1142,7 +1059,7 @@ export function createHooksStorage(config: UpstashStorageConfig): Storage['hooks
       for (const hId of hookIds) {
         const data = await redis.get<string>(hookKeyFn(hId));
         if (data) {
-          const hook = parseWithUint8Array<Hook>(data);
+          const hook = parse<Hook>(data);
           const parsed = HookSchema.parse(compact(hook));
           const filtered = filterHookData(parsed, params?.resolveData ?? 'all');
           hooks.push(filtered);

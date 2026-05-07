@@ -4,53 +4,39 @@
       "collectionGroup": "workflow_runs",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "workflowName",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "createdAt",
-          "order": "DESCENDING"
-        }
+        { "fieldPath": "workflowName", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
     },
     {
       "collectionGroup": "workflow_runs",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "status",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "createdAt",
-          "order": "DESCENDING"
-        }
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "workflow_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "workflowName", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
     },
     {
       "collectionGroup": "events",
       "queryScope": "COLLECTION_GROUP",
       "fields": [
-        {
-          "fieldPath": "correlationId",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "createdAt",
-          "order": "DESCENDING"
-        }
+        { "fieldPath": "correlationId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "ASCENDING" }
       ]
     },
     {
       "collectionGroup": "hooks",
       "queryScope": "COLLECTION_GROUP",
-      "fields": [
-        {
-          "fieldPath": "hookId",
-          "order": "ASCENDING"
-        }
-      ]
+      "fields": [{ "fieldPath": "hookId", "order": "ASCENDING" }]
     }
   ],
   "fieldOverrides": []

@@ -33,69 +33,17 @@ import {
 } from '@workflow/world';
 import type { JetStreamClient, KV } from 'nats';
 import { monotonicFactory } from 'ulid';
-import { compact } from './util.js';
+import { parse, stringify } from '@fantasticfour/utils';
+import { compact, debug } from './util.js';
 
 interface NatsStorageConfig {
   getJetStream: () => Promise<JetStreamClient>;
   keyPrefix: string;
+  terminalRunTTLMs?: number;
 }
 
-/**
- * Date fields that need to be converted from ISO strings back to Date objects
- * when deserializing from NATS JetStream KV storage.
- */
-const DATE_FIELDS = new Set(['createdAt', 'updatedAt', 'startedAt', 'completedAt', 'retryAfter']);
-
-/**
- * Reviver function for JSON.parse() that converts ISO date strings to Date objects.
- */
-function dateReviver(key: string, value: any): any {
-  if (DATE_FIELDS.has(key) && typeof value === 'string') {
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : date;
-  }
-  return value;
-}
-
-/**
- * JSON replacer function that converts Uint8Array to a special marker object.
- */
-function uint8ArrayReplacer(_key: string, value: any): any {
-  if (value instanceof Uint8Array) {
-    return {
-      __uint8array: true,
-      data: Array.from(value),
-    };
-  }
-  return value;
-}
-
-/**
- * JSON reviver function that converts marker objects back to Uint8Array.
- */
-function uint8ArrayReviver(key: string, value: any): any {
-  const dateValue = dateReviver(key, value);
-
-  if (dateValue && typeof dateValue === 'object' && dateValue.__uint8array === true) {
-    return new Uint8Array(dateValue.data);
-  }
-
-  return dateValue;
-}
-
-/**
- * Stringify an object with Uint8Array support.
- */
-function stringifyWithUint8Array(obj: any): string {
-  return JSON.stringify(obj, uint8ArrayReplacer);
-}
-
-/**
- * Parse JSON with Uint8Array and Date support.
- */
-function parseWithUint8Array<T>(json: string): T {
-  return JSON.parse(json, uint8ArrayReviver);
-}
+/** Default TTL for terminal runs: 30 days. */
+const DEFAULT_TERMINAL_RUN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * Convert KV entry value to string (handles both string and Uint8Array)
@@ -152,21 +100,53 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
   return event;
 }
 
+// ---------------------------------------------------------------------------
+// Secondary index helpers
+// ---------------------------------------------------------------------------
+
 /**
- * Create storage for workflow runs using JetStream KV Store
+ * Collect all keys currently stored in a KV bucket that match a given prefix.
+ * Returns the *values* (decoded as strings) for matching keys.
+ */
+async function collectIndexKeys(bucket: KV, prefix: string): Promise<string[]> {
+  const results: string[] = [];
+  try {
+    const keys = await bucket.keys();
+    for await (const key of keys) {
+      if (key.startsWith(prefix)) {
+        results.push(key.slice(prefix.length));
+      }
+    }
+  } catch {
+    // Bucket may be empty — that's fine
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Runs storage
+// ---------------------------------------------------------------------------
+
+/**
+ * Create storage for workflow runs using JetStream KV Store.
+ *
+ * Uses a secondary index bucket (`<prefix>runs_by_status`) so that
+ * `runs.list({ status })` no longer requires a full bucket scan.
  */
 export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
   const { getJetStream, keyPrefix } = config;
   let runsBucket: KV;
+  let runsByStatusBucket: KV;
 
-  // Initialize KV buckets on first access
   const initBuckets = async () => {
     if (!runsBucket) {
       const jetstream = await getJetStream();
-      const kv = jetstream.views.kv(`${keyPrefix}runs`, {
+      runsBucket = await jetstream.views.kv(`${keyPrefix}runs`, {
         history: 10,
       });
-      runsBucket = await kv;
+      runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, {
+        history: 1,
+      });
     }
   };
 
@@ -178,7 +158,7 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
         throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
       }
       const data = kvValueToString(entry.value);
-      const run = parseWithUint8Array<WorkflowRun>(data);
+      const run = parse<WorkflowRun>(data);
       const parsed = WorkflowRunSchema.parse(compact(run));
       const resolveData = params?.resolveData ?? 'all';
       return filterRunData(parsed, resolveData);
@@ -189,23 +169,51 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
       const limit = params?.pagination?.limit ?? 20;
       const resolveData = params?.resolveData ?? 'all';
 
-      // Get all runs and filter/sort in memory
-      // For production: consider using JetStream streams for better filtering
+      let candidateRunIds: string[] | null = null;
+
+      // If filtering by status, use the secondary index for a fast lookup
+      if (params?.status) {
+        const prefix = `${params.status}.`;
+        candidateRunIds = await collectIndexKeys(runsByStatusBucket, prefix);
+      }
+
       const runs: (WorkflowRun | WorkflowRunWithoutData)[] = [];
 
-      for await (const entry of await runsBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
+      if (candidateRunIds !== null) {
+        // Fetch each run by primary key
+        for (const runId of candidateRunIds) {
+          try {
+            const entry = await runsBucket.get(runId);
+            if (!entry || entry.operation === 'DEL') continue;
 
-        const data = kvValueToString(entry.value);
-        const run: WorkflowRun = parseWithUint8Array<WorkflowRun>(data);
+            const data = kvValueToString(entry.value);
+            const run = parse<WorkflowRun>(data);
 
-        // Apply filters
-        const statusMatches = !params?.status || run.status === params.status;
-        const nameMatches = !params?.workflowName || run.workflowName === params.workflowName;
+            const nameMatches = !params?.workflowName || run.workflowName === params.workflowName;
+            if (nameMatches) {
+              const parsed = WorkflowRunSchema.parse(compact(run));
+              runs.push(filterRunData(parsed, resolveData));
+            }
+          } catch {
+            // Run may have been deleted between index read and primary fetch
+            debug(`Stale index entry for run ${runId}, skipping`);
+          }
+        }
+      } else {
+        // No status filter — fall back to full bucket scan
+        for await (const entry of await runsBucket.history()) {
+          if (!entry || entry.operation === 'DEL') continue;
 
-        if (statusMatches && nameMatches) {
-          const parsed = WorkflowRunSchema.parse(compact(run));
-          runs.push(filterRunData(parsed, resolveData));
+          const data = kvValueToString(entry.value);
+          const run: WorkflowRun = parse<WorkflowRun>(data);
+
+          const statusMatches = !params?.status || run.status === params.status;
+          const nameMatches = !params?.workflowName || run.workflowName === params.workflowName;
+
+          if (statusMatches && nameMatches) {
+            const parsed = WorkflowRunSchema.parse(compact(run));
+            runs.push(filterRunData(parsed, resolveData));
+          }
         }
       }
 
@@ -233,6 +241,10 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Events storage
+// ---------------------------------------------------------------------------
+
 /**
  * Create storage for workflow events using JetStream KV Store
  */
@@ -245,6 +257,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   let stepsBucket: KV;
   let hooksBucket: KV;
   let hooksTokenBucket: KV;
+  // Secondary index buckets
+  let runsByStatusBucket: KV;
+  let stepsByRunBucket: KV;
+  let hooksByRunBucket: KV;
 
   const initBuckets = async () => {
     if (!eventsBucket) {
@@ -264,23 +280,97 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
         history: 1,
       });
+      // Secondary indexes
+      runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, {
+        history: 1,
+      });
+      stepsByRunBucket = await jetstream.views.kv(`${keyPrefix}steps_by_run`, {
+        history: 1,
+      });
+      hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, {
+        history: 1,
+      });
     }
   };
+
+  // ------------------------------------------------------------------
+  // Index maintenance helpers
+  // ------------------------------------------------------------------
+
+  /** Write a run into the status index. */
+  async function indexRunStatus(runId: string, status: string): Promise<void> {
+    await runsByStatusBucket.put(`${status}.${runId}`, runId);
+  }
+
+  /** Move a run from one status to another in the index. */
+  async function reindexRunStatus(
+    runId: string,
+    oldStatus: string | undefined,
+    newStatus: string,
+  ): Promise<void> {
+    if (oldStatus && oldStatus !== newStatus) {
+      try {
+        await runsByStatusBucket.delete(`${oldStatus}.${runId}`);
+      } catch {
+        // Key may not exist (e.g. backfill hasn't run)
+      }
+    }
+    await indexRunStatus(runId, newStatus);
+  }
+
+  /** Index a step under its run. */
+  async function indexStep(runId: string, stepId: string): Promise<void> {
+    await stepsByRunBucket.put(`${runId}.${stepId}`, stepId);
+  }
+
+  /** Index a hook under its run. */
+  async function indexHook(runId: string, hookId: string): Promise<void> {
+    await hooksByRunBucket.put(`${runId}.${hookId}`, hookId);
+  }
+
+  /** Remove a hook from the run index. */
+  async function removeHookIndex(runId: string, hookId: string): Promise<void> {
+    try {
+      await hooksByRunBucket.delete(`${runId}.${hookId}`);
+    } catch {
+      // May not exist
+    }
+  }
 
   // Helper: Clean up hooks when run reaches terminal status
   async function cleanupHooks(runId: string): Promise<void> {
     await initBuckets();
 
-    // Get all hooks for this run
-    for await (const entry of await hooksBucket.history()) {
-      if (!entry || entry.operation === 'DEL') continue;
+    // Try index-based lookup first
+    const hookIds = await collectIndexKeys(hooksByRunBucket, `${runId}.`);
 
-      const data = kvValueToString(entry.value);
-      const hook = parseWithUint8Array<Hook>(data);
+    if (hookIds.length > 0) {
+      for (const hookId of hookIds) {
+        try {
+          const hookEntry = await hooksBucket.get(hookId);
+          if (hookEntry) {
+            const hookData = kvValueToString(hookEntry.value);
+            const hook = parse<Hook>(hookData);
+            await hooksBucket.delete(hook.hookId);
+            await hooksTokenBucket.delete(hook.token);
+          }
+          await removeHookIndex(runId, hookId);
+        } catch {
+          debug(`Failed to clean up hook ${hookId} for run ${runId}`);
+        }
+      }
+    } else {
+      // Fallback: full scan (handles data created before indexes existed)
+      for await (const entry of await hooksBucket.history()) {
+        if (!entry || entry.operation === 'DEL') continue;
 
-      if (hook.runId === runId) {
-        await hooksBucket.delete(hook.hookId);
-        await hooksTokenBucket.delete(hook.token);
+        const data = kvValueToString(entry.value);
+        const hook = parse<Hook>(data);
+
+        if (hook.runId === runId) {
+          await hooksBucket.delete(hook.hookId);
+          await hooksTokenBucket.delete(hook.token);
+        }
       }
     }
   }
@@ -303,7 +393,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await runsBucket.get(runId);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
           const now = new Date();
           const updatedRun = {
             ...existing,
@@ -311,7 +401,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(runId, stringifyWithUint8Array(updatedRun));
+          await runsBucket.put(runId, stringify(updatedRun));
+          await reindexRunStatus(runId, currentRun.status, 'cancelled');
           await cleanupHooks(runId);
 
           const parsed = WorkflowRunSchema.parse(compact(updatedRun));
@@ -333,7 +424,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await eventsBucket.put(eventId, stringifyWithUint8Array(event));
+        await eventsBucket.put(eventId, stringify(event));
         const parsed = EventSchema.parse(event);
         return { event: filterEventData(parsed, resolveData) };
       }
@@ -390,7 +481,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const runEntry = await runsBucket.get(effectiveRunId);
         if (runEntry) {
           const runData = kvValueToString(runEntry.value);
-          const parsed = parseWithUint8Array<WorkflowRun>(runData);
+          const parsed = parse<WorkflowRun>(runData);
           currentRun = {
             status: parsed.status,
             specVersion: parsed.specVersion,
@@ -427,16 +518,14 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          await eventsBucket.put(eventId, stringifyWithUint8Array(event));
+          await eventsBucket.put(eventId, stringify(event));
 
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
           return {
             event: filterEventData(parsed, resolveData),
             run: fullRunEntry
-              ? (parseWithUint8Array<WorkflowRun>(
-                  kvValueToString(fullRunEntry.value),
-                ) as WorkflowRun)
+              ? (parse<WorkflowRun>(kvValueToString(fullRunEntry.value)) as WorkflowRun)
               : undefined,
           };
         }
@@ -464,7 +553,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const stepEntry = await stepsBucket.get(stepKey);
         if (stepEntry) {
           const stepData = kvValueToString(stepEntry.value);
-          const parsed = parseWithUint8Array<Step>(stepData);
+          const parsed = parse<Step>(stepData);
           validatedStep = {
             status: parsed.status,
             startedAt: parsed.startedAt,
@@ -529,12 +618,13 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         // Check if run already exists
         const existing = await runsBucket.get(effectiveRunId);
         if (!existing) {
-          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(newRun));
+          await runsBucket.put(effectiveRunId, stringify(newRun));
+          await indexRunStatus(effectiveRunId, 'pending');
           run = WorkflowRunSchema.parse(compact(newRun));
         } else {
           // Event replay: return existing run
           const existingData = kvValueToString(existing.value);
-          run = WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(existingData)));
+          run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
         }
       }
 
@@ -542,14 +632,16 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await runsBucket.get(effectiveRunId);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
+          const oldStatus = existing.status;
           const updatedRun = {
             ...existing,
             status: 'running' as const,
             startedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
+          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+          await reindexRunStatus(effectiveRunId, oldStatus, 'running');
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
       }
@@ -559,7 +651,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await runsBucket.get(effectiveRunId);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
+          const oldStatus = existing.status;
           const updatedRun = {
             ...existing,
             status: 'completed' as const,
@@ -567,7 +660,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
+          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+          await reindexRunStatus(effectiveRunId, oldStatus, 'completed');
           await cleanupHooks(effectiveRunId);
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
@@ -586,7 +680,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await runsBucket.get(effectiveRunId);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
+          const oldStatus = existing.status;
           const updatedRun = {
             ...existing,
             status: 'failed' as const,
@@ -598,7 +693,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
+          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+          await reindexRunStatus(effectiveRunId, oldStatus, 'failed');
           await cleanupHooks(effectiveRunId);
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
@@ -608,14 +704,16 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await runsBucket.get(effectiveRunId);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<WorkflowRun>(existingData);
+          const existing = parse<WorkflowRun>(existingData);
+          const oldStatus = existing.status;
           const updatedRun = {
             ...existing,
             status: 'cancelled' as const,
             completedAt: now,
             updatedAt: now,
           };
-          await runsBucket.put(effectiveRunId, stringifyWithUint8Array(updatedRun));
+          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+          await reindexRunStatus(effectiveRunId, oldStatus, 'cancelled');
           await cleanupHooks(effectiveRunId);
           run = WorkflowRunSchema.parse(compact(updatedRun));
         }
@@ -642,12 +740,13 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
         const existing = await stepsBucket.get(stepKey);
         if (!existing) {
-          await stepsBucket.put(stepKey, stringifyWithUint8Array(newStep));
+          await stepsBucket.put(stepKey, stringify(newStep));
+          await indexStep(effectiveRunId, data.correlationId!);
           step = StepSchema.parse(compact(newStep));
         } else {
           // Event replay: return existing step
           const existingData = kvValueToString(existing.value);
-          step = StepSchema.parse(compact(parseWithUint8Array<Step>(existingData)));
+          step = StepSchema.parse(compact(parse<Step>(existingData)));
         }
       }
 
@@ -657,7 +756,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await stepsBucket.get(stepKey);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           const updatedStep = {
             ...existing,
             status: 'running' as const,
@@ -665,7 +764,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             ...(isFirstStart ? { startedAt: now } : {}),
             updatedAt: now,
           };
-          await stepsBucket.put(stepKey, stringifyWithUint8Array(updatedStep));
+          await stepsBucket.put(stepKey, stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         }
       }
@@ -676,7 +775,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await stepsBucket.get(stepKey);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
@@ -690,7 +789,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             completedAt: now,
             updatedAt: now,
           };
-          await stepsBucket.put(stepKey, stringifyWithUint8Array(updatedStep));
+          await stepsBucket.put(stepKey, stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         } else {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
@@ -711,7 +810,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await stepsBucket.get(stepKey);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           if (['completed', 'failed'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
@@ -728,7 +827,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             completedAt: now,
             updatedAt: now,
           };
-          await stepsBucket.put(stepKey, stringifyWithUint8Array(updatedStep));
+          await stepsBucket.put(stepKey, stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         } else {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
@@ -750,7 +849,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const entry = await stepsBucket.get(stepKey);
         if (entry) {
           const existingData = kvValueToString(entry.value);
-          const existing = parseWithUint8Array<Step>(existingData);
+          const existing = parse<Step>(existingData);
           const updatedStep = {
             ...existing,
             status: 'pending' as const,
@@ -761,7 +860,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             retryAfter: eventData.retryAfter,
             updatedAt: now,
           };
-          await stepsBucket.put(stepKey, stringifyWithUint8Array(updatedStep));
+          await stepsBucket.put(stepKey, stringify(updatedStep));
           step = StepSchema.parse(compact(updatedStep));
         }
       }
@@ -787,7 +886,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             specVersion: effectiveSpecVersion,
           };
 
-          await eventsBucket.put(eventId, stringifyWithUint8Array(conflictEvent));
+          await eventsBucket.put(eventId, stringify(conflictEvent));
 
           const parsedConflict = EventSchema.parse(conflictEvent);
           const resolveData = params?.resolveData ?? 'all';
@@ -813,13 +912,14 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
         const existing = await hooksBucket.get(data.correlationId!);
         if (!existing) {
-          await hooksBucket.put(data.correlationId!, stringifyWithUint8Array(newHook));
+          await hooksBucket.put(data.correlationId!, stringify(newHook));
           await hooksTokenBucket.put(eventData.token, data.correlationId!);
+          await indexHook(effectiveRunId, data.correlationId!);
           hook = HookSchema.parse(compact(newHook));
         } else {
           // Event replay: return existing hook
           const existingData = kvValueToString(existing.value);
-          hook = HookSchema.parse(compact(parseWithUint8Array<Hook>(existingData)));
+          hook = HookSchema.parse(compact(parse<Hook>(existingData)));
         }
       }
 
@@ -827,9 +927,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         const hookEntry = await hooksBucket.get(data.correlationId);
         if (hookEntry) {
           const hookData = kvValueToString(hookEntry.value);
-          const existingHook = parseWithUint8Array<Hook>(hookData);
+          const existingHook = parse<Hook>(hookData);
           await hooksBucket.delete(data.correlationId);
           await hooksTokenBucket.delete(existingHook.token);
+          await removeHookIndex(effectiveRunId, data.correlationId);
         }
       }
 
@@ -843,7 +944,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         specVersion: effectiveSpecVersion,
       };
 
-      await eventsBucket.put(eventId, stringifyWithUint8Array(event));
+      await eventsBucket.put(eventId, stringify(event));
 
       const parsed = EventSchema.parse(event);
       const resolveData = params?.resolveData ?? 'all';
@@ -864,7 +965,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         });
       }
       const data = kvValueToString(entry.value);
-      return parseWithUint8Array<Event>(data);
+      return parse<Event>(data);
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -879,7 +980,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         if (!entry || entry.operation === 'DEL') continue;
 
         const data = kvValueToString(entry.value);
-        const event = parseWithUint8Array<Event>(data);
+        const event = parse<Event>(data);
 
         if (event.runId === params.runId) {
           events.push(event);
@@ -929,7 +1030,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         if (!entry || entry.operation === 'DEL') continue;
 
         const data = kvValueToString(entry.value);
-        const event = parseWithUint8Array<Event>(data);
+        const event = parse<Event>(data);
 
         if (event.correlationId === params.correlationId) {
           events.push(event);
@@ -967,18 +1068,29 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   };
 }
 
+// ---------------------------------------------------------------------------
+// Steps storage
+// ---------------------------------------------------------------------------
+
 /**
- * Create storage for workflow steps using JetStream KV Store
+ * Create storage for workflow steps using JetStream KV Store.
+ *
+ * Uses a secondary index bucket (`<prefix>steps_by_run`) so that
+ * `steps.list({ runId })` can look up step IDs by run without scanning.
  */
 export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] {
   const { getJetStream, keyPrefix } = config;
   let stepsBucket: KV;
+  let stepsByRunBucket: KV;
 
   const initBuckets = async () => {
     if (!stepsBucket) {
       const jetstream = await getJetStream();
       stepsBucket = await jetstream.views.kv(`${keyPrefix}steps`, {
         history: 10,
+      });
+      stepsByRunBucket = await jetstream.views.kv(`${keyPrefix}steps_by_run`, {
+        history: 1,
       });
     }
   };
@@ -997,7 +1109,7 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
           });
         }
         const data = kvValueToString(entry.value);
-        const step = parseWithUint8Array<Step>(data);
+        const step = parse<Step>(data);
         const parsed = StepSchema.parse(compact(step));
         const resolveData = params?.resolveData ?? 'all';
         return filterStepData(parsed, resolveData);
@@ -1008,7 +1120,7 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
         if (!entry || entry.operation === 'DEL') continue;
 
         const data = kvValueToString(entry.value);
-        const step = parseWithUint8Array<Step>(data);
+        const step = parse<Step>(data);
 
         if (step.stepId === stepId) {
           const parsed = StepSchema.parse(compact(step));
@@ -1029,15 +1141,36 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
 
       const steps: (Step | StepWithoutData)[] = [];
 
-      for await (const entry of await stepsBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
+      // Try index-based lookup first
+      const stepIds = await collectIndexKeys(stepsByRunBucket, `${params.runId}.`);
 
-        const data = kvValueToString(entry.value);
-        const step = parseWithUint8Array<Step>(data);
+      if (stepIds.length > 0) {
+        for (const stepId of stepIds) {
+          const stepKey = `${params.runId}.${stepId}`;
+          try {
+            const entry = await stepsBucket.get(stepKey);
+            if (!entry || entry.operation === 'DEL') continue;
 
-        if (step.runId === params.runId) {
-          const parsed = StepSchema.parse(compact(step));
-          steps.push(filterStepData(parsed, resolveData));
+            const data = kvValueToString(entry.value);
+            const step = parse<Step>(data);
+            const parsed = StepSchema.parse(compact(step));
+            steps.push(filterStepData(parsed, resolveData));
+          } catch {
+            debug(`Stale index entry for step ${stepId}, skipping`);
+          }
+        }
+      } else {
+        // Fallback: full scan (handles data created before indexes existed)
+        for await (const entry of await stepsBucket.history()) {
+          if (!entry || entry.operation === 'DEL') continue;
+
+          const data = kvValueToString(entry.value);
+          const step = parse<Step>(data);
+
+          if (step.runId === params.runId) {
+            const parsed = StepSchema.parse(compact(step));
+            steps.push(filterStepData(parsed, resolveData));
+          }
         }
       }
 
@@ -1065,13 +1198,21 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
   };
 }
 
+// ---------------------------------------------------------------------------
+// Hooks storage
+// ---------------------------------------------------------------------------
+
 /**
- * Create storage for hooks using JetStream KV Store
+ * Create storage for hooks using JetStream KV Store.
+ *
+ * Uses a secondary index bucket (`<prefix>hooks_by_run`) so that
+ * `hooks.list({ runId })` can look up hook IDs by run without scanning.
  */
 export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] {
   const { getJetStream, keyPrefix } = config;
   let hooksBucket: KV;
   let hooksTokenBucket: KV;
+  let hooksByRunBucket: KV;
 
   const initBuckets = async () => {
     if (!hooksBucket) {
@@ -1080,6 +1221,9 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
         history: 10,
       });
       hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
+        history: 1,
+      });
+      hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, {
         history: 1,
       });
     }
@@ -1095,7 +1239,7 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
         });
       }
       const data = kvValueToString(entry.value);
-      const hook = parseWithUint8Array<Hook>(data);
+      const hook = parse<Hook>(data);
       const parsed = HookSchema.parse(compact(hook));
       const resolveData = params?.resolveData ?? 'all';
       return filterHookData(parsed, resolveData);
@@ -1123,16 +1267,37 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
 
       const hooks: Hook[] = [];
 
-      for await (const entry of await hooksBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
+      // Try index-based lookup first
+      const hookIds = await collectIndexKeys(hooksByRunBucket, `${params.runId}.`);
 
-        const data = kvValueToString(entry.value);
-        const hook = parseWithUint8Array<Hook>(data);
+      if (hookIds.length > 0) {
+        for (const hookId of hookIds) {
+          try {
+            const entry = await hooksBucket.get(hookId);
+            if (!entry || entry.operation === 'DEL') continue;
 
-        if (hook.runId === params.runId) {
-          const parsed = HookSchema.parse(compact(hook));
-          const filtered = filterHookData(parsed, params?.resolveData ?? 'all');
-          hooks.push(filtered);
+            const data = kvValueToString(entry.value);
+            const hook = parse<Hook>(data);
+            const parsed = HookSchema.parse(compact(hook));
+            const filtered = filterHookData(parsed, params?.resolveData ?? 'all');
+            hooks.push(filtered);
+          } catch {
+            debug(`Stale index entry for hook ${hookId}, skipping`);
+          }
+        }
+      } else {
+        // Fallback: full scan (handles data created before indexes existed)
+        for await (const entry of await hooksBucket.history()) {
+          if (!entry || entry.operation === 'DEL') continue;
+
+          const data = kvValueToString(entry.value);
+          const hook = parse<Hook>(data);
+
+          if (hook.runId === params.runId) {
+            const parsed = HookSchema.parse(compact(hook));
+            const filtered = filterHookData(parsed, params?.resolveData ?? 'all');
+            hooks.push(filtered);
+          }
         }
       }
 
@@ -1158,4 +1323,136 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
       };
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'] as const;
+
+/**
+ * Compact terminal runs that exceed the configured TTL.
+ *
+ * Deletes the run plus its associated steps, hooks, events, and index
+ * entries. Intended to be called periodically (e.g. via `setInterval`).
+ */
+export async function compactTerminalRuns(config: NatsStorageConfig): Promise<number> {
+  const { getJetStream, keyPrefix, terminalRunTTLMs } = config;
+  const ttl = terminalRunTTLMs ?? DEFAULT_TERMINAL_RUN_TTL_MS;
+
+  // 0 means retain indefinitely
+  if (ttl === 0) return 0;
+
+  const cutoff = Date.now() - ttl;
+
+  const jetstream = await getJetStream();
+  const runsBucket = await jetstream.views.kv(`${keyPrefix}runs`, { history: 10 });
+  const runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, { history: 1 });
+  const stepsBucket = await jetstream.views.kv(`${keyPrefix}steps`, { history: 10 });
+  const stepsByRunBucket = await jetstream.views.kv(`${keyPrefix}steps_by_run`, { history: 1 });
+  const hooksBucket = await jetstream.views.kv(`${keyPrefix}hooks`, { history: 10 });
+  const hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, { history: 1 });
+  const hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, { history: 1 });
+  const eventsBucket = await jetstream.views.kv(`${keyPrefix}events`, { history: 10 });
+
+  let compactedCount = 0;
+
+  // Iterate terminal run index entries
+  for (const status of TERMINAL_STATUSES) {
+    const runIds = await collectIndexKeys(runsByStatusBucket, `${status}.`);
+
+    for (const runId of runIds) {
+      try {
+        const entry = await runsBucket.get(runId);
+        if (!entry) {
+          // Stale index — clean up
+          try {
+            await runsByStatusBucket.delete(`${status}.${runId}`);
+          } catch {
+            /* noop */
+          }
+          continue;
+        }
+
+        const data = kvValueToString(entry.value);
+        const run = parse<WorkflowRun>(data);
+
+        if (!run.completedAt || run.completedAt.getTime() >= cutoff) continue;
+
+        // Delete associated steps
+        const stepIds = await collectIndexKeys(stepsByRunBucket, `${runId}.`);
+        for (const stepId of stepIds) {
+          try {
+            await stepsBucket.delete(`${runId}.${stepId}`);
+          } catch {
+            /* noop */
+          }
+          try {
+            await stepsByRunBucket.delete(`${runId}.${stepId}`);
+          } catch {
+            /* noop */
+          }
+        }
+
+        // Delete associated hooks
+        const hookIds = await collectIndexKeys(hooksByRunBucket, `${runId}.`);
+        for (const hookId of hookIds) {
+          try {
+            const hookEntry = await hooksBucket.get(hookId);
+            if (hookEntry) {
+              const hookData = kvValueToString(hookEntry.value);
+              const hook = parse<Hook>(hookData);
+              try {
+                await hooksTokenBucket.delete(hook.token);
+              } catch {
+                /* noop */
+              }
+            }
+            await hooksBucket.delete(hookId);
+          } catch {
+            /* noop */
+          }
+          try {
+            await hooksByRunBucket.delete(`${runId}.${hookId}`);
+          } catch {
+            /* noop */
+          }
+        }
+
+        // Delete associated events (full scan — events aren't indexed by run)
+        for await (const evtEntry of await eventsBucket.history()) {
+          if (!evtEntry || evtEntry.operation === 'DEL') continue;
+          const evtData = kvValueToString(evtEntry.value);
+          const evt = parse<Event>(evtData);
+          if (evt.runId === runId) {
+            try {
+              await eventsBucket.delete(evt.eventId);
+            } catch {
+              /* noop */
+            }
+          }
+        }
+
+        // Delete the run itself and its index entry
+        try {
+          await runsBucket.delete(runId);
+        } catch {
+          /* noop */
+        }
+        try {
+          await runsByStatusBucket.delete(`${status}.${runId}`);
+        } catch {
+          /* noop */
+        }
+
+        compactedCount++;
+        debug(`Compacted terminal run ${runId} (status=${status})`);
+      } catch (err) {
+        debug(`Failed to compact run ${runId}`, { error: err });
+      }
+    }
+  }
+
+  return compactedCount;
 }

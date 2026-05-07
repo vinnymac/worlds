@@ -28,4 +28,20 @@ export interface NatsJetStreamWorldConfig {
    * Default: 'workflow_'
    */
   keyPrefix?: string;
+
+  /**
+   * Window (in milliseconds) during which duplicate messages (matched by
+   * Nats-Msg-Id header) are silently dropped. Should be larger than the
+   * longest expected job duration.
+   * Default: 15 minutes (900_000)
+   */
+  dedupWindowMs?: number;
+
+  /**
+   * Time-to-live (in milliseconds) for completed/failed/cancelled runs.
+   * After this period the run and its associated steps, hooks, and events
+   * become eligible for compaction. Set to 0 to retain indefinitely.
+   * Default: 30 days (2_592_000_000)
+   */
+  terminalRunTTLMs?: number;
 }

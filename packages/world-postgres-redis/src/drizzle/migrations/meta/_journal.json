@@ -15,6 +15,13 @@
       "when": 1777858222977,
       "tag": "0001_sudden_wilson_fisk",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1778300000000,
+      "tag": "0002_outbox_and_notify",
+      "breakpoints": true
     }
   ]
 }

@@ -13,6 +13,8 @@ import { decode, encode } from 'cbor-x';
 import { eq, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { monotonicFactory } from 'ulid';
+import { debug } from './util.js';
+import { type QueueMetrics, metrics } from './metrics.js';
 import * as schema from './schema.js';
 
 type Drizzle = MySql2Database<typeof schema>;
@@ -26,6 +28,10 @@ export interface MysqlQueueConfig {
   maxAttempts?: number;
   /** Worker ID for lock tracking */
   workerId?: string;
+  /** TTL for idempotency records in milliseconds (default: 5 minutes) */
+  idempotencyTtlMs?: number;
+  /** How often to run idempotency cleanup in milliseconds (default: 60 seconds) */
+  cleanupIntervalMs?: number;
 }
 
 /** Row shape returned by raw SQL SELECT on workflow_jobs (snake_case columns) */
@@ -43,6 +49,27 @@ interface RawJobRow {
   locked_by: string | null;
   error: string | null;
   scheduled_for: Date | null;
+}
+
+/**
+ * Delete idempotency records older than the given TTL.
+ * Returns the number of records removed.
+ */
+async function cleanupExpiredIdempotencyKeys(db: Drizzle, ttlMs: number): Promise<number> {
+  const cutoff = new Date(Date.now() - ttlMs);
+
+  const result = await db.execute(sql`
+    DELETE FROM \`workflow\`.\`workflow_job_idempotency\`
+    WHERE \`created_at\` < ${cutoff}
+  `);
+
+  const affectedRows =
+    (result as unknown as [{ affectedRows: number }, unknown])[0]?.affectedRows ?? 0;
+  debug('Cleaned up expired idempotency keys', {
+    affectedRows,
+    cutoffDate: cutoff.toISOString(),
+  });
+  return affectedRows;
 }
 
 /**
@@ -231,13 +258,21 @@ async function completeJob(db: Drizzle, jobId: number, idempotencyKey?: string):
 export function createQueue(
   db: Drizzle,
   config: MysqlQueueConfig = {},
-): Queue & { start(): Promise<void>; stop(): void } {
+): Queue & {
+  start(): Promise<void>;
+  stop(): void;
+  getMetrics(queueName: string): Promise<QueueMetrics>;
+} {
   const {
     pollIntervalMs = 50,
     concurrency = 10,
     maxAttempts = 3,
     workerId = `worker_${monotonicFactory()()}`,
+    idempotencyTtlMs = 5 * 60 * 1000,
+    cleanupIntervalMs = 60 * 1000,
   } = config;
+
+  let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
@@ -279,9 +314,10 @@ export function createQueue(
 
   async function processJob(
     job: RawJobRow,
-    _listKey: string,
+    listKey: string,
     _queuePrefix: QueuePrefix,
   ): Promise<void> {
+    const startTime = Date.now();
     try {
       // Decode CBOR payload - contains our envelope with original queue name
       const envelope = decode(job.payload) as {
@@ -299,7 +335,10 @@ export function createQueue(
 
       // Success - remove the job
       await completeJob(db, job.id, job.job_id);
+      metrics.recordProcessed(listKey, Date.now() - startTime);
     } catch (error) {
+      const isRetry = (job.attempt ?? 1) < (job.max_attempts ?? maxAttempts);
+      metrics.recordError(listKey, isRetry);
       console.error(
         `[world-mysql processJob] Error processing job ${job.job_id} (attempt ${job.attempt}/${job.max_attempts}):`,
         error instanceof Error ? error.message : error,
@@ -348,9 +387,33 @@ export function createQueue(
     async start() {
       running = true;
       startWorkers();
+
+      // Start periodic idempotency cleanup
+      cleanupTimer = setInterval(async () => {
+        try {
+          await cleanupExpiredIdempotencyKeys(db, idempotencyTtlMs);
+        } catch (error) {
+          debug('Error in idempotency cleanup', { error });
+        }
+      }, cleanupIntervalMs);
+
+      debug('Started queue workers and cleanup timer', {
+        concurrency,
+        pollIntervalMs,
+        idempotencyTtlMs,
+        cleanupIntervalMs,
+      });
     },
     stop() {
       running = false;
+      if (cleanupTimer) {
+        clearInterval(cleanupTimer);
+        cleanupTimer = null;
+      }
+      debug('Stopped queue workers and cleanup timer');
+    },
+    async getMetrics(queueName: string): Promise<QueueMetrics> {
+      return metrics.getMetrics(db, queueName);
     },
   };
 }

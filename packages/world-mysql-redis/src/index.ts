@@ -1,12 +1,21 @@
+import type { HealthCheckable } from '@fantasticfour/utils';
 import type { World } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { Redis } from 'ioredis';
 import mysql from 'mysql2/promise';
 import type { MysqlRedisWorldConfig } from './config.js';
+import { getHealth, type MysqlRedisHealthResult } from './health.js';
+import { startOutboxRelay } from './outbox.js';
 import { createQueue } from './queue.js';
 import * as schema from './schema.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
+
+export type MysqlRedisWorld = World &
+  HealthCheckable & {
+    start(): Promise<void>;
+    stop(): void;
+  };
 
 export function createWorld(
   config: MysqlRedisWorldConfig = {
@@ -19,7 +28,7 @@ export function createWorld(
     queueConcurrency:
       Number.parseInt(process.env.WORKFLOW_MYSQL_WORKER_CONCURRENCY || '10', 10) || 10,
   },
-): World & { start(): Promise<void> } {
+): MysqlRedisWorld {
   // Create Redis client for queue
   const redis =
     typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
@@ -32,16 +41,45 @@ export function createWorld(
   const storage = createStorage(db as any);
   const streamer = createStreamer(db as any);
 
+  let outboxAbort: AbortController | undefined;
+
   return {
     ...storage,
     ...streamer,
     ...queue,
+    async health(): Promise<MysqlRedisHealthResult> {
+      return getHealth(db as any, redis);
+    },
     async start() {
       await queue.start();
+
+      // Start the outbox relay loop to drain pending outbox messages to Redis
+      outboxAbort = startOutboxRelay(
+        db as any,
+        async (payload, messageId) => {
+          // Relay outbox messages through the queue's push mechanism
+          const queueName = (payload as any)?.queueName;
+          const message = (payload as any)?.message;
+          if (queueName && message) {
+            await queue.queue(queueName, message, { idempotencyKey: messageId });
+          }
+        },
+        {
+          pollIntervalMs: config.outboxPollIntervalMs,
+          batchSize: config.outboxBatchSize,
+        },
+      );
+    },
+    stop() {
+      outboxAbort?.abort();
     },
   };
 }
 
 // Re-export schema for users who want to extend or inspect the database schema
 export type { MysqlRedisWorldConfig } from './config.js';
+export type { MysqlRedisHealthResult } from './health.js';
+export { getHealth } from './health.js';
+export { withDeadlockRetry, isDeadlockError } from './util.js';
+export { insertOutboxMessage, relayOutbox, getOutboxStats, startOutboxRelay } from './outbox.js';
 export * from './schema.js';

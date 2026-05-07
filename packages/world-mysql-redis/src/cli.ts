@@ -22,7 +22,7 @@ async function setupDatabase() {
     const migrationsDir = join(__dirname, '..', 'migrations');
 
     // Read migration files in order
-    const migrationFiles = ['0000_initial.sql'];
+    const migrationFiles = ['0000_initial.sql', '0001_outbox.sql'];
 
     for (const file of migrationFiles) {
       const migrationPath = join(migrationsDir, file);
@@ -46,6 +46,7 @@ async function setupDatabase() {
     console.log('  - workflow.workflow_steps');
     console.log('  - workflow.workflow_hooks');
     console.log('  - workflow.workflow_stream_chunks');
+    console.log('  - workflow.workflow_outbox');
 
     await connection.end();
     process.exit(0);

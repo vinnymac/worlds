@@ -147,6 +147,19 @@ export const hooks = schema.table(
   (tb) => [index().on(tb.runId), index().on(tb.token)],
 );
 
+export const outbox = schema.table(
+  'workflow_outbox',
+  {
+    id: text('id').primaryKey(),
+    messageId: text('message_id').notNull().unique(),
+    payload: jsonb('payload').notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    attempts: integer('attempts').default(0).notNull(),
+    lastError: text('last_error'),
+  },
+  (tb) => [index('idx_outbox_unsent').on(tb.createdAt)],
+);
+
 const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
   dataType() {
     return 'bytea';

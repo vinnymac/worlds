@@ -9,6 +9,7 @@ import {
   createStepsStorage,
 } from './storage.js';
 import { createStreamer } from './streamer.js';
+import { instrumentRedis } from './util.js';
 
 function createStorage(redis: Redis, keyPrefix: string): Storage {
   const config = { redis, keyPrefix };
@@ -30,20 +31,27 @@ export function createWorld(config: UpstashWorldConfig = {}): World {
     );
   }
 
-  const redis = new Redis({
+  const rawRedis = new Redis({
     url: redisUrl,
     token: redisToken,
   });
+
+  // Enhancement 4: Instrument Redis client for HTTP request budget monitoring
+  const storageRedis = instrumentRedis(rawRedis, 'storage');
+  const streamerRedis = instrumentRedis(rawRedis, 'streamer');
 
   const keyPrefix = config.keyPrefix || 'workflow:';
 
   const queue = createQueue({
     token: config.qstashToken,
     targetUrl: config.qstashTargetUrl,
+    currentSigningKey: config.qstashCurrentSigningKey,
+    nextSigningKey: config.qstashNextSigningKey,
+    enableDeduplication: config.enableDeduplication,
   });
 
-  const storage = createStorage(redis, keyPrefix);
-  const streamer = createStreamer({ redis, keyPrefix });
+  const storage = createStorage(storageRedis, keyPrefix);
+  const streamer = createStreamer({ redis: streamerRedis, keyPrefix });
 
   return {
     ...storage,
@@ -52,4 +60,5 @@ export function createWorld(config: UpstashWorldConfig = {}): World {
   };
 }
 
+export { getRequestStats, resetRequestStats } from './util.js';
 export type { UpstashWorldConfig } from './config.js';

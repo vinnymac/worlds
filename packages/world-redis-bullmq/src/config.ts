@@ -28,4 +28,38 @@ export interface RedisWorldConfig {
    * Default: 'workflow:'
    */
   keyPrefix?: string;
+
+  /**
+   * Maximum retry attempts before marking a job as permanently failed.
+   * Default: 5
+   */
+  maxAttempts?: number;
+
+  /**
+   * Backoff strategy for retries: 'fixed' replays at the same interval,
+   * 'exponential' doubles the delay on each attempt.
+   * Default: 'exponential'
+   */
+  backoffType?: 'fixed' | 'exponential';
+
+  /**
+   * Base delay for backoff (ms). For exponential backoff this is multiplied
+   * by 2^(attempt - 1).
+   * Default: 1000
+   */
+  backoffDelayMs?: number;
+
+  /**
+   * How often workers check for stalled jobs (ms). A job is considered stalled
+   * when a worker has not sent a heartbeat within this interval.
+   * Default: 30000 (30s)
+   */
+  stalledInterval?: number;
+
+  /**
+   * Number of consecutive stall checks with no heartbeat before a job is
+   * marked as failed. Total stall tolerance = stalledInterval * maxStalledCount.
+   * Default: 1
+   */
+  maxStalledCount?: number;
 }

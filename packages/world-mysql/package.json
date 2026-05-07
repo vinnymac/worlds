@@ -27,7 +27,6 @@
     "migrations"
   ],
   "type": "module",
-  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -48,9 +47,9 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "clean": "tsc --build --clean && rm -rf dist",
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
@@ -68,12 +67,14 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/utils": "workspace:*",
     "@testcontainers/mysql": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "dotenv": "catalog:",
     "drizzle-kit": "catalog:",
     "testcontainers": "catalog:",
+    "tsup": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

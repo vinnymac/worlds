@@ -1,4 +1,5 @@
-import type { Container, SqlQuerySpec } from '@azure/cosmos';
+import type { Container, OperationInput, SqlQuerySpec } from '@azure/cosmos';
+import { BulkOperationType } from '@azure/cosmos';
 import { WorkflowWorldError } from '@workflow/errors';
 import type {
   CreateEventParams,
@@ -26,7 +27,7 @@ import type {
 import { EventSchema, HookSchema, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { encodeCbor, decodeCbor } from './cbor.js';
-import { compact } from './util.js';
+import { compact, withCosmosRetry } from './util.js';
 
 /**
  * Document type discriminators for the single-container model.
@@ -283,9 +284,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       parameters: [{ name: '@runId', value: runId }],
     };
 
-    const { resources } = await container.items
-      .query(querySpec, { partitionKey: runId })
-      .fetchAll();
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
 
     if (resources.length === 0) {
       throw new WorkflowWorldError(`Run not found: ${runId}`, {
@@ -308,9 +309,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       ],
     };
 
-    const { resources } = await container.items
-      .query(querySpec, { partitionKey: runId })
-      .fetchAll();
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
 
     if (resources.length === 0) {
       throw new WorkflowWorldError(`Step not found: ${stepId}`, {
@@ -323,19 +324,14 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
   /**
    * Internal: create a run entity in Cosmos DB (called from events.create for run_created).
+   * Uses a transactional batch to atomically create the event and run documents
+   * within the same partition (runId).
    */
   async function createRunFromEvent(
     runId: string,
     data: RunCreatedEventRequest['eventData'],
-  ): Promise<WorkflowRun> {
-    // Check if run already exists (defensive idempotency)
-    try {
-      const existing = await getRun(runId);
-      return existing;
-    } catch {
-      // Not found, proceed with creation
-    }
-
+    eventDoc: Record<string, unknown>,
+  ): Promise<{ run: WorkflowRun; batchedEvent: true }> {
     const now = new Date();
     const run: Record<string, unknown> = {
       id: `run:${runId}`,
@@ -352,17 +348,35 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     };
 
     try {
-      await container.items.create(run);
+      if (typeof container.items.batch === 'function') {
+        const operations: OperationInput[] = [
+          {
+            operationType: BulkOperationType.Create,
+            resourceBody: eventDoc as Record<string, any>,
+          },
+          {
+            operationType: BulkOperationType.Create,
+            resourceBody: run as Record<string, any>,
+          },
+        ];
+        await withCosmosRetry(() => container.items.batch(operations, runId));
+      } else {
+        // Fallback for environments without batch support (e.g. emulator/mock)
+        await withCosmosRetry(() => container.items.create(eventDoc));
+        await withCosmosRetry(() => container.items.create(run));
+      }
       return {
-        ...run,
-        createdAt: now,
-        updatedAt: now,
-      } as unknown as WorkflowRun;
+        run: {
+          ...run,
+          createdAt: now,
+          updatedAt: now,
+        } as unknown as WorkflowRun,
+        batchedEvent: true,
+      };
     } catch (error: any) {
-      // Handle concurrent creation attempts (409 Conflict)
-      // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
+      // Handle concurrent creation attempts (409 Conflict on batch)
       if (error?.code === 409) {
-        return await getRun(runId);
+        return { run: await getRun(runId), batchedEvent: true };
       }
       throw error;
     }
@@ -382,9 +396,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       parameters: [{ name: '@runId', value: runId }],
     };
 
-    const { resources } = await container.items
-      .query(querySpec, { partitionKey: runId })
-      .fetchAll();
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
 
     if (resources.length === 0) {
       throw new WorkflowWorldError(`Run not found: ${runId}`, { status: 404 });
@@ -431,7 +445,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       }
     }
 
-    await container.item(doc.id, runId).replace(doc);
+    await withCosmosRetry(() => container.item(doc.id, runId).replace(doc));
 
     // Cleanup hooks when run reaches terminal state
     if (
@@ -447,20 +461,15 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
   /**
    * Internal: create a step entity in Cosmos DB (called from events.create for step_created).
+   * Uses a transactional batch to atomically create the event and step documents
+   * within the same partition (runId).
    */
   async function createStepFromEvent(
     runId: string,
     stepId: string,
     data: { stepName: string; input: unknown },
-  ): Promise<Step> {
-    // Check if step already exists (idempotency)
-    try {
-      const existing = await getStep(runId, stepId);
-      return existing;
-    } catch {
-      // Not found, proceed with creation
-    }
-
+    eventDoc: Record<string, unknown>,
+  ): Promise<{ step: Step; batchedEvent: true }> {
     const now = new Date();
     const step: Record<string, unknown> = {
       id: `step:${runId}:${stepId}`,
@@ -476,17 +485,35 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     };
 
     try {
-      await container.items.create(step);
+      if (typeof container.items.batch === 'function') {
+        const operations: OperationInput[] = [
+          {
+            operationType: BulkOperationType.Create,
+            resourceBody: eventDoc as Record<string, any>,
+          },
+          {
+            operationType: BulkOperationType.Create,
+            resourceBody: step as Record<string, any>,
+          },
+        ];
+        await withCosmosRetry(() => container.items.batch(operations, runId));
+      } else {
+        // Fallback for environments without batch support (e.g. emulator/mock)
+        await withCosmosRetry(() => container.items.create(eventDoc));
+        await withCosmosRetry(() => container.items.create(step));
+      }
       return {
-        ...step,
-        createdAt: now,
-        updatedAt: now,
-      } as unknown as Step;
+        step: {
+          ...step,
+          createdAt: now,
+          updatedAt: now,
+        } as unknown as Step,
+        batchedEvent: true,
+      };
     } catch (error: any) {
-      // Handle concurrent creation attempts (409 Conflict)
-      // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
+      // Handle concurrent creation attempts (409 Conflict on batch)
       if (error?.code === 409) {
-        return await getStep(runId, stepId);
+        return { step: await getStep(runId, stepId), batchedEvent: true };
       }
       throw error;
     }
@@ -512,9 +539,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       ],
     };
 
-    const { resources } = await container.items
-      .query(querySpec, { partitionKey: runId })
-      .fetchAll();
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
 
     const doc = resources[0];
     const now = new Date();
@@ -560,7 +587,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       }
     }
 
-    await container.item(doc.id, runId).replace(doc);
+    await withCosmosRetry(() => container.item(doc.id, runId).replace(doc));
 
     return getStep(runId, stepId);
   }
@@ -604,15 +631,19 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     };
 
     try {
+      // Hook creation spans two containers with different partition keys,
+      // so it cannot be batched. Wrap each call with retry instead.
       await Promise.all([
-        container.items.create(hookDoc),
-        hooksByTokenContainer.items.create(tokenDoc),
+        withCosmosRetry(() => container.items.create(hookDoc)),
+        withCosmosRetry(() => hooksByTokenContainer.items.create(tokenDoc)),
       ]);
     } catch (error: any) {
       // Handle concurrent creation attempts (409 Conflict)
       // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
       if (error?.code === 409) {
-        const { resource: doc } = await container.item(`hook:${runId}:${hookId}`, runId).read();
+        const { resource: doc } = await withCosmosRetry(() =>
+          container.item(`hook:${runId}:${hookId}`, runId).read(),
+        );
         if (!doc) throw error;
         return deserializeHook(doc);
       }
@@ -644,21 +675,20 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       parameters: [{ name: '@runId', value: runId }],
     };
 
-    const { resources } = await container.items
-      .query(querySpec, { partitionKey: runId })
-      .fetchAll();
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
 
     const deleteOps: Promise<unknown>[] = [];
     for (const doc of resources) {
-      deleteOps.push(container.item(doc.id, runId).delete());
+      deleteOps.push(withCosmosRetry(() => container.item(doc.id, runId).delete()));
       if (doc.token) {
         deleteOps.push(
-          hooksByTokenContainer
-            .item(doc.token, doc.token)
-            .delete()
-            .catch(() => {
+          withCosmosRetry(() => hooksByTokenContainer.item(doc.token, doc.token).delete()).catch(
+            () => {
               // Token doc may already be deleted
-            }),
+            },
+          ),
         );
       }
     }
@@ -703,9 +733,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         };
 
         // Cross-partition query for run listings
-        const { resources } = await container.items
-          .query(querySpec, { maxItemCount: limit + 1 })
-          .fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec, { maxItemCount: limit + 1 }).fetchAll(),
+        );
 
         const values = resources.slice(0, limit);
         const hasMore = resources.length > limit;
@@ -754,9 +784,6 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           eventDoc.correlationId = (data as any).correlationId;
         }
 
-        // Store the event
-        await container.items.create(eventDoc);
-
         // Parse and validate using EventSchema
         // Note: Use original eventData (not encoded) for validation
         const parsed = EventSchema.parse({
@@ -769,67 +796,82 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         // Process entity side effects based on event type
         const eventData = (data as any).eventData;
 
+        // For run_created and step_created, use transactional batches that
+        // atomically write the event + entity in a single partition-scoped
+        // transaction. The event doc is NOT written separately for these cases.
         switch (data.eventType) {
           case 'run_created': {
-            result.run = await createRunFromEvent(
+            const { run } = await createRunFromEvent(
               effectiveRunId,
               eventData as RunCreatedEventRequest['eventData'],
+              eventDoc,
             );
-            break;
-          }
-          case 'run_started':
-          case 'run_completed':
-          case 'run_failed':
-          case 'run_cancelled': {
-            result.run = await updateRunFromEvent(effectiveRunId, data.eventType, eventData);
+            result.run = run;
             break;
           }
           case 'step_created': {
             const correlationId = (data as any).correlationId;
-            result.step = await createStepFromEvent(
+            const { step } = await createStepFromEvent(
               effectiveRunId,
               correlationId,
               eventData as { stepName: string; input: unknown },
+              eventDoc,
             );
+            result.step = step;
             break;
           }
-          case 'step_started':
-          case 'step_completed':
-          case 'step_failed':
-          case 'step_retrying': {
-            const correlationId = (data as any).correlationId;
-            result.step = await updateStepFromEvent(
-              effectiveRunId,
-              correlationId,
-              data.eventType,
-              eventData,
-            );
-            break;
-          }
-          case 'hook_created': {
-            const correlationId = (data as any).correlationId;
-            const hookEventData = eventData as {
-              token: string;
-              metadata?: unknown;
-            };
+          default: {
+            // All other event types: store the event first, then apply side effects
+            await withCosmosRetry(() => container.items.create(eventDoc));
 
-            if (!correlationId) {
-              console.error('[hook_created] Missing correlationId');
-            }
-            if (!hookEventData.token) {
-              console.error('[hook_created] Missing token in eventData');
-            }
+            switch (data.eventType) {
+              case 'run_started':
+              case 'run_completed':
+              case 'run_failed':
+              case 'run_cancelled': {
+                result.run = await updateRunFromEvent(effectiveRunId, data.eventType, eventData);
+                break;
+              }
+              case 'step_started':
+              case 'step_completed':
+              case 'step_failed':
+              case 'step_retrying': {
+                const correlationId = (data as any).correlationId;
+                result.step = await updateStepFromEvent(
+                  effectiveRunId,
+                  correlationId,
+                  data.eventType,
+                  eventData,
+                );
+                break;
+              }
+              case 'hook_created': {
+                const correlationId = (data as any).correlationId;
+                const hookEventData = eventData as {
+                  token: string;
+                  metadata?: unknown;
+                };
 
-            result.hook = await createHookFromEvent(
-              effectiveRunId,
-              correlationId,
-              hookEventData,
-              effectiveSpecVersion,
-            );
+                if (!correlationId) {
+                  console.error('[hook_created] Missing correlationId');
+                }
+                if (!hookEventData.token) {
+                  console.error('[hook_created] Missing token in eventData');
+                }
+
+                result.hook = await createHookFromEvent(
+                  effectiveRunId,
+                  correlationId,
+                  hookEventData,
+                  effectiveSpecVersion,
+                );
+                break;
+              }
+              // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
+              // are event-only; no entity mutation needed at the storage level
+            }
             break;
           }
-          // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
-          // are event-only; no entity mutation needed at the storage level
         }
 
         return result;
@@ -845,9 +887,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           ],
         };
 
-        const { resources } = await container.items
-          .query(querySpec, { partitionKey: runId })
-          .fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+        );
 
         if (resources.length === 0) {
           throw new WorkflowWorldError(`Event not found: ${eventId}`, {
@@ -878,9 +920,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters: [...parameters, { name: '@limit', value: limit + 1 }],
         };
 
-        const { resources } = await container.items
-          .query(querySpec, { partitionKey: runId })
-          .fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+        );
 
         const values = resources.slice(0, limit);
         const hasMore = resources.length > limit;
@@ -918,9 +960,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         };
 
         // Cross-partition query for correlationId lookups
-        const { resources } = await container.items
-          .query(querySpec, { maxItemCount: limit + 1 })
-          .fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec, { maxItemCount: limit + 1 }).fetchAll(),
+        );
 
         const values = resources.slice(0, limit);
         const hasMore = resources.length > limit;
@@ -966,9 +1008,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters: [...parameters, { name: '@limit', value: limit + 1 }],
         };
 
-        const { resources } = await container.items
-          .query(querySpec, { partitionKey: runId })
-          .fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+        );
 
         const values = resources.slice(0, limit);
         const hasMore = resources.length > limit;
@@ -995,7 +1037,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters: [{ name: '@hookId', value: hookId }],
         };
 
-        const { resources } = await container.items.query(querySpec).fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec).fetchAll(),
+        );
 
         if (resources.length === 0) {
           throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
@@ -1010,7 +1054,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
       async getByToken(token: string, params?: GetHookParams) {
         try {
-          const { resource } = await hooksByTokenContainer.item(token, token).read();
+          const { resource } = await withCosmosRetry(() =>
+            hooksByTokenContainer.item(token, token).read(),
+          );
 
           if (!resource) {
             throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
@@ -1053,9 +1099,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters: [...parameters, { name: '@limit', value: limit + 1 }],
         };
 
-        const { resources } = await container.items
-          .query(querySpec, { partitionKey: runId })
-          .fetchAll();
+        const { resources } = await withCosmosRetry(() =>
+          container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+        );
 
         const values = resources.slice(0, limit);
         const hasMore = resources.length > limit;

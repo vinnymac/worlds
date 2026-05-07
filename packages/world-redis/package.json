@@ -22,7 +22,6 @@
     "bin"
   ],
   "type": "module",
-  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -38,9 +37,9 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "clean": "tsc --build --clean && rm -rf dist",
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -54,10 +53,12 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/utils": "workspace:*",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "dotenv": "catalog:",
+    "tsup": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
