@@ -1,6 +1,6 @@
-import { createDebugLogger } from '@fantasticfour/utils';
+import { createDebugLogger } from '@fantasticfour/shared';
 
-export { compact, Mutex } from '@fantasticfour/utils';
+export { compact, Mutex } from '@fantasticfour/shared';
 export const debug = createDebugLogger('mysql-redis-world');
 
 const MAX_DEADLOCK_RETRIES = 3;

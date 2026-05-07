@@ -45,7 +45,7 @@
     "ulid": "catalog:"
   },
   "devDependencies": {
-    "@fantasticfour/utils": "workspace:*",
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/gcloud": "11.8.1",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",

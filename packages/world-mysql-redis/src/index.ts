@@ -1,4 +1,4 @@
-import type { HealthCheckable } from '@fantasticfour/utils';
+import type { HealthCheckable } from '@fantasticfour/shared';
 import type { World } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { Redis } from 'ioredis';

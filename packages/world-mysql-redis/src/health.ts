@@ -1,5 +1,5 @@
-import type { HealthCheckResult } from '@fantasticfour/utils';
-import { timeOperation } from '@fantasticfour/utils';
+import type { HealthCheckResult } from '@fantasticfour/shared';
+import { timeOperation } from '@fantasticfour/shared';
 import { sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import type { Redis } from 'ioredis';

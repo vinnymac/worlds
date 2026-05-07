@@ -143,7 +143,7 @@ importers:
         specifier: 'catalog:'
         version: 3.0.2
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@testcontainers/azure-cosmosdb-emulator':
@@ -189,7 +189,7 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^4.20241127.0
         version: 4.20260503.1
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@types/node':
@@ -235,7 +235,7 @@ importers:
         specifier: 'catalog:'
         version: 3.0.2
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@testcontainers/gcloud':
@@ -290,7 +290,7 @@ importers:
         specifier: 'catalog:'
         version: 4.3.6
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@testcontainers/mysql':
@@ -323,7 +323,7 @@ importers:
 
   packages/world-mysql-redis:
     dependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@vercel/queue':
@@ -409,7 +409,7 @@ importers:
         specifier: 'catalog:'
         version: 4.3.6
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@types/node':
@@ -464,7 +464,7 @@ importers:
         specifier: 'catalog:'
         version: 4.3.6
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@testcontainers/postgresql':
@@ -519,7 +519,7 @@ importers:
         specifier: 'catalog:'
         version: 4.3.6
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@testcontainers/redis':
@@ -571,7 +571,7 @@ importers:
         specifier: 'catalog:'
         version: 4.3.6
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@testcontainers/redis':
@@ -614,7 +614,7 @@ importers:
         specifier: 'catalog:'
         version: 3.0.2
     devDependencies:
-      '@fantasticfour/utils':
+      '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
       '@types/node':

@@ -1,97 +1,106 @@
 ---
-"@fantasticfour/world-redis-bullmq": patch
-"@fantasticfour/world-upstash": patch
-"@fantasticfour/world-redis": patch
-"@fantasticfour/world-postgres-redis": patch
-"@fantasticfour/world-mysql": patch
-"@fantasticfour/world-mysql-redis": patch
-"@fantasticfour/world-cloudflare": patch
-"@fantasticfour/world-firestore-tasks": patch
-"@fantasticfour/world-azure": patch
-"@fantasticfour/world-nats-jetstream": patch
+"@fantasticfour/world-azure": minor
+"@fantasticfour/world-cloudflare": minor
+"@fantasticfour/world-firestore-tasks": minor
+"@fantasticfour/world-mysql": minor
+"@fantasticfour/world-mysql-redis": minor
+"@fantasticfour/world-nats-jetstream": minor
+"@fantasticfour/world-postgres-redis": minor
+"@fantasticfour/world-redis": minor
+"@fantasticfour/world-redis-bullmq": minor
+"@fantasticfour/world-upstash": minor
 ---
 
-Fix event idempotency bugs and add comprehensive test coverage across all world packages
+Reliability and observability enhancements across all world packages, plus event-idempotency bug fixes and a new shared utilities package.
 
-## Critical Bug Fixes
+## New Package
 
-**BREAKING BUG** - Event-sourced systems must be idempotent. Replaying events (for recovery, debugging, or state reconstruction) should produce the same result. This release fixes critical bugs where duplicate creation events caused entities to become invisible in list queries.
+- `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
-### Affected Packages with Implementation Fixes
+## Critical Bug Fixes — Event Idempotency
 
-- `world-redis-bullmq`: Fixed SETNX-based idempotency bug where duplicate `run_created`, `step_created`, and `hook_created` events skipped index updates and didn't return existing entities
-- `world-upstash`: Fixed identical SETNX bug
-- `world-redis`: Fixed identical SETNX bug
-- `world-postgres-redis`: Fixed Drizzle `.onConflictDoNothing()` bug where duplicate events returned undefined instead of existing entities
+Event-sourced systems must be idempotent. Replaying creation events (for recovery, debugging, or state reconstruction) was causing entities to disappear from list queries because the "Always-Add Pattern" implementation skipped index updates and returned `undefined` on duplicates.
 
-### Root Cause
+Fixed in:
 
-The bug was in the "Always-Add Pattern" implementation:
+- `world-redis-bullmq`, `world-upstash`, `world-redis` — SETNX-based handlers for `run_created`, `step_created`, `hook_created` now always update indexes (ZADD is idempotent) and return the existing entity on replay.
+- `world-postgres-redis` — Drizzle `.onConflictDoNothing()` paths now fetch and return the existing row instead of `undefined`.
+- `world-nats-jetstream` — KV-bucket creation handlers now read back the existing entity when the key already exists rather than returning `undefined`.
 
-**Before (Broken)**:
-```typescript
-const existed = await redis.setnx(stepKey, newStep);
-if (existed) {  // Only runs when SETNX returns 1 (newly created)
-  await redis.zadd(stepsIndex, score, stepId); // Index update
-  step = StepSchema.parse(newStep);
-}
-// When SETNX returns 0 (exists): NO index, NO entity returned
-```
+Naming: `existed` renamed to `wasCreated` for clarity.
 
-**After (Fixed)**:
-```typescript
-const wasCreated = await redis.setnx(stepKey, newStep);
+## Reliability & Observability
 
-// Always add to index (ZADD is idempotent - safe to call repeatedly)
-await redis.zadd(stepsIndex, score, stepId);
+### `world-azure`
+- Cosmos DB transactional batches for multi-document writes
+- RU/s throttling retry with backoff
+- Service Bus session support
 
-if (wasCreated === 1) {
-  step = StepSchema.parse(newStep);
-} else {
-  // Event replay: fetch existing entity
-  const existingData = await redis.get(stepKey);
-  if (existingData) {
-    step = StepSchema.parse(existingData);
-  }
-}
-```
+### `world-cloudflare`
+- Durable Object storage transactions
+- Permanent vs. transient error handling in queue consumers
+- Schema migration framework for DO storage
 
-## Test Coverage Added
+### `world-firestore-tasks`
+- Batched writes for atomic multi-document mutations
+- Cloud Tasks idempotency keys
+- Idempotent consumer pattern
+- Composite indexes (`firestore.indexes.json`)
+- Polling-mode streamer
 
-All 10 world packages now have comprehensive idempotency test coverage:
+### `world-mysql`
+- TTL-based cleanup of idempotency rows
+- Queue processing metrics (`src/metrics.ts`)
 
-### New Test Suites Created
+### `world-mysql-redis`
+- Outbox pattern (`src/outbox.ts`, `migrations/0001_outbox.sql`)
+- Deadlock retry logic
+- Cross-backend health check
 
-- `world-mysql/test/storage.test.ts` - New file with idempotency tests
-- `world-mysql-redis/test/storage.test.ts` - New file with idempotency tests
-- `world-azure/test/storage.test.ts` - New file with mocked Cosmos DB tests
-- `world-nats-jetstream/test/storage.test.ts` - New file with NATS container tests
+### `world-nats-jetstream`
+- Secondary indexes for query patterns
+- Configurable JetStream dedup window
+- Worker health checks + exponential backoff
+- Bucket TTL/compaction configuration
 
-### Expanded Existing Test Suites
+### `world-postgres-redis`
+- Outbox pattern (`src/outbox.ts`)
+- LISTEN/NOTIFY pub/sub (`src/notify.ts`, migration `0002_outbox_and_notify.sql`)
+- Cross-backend health check (`src/health.ts`)
+- Setup CLI improvements
+- Unified idempotency handling
 
-- `world-redis-bullmq/test/storage.test.ts` - Added 3 idempotency tests
-- `world-upstash/test/storage.test.ts` - Created new test file with full suite
-- `world-redis/test/storage.test.ts` - Added 3 idempotency tests (24 tests total now pass)
-- `world-postgres-redis/test/storage.test.ts` - Added 3 idempotency tests (48 tests total now pass)
-- `world-cloudflare/test/storage.test.ts` - Added 3 idempotency tests (25 tests total now pass)
-- `world-firestore-tasks/test/storage.test.ts` - Added 3 idempotency tests (36 tests total now pass)
+### `world-redis`
+- Atomic Lua scripts for multi-key writes
+- Queue/stream metrics
+- Streams-based event log
 
-### Test Pattern
+### `world-redis-bullmq`
+- Stalled-job recovery
+- Configurable retry/backoff
+- Queue metrics
+- Delayed-job support
 
-Each package now verifies that:
-1. Creating an entity twice returns the existing entity (not undefined/error)
-2. Duplicate events don't create duplicate entries
+### `world-upstash`
+- QStash signature verification
+- Request deduplication
+- Request-budget monitoring
+- Streaming via polling
+
+## Test Coverage
+
+All 10 world packages now have idempotency test coverage. New test files added for `world-mysql`, `world-mysql-redis`, `world-azure`, `world-nats-jetstream`, and `world-upstash`. Existing suites in `world-redis-bullmq`, `world-redis`, `world-postgres-redis`, `world-cloudflare`, and `world-firestore-tasks` were expanded with idempotency cases. Tests verify:
+
+1. Creating an entity twice returns the existing entity (not `undefined`/error)
+2. Duplicate events do not create duplicate entries
 3. Entities always appear in list/index queries after duplicate events
 
-## Impact
+Test files were also DRYed up (helper simplification, direct `beforeEach` references, inlined schema setup) and storage API call signatures corrected (`.get(id)` rather than `.get({ id })`).
 
-**Before**: Event replay (for recovery or debugging) would cause:
-- Missing entities in queries
-- "Unconsumed event" errors
-- Inconsistent state between entity storage and indexes
+## Build
 
-**After**: Event replay is safe and idempotent across all world packages.
+`tsup.config.ts` added to all world packages for consistent bundling.
 
 ## Migration
 
-No breaking changes. These are pure bug fixes with additional test coverage. All existing functionality preserved.
+No breaking API changes. The new `@fantasticfour/shared` package is a workspace dependency consumed internally by the world packages. Outbox/NOTIFY migrations are additive (`0001_outbox.sql`, `0002_outbox_and_notify.sql`) and should be applied via the package's existing migration tooling.

@@ -1,5 +1,5 @@
-import type { ComponentHealth, HealthCheckResult } from '@fantasticfour/utils';
-import { timeOperation } from '@fantasticfour/utils';
+import type { ComponentHealth, HealthCheckResult } from '@fantasticfour/shared';
+import { timeOperation } from '@fantasticfour/shared';
 import { sql } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import type { Drizzle } from './drizzle/index.js';

@@ -65,7 +65,7 @@
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@fantasticfour/utils": "workspace:*",
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/postgresql": "catalog:",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",

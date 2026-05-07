@@ -67,7 +67,7 @@
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@fantasticfour/utils": "workspace:*",
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/mysql": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",

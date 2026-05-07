@@ -1,6 +1,6 @@
-import { createDebugLogger } from '@fantasticfour/utils';
+import { createDebugLogger } from '@fantasticfour/shared';
 
-export { compact } from '@fantasticfour/utils';
+export { compact } from '@fantasticfour/shared';
 export const debug = createDebugLogger('azure-world');
 
 /**

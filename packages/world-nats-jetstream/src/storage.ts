@@ -33,7 +33,7 @@ import {
 } from '@workflow/world';
 import type { JetStreamClient, KV } from 'nats';
 import { monotonicFactory } from 'ulid';
-import { parse, stringify } from '@fantasticfour/utils';
+import { parse, stringify } from '@fantasticfour/shared';
 import { compact, debug } from './util.js';
 
 interface NatsStorageConfig {

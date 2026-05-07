@@ -52,7 +52,7 @@
     "db:push": "node dist/cli.js"
   },
   "dependencies": {
-    "@fantasticfour/utils": "workspace:*",
+    "@fantasticfour/shared": "workspace:*",
     "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",

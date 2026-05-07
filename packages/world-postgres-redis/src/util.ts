@@ -1,4 +1,4 @@
-import { createDebugLogger } from '@fantasticfour/utils';
+import { createDebugLogger } from '@fantasticfour/shared';
 
-export { compact, Mutex } from '@fantasticfour/utils';
+export { compact, Mutex } from '@fantasticfour/shared';
 export const debug = createDebugLogger('postgres-redis-world');

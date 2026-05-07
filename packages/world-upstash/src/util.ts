@@ -1,8 +1,8 @@
-import { createDebugLogger } from '@fantasticfour/utils';
+import { createDebugLogger } from '@fantasticfour/shared';
 import type { Redis } from '@upstash/redis';
 
-export { compact } from '@fantasticfour/utils';
-export { stringify, parse } from '@fantasticfour/utils';
+export { compact } from '@fantasticfour/shared';
+export { stringify, parse } from '@fantasticfour/shared';
 export const debug = createDebugLogger('upstash-world');
 
 /**
