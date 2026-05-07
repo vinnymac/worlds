@@ -1,4 +1,4 @@
-import { WorkflowWorldError } from '@workflow/errors';
+import { EntityConflictError, RunExpiredError, WorkflowWorldError } from '@workflow/errors';
 import type {
   CreateEventParams,
   CreateEventRequest,
@@ -305,7 +305,8 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
       const isRunTerminal = (status: string) =>
         ['completed', 'failed', 'cancelled'].includes(status);
-      const isStepTerminal = (status: string) => ['completed', 'failed'].includes(status);
+      const isStepTerminal = (status: string) =>
+        ['completed', 'failed', 'cancelled'].includes(status);
 
       let currentRun: {
         status: string;
@@ -320,6 +321,84 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             status: parsed.status,
             specVersion: parsed.specVersion,
           };
+        }
+      }
+
+      // ============================================================
+      // RESILIENT START: Bootstrap run from run_started eventData
+      // ============================================================
+      if (
+        data.eventType === 'run_started' &&
+        !currentRun &&
+        'eventData' in data &&
+        data.eventData
+      ) {
+        const runInputData = (data as any).eventData as {
+          deploymentId?: string;
+          workflowName?: string;
+          input?: any;
+          executionContext?: any;
+        };
+        if (
+          runInputData.deploymentId &&
+          runInputData.workflowName &&
+          runInputData.input !== undefined
+        ) {
+          const newRun = {
+            runId: effectiveRunId,
+            deploymentId: runInputData.deploymentId,
+            workflowName: runInputData.workflowName,
+            specVersion: effectiveSpecVersion,
+            input: runInputData.input,
+            executionContext: runInputData.executionContext,
+            status: 'pending' as const,
+            output: undefined,
+            error: undefined,
+            completedAt: undefined,
+            startedAt: undefined,
+            createdAt: now,
+            updatedAt: now,
+          };
+          // Use SETNX for idempotent creation
+          const wasCreated = await redis.setnx(runKey(effectiveRunId), stringify(newRun));
+          if (wasCreated === 1) {
+            // Index the new run
+            const score = now.getTime();
+            await redis.zadd(runsIndexKey(), { score, member: effectiveRunId });
+            await redis.zadd(runsByNameKey(runInputData.workflowName), {
+              score,
+              member: effectiveRunId,
+            });
+            await redis.zadd(runsByStatusKey('pending'), { score, member: effectiveRunId });
+            // Create synthetic run_created event
+            const runCreatedEventId = `wevt_${ulid()}`;
+            const runCreatedEvent = {
+              eventType: 'run_created' as const,
+              eventData: {
+                deploymentId: runInputData.deploymentId,
+                workflowName: runInputData.workflowName,
+                input: runInputData.input,
+                executionContext: runInputData.executionContext,
+              },
+              runId: effectiveRunId,
+              eventId: runCreatedEventId,
+              createdAt: now,
+              specVersion: effectiveSpecVersion,
+            };
+            await redis.set(eventKey(runCreatedEventId), stringify(runCreatedEvent));
+            await redis.zadd(eventsIndexKey(effectiveRunId), {
+              score: now.getTime(),
+              member: runCreatedEventId,
+            });
+            currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
+          } else {
+            // Run already exists — re-read state
+            const runData = await redis.get<string>(runKey(effectiveRunId));
+            if (runData) {
+              const parsed = parse<WorkflowRun>(runData);
+              currentRun = { status: parsed.status, specVersion: parsed.specVersion };
+            }
+          }
         }
       }
 
@@ -362,17 +441,25 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           };
         }
 
-        if (runTerminalEvents.includes(data.eventType) || data.eventType === 'run_cancelled') {
-          throw new WorkflowWorldError(
-            `Cannot transition run from terminal state "${currentRun.status}"`,
-            { status: 410 },
+        // For run_started on terminal runs, use RunExpiredError so the
+        // runtime knows to exit without retrying.
+        if (data.eventType === 'run_started') {
+          throw new RunExpiredError(
+            `Workflow run "${effectiveRunId}" is already in terminal state "${currentRun.status}"`,
           );
         }
 
+        // Other run state transitions are not allowed on terminal runs
+        if (runTerminalEvents.includes(data.eventType) || data.eventType === 'run_cancelled') {
+          throw new EntityConflictError(
+            `Cannot transition run from terminal state "${currentRun.status}"`,
+          );
+        }
+
+        // Creating new entities on terminal runs is not allowed
         if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
-          throw new WorkflowWorldError(
+          throw new EntityConflictError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
-            { status: 410 },
           );
         }
       }
@@ -467,7 +554,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType === 'run_started') {
         // Idempotency: if run is already past pending, this is a replay.
         // Return existing run state without creating a duplicate event.
-        if (currentRun && currentRun.status !== 'pending') {
+        if (currentRun?.status === 'running') {
           const existingData = await redis.get<string>(runKey(effectiveRunId));
           if (existingData) {
             run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
@@ -649,7 +736,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
           const existing = parse<Step>(existingData);
-          if (['completed', 'failed'].includes(existing.status)) {
+          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
               { status: 410 },
@@ -682,7 +769,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
         if (existingData) {
           const existing = parse<Step>(existingData);
-          if (['completed', 'failed'].includes(existing.status)) {
+          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
               { status: 410 },
@@ -825,6 +912,11 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         specVersion: effectiveSpecVersion,
       };
 
+      // Strip eventData from run_started events before storage
+      if (data.eventType === 'run_started') {
+        delete (event as any).eventData;
+      }
+
       await redis.set(eventKey(eventId), stringify(event));
 
       const score = createdAt.getTime();
@@ -835,11 +927,33 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
       const parsed = EventSchema.parse(event);
       const resolveData = params?.resolveData ?? 'all';
+
+      // Preload all events for run_started to reduce TTFB
+      let allEvents: Event[] | undefined;
+      if (data.eventType === 'run_started' && run) {
+        const allEventIds = await redis.zrange<string[]>(eventsIndexKey(effectiveRunId), 0, -1);
+        if (allEventIds.length > 0) {
+          const eventsList: Event[] = [];
+          for (const eid of allEventIds) {
+            const eData = await redis.get<string>(eventKey(eid));
+            if (eData) {
+              const e = parse<Event>(eData);
+              const p = EventSchema.parse(compact(e));
+              eventsList.push(filterEventData(p, resolveData));
+            }
+          }
+          allEvents = eventsList;
+        } else {
+          allEvents = [];
+        }
+      }
+
       return {
         event: filterEventData(parsed, resolveData),
         run,
         step,
         hook,
+        events: allEvents,
       };
     },
 

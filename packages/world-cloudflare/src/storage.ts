@@ -214,14 +214,73 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           specVersion: SPEC_VERSION_CURRENT,
         };
 
+        // Strip eventData from run_started events before storage
+        if (data.eventType === 'run_started') {
+          delete eventRecord.eventData;
+        }
+
         const stub = getRunDO(effectiveRunId);
 
-        // Idempotency: for run_started, skip if run is already past pending.
-        // Return existing run state without creating a duplicate event.
+        // ============================================================
+        // RESILIENT START: Bootstrap run from run_started eventData
+        // ============================================================
         if (data.eventType === 'run_started') {
           const currentRun = await stub.getRun();
-          if (currentRun && currentRun.status !== 'pending') {
+
+          // Idempotency: if run is already past pending, this is a replay.
+          if (currentRun?.status === 'running') {
             return { run: currentRun };
+          }
+
+          // If run doesn't exist, bootstrap it from eventData
+          if (!currentRun && 'eventData' in data && (data as any).eventData) {
+            const runInputData = (data as any).eventData as {
+              deploymentId?: string;
+              workflowName?: string;
+              input?: any;
+              executionContext?: any;
+            };
+            if (
+              runInputData.deploymentId &&
+              runInputData.workflowName &&
+              runInputData.input !== undefined
+            ) {
+              // Create the run via DO (DO handles idempotency)
+              await stub.createRun({
+                runId: effectiveRunId,
+                workflowName: runInputData.workflowName,
+                input: runInputData.input,
+                executionContext: runInputData.executionContext as
+                  | Record<string, unknown>
+                  | undefined,
+                deploymentId: runInputData.deploymentId,
+              });
+              // Create synthetic run_created event
+              const runCreatedEventId = `wevt_${ulid()}`;
+              const runCreatedEventRecord: Record<string, unknown> = {
+                eventType: 'run_created',
+                eventData: {
+                  deploymentId: runInputData.deploymentId,
+                  workflowName: runInputData.workflowName,
+                  input: runInputData.input,
+                  executionContext: runInputData.executionContext,
+                },
+                runId: effectiveRunId,
+                eventId: runCreatedEventId,
+                createdAt: now,
+                specVersion: SPEC_VERSION_CURRENT,
+              };
+              await stub.createEvent(runCreatedEventRecord);
+              // Index for list operations
+              await env.WORKFLOW_INDEX.put(
+                `run:${runInputData.workflowName}:${effectiveRunId}`,
+                JSON.stringify({
+                  runId: effectiveRunId,
+                  createdAt: now.toISOString(),
+                  status: 'pending',
+                }),
+              );
+            }
           }
         }
 
@@ -442,6 +501,18 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           }
           // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
           // are event-only; no entity mutation needed at the storage level
+        }
+
+        // Preload all events for run_started to reduce TTFB
+        if (data.eventType === 'run_started' && result.run) {
+          const eventsResult = await stub.listEvents({
+            limit: 1000,
+            sortOrder: 'asc',
+          });
+          result.events = eventsResult.data.map((e: Event) => ({
+            ...e,
+            createdAt: new Date(e.createdAt),
+          }));
         }
 
         return result;

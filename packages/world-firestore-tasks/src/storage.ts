@@ -430,7 +430,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
     // Idempotency: for run_started, if run is already past pending, this is a replay.
     // Return existing run state without creating a duplicate event.
-    if (eventType === 'run_started' && currentRun.status !== 'pending') {
+    if (eventType === 'run_started' && currentRun.status === 'running') {
       return currentRun;
     }
 
@@ -796,6 +796,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           createdAt: now,
         };
 
+        // Strip eventData from run_started events before storage
+        if (data.eventType === 'run_started') {
+          delete eventRecord.eventData;
+        }
+
         // Add optional correlationId if present
         if ('correlationId' in data && (data as any).correlationId !== undefined) {
           eventRecord.correlationId = (data as any).correlationId;
@@ -808,6 +813,65 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
         // Track whether the event was written inside a transaction
         let eventWrittenInTransaction = false;
+
+        // ============================================================
+        // RESILIENT START: Bootstrap run from run_started eventData
+        // ============================================================
+        if (data.eventType === 'run_started' && eventData) {
+          const runInputData = eventData as {
+            deploymentId?: string;
+            workflowName?: string;
+            input?: any;
+            executionContext?: any;
+          };
+          if (
+            runInputData.deploymentId &&
+            runInputData.workflowName &&
+            runInputData.input !== undefined
+          ) {
+            const runRef = firestore.collection('workflow_runs').doc(effectiveRunId);
+            const existingDoc = await runRef.get();
+            if (!existingDoc.exists) {
+              // Create run + synthetic run_created event atomically
+              const runCreatedEventId = `wevt_${ulid()}`;
+              const syntheticEventRecord: Record<string, unknown> = {
+                runId: effectiveRunId,
+                eventId: runCreatedEventId,
+                eventType: 'run_created',
+                eventData: {
+                  deploymentId: runInputData.deploymentId,
+                  workflowName: runInputData.workflowName,
+                  input: runInputData.input,
+                  executionContext: runInputData.executionContext,
+                },
+                specVersion: effectiveSpecVersion,
+                createdAt: now,
+              };
+              const newRun = {
+                runId: effectiveRunId,
+                workflowName: runInputData.workflowName,
+                specVersion: effectiveSpecVersion,
+                status: 'pending',
+                input: serializeNestedArrays(runInputData.input),
+                executionContext: runInputData.executionContext as
+                  | Record<string, unknown>
+                  | undefined,
+                deploymentId: runInputData.deploymentId,
+                createdAt: now,
+                updatedAt: now,
+              } as any;
+              const syntheticEventRef = firestore
+                .collection('workflow_runs')
+                .doc(effectiveRunId)
+                .collection('events')
+                .doc(runCreatedEventId);
+              const batch = firestore.batch();
+              batch.set(syntheticEventRef, syntheticEventRecord);
+              batch.set(runRef, newRun);
+              await batch.commit();
+            }
+          }
+        }
 
         // Parse and validate using EventSchema like other implementations
         const parsed = EventSchema.parse(eventRecord);
@@ -909,6 +973,24 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             .collection('events')
             .doc(eventId)
             .set(eventRecord);
+        }
+
+        // Preload all events for run_started to reduce TTFB
+        if (data.eventType === 'run_started' && result.run) {
+          const eventsSnapshot = await firestore
+            .collection('workflow_runs')
+            .doc(effectiveRunId)
+            .collection('events')
+            .orderBy('createdAt', 'asc')
+            .get();
+          result.events = eventsSnapshot.docs.map((doc) => {
+            const eData = doc.data();
+            return {
+              ...eData,
+              eventData: convertBuffersToUint8Array(eData.eventData),
+              createdAt: fromFirestoreTimestamp(eData.createdAt),
+            } as Event;
+          });
         }
 
         return result;

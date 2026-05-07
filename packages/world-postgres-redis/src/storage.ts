@@ -1,4 +1,4 @@
-import { WorkflowWorldError } from '@workflow/errors';
+import { EntityConflictError, RunExpiredError, WorkflowWorldError } from '@workflow/errors';
 import type {
   Event,
   EventResult,
@@ -210,7 +210,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         ['completed', 'failed', 'cancelled'].includes(status);
 
       // Helper to check if step is in terminal state
-      const isStepTerminal = (status: string) => ['completed', 'failed'].includes(status);
+      const isStepTerminal = (status: string) =>
+        ['completed', 'failed', 'cancelled'].includes(status);
 
       // ============================================================
       // VALIDATION: Terminal state checks
@@ -225,6 +226,61 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           runId: effectiveRunId,
         });
         currentRun = runValue ?? null;
+      }
+
+      // ============================================================
+      // RESILIENT START: Bootstrap run from run_started eventData
+      // ============================================================
+      if (
+        data.eventType === 'run_started' &&
+        !currentRun &&
+        'eventData' in data &&
+        data.eventData
+      ) {
+        const runInputData = (data as any).eventData as {
+          deploymentId?: string;
+          workflowName?: string;
+          input?: any;
+          executionContext?: any;
+        };
+        if (
+          runInputData.deploymentId &&
+          runInputData.workflowName &&
+          runInputData.input !== undefined
+        ) {
+          const [runValue] = await drizzle
+            .insert(Schema.runs)
+            .values({
+              runId: effectiveRunId,
+              deploymentId: runInputData.deploymentId,
+              workflowName: runInputData.workflowName,
+              input: runInputData.input as SerializedContent,
+              executionContext: runInputData.executionContext as SerializedContent | undefined,
+              status: 'pending',
+            })
+            .onConflictDoNothing()
+            .returning();
+          if (runValue) {
+            // Create synthetic run_created event
+            const runCreatedEventId = `wevt_${ulid()}`;
+            await drizzle.insert(events).values({
+              runId: effectiveRunId,
+              eventId: runCreatedEventId,
+              eventType: 'run_created',
+              eventData: {
+                deploymentId: runInputData.deploymentId,
+                workflowName: runInputData.workflowName,
+                input: runInputData.input,
+                executionContext: runInputData.executionContext,
+              },
+            });
+            currentRun = { status: 'pending' };
+          } else {
+            // Run already exists — re-read state
+            const [existingRun] = await getRunForValidation.execute({ runId: effectiveRunId });
+            currentRun = existingRun ?? null;
+          }
+        }
       }
 
       // Run terminal state validation
@@ -269,19 +325,25 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           };
         }
 
-        // Run state transitions are not allowed on terminal runs
+        // For run_started on terminal runs, use RunExpiredError so the
+        // runtime knows to exit without retrying.
+        if (data.eventType === 'run_started') {
+          throw new RunExpiredError(
+            `Workflow run "${effectiveRunId}" is already in terminal state "${currentRun.status}"`,
+          );
+        }
+
+        // Other run state transitions are not allowed on terminal runs
         if (runTerminalEvents.includes(data.eventType) || data.eventType === 'run_cancelled') {
-          throw new WorkflowWorldError(
+          throw new EntityConflictError(
             `Cannot transition run from terminal state "${currentRun.status}"`,
-            { status: 410 },
           );
         }
 
         // Creating new entities on terminal runs is not allowed
         if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
-          throw new WorkflowWorldError(
+          throw new EntityConflictError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
-            { status: 410 },
           );
         }
       }
@@ -384,7 +446,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
       if (data.eventType === 'run_started') {
         // Idempotency: if run is already past pending, this is a replay.
         // Return existing run state without creating a duplicate event.
-        if (currentRun && currentRun.status !== 'pending') {
+        if (currentRun?.status === 'running') {
           const [existingRun] = await drizzle
             .select()
             .from(Schema.runs)
@@ -582,7 +644,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             and(
               eq(Schema.steps.runId, effectiveRunId),
               eq(Schema.steps.stepId, data.correlationId!),
-              notInArray(Schema.steps.status, ['completed', 'failed']),
+              notInArray(Schema.steps.status, ['completed', 'failed', 'cancelled']),
             ),
           )
           .returning();
@@ -598,7 +660,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           if (!existing) {
             throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
           }
-          if (['completed', 'failed'].includes(existing.status)) {
+          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
               { status: 410 },
@@ -632,7 +694,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             and(
               eq(Schema.steps.runId, effectiveRunId),
               eq(Schema.steps.stepId, data.correlationId!),
-              notInArray(Schema.steps.status, ['completed', 'failed']),
+              notInArray(Schema.steps.status, ['completed', 'failed', 'cancelled']),
             ),
           )
           .returning();
@@ -648,7 +710,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           if (!existing) {
             throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
           }
-          if (['completed', 'failed'].includes(existing.status)) {
+          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
             throw new WorkflowWorldError(
               `Cannot modify step in terminal state "${existing.status}"`,
               { status: 410 },
@@ -769,6 +831,12 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         await drizzle.delete(Schema.hooks).where(eq(Schema.hooks.hookId, data.correlationId));
       }
 
+      const storedEventData =
+        data.eventType === 'run_started'
+          ? undefined
+          : 'eventData' in data
+            ? data.eventData
+            : undefined;
       const [value] = await drizzle
         .insert(events)
         .values({
@@ -776,7 +844,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           eventId,
           correlationId: data.correlationId,
           eventType: data.eventType,
-          eventData: 'eventData' in data ? data.eventData : undefined,
+          eventData: storedEventData,
         })
         .returning({ createdAt: events.createdAt });
       if (!value) {
@@ -785,9 +853,28 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         });
       }
       const result = { ...data, ...value, runId: effectiveRunId, eventId };
+      if (data.eventType === 'run_started') {
+        delete (result as any).eventData;
+      }
       const parsed = EventSchema.parse(result);
       const resolveData = params?.resolveData ?? 'all';
-      return { event: filterEventData(parsed, resolveData), run, step, hook };
+
+      // Preload all events for run_started to reduce TTFB
+      let allEvents: Event[] | undefined;
+      if (data.eventType === 'run_started' && run) {
+        const eventRows = await drizzle
+          .select()
+          .from(events)
+          .where(eq(events.runId, effectiveRunId))
+          .orderBy(events.eventId);
+        allEvents = eventRows.map((e) => {
+          e.eventData ||= e.eventDataJson;
+          const p = EventSchema.parse(compact(e));
+          return filterEventData(p, resolveData);
+        });
+      }
+
+      return { event: filterEventData(parsed, resolveData), run, step, hook, events: allEvents };
     },
     async get(runId, eventId, params) {
       const [value] = await drizzle
