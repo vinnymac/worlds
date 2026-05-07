@@ -405,6 +405,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     }
 
     const doc = resources[0];
+
+    // Idempotency: for run_started, if run is already past pending, this is a replay.
+    // Return existing run state without creating a duplicate event.
+    if (eventType === 'run_started' && doc.status !== 'pending') {
+      return getRun(runId);
+    }
+
     const now = new Date();
     doc.updatedAt = now.toISOString();
 
@@ -821,6 +828,16 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             break;
           }
           default: {
+            // Idempotency: for run_started, check if run is already past pending
+            // before storing the event. Skip to avoid duplicate events on replay.
+            if (data.eventType === 'run_started') {
+              const existingRun = await getRun(effectiveRunId);
+              if (existingRun.status !== 'pending') {
+                result.run = existingRun;
+                break;
+              }
+            }
+
             // All other event types: store the event first, then apply side effects
             await withCosmosRetry(() => container.items.create(eventDoc));
 

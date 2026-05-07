@@ -77,6 +77,16 @@ describe('Storage (Azure Cosmos DB integration)', () => {
           return { resource: doc };
         }),
       },
+      item: vi.fn((id: string, _partitionKey: string) => ({
+        replace: vi.fn(async (doc: any) => {
+          mockData.set(id, doc);
+          return { resource: doc };
+        }),
+        delete: vi.fn(async () => {
+          mockData.delete(id);
+          return {};
+        }),
+      })),
       delete: vi.fn(async () => ({})),
     } as any;
 
@@ -177,6 +187,34 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       expect(listResult.data).toHaveLength(2);
       expect(listResult.data.some((h) => h.hookId === hookId1)).toBe(true);
       expect(listResult.data.some((h) => h.hookId === hookId2)).toBe(true);
+    });
+
+    it('should not create duplicate run_started event on replay', async () => {
+      const run = await createRun();
+
+      // First run_started
+      const result1 = await storage.events.create(run.runId, {
+        eventType: 'run_started',
+      });
+      expect(result1.run?.status).toBe('running');
+      expect(result1.run?.startedAt).toBeInstanceOf(Date);
+      const originalStartedAt = result1.run!.startedAt!;
+
+      // Second run_started (replay scenario — should be idempotent)
+      const result2 = await storage.events.create(run.runId, {
+        eventType: 'run_started',
+      });
+      expect(result2.run?.status).toBe('running');
+      // startedAt should be preserved from first call
+      expect(result2.run!.startedAt!.getTime()).toBe(originalStartedAt.getTime());
+
+      // Only ONE run_started event should exist in the log
+      const eventList = await storage.events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      const runStartedEvents = eventList.data.filter((e: any) => e.eventType === 'run_started');
+      expect(runStartedEvents).toHaveLength(1);
     });
   });
 

@@ -645,6 +645,17 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
       // Handle run_started event: update run status
       if (data.eventType === 'run_started') {
+        // Idempotency: if run is already past pending, this is a replay.
+        // Return existing run state without creating a duplicate event.
+        if (currentRun && currentRun.status !== 'pending') {
+          const existingData = await redis.get(runKey(effectiveRunId));
+          if (existingData) {
+            run = WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(existingData)));
+          }
+          const resolveData = params?.resolveData ?? 'all';
+          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
+        }
+
         const existingData = await redis.get(runKey(effectiveRunId));
         if (existingData) {
           const existing = parseWithUint8Array<WorkflowRun>(existingData);

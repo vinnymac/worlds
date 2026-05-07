@@ -193,6 +193,34 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(listResult.data.some((h) => h.hookId === hookId1)).toBe(true);
       expect(listResult.data.some((h) => h.hookId === hookId2)).toBe(true);
     });
+
+    it('should not create duplicate run_started event on replay', async () => {
+      const run = await createRun();
+
+      // First run_started
+      const result1 = await events.create(run.runId, {
+        eventType: 'run_started',
+      });
+      expect(result1.run?.status).toBe('running');
+      expect(result1.run?.startedAt).toBeInstanceOf(Date);
+      const originalStartedAt = result1.run!.startedAt!;
+
+      // Second run_started (replay scenario — should be idempotent)
+      const result2 = await events.create(run.runId, {
+        eventType: 'run_started',
+      });
+      expect(result2.run?.status).toBe('running');
+      // startedAt should be preserved from first call
+      expect(result2.run!.startedAt!.getTime()).toBe(originalStartedAt.getTime());
+
+      // Only ONE run_started event should exist in the log
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
+      expect(runStartedEvents).toHaveLength(1);
+    });
   });
 
   describe('Basic functionality', () => {

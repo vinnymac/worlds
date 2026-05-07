@@ -629,6 +629,18 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       }
 
       if (data.eventType === 'run_started') {
+        // Idempotency: if run is already past pending, this is a replay.
+        // Return existing run state without creating a duplicate event.
+        if (currentRun && currentRun.status !== 'pending') {
+          const entry = await runsBucket.get(effectiveRunId);
+          if (entry) {
+            const existingData = kvValueToString(entry.value);
+            run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
+          }
+          const resolveData = params?.resolveData ?? 'all';
+          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
+        }
+
         const entry = await runsBucket.get(effectiveRunId);
         if (entry) {
           const existingData = kvValueToString(entry.value);

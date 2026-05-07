@@ -427,6 +427,13 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
     // Read current run state (non-transactional)
     const currentRun = await getRun(runId);
+
+    // Idempotency: for run_started, if run is already past pending, this is a replay.
+    // Return existing run state without creating a duplicate event.
+    if (eventType === 'run_started' && currentRun.status !== 'pending') {
+      return currentRun;
+    }
+
     const now = new Date();
     const updates: Record<string, unknown> = { updatedAt: now };
 

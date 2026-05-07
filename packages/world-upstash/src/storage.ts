@@ -465,6 +465,17 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
 
       if (data.eventType === 'run_started') {
+        // Idempotency: if run is already past pending, this is a replay.
+        // Return existing run state without creating a duplicate event.
+        if (currentRun && currentRun.status !== 'pending') {
+          const existingData = await redis.get<string>(runKey(effectiveRunId));
+          if (existingData) {
+            run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
+          }
+          const resolveData = params?.resolveData ?? 'all';
+          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
+        }
+
         const existingData = await redis.get<string>(runKey(effectiveRunId));
         if (existingData) {
           const existing = parse<WorkflowRun>(existingData);

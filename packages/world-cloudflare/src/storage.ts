@@ -214,8 +214,18 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        // Store the event in the DO
         const stub = getRunDO(effectiveRunId);
+
+        // Idempotency: for run_started, skip if run is already past pending.
+        // Return existing run state without creating a duplicate event.
+        if (data.eventType === 'run_started') {
+          const currentRun = await stub.getRun();
+          if (currentRun && currentRun.status !== 'pending') {
+            return { run: currentRun };
+          }
+        }
+
+        // Store the event in the DO
         await stub.createEvent(eventRecord);
 
         // Parse and validate using EventSchema

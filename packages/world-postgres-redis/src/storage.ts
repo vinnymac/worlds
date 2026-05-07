@@ -382,6 +382,25 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
 
       // Handle run_started event: update run status
       if (data.eventType === 'run_started') {
+        // Idempotency: if run is already past pending, this is a replay.
+        // Return existing run state without creating a duplicate event.
+        if (currentRun && currentRun.status !== 'pending') {
+          const [existingRun] = await drizzle
+            .select()
+            .from(Schema.runs)
+            .where(eq(Schema.runs.runId, effectiveRunId))
+            .limit(1);
+          if (existingRun) {
+            existingRun.output ||= existingRun.outputJson;
+            existingRun.input ||= existingRun.inputJson;
+            existingRun.executionContext ||= existingRun.executionContextJson;
+            existingRun.error = parseErrorJson(existingRun.error);
+            run = deserializeRunError(compact(existingRun));
+          }
+          const resolveData = params?.resolveData ?? 'all';
+          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
+        }
+
         const [runValue] = await drizzle
           .update(Schema.runs)
           .set({
