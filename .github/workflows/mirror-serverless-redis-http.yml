@@ -1,0 +1,26 @@
+name: Mirror serverless-redis-http to GHCR
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Weekly on Monday at 6am UTC
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull, tag, and push
+        run: |
+          docker pull hiett/serverless-redis-http:latest
+          docker tag hiett/serverless-redis-http:latest ghcr.io/${{ github.repository_owner }}/serverless-redis-http:latest
+          docker push ghcr.io/${{ github.repository_owner }}/serverless-redis-http:latest

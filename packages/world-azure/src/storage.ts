@@ -405,6 +405,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     }
 
     const doc = resources[0];
+
+    // Idempotency: for run_started, if run is already past pending, this is a replay.
+    // Return existing run state without creating a duplicate event.
+    if (eventType === 'run_started' && doc.status === 'running') {
+      return getRun(runId);
+    }
+
     const now = new Date();
     doc.updatedAt = now.toISOString();
 
@@ -779,6 +786,11 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           createdAt: now.toISOString(),
         };
 
+        // Strip eventData from run_started events before storage
+        if (data.eventType === 'run_started') {
+          delete eventDoc.eventData;
+        }
+
         // Add optional correlationId if present
         if ('correlationId' in data && (data as any).correlationId !== undefined) {
           eventDoc.correlationId = (data as any).correlationId;
@@ -786,15 +798,78 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
         // Parse and validate using EventSchema
         // Note: Use original eventData (not encoded) for validation
-        const parsed = EventSchema.parse({
+        const parsedInput: Record<string, unknown> = {
           ...eventDoc,
           eventData: (data as any).eventData || {},
           createdAt: now,
-        });
+        };
+        // Strip eventData from run_started events
+        if (data.eventType === 'run_started') {
+          delete parsedInput.eventData;
+        }
+        const parsed = EventSchema.parse(parsedInput);
         const result: EventResult = { event: parsed };
 
         // Process entity side effects based on event type
         const eventData = (data as any).eventData;
+
+        // ============================================================
+        // RESILIENT START: Bootstrap run from run_started eventData
+        // ============================================================
+        if (data.eventType === 'run_started' && eventData) {
+          const runInputData = eventData as {
+            deploymentId?: string;
+            workflowName?: string;
+            input?: any;
+            executionContext?: any;
+          };
+          if (
+            runInputData.deploymentId &&
+            runInputData.workflowName &&
+            runInputData.input !== undefined
+          ) {
+            // Try to create the run (409 = already exists, which is fine)
+            const runDoc: Record<string, unknown> = {
+              id: `run:${effectiveRunId}`,
+              type: 'run' as DocType,
+              runId: effectiveRunId,
+              workflowName: runInputData.workflowName,
+              specVersion: effectiveSpecVersion,
+              status: 'pending',
+              input: encodeCbor(runInputData.input),
+              executionContext: runInputData.executionContext as
+                | Record<string, unknown>
+                | undefined,
+              deploymentId: runInputData.deploymentId,
+              createdAt: now.toISOString(),
+              updatedAt: now.toISOString(),
+            };
+            try {
+              await withCosmosRetry(() => container.items.create(runDoc));
+              // Run was created — also create synthetic run_created event
+              const runCreatedEventId = `wevt_${ulid()}`;
+              const syntheticEventDoc: Record<string, unknown> = {
+                id: `event:${effectiveRunId}:${runCreatedEventId}`,
+                type: 'event' as DocType,
+                runId: effectiveRunId,
+                eventId: runCreatedEventId,
+                eventType: 'run_created',
+                eventData: encodeCbor({
+                  deploymentId: runInputData.deploymentId,
+                  workflowName: runInputData.workflowName,
+                  input: runInputData.input,
+                  executionContext: runInputData.executionContext,
+                }),
+                specVersion: effectiveSpecVersion,
+                createdAt: now.toISOString(),
+              };
+              await withCosmosRetry(() => container.items.create(syntheticEventDoc));
+            } catch (error: any) {
+              // 409 = run already exists, which is expected in race conditions
+              if (error?.code !== 409) throw error;
+            }
+          }
+        }
 
         // For run_created and step_created, use transactional batches that
         // atomically write the event + entity in a single partition-scoped
@@ -821,6 +896,16 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             break;
           }
           default: {
+            // Idempotency: for run_started, check if run is already past pending
+            // before storing the event. Skip to avoid duplicate events on replay.
+            if (data.eventType === 'run_started') {
+              const existingRun = await getRun(effectiveRunId);
+              if (existingRun.status === 'running') {
+                result.run = existingRun;
+                break;
+              }
+            }
+
             // All other event types: store the event first, then apply side effects
             await withCosmosRetry(() => container.items.create(eventDoc));
 
@@ -872,6 +957,19 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             }
             break;
           }
+        }
+
+        // Preload all events for run_started to reduce TTFB
+        if (data.eventType === 'run_started' && result.run) {
+          const eventsQuery: SqlQuerySpec = {
+            query:
+              'SELECT * FROM c WHERE c.type = "event" AND c.runId = @runId ORDER BY c.createdAt ASC',
+            parameters: [{ name: '@runId', value: effectiveRunId }],
+          };
+          const { resources: eventDocs } = await withCosmosRetry(() =>
+            container.items.query(eventsQuery, { partitionKey: effectiveRunId }).fetchAll(),
+          );
+          result.events = eventDocs.map((doc: Record<string, unknown>) => deserializeEvent(doc));
         }
 
         return result;
