@@ -21,7 +21,7 @@ catalog:
   mysql2: ^3.14.1
   postgres: ^3.4.9
   testcontainers: 11.14.0
-  tsup: ^8.5.1
+  tsdown: ^0.21.10
   typescript: ^5.9.3
   ulid: ^3.0.2
   vitest: ^3.2.4

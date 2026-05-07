@@ -29,7 +29,7 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsdown",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "clean": "rm -rf dist",
@@ -51,7 +51,7 @@
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "miniflare": "^3.20241106.2",
-    "tsup": "catalog:",
+    "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "wrangler": "^3.91.0"

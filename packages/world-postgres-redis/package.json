@@ -45,8 +45,8 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsup && chmod +x bin/setup.js",
-    "dev": "tsup --watch",
+    "build": "tsdown && chmod +x bin/setup.js",
+    "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
@@ -72,7 +72,7 @@
     "@workflow/world-testing": "catalog:",
     "dotenv": "catalog:",
     "drizzle-kit": "catalog:",
-    "tsup": "catalog:",
+    "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

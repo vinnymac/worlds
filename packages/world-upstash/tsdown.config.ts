@@ -1,15 +1,13 @@
-import { defineConfig } from 'tsup';
+import { defineConfig } from 'tsdown';
 
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
   },
-  format: ['esm'],
+  format: 'esm',
   dts: true,
   sourcemap: true,
   clean: true,
-  splitting: false,
   outDir: 'dist',
-  packages: 'external',
-  external: ['dotenv', 'dotenv/config'],
+  outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
 });
