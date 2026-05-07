@@ -81,9 +81,19 @@ export function createQueue(config: ServiceBusConfig): Queue & {
 
       const messageIdValue = opts?.idempotencyKey || `msg_${Date.now()}`;
 
+      // Extract runId from the message for session-based ordering.
+      // Service Bus sessions guarantee that all messages with the same sessionId
+      // are processed in order by a single consumer.
+      // See: https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions
+      const messageRunId =
+        typeof message === 'object' && message !== null
+          ? (message as Record<string, unknown>).runId
+          : undefined;
+
       await sender.sendMessages({
         body: message,
         messageId: messageIdValue,
+        sessionId: typeof messageRunId === 'string' ? messageRunId : undefined,
         subject: queueName,
         applicationProperties: {
           queueName,

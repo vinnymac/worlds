@@ -618,16 +618,28 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         };
 
         // Use SET NX to ensure run doesn't already exist
-        const existed = await redis.setnx(runKey(effectiveRunId), stringifyWithUint8Array(newRun));
-        if (existed) {
-          const score = now.getTime();
-          await redis
-            .pipeline()
-            .zadd(runsIndexKey(), score, effectiveRunId)
-            .zadd(runsByNameKey(eventData.workflowName), score, effectiveRunId)
-            .zadd(runsByStatusKey('pending'), score, effectiveRunId)
-            .exec();
+        const wasCreated = await redis.setnx(
+          runKey(effectiveRunId),
+          stringifyWithUint8Array(newRun),
+        );
+
+        // Always add to indexes (idempotent)
+        const score = now.getTime();
+        await redis
+          .pipeline()
+          .zadd(runsIndexKey(), score, effectiveRunId)
+          .zadd(runsByNameKey(eventData.workflowName), score, effectiveRunId)
+          .zadd(runsByStatusKey('pending'), score, effectiveRunId)
+          .exec();
+
+        if (wasCreated === 1) {
           run = WorkflowRunSchema.parse(compact(newRun));
+        } else {
+          // Event replay: fetch existing run
+          const existingData = await redis.get(runKey(effectiveRunId));
+          if (existingData) {
+            run = WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(existingData)));
+          }
         }
       }
 
@@ -761,13 +773,22 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           updatedAt: now,
         };
 
-        const existed = await redis.setnx(
+        const wasCreated = await redis.setnx(
           stepKey(effectiveRunId, data.correlationId!),
           stringifyWithUint8Array(newStep),
         );
-        if (existed) {
-          await redis.zadd(stepsIndexKey(effectiveRunId), now.getTime(), data.correlationId!);
+
+        // Always add to index (ZADD is idempotent)
+        await redis.zadd(stepsIndexKey(effectiveRunId), now.getTime(), data.correlationId!);
+
+        if (wasCreated === 1) {
           step = StepSchema.parse(compact(newStep));
+        } else {
+          // Event replay: fetch existing step
+          const existingData = await redis.get(stepKey(effectiveRunId, data.correlationId!));
+          if (existingData) {
+            step = StepSchema.parse(compact(parseWithUint8Array<Step>(existingData)));
+          }
         }
       }
 
@@ -948,17 +969,26 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           createdAt: now,
         };
 
-        const existed = await redis.setnx(
+        const wasCreated = await redis.setnx(
           hookKey(data.correlationId!),
           stringifyWithUint8Array(newHook),
         );
-        if (existed) {
-          await redis
-            .pipeline()
-            .set(hooksByTokenKey(eventData.token), data.correlationId!)
-            .zadd(hooksIndexKey(effectiveRunId), now.getTime(), data.correlationId!)
-            .exec();
+
+        // Always add to indexes (idempotent)
+        await redis
+          .pipeline()
+          .set(hooksByTokenKey(eventData.token), data.correlationId!)
+          .zadd(hooksIndexKey(effectiveRunId), now.getTime(), data.correlationId!)
+          .exec();
+
+        if (wasCreated === 1) {
           hook = HookSchema.parse(compact(newHook));
+        } else {
+          // Event replay: fetch existing hook
+          const existingData = await redis.get(hookKey(data.correlationId!));
+          if (existingData) {
+            hook = HookSchema.parse(compact(parseWithUint8Array<Hook>(existingData)));
+          }
         }
       }
 

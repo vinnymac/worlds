@@ -25,7 +25,6 @@
     "src/drizzle/migrations"
   ],
   "type": "module",
-  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -46,9 +45,9 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc && chmod +x bin/setup.js",
-    "dev": "tsc --watch",
-    "clean": "tsc --build --clean && rm -rf dist",
+    "build": "tsdown && chmod +x bin/setup.js",
+    "dev": "tsdown --watch",
+    "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:push": "node dist/cli.js"
@@ -66,12 +65,14 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/postgresql": "catalog:",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "dotenv": "catalog:",
     "drizzle-kit": "catalog:",
+    "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

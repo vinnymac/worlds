@@ -5,19 +5,35 @@ import type {
   Streamer,
 } from '@workflow/world';
 import type { Redis } from '@upstash/redis';
+import { debug } from './util.js';
 
 interface UpstashStreamerConfig {
   redis: Redis;
   keyPrefix: string;
+  /**
+   * Default polling interval in milliseconds for readFromStream.
+   * Upstash Redis HTTP API does not support long-lived SUBSCRIBE/BLPOP,
+   * so readFromStream polls at this interval.
+   * @default 500
+   */
+  pollIntervalMs?: number;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Create a basic streamer for Upstash world using Redis as storage.
- * Note: Real-time streaming via ReadableStream is not fully supported in this serverless implementation.
- * Use getStreamChunks() for polling-based stream access instead.
+ * Create a streamer for Upstash world using Redis as storage.
+ *
+ * Because Upstash Redis is HTTP-based, there is no long-lived connection for
+ * SUBSCRIBE or BLPOP. readFromStream uses polling with a configurable interval.
+ * For serverless environments where long-running responses are not practical,
+ * prefer getStreamChunks() for explicit polling from the client side.
  */
 export function createStreamer(config: UpstashStreamerConfig): Streamer {
   const { redis, keyPrefix } = config;
+  const defaultPollIntervalMs = config.pollIntervalMs ?? 500;
 
   const streamChunksKey = (name: string, runId: string) =>
     `${keyPrefix}stream:${runId}:${name}:chunks`;
@@ -42,20 +58,70 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
       await redis.set(key, '1');
     },
 
-    async readFromStream(_name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
-      // Serverless environments don't support long-running ReadableStreams well
-      // Return an empty ReadableStream as a placeholder
-      // Users should use getStreamChunks() for polling instead
-      const chunks: Uint8Array[] = [];
-      let currentIndex = startIndex || 0;
+    async readFromStream(
+      name: string,
+      startIndex?: number,
+      runId?: string,
+    ): Promise<ReadableStream<Uint8Array>> {
+      // Enhancement 7: Polling-based ReadableStream implementation.
+      // Upstash Redis HTTP API does not support SUBSCRIBE or BLPOP, so we poll
+      // at a configurable interval until the stream is closed.
+      //
+      // If no runId is provided, fall back to an empty stream (cannot poll without it).
+      if (!runId) {
+        debug('readFromStream called without runId; returning empty stream');
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close();
+          },
+        });
+      }
+
+      const chunksKey = streamChunksKey(name, runId);
+      const closedKey = streamClosedKey(name, runId);
+      let currentIndex = startIndex ?? 0;
+      const pollInterval = defaultPollIntervalMs;
 
       return new ReadableStream<Uint8Array>({
-        start(controller) {
-          // Immediately close the stream with any available chunks
-          for (const chunk of chunks.slice(currentIndex)) {
-            controller.enqueue(chunk);
+        async pull(controller) {
+          // Poll until we get new data or the stream is closed
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            try {
+              const rawChunks = (await redis.lrange(
+                chunksKey,
+                currentIndex,
+                currentIndex + 99,
+              )) as string[];
+
+              if (rawChunks.length > 0) {
+                for (const chunk of rawChunks) {
+                  try {
+                    controller.enqueue(new Uint8Array(Buffer.from(chunk, 'base64')));
+                  } catch {
+                    controller.enqueue(new Uint8Array(Buffer.from(chunk, 'utf-8')));
+                  }
+                  currentIndex++;
+                }
+                // Yield control after enqueuing a batch
+                return;
+              }
+
+              // No new data -- check if stream is closed
+              const isClosed = (await redis.get(closedKey)) === '1';
+              if (isClosed) {
+                controller.close();
+                return;
+              }
+
+              // Wait before next poll
+              await sleep(pollInterval);
+            } catch (err) {
+              debug('readFromStream poll error:', err);
+              controller.error(err);
+              return;
+            }
           }
-          controller.close();
         },
       });
     },

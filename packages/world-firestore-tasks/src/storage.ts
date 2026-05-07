@@ -26,7 +26,7 @@ import type {
 } from '@workflow/world';
 import { EventSchema, HookSchema, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
-import { compact } from './util.js';
+import { compact, debug } from './util.js';
 
 interface FirestoreStorageConfig {
   firestore: Firestore;
@@ -300,7 +300,8 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
    * Internal helper to get a run from Firestore.
    */
   async function getRun(runId: string): Promise<WorkflowRun> {
-    const doc = await firestore.collection('workflow_runs').doc(runId).get();
+    const docRef = firestore.collection('workflow_runs').doc(runId);
+    const doc = await docRef.get();
 
     if (!doc.exists) {
       throw new WorkflowWorldError(`Run not found: ${runId}`, {
@@ -324,12 +325,8 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
    * Internal helper to get a step from Firestore.
    */
   async function getStep(runId: string, stepId: string): Promise<Step> {
-    const doc = await firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('steps')
-      .doc(stepId)
-      .get();
+    const docRef = firestore.collection('workflow_runs').doc(runId).collection('steps').doc(stepId);
+    const doc = await docRef.get();
 
     if (!doc.exists) {
       throw new WorkflowWorldError(`Step not found: ${stepId}`, {
@@ -352,17 +349,28 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
   /**
    * Internal: create a run entity in Firestore (called from events.create for run_created).
+   * Uses a batch write for atomicity without read locks.
+   * Idempotency: if the run already exists, return the existing one.
    */
   async function createRunFromEvent(
     runId: string,
     data: RunCreatedEventRequest['eventData'],
+    eventRecord: Record<string, unknown>,
+    eventId: string,
   ): Promise<WorkflowRun> {
     const runRef = firestore.collection('workflow_runs').doc(runId);
+    const eventRef = firestore
+      .collection('workflow_runs')
+      .doc(runId)
+      .collection('events')
+      .doc(eventId);
 
-    // Check if run already exists (defensive idempotency)
+    // Idempotency check: if the run already exists, return it
     const existing = await runRef.get();
     if (existing.exists) {
       const existingData = existing.data() as FirebaseFirestore.DocumentData;
+      // Still write the event (idempotent via doc ID)
+      await eventRef.set(eventRecord);
       return deserializeRunError({
         ...existingData,
         input: deserializeNestedArrays(existingData.input),
@@ -387,7 +395,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       updatedAt: now,
     } as any;
 
-    await runRef.set(run);
+    // Atomic batch write: event + run together
+    const batch = firestore.batch();
+    batch.set(eventRef, eventRecord);
+    batch.set(runRef, run);
+    await batch.commit();
 
     return {
       ...run,
@@ -397,12 +409,23 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
   /**
    * Internal: update a run entity in Firestore (called from events.create for run_* events).
+   * Uses a batch write for atomicity without read locks.
    */
   async function updateRunFromEvent(
     runId: string,
     eventType: string,
+    eventRecord: Record<string, unknown>,
+    eventId: string,
     eventData?: Record<string, unknown>,
   ): Promise<WorkflowRun> {
+    const runRef = firestore.collection('workflow_runs').doc(runId);
+    const eventRef = firestore
+      .collection('workflow_runs')
+      .doc(runId)
+      .collection('events')
+      .doc(eventId);
+
+    // Read current run state (non-transactional)
     const currentRun = await getRun(runId);
     const now = new Date();
     const updates: Record<string, unknown> = { updatedAt: now };
@@ -444,7 +467,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       }
     }
 
-    await firestore.collection('workflow_runs').doc(runId).update(updates);
+    // Atomic batch write: event + run update together
+    const batch = firestore.batch();
+    batch.set(eventRef, eventRecord);
+    batch.update(runRef, updates);
+    await batch.commit();
 
     // Cleanup hooks when run reaches terminal state
     if (
@@ -455,27 +482,39 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       await cleanupHooks(runId);
     }
 
+    // Read the updated run
     return getRun(runId);
   }
 
   /**
    * Internal: create a step entity in Firestore (called from events.create for step_created).
+   * Uses a batch write for atomicity without read locks.
+   * Idempotency: if the step already exists, return the existing one.
    */
   async function createStepFromEvent(
     runId: string,
     stepId: string,
     data: { stepName: string; input: unknown },
+    eventRecord: Record<string, unknown>,
+    eventId: string,
   ): Promise<Step> {
     const stepRef = firestore
       .collection('workflow_runs')
       .doc(runId)
       .collection('steps')
       .doc(stepId);
+    const eventRef = firestore
+      .collection('workflow_runs')
+      .doc(runId)
+      .collection('events')
+      .doc(eventId);
 
-    // Check if step already exists (idempotency)
+    // Idempotency check: if the step already exists, return it
     const existing = await stepRef.get();
     if (existing.exists) {
       const existingData = existing.data() as FirebaseFirestore.DocumentData;
+      // Still write the event (idempotent via doc ID)
+      await eventRef.set(eventRecord);
       return deserializeStepError({
         ...existingData,
         input: deserializeNestedArrays(existingData.input),
@@ -500,7 +539,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       updatedAt: now,
     } as any;
 
-    await stepRef.set(step);
+    // Atomic batch write: event + step together
+    const batch = firestore.batch();
+    batch.set(eventRef, eventRecord);
+    batch.set(stepRef, step);
+    await batch.commit();
 
     return {
       ...step,
@@ -510,13 +553,28 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
   /**
    * Internal: update a step entity in Firestore (called from events.create for step_* events).
+   * Uses a batch write for atomicity without read locks.
    */
   async function updateStepFromEvent(
     runId: string,
     stepId: string,
     eventType: string,
+    eventRecord: Record<string, unknown>,
+    eventId: string,
     eventData?: Record<string, unknown>,
   ): Promise<Step> {
+    const stepRef = firestore
+      .collection('workflow_runs')
+      .doc(runId)
+      .collection('steps')
+      .doc(stepId);
+    const eventRef = firestore
+      .collection('workflow_runs')
+      .doc(runId)
+      .collection('events')
+      .doc(eventId);
+
+    // Read current step state (non-transactional)
     const currentStep = await getStep(runId, stepId);
     const now = new Date();
     const updates: Record<string, unknown> = { updatedAt: now };
@@ -561,24 +619,27 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       }
     }
 
-    await firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('steps')
-      .doc(stepId)
-      .update(updates);
+    // Atomic batch write: event + step update together
+    const batch = firestore.batch();
+    batch.set(eventRef, eventRecord);
+    batch.update(stepRef, updates);
+    await batch.commit();
 
+    // Read the updated step
     return getStep(runId, stepId);
   }
 
   /**
    * Internal: create a hook entity in Firestore (called from events.create for hook_created).
+   * Uses a batch write for atomicity without read locks.
    */
   async function createHookFromEvent(
     runId: string,
     hookId: string,
     data: { token: string; metadata?: unknown },
     specVersion: number,
+    eventRecord: Record<string, unknown>,
+    eventId: string,
   ): Promise<Hook> {
     const now = new Date();
 
@@ -595,15 +656,29 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     };
 
     try {
-      await Promise.all([
-        firestore.collection('workflow_runs').doc(runId).collection('hooks').doc(hookId).set(hook),
-        firestore.collection('hooks_by_token').doc(data.token).set(hook),
-      ]);
+      const hookRef = firestore
+        .collection('workflow_runs')
+        .doc(runId)
+        .collection('hooks')
+        .doc(hookId);
+      const tokenRef = firestore.collection('hooks_by_token').doc(data.token);
+      const eventRef = firestore
+        .collection('workflow_runs')
+        .doc(runId)
+        .collection('events')
+        .doc(eventId);
+
+      // Atomic batch write: event + hook + token index together
+      const batch = firestore.batch();
+      batch.set(eventRef, eventRecord);
+      batch.set(hookRef, hook);
+      batch.set(tokenRef, hook);
+      await batch.commit();
 
       const parsed = HookSchema.parse(compact(hook));
       return parsed;
     } catch (error) {
-      console.error('[createHookFromEvent] Error creating hook:', error);
+      debug('[createHookFromEvent] Error creating hook:', error);
       throw error;
     }
   }
@@ -719,26 +794,26 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           eventRecord.correlationId = (data as any).correlationId;
         }
 
-        // Store the event
-        await firestore
-          .collection('workflow_runs')
-          .doc(effectiveRunId)
-          .collection('events')
-          .doc(eventId)
-          .set(eventRecord);
+        // Process entity side effects based on event type.
+        // Entity-mutating events use Firestore transactions to atomically write
+        // the event + entity together, preventing partial writes on failure.
+        const eventData = (data as any).eventData;
+
+        // Track whether the event was written inside a transaction
+        let eventWrittenInTransaction = false;
 
         // Parse and validate using EventSchema like other implementations
         const parsed = EventSchema.parse(eventRecord);
         const result: EventResult = { event: parsed };
 
-        // Process entity side effects based on event type
-        const eventData = (data as any).eventData;
-
         switch (data.eventType) {
           case 'run_created': {
+            eventWrittenInTransaction = true;
             result.run = await createRunFromEvent(
               effectiveRunId,
               eventData as RunCreatedEventRequest['eventData'],
+              eventRecord,
+              eventId,
             );
             break;
           }
@@ -746,15 +821,25 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           case 'run_completed':
           case 'run_failed':
           case 'run_cancelled': {
-            result.run = await updateRunFromEvent(effectiveRunId, data.eventType, eventData);
+            eventWrittenInTransaction = true;
+            result.run = await updateRunFromEvent(
+              effectiveRunId,
+              data.eventType,
+              eventRecord,
+              eventId,
+              eventData,
+            );
             break;
           }
           case 'step_created': {
+            eventWrittenInTransaction = true;
             const correlationId = (data as any).correlationId;
             result.step = await createStepFromEvent(
               effectiveRunId,
               correlationId,
               eventData as { stepName: string; input: unknown },
+              eventRecord,
+              eventId,
             );
             break;
           }
@@ -762,16 +847,20 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           case 'step_completed':
           case 'step_failed':
           case 'step_retrying': {
+            eventWrittenInTransaction = true;
             const correlationId = (data as any).correlationId;
             result.step = await updateStepFromEvent(
               effectiveRunId,
               correlationId,
               data.eventType,
+              eventRecord,
+              eventId,
               eventData,
             );
             break;
           }
           case 'hook_created': {
+            eventWrittenInTransaction = true;
             const correlationId = (data as any).correlationId;
             const hookEventData = eventData as {
               token: string;
@@ -780,10 +869,10 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
             // Debug logging for CI troubleshooting
             if (!correlationId) {
-              console.error('[hook_created] Missing correlationId');
+              debug('[hook_created] Missing correlationId');
             }
             if (!hookEventData.token) {
-              console.error('[hook_created] Missing token in eventData');
+              debug('[hook_created] Missing token in eventData');
             }
 
             result.hook = await createHookFromEvent(
@@ -791,16 +880,28 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               correlationId,
               hookEventData,
               effectiveSpecVersion,
+              eventRecord,
+              eventId,
             );
 
             // Verify hook was created
             if (!result.hook) {
-              console.error('[hook_created] Hook creation returned undefined');
+              debug('[hook_created] Hook creation returned undefined');
             }
             break;
           }
           // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
           // are event-only; no entity mutation needed at the storage level
+        }
+
+        // For event-only types (no entity mutation), write the event standalone
+        if (!eventWrittenInTransaction) {
+          await firestore
+            .collection('workflow_runs')
+            .doc(effectiveRunId)
+            .collection('events')
+            .doc(eventId)
+            .set(eventRecord);
         }
 
         return result;
@@ -1011,7 +1112,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           return filterHookData(parsed, resolveData);
         } catch (error) {
           // Log and re-throw to help diagnose CI issues
-          console.error('[hooks.get] Error querying hooks:', error);
+          debug('[hooks.get] Error querying hooks:', error);
           throw error;
         }
       },

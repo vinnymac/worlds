@@ -2,7 +2,18 @@ import { EventEmitter } from 'node:events';
 import type { Streamer } from '@workflow/world';
 import type { Redis } from 'ioredis';
 import * as z from 'zod';
-import { Mutex, Rc } from './util.js';
+import { debug, Mutex, Rc } from './util.js';
+
+/**
+ * Stream health statistics for observability.
+ * Reports the length and active listener count for a given stream.
+ */
+export interface StreamStats {
+  /** Total number of entries in the Redis Stream */
+  streamLength: number;
+  /** Number of active event listeners for this stream */
+  activeListeners: number;
+}
 
 const StreamPublishMessage = z.object({
   streamId: z.string(),
@@ -27,7 +38,9 @@ interface StreamerConfig {
  * instead of custom IDs, since Redis Streams require IDs in
  * `<millisecondsTime>-<sequenceNumber>` format.
  */
-export function createStreamer(config: StreamerConfig): Streamer {
+export function createStreamer(
+  config: StreamerConfig,
+): Streamer & { getStreamStats(name: string): Promise<StreamStats> } {
   const { redis, keyPrefix } = config;
   const events = new EventEmitter<{
     [key: `strm:${string}`]: [StreamChunkEvent];
@@ -99,9 +112,36 @@ export function createStreamer(config: StreamerConfig): Streamer {
     }
   });
 
+  /**
+   * Get health/observability stats for a specific stream.
+   * Useful for dashboards and alerting on stream health.
+   */
+  async function getStreamStats(name: string): Promise<StreamStats> {
+    const key = streamKey(name);
+    const listenerKey = `strm:${name}` as const;
+
+    let streamLength = 0;
+    try {
+      streamLength = await redis.xlen(key);
+    } catch {
+      // Stream may not exist yet
+    }
+
+    const activeListeners = events.listenerCount(listenerKey);
+
+    const stats: StreamStats = {
+      streamLength,
+      activeListeners,
+    };
+
+    debug('stream stats', { name, ...stats });
+    return stats;
+  }
+
   // Type assertion to match updated Streamer interface signature
   // This package uses the updated API but the old @workflow/world types
   return {
+    getStreamStats,
     async writeToStream(
       name: string,
       _runId: string | Promise<string>,
@@ -240,5 +280,5 @@ export function createStreamer(config: StreamerConfig): Streamer {
         },
       });
     },
-  } as any as Streamer; // Type assertion for updated API with old @workflow/world types
+  } as any as Streamer & { getStreamStats(name: string): Promise<StreamStats> }; // Type assertion for updated API with old @workflow/world types
 }

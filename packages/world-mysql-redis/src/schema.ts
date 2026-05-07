@@ -158,6 +158,19 @@ export const hooks = schema.table(
   ],
 );
 
+export const outbox = schema.table(
+  'workflow_outbox',
+  {
+    id: bigint('id', { mode: 'number' }).autoincrement().primaryKey(),
+    messageId: varchar('message_id', { length: 36 }).notNull().unique(),
+    payload: json('payload').notNull(),
+    createdAt: timestamp('created_at', { fsp: 6 }).defaultNow().notNull(),
+    attempts: int('attempts').default(0).notNull(),
+    lastError: text('last_error'),
+  },
+  (tb) => [index('idx_outbox_created_at').on(tb.createdAt)],
+);
+
 const blob = customType<{ data: Buffer; notNull: false; default: false }>({
   dataType() {
     return 'blob';

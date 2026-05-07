@@ -3,6 +3,7 @@ import { JsonTransport } from '@vercel/queue';
 import {
   MessageId,
   type Queue as QueueInterface,
+  type QueueOptions,
   QueuePayloadSchema,
   type QueuePrefix,
   type ValidQueueName,
@@ -22,6 +23,22 @@ interface MessageData {
 }
 
 /**
+ * Queue statistics from BullMQ, useful for monitoring and observability.
+ */
+export interface QueueStats {
+  /** Jobs waiting to be processed */
+  waiting: number;
+  /** Jobs currently being processed */
+  active: number;
+  /** Successfully completed jobs (still retained) */
+  completed: number;
+  /** Failed jobs (still retained) */
+  failed: number;
+  /** Jobs scheduled for future execution */
+  delayed: number;
+}
+
+/**
  * The Redis queue works by creating two BullMQ queues:
  * - `{prefix}flows` for workflow jobs
  * - `{prefix}steps` for step jobs
@@ -34,7 +51,7 @@ interface MessageData {
 export function createQueue(
   redis: Redis,
   config: RedisWorldConfig,
-): QueueInterface & { start(): Promise<void> } {
+): QueueInterface & { start(): Promise<void>; getQueueStats(): Promise<QueueStats> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
@@ -46,6 +63,15 @@ export function createQueue(
     __wkf_workflow_: `${prefix}flows`,
     __wkf_step_: `${prefix}steps`,
   } as const satisfies Record<QueuePrefix, string>;
+
+  // Retry / backoff defaults
+  const maxAttempts = config.maxAttempts ?? 5;
+  const backoffType = config.backoffType ?? 'exponential';
+  const backoffDelayMs = config.backoffDelayMs ?? 1000;
+
+  // Stalled-job recovery defaults (BullMQ v5 handles this internally)
+  const stalledInterval = config.stalledInterval ?? 30_000;
+  const maxStalledCount = config.maxStalledCount ?? 1;
 
   // Create BullMQ connection options from Redis instance
   const connectionOptions = {
@@ -83,7 +109,7 @@ export function createQueue(
   const queue: QueueInterface['queue'] = async (
     queueName: ValidQueueName,
     message: unknown,
-    opts?: { idempotencyKey?: string },
+    opts?: QueueOptions,
   ) => {
     const [queuePrefix, queueId] = parseQueueName(queueName);
     const jobName = Queues[queuePrefix] as string;
@@ -100,7 +126,12 @@ export function createQueue(
       idempotencyKey: opts?.idempotencyKey,
     };
 
-    // BullMQ uses jobId for deduplication
+    // Compute delay from delaySeconds (BullMQ expects milliseconds)
+    const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
+
+    // BullMQ uses jobId for deduplication — passing the messageId as the
+    // jobId means re-submitting the same message is a no-op while the job
+    // is still in the queue, giving us free idempotency.
     await bullQueue.add(
       jobName,
       {
@@ -109,9 +140,14 @@ export function createQueue(
       },
       {
         jobId: opts?.idempotencyKey ?? messageId,
-        attempts: 3,
-        removeOnComplete: 100, // Keep last 100 completed jobs
-        removeOnFail: 1000, // Keep last 1000 failed jobs
+        delay: delayMs,
+        attempts: maxAttempts,
+        backoff: {
+          type: backoffType,
+          delay: backoffDelayMs,
+        },
+        removeOnComplete: { age: 86_400, count: 1000 },
+        removeOnFail: { age: 7 * 86_400 },
       },
     );
 
@@ -140,6 +176,8 @@ export function createQueue(
       {
         connection: connectionOptions,
         concurrency,
+        stalledInterval,
+        maxStalledCount,
         // Use a low drainDelay to ensure fast job pickup when the queue is idle.
         // The default of 5000ms causes unnecessary latency for health checks and
         // other time-sensitive operations.
@@ -165,10 +203,43 @@ export function createQueue(
     }
   }
 
+  /**
+   * Returns aggregate job counts across all BullMQ queues.
+   * Useful for monitoring dashboards and health checks.
+   */
+  async function getQueueStats(): Promise<QueueStats> {
+    const totals: QueueStats = {
+      waiting: 0,
+      active: 0,
+      completed: 0,
+      failed: 0,
+      delayed: 0,
+    };
+
+    for (const bullQueue of bullQueues.values()) {
+      const counts = await bullQueue.getJobCounts(
+        'waiting',
+        'active',
+        'completed',
+        'failed',
+        'delayed',
+      );
+
+      totals.waiting += counts.waiting;
+      totals.active += counts.active;
+      totals.completed += counts.completed;
+      totals.failed += counts.failed;
+      totals.delayed += counts.delayed;
+    }
+
+    return totals;
+  }
+
   return {
     createQueueHandler,
     getDeploymentId,
     queue,
+    getQueueStats,
     async start() {
       await setupListeners();
     },

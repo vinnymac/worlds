@@ -512,4 +512,98 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       });
     });
   });
+
+  describe('Event idempotency', () => {
+    it('should handle duplicate step_created events', async () => {
+      const run = await createRun({
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      const stepId = 'step-idempotent-test';
+
+      // First step_created event
+      const result1 = await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: stepId,
+        eventData: { stepName: 'test-step', input: ['input1'] },
+      });
+      expect(result1.step).toBeDefined();
+      expect(result1.step!.stepId).toBe(stepId);
+
+      // Duplicate step_created event (replay scenario)
+      const result2 = await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: stepId,
+        eventData: { stepName: 'test-step', input: ['input1'] },
+      });
+      expect(result2.step).toBeDefined();
+      expect(result2.step!.stepId).toBe(stepId);
+
+      // Verify step appears in list query (critical!)
+      const listResult = await storage.steps.list({ runId: run.runId });
+      expect(listResult.data).toHaveLength(1);
+      expect(listResult.data[0].stepId).toBe(stepId);
+    });
+
+    it('should handle duplicate run_created events', async () => {
+      // First run_created event
+      const result1 = await storage.events.create(null, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'test-workflow-idempotent',
+          input: [],
+        },
+      });
+      expect(result1.run).toBeDefined();
+      const runId = result1.run!.runId;
+
+      // Duplicate run_created event (replay scenario)
+      const result2 = await storage.events.create(runId, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'test-workflow-idempotent',
+          input: [],
+        },
+      });
+      expect(result2.run).toBeDefined();
+      expect(result2.run!.runId).toBe(runId);
+
+      const listResult = await storage.runs.list({ workflowName: 'test-workflow-idempotent' });
+      expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+    });
+
+    it('should handle duplicate hook_created events with different tokens', async () => {
+      const run = await createRun({
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      const hookId1 = 'hook-idempotent-test-1';
+      const hookId2 = 'hook-idempotent-test-2';
+
+      // Test idempotency by creating two separate hooks
+      const result1 = await storage.events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId1,
+        eventData: { token: 'test-token-1' },
+      });
+      expect(result1.hook).toBeDefined();
+
+      const result2 = await storage.events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId2,
+        eventData: { token: 'test-token-2' },
+      });
+      expect(result2.hook).toBeDefined();
+
+      // Both hooks should be in the index
+      const listResult = await storage.hooks.list({ runId: run.runId });
+      expect(listResult.data).toHaveLength(2);
+      expect(listResult.data.some((h) => h.hookId === hookId1)).toBe(true);
+      expect(listResult.data.some((h) => h.hookId === hookId2)).toBe(true);
+    });
+  });
 });

@@ -1,0 +1,49 @@
+{
+  "name": "@fantasticfour/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared utilities for @fantasticfour world packages: debug logging, serialization, correlation context, and common helpers",
+  "license": "Apache-2.0",
+  "author": "vinnymac",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinnymac/worlds.git",
+    "directory": "packages/shared"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cbor": {
+      "types": "./dist/cbor.d.ts",
+      "default": "./dist/cbor.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "cbor-x": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "cbor-x": ">=1.6.0"
+  },
+  "peerDependenciesMeta": {
+    "cbor-x": {
+      "optional": true
+    }
+  },
+  "volta": {
+    "extends": "../../package.json"
+  },
+  "packageManager": "pnpm@11.0.5"
+}

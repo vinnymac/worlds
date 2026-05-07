@@ -59,6 +59,8 @@ export function createMysqlWorld(
 }
 
 export type { MysqlQueueConfig };
+export type { QueueMetrics } from './metrics.js';
+export { metrics } from './metrics.js';
 export { schema };
 
 // Re-export as createWorld for @workflow/core compatibility

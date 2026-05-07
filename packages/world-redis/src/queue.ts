@@ -11,6 +11,24 @@ import { createLocalWorld } from '@workflow/world-local';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import type { RedisWorldConfig } from './config.js';
+import { debug } from './util.js';
+
+/**
+ * Queue depth and health statistics for observability.
+ * Use these metrics to power dashboards, alerts, and auto-scaling decisions.
+ */
+export interface QueueStats {
+  /** Number of pending messages in the workflow queue */
+  workflowsPending: number;
+  /** Number of pending messages in the steps queue */
+  stepsPending: number;
+  /** Total number of tracked idempotency keys for workflows */
+  workflowsIdempotencyKeys: number;
+  /** Total number of tracked idempotency keys for steps */
+  stepsIdempotencyKeys: number;
+  /** Total pending across all queues */
+  totalPending: number;
+}
 
 interface MessageData {
   id: string;
@@ -31,7 +49,7 @@ interface MessageData {
 export function createQueue(
   redis: Redis,
   config: RedisWorldConfig,
-): Queue & { start(): Promise<void> } {
+): Queue & { start(): Promise<void>; getQueueStats(): Promise<QueueStats> } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
@@ -159,10 +177,35 @@ export function createQueue(
     );
   }
 
+  async function getQueueStats(): Promise<QueueStats> {
+    const flowsKey = Queues['__wkf_workflow_'];
+    const stepsKey = Queues['__wkf_step_'];
+
+    const [workflowsPending, stepsPending, workflowsIdempotencyKeys, stepsIdempotencyKeys] =
+      await Promise.all([
+        redis.llen(flowsKey),
+        redis.llen(stepsKey),
+        redis.scard(`${flowsKey}:idempotent`),
+        redis.scard(`${stepsKey}:idempotent`),
+      ]);
+
+    const stats: QueueStats = {
+      workflowsPending,
+      stepsPending,
+      workflowsIdempotencyKeys,
+      stepsIdempotencyKeys,
+      totalPending: workflowsPending + stepsPending,
+    };
+
+    debug('queue stats', stats);
+    return stats;
+  }
+
   return {
     createQueueHandler,
     getDeploymentId,
     queue,
+    getQueueStats,
     async start() {
       // workers run in background
       void startWorkers();

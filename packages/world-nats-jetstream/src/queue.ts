@@ -12,6 +12,7 @@ import type { JetStreamClient } from 'nats';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
 import { monotonicFactory } from 'ulid';
 import type { NatsJetStreamWorldConfig } from './config.js';
+import { debug } from './util.js';
 
 interface MessageData {
   id: string;
@@ -21,17 +22,33 @@ interface MessageData {
   attempt: number;
 }
 
+/** Health statistics for a queue worker. */
+export interface WorkerHealth {
+  lastSuccessfulFetch: number | null;
+  consecutiveFailures: number;
+  totalProcessed: number;
+  totalFailed: number;
+}
+
+/** Default deduplication window: 15 minutes. */
+const DEFAULT_DEDUP_WINDOW_MS = 15 * 60 * 1000;
+
+/** Backoff constants for worker reconnection. */
+const BASE_BACKOFF_MS = 100;
+const MAX_BACKOFF_MS = 30_000;
+
 /**
  * The NATS JetStream queue uses JetStream streams with work queue consumers.
  * Each queue type (workflows, steps) gets its own stream and consumer group.
  *
- * Deduplication is handled via Nats-Msg-Id header (2-minute window).
- * Workers use durable consumers in work queue mode for load balancing.
+ * Deduplication is handled via Nats-Msg-Id header (configurable window,
+ * defaults to 15 minutes). Workers use durable consumers in work queue mode
+ * for load balancing.
  */
 export function createQueue(
   getJetStream: () => Promise<JetStreamClient>,
   config: NatsJetStreamWorldConfig,
-): Queue & { start(): Promise<void> } {
+): Queue & { start(): Promise<void>; getHealth(): WorkerHealth } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
@@ -45,6 +62,18 @@ export function createQueue(
   } as const satisfies Record<QueuePrefix, string>;
 
   const createQueueHandler = embeddedWorld.createQueueHandler;
+
+  const dedupWindowMs = config.dedupWindowMs ?? DEFAULT_DEDUP_WINDOW_MS;
+  // Convert milliseconds to nanoseconds for JetStream
+  const dedupWindowNanos = dedupWindowMs * 1_000_000;
+
+  // Aggregate worker health
+  const health: WorkerHealth = {
+    lastSuccessfulFetch: null,
+    consecutiveFailures: 0,
+    totalProcessed: 0,
+    totalFailed: 0,
+  };
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => {
     return 'nats-jetstream';
@@ -68,7 +97,7 @@ export function createQueue(
           discard: DiscardPolicy.Old,
           max_msgs: 100000,
           max_age: 7 * 24 * 60 * 60 * 1_000_000_000, // 7 days in nanoseconds
-          duplicate_window: 120 * 1_000_000_000, // 2 minutes in nanoseconds
+          duplicate_window: dedupWindowNanos,
         });
       } catch (err: any) {
         // Stream might already exist
@@ -138,6 +167,9 @@ export function createQueue(
       const consumer = await jetstream.consumers.get(streamName, consumerName);
       const messages = await consumer.consume();
 
+      // Reset backoff on successful connection
+      health.consecutiveFailures = 0;
+
       for await (const msg of messages) {
         try {
           const data = new TextDecoder().decode(msg.data);
@@ -161,6 +193,8 @@ export function createQueue(
 
           // Acknowledge successful processing
           msg.ack();
+          health.lastSuccessfulFetch = Date.now();
+          health.totalProcessed++;
         } catch (error) {
           console.error(
             `[world-nats-jetstream worker] Error processing message from ${streamName}:`,
@@ -169,13 +203,24 @@ export function createQueue(
 
           // Negative acknowledge to trigger redelivery
           msg.nak();
+          health.totalFailed++;
         }
       }
     } catch (error) {
+      health.consecutiveFailures++;
+      health.totalFailed++;
+
+      const backoff = Math.min(BASE_BACKOFF_MS * 2 ** health.consecutiveFailures, MAX_BACKOFF_MS);
+
+      debug(
+        `Worker for ${streamName} failed (consecutiveFailures=${health.consecutiveFailures}), backing off ${backoff}ms`,
+        { error },
+      );
+
       console.error(`[world-nats-jetstream worker] Error in worker for ${streamName}:`, error);
 
-      // Wait before retrying
-      await setTimeout(5000);
+      // Exponential backoff before retrying
+      await setTimeout(backoff);
 
       // Restart worker
       void worker(workerQueuePrefix, streamName);
@@ -202,6 +247,9 @@ export function createQueue(
     queue,
     async start() {
       void startWorkers();
+    },
+    getHealth(): WorkerHealth {
+      return { ...health };
     },
   };
 }

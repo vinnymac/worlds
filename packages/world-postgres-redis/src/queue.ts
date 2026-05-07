@@ -8,8 +8,13 @@ import {
   type ValidQueueName,
 } from '@workflow/world';
 import { createLocalWorld } from '@workflow/world-local';
+import { eq } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
+import type { Drizzle } from './drizzle/index.js';
+import { Schema } from './drizzle/index.js';
+import { createOutboxRelay, type OutboxRelay } from './outbox.js';
+import { debug } from './util.js';
 
 interface MessageData {
   id: string;
@@ -24,13 +29,19 @@ interface MessageData {
  * - `${prefix}flows` for workflow jobs
  * - `${prefix}steps` for step jobs
  *
- * When a message is queued, it is LPUSHed to the appropriate Redis list with idempotency tracking.
- * Workers use BRPOPLPUSH to atomically move messages to a processing list, then forward them to the _embedded world_.
+ * When a message is queued, it is written to a Postgres outbox table first
+ * for atomicity. An outbox relay worker polls the outbox and pushes to Redis,
+ * deleting outbox rows once Redis confirms receipt. This ensures no messages
+ * are lost if Redis is temporarily unavailable.
+ *
+ * Workers use BRPOPLPUSH to atomically move messages to a processing list,
+ * then forward them to the _embedded world_.
  */
 export function createQueue(
   redis: Redis,
+  drizzle: Drizzle,
   config: { jobPrefix?: string; queueConcurrency?: number },
-): Queue & { start(): Promise<void> } {
+): Queue & { start(): Promise<void>; outboxRelay: OutboxRelay } {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
@@ -49,6 +60,21 @@ export function createQueue(
     return 'postgres-redis';
   };
 
+  /**
+   * Push a message payload directly to Redis (used by the outbox relay).
+   * Idempotency is handled by the outbox's UNIQUE(message_id) constraint,
+   * so we skip Redis-side idempotency tracking entirely (Enhancement 6).
+   */
+  async function pushToRedis(listKey: string, payload: string): Promise<void> {
+    await redis.multi().lpush(listKey, payload).publish(`chan:${listKey}`, 'new').exec();
+  }
+
+  // Create the outbox relay that drains Postgres outbox -> Redis
+  const outboxRelay = createOutboxRelay(drizzle, async (entry) => {
+    const outboxPayload = entry.payload as { listKey: string; messageData: string };
+    await pushToRedis(outboxPayload.listKey, outboxPayload.messageData);
+  });
+
   const queue: Queue['queue'] = async (queueName, message, opts) => {
     const [qPrefix, id] = parseQueueName(queueName);
     const listKey = Queues[qPrefix];
@@ -57,17 +83,6 @@ export function createQueue(
 
     // Use idempotency key to prevent duplicate processing
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
-    const idempotencySetKey = `${listKey}:idempotent`;
-
-    // Atomically check and add - SADD returns number of elements added (0 if already exists)
-    const added = await redis.sadd(idempotencySetKey, idempotencyKey);
-    if (added === 0) {
-      // Already queued with this idempotency key, return early
-      return { messageId };
-    }
-
-    // Set TTL on the Set (24 hours)
-    await redis.expire(idempotencySetKey, 86400);
 
     const messageData: MessageData = {
       id,
@@ -77,10 +92,38 @@ export function createQueue(
       attempt: 1,
     };
 
-    const payload = JSON.stringify(messageData);
+    const serializedMessage = JSON.stringify(messageData);
 
-    // Use pipeline for better performance
-    await redis.multi().lpush(listKey, payload).publish(`chan:${listKey}`, 'new').exec();
+    // Write to Postgres outbox for guaranteed delivery.
+    // The UNIQUE(message_id) constraint handles idempotency -- if this
+    // idempotency key was already written, onConflictDoNothing ensures
+    // we don't duplicate and we return early.
+    const [inserted] = await drizzle
+      .insert(Schema.outbox)
+      .values({
+        id: messageId,
+        messageId: idempotencyKey,
+        payload: { listKey, messageData: serializedMessage },
+      })
+      .onConflictDoNothing()
+      .returning({ id: Schema.outbox.id });
+
+    if (!inserted) {
+      // Idempotency: this message was already queued
+      debug(`Queue: idempotent skip for ${idempotencyKey}`);
+      return { messageId };
+    }
+
+    // Optimistic fast path: try to push to Redis immediately.
+    // If this fails, the outbox relay will pick it up.
+    try {
+      await pushToRedis(listKey, serializedMessage);
+      // Success: remove from outbox immediately
+      await drizzle.delete(Schema.outbox).where(eq(Schema.outbox.id, messageId));
+    } catch (err) {
+      debug(`Queue: Redis push failed for ${messageId}, outbox relay will retry:`, err);
+      // Leave in outbox for relay to handle
+    }
 
     return { messageId };
   };
@@ -127,15 +170,14 @@ export function createQueue(
   // Helper: Clean up successful message
   async function processMessageSuccess(
     workerRedis: Redis,
-    listKey: string,
+    _listKey: string,
     processingListKey: string,
     item: string,
-    idempotencyKey?: string,
+    _idempotencyKey?: string,
   ) {
     await workerRedis.lrem(processingListKey, 1, item);
-    if (idempotencyKey) {
-      await workerRedis.srem(`${listKey}:idempotent`, idempotencyKey);
-    }
+    // Idempotency is now handled by the Postgres outbox UNIQUE(message_id)
+    // constraint (Enhancement 6), so no Redis-side dedup set to clean up.
   }
 
   // Helper: Requeue message after error
@@ -233,7 +275,10 @@ export function createQueue(
     createQueueHandler,
     getDeploymentId,
     queue,
+    outboxRelay,
     async start() {
+      // Start outbox relay (polls Postgres outbox -> Redis)
+      outboxRelay.start();
       // Start workers (runs in background)
       startWorkers();
     },

@@ -1,0 +1,114 @@
+import { describe, expect, it } from 'vitest';
+import { DATE_FIELDS, dateReviver, deepClone, parse, stringify } from '../src/serialization.js';
+
+describe('serialization', () => {
+  describe('DATE_FIELDS', () => {
+    it('contains all standard date fields', () => {
+      expect(DATE_FIELDS.has('createdAt')).toBe(true);
+      expect(DATE_FIELDS.has('updatedAt')).toBe(true);
+      expect(DATE_FIELDS.has('startedAt')).toBe(true);
+      expect(DATE_FIELDS.has('completedAt')).toBe(true);
+      expect(DATE_FIELDS.has('retryAfter')).toBe(true);
+    });
+  });
+
+  describe('dateReviver', () => {
+    it('converts date field ISO strings to Date objects', () => {
+      const result = dateReviver('createdAt', '2024-01-15T10:30:00.000Z');
+      expect(result).toBeInstanceOf(Date);
+      expect((result as Date).toISOString()).toBe('2024-01-15T10:30:00.000Z');
+    });
+
+    it('passes through non-date fields unchanged', () => {
+      const result = dateReviver('name', '2024-01-15T10:30:00.000Z');
+      expect(typeof result).toBe('string');
+    });
+
+    it('passes through invalid date strings unchanged', () => {
+      const result = dateReviver('createdAt', 'not-a-date');
+      expect(result).toBe('not-a-date');
+    });
+
+    it('passes through non-string values unchanged', () => {
+      const result = dateReviver('createdAt', 12345);
+      expect(result).toBe(12345);
+    });
+  });
+
+  describe('stringify / parse round-trip', () => {
+    it('round-trips dates correctly', () => {
+      const original = {
+        createdAt: new Date('2024-01-15T10:30:00Z'),
+        name: 'test',
+      };
+      const restored = parse<typeof original>(stringify(original));
+      expect(restored.createdAt).toBeInstanceOf(Date);
+      expect(restored.createdAt.toISOString()).toBe(original.createdAt.toISOString());
+      expect(restored.name).toBe('test');
+    });
+
+    it('round-trips Uint8Array correctly', () => {
+      const original = { data: new Uint8Array([1, 2, 3, 0, 255]) };
+      const restored = parse<typeof original>(stringify(original));
+      expect(restored.data).toBeInstanceOf(Uint8Array);
+      expect(Array.from(restored.data)).toEqual([1, 2, 3, 0, 255]);
+    });
+
+    it('handles null bytes in Uint8Array', () => {
+      const original = { data: new Uint8Array([0, 0, 0]) };
+      const restored = parse<typeof original>(stringify(original));
+      expect(restored.data).toEqual(new Uint8Array([0, 0, 0]));
+    });
+
+    it('does not modify non-date string fields', () => {
+      const original = {
+        name: '2024-01-15T10:30:00Z',
+        createdAt: new Date('2024-01-15T10:30:00Z'),
+      };
+      const restored = parse<typeof original>(stringify(original));
+      expect(typeof restored.name).toBe('string');
+      expect(restored.createdAt).toBeInstanceOf(Date);
+    });
+
+    it('handles nested objects with mixed types', () => {
+      const original = {
+        createdAt: new Date('2024-01-01T00:00:00Z'),
+        payload: { data: new Uint8Array([42, 0, 99]) },
+        label: 'test',
+      };
+      const restored = parse<typeof original>(stringify(original));
+      expect(restored.createdAt).toBeInstanceOf(Date);
+      expect(restored.payload.data).toBeInstanceOf(Uint8Array);
+      expect(Array.from(restored.payload.data)).toEqual([42, 0, 99]);
+      expect(restored.label).toBe('test');
+    });
+  });
+
+  describe('uint8ArrayReviver - legacy format', () => {
+    it('handles legacy __uint8array marker format', () => {
+      const json = JSON.stringify({
+        data: { __uint8array: true, data: [1, 2, 3] },
+      });
+      const restored = parse<{ data: Uint8Array }>(json);
+      expect(restored.data).toBeInstanceOf(Uint8Array);
+      expect(Array.from(restored.data)).toEqual([1, 2, 3]);
+    });
+
+    it('handles legacy format with null bytes', () => {
+      const json = JSON.stringify({
+        data: { __uint8array: true, data: [0, 0, 0] },
+      });
+      const restored = parse<{ data: Uint8Array }>(json);
+      expect(restored.data).toEqual(new Uint8Array([0, 0, 0]));
+    });
+  });
+
+  describe('deepClone', () => {
+    it('creates independent copy', () => {
+      const original = { a: 1, nested: { b: 2 } };
+      const clone = deepClone(original);
+      clone.nested.b = 99;
+      expect(original.nested.b).toBe(2);
+    });
+  });
+});

@@ -19,7 +19,6 @@
     "directory": "packages/world-firestore-tasks"
   },
   "type": "module",
-  "main": "dist/index.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -31,9 +30,9 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "clean": "tsc --build --clean && rm -rf dist",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -46,11 +45,13 @@
     "ulid": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/gcloud": "11.8.1",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "axios": "1.13.2",
     "testcontainers": "catalog:",
+    "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
