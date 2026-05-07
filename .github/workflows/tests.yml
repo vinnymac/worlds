@@ -60,7 +60,7 @@ jobs:
           docker pull redis:7-alpine || true
           docker pull mysql:8.0 || true
           docker pull nats:2.10-alpine || true
-          docker pull hiett/serverless-redis-http:latest || true
+          docker pull ghcr.io/vinnymac/serverless-redis-http:latest || true
           docker pull gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators || true
 
       - name: Run Unit Tests for ${{ matrix.package }}
