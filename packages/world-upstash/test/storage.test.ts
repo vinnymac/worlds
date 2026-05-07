@@ -103,7 +103,7 @@ describe('Storage (Upstash Redis integration)', () => {
       .start();
 
     // Start serverless-redis-http (Upstash-compatible REST API)
-    srhContainer = await new GenericContainer('hiett/serverless-redis-http:latest')
+    srhContainer = await new GenericContainer('ghcr.io/vinnymac/serverless-redis-http:latest')
       .withNetwork(network)
       .withEnvironment({
         SRH_MODE: 'env',
