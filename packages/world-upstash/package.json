@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-upstash",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Serverless World implementation using Upstash Redis and QStash for edge-ready durable workflows",
   "keywords": [
     "durable-functions",

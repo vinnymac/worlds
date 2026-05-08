@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-azure",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Azure Cosmos DB + Service Bus World implementation with Change Feed streaming",
   "keywords": [
     "azure",
