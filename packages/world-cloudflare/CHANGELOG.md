@@ -1,5 +1,15 @@
 # @fantasticfour/world-cloudflare
 
+## 2.1.2
+
+### Patch Changes
+
+- 66826e7: Bump tsdown to ^0.22.0 so the bundler resolves rolldown@1.0.0 (stable v1)
+  instead of the prior 1.0.0-rc.17. tsdown 0.22 drops Node < 22.18 support,
+  makes `unrun` optional, and adds a `tsx` config loader; CI already runs
+  Node 24, which uses the native TS config loader and needs neither.
+  No consumer-facing API change.
+
 ## 2.1.1
 
 ### Patch Changes
