@@ -1,26 +1,15 @@
-import * as Stream from 'node:stream';
-import { JsonTransport } from '@vercel/queue';
 import {
   MessageId,
   type Queue as QueueInterface,
-  type QueueOptions,
-  QueuePayloadSchema,
+  type QueuePayload,
   type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
-import { createLocalWorld } from '@workflow/world-local';
-import { Queue, Worker } from 'bullmq';
+import { type Job, Queue, Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import type { RedisWorldConfig } from './config.js';
-
-interface MessageData {
-  attempt: number;
-  messageId: string;
-  idempotencyKey?: string;
-  id: string;
-  data: Buffer;
-}
+import { debug } from './util.js';
 
 /**
  * Queue statistics from BullMQ, useful for monitoring and observability.
@@ -38,24 +27,38 @@ export interface QueueStats {
   delayed: number;
 }
 
+const QUEUE_PATHNAMES = {
+  __wkf_workflow_: 'flow',
+  __wkf_step_: 'step',
+} as const satisfies Record<QueuePrefix, string>;
+
+interface QueueJobData {
+  /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_…`) */
+  queueName: ValidQueueName;
+  /** The opaque message payload — forwarded as the fetch body */
+  message: QueuePayload;
+}
+
 /**
- * The Redis queue works by creating two BullMQ queues:
- * - `{prefix}flows` for workflow jobs
- * - `{prefix}steps` for step jobs
- *
- * When a message is queued, it is sent to BullMQ with the appropriate queue name.
- * When a job is processed, it is deserialized and then re-queued into the _embedded world_,
- * showing that we can reuse the embedded world, mix and match worlds to build
- * hybrid architectures, and even migrate between worlds.
+ * Build the HTTP callback URL the BullMQ worker will POST to. The user must
+ * mount `world.createQueueHandler(...)` at `/.well-known/workflow/v1/flow` and
+ * `/.well-known/workflow/v1/step` (the Workflow DevKit convention).
+ */
+function resolveBaseUrl(config: RedisWorldConfig): string {
+  if (config.baseUrl) return config.baseUrl;
+  if (process.env.WORKFLOW_BASE_URL) return process.env.WORKFLOW_BASE_URL;
+  const port = process.env.PORT ?? '3000';
+  return `http://localhost:${port}`;
+}
+
+/**
+ * BullMQ-backed Queue. Job dispatch happens via HTTP fetch to the user's
+ * server — this package does not embed a workflow runtime.
  */
 export function createQueue(
   redis: Redis,
   config: RedisWorldConfig,
 ): QueueInterface & { start(): Promise<void>; getQueueStats(): Promise<QueueStats> } {
-  const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
-
-  const transport = new JsonTransport();
   const generateMessageId = monotonicFactory();
 
   const prefix = config.jobPrefix || 'workflow_';
@@ -64,149 +67,169 @@ export function createQueue(
     __wkf_step_: `${prefix}steps`,
   } as const satisfies Record<QueuePrefix, string>;
 
-  // Retry / backoff defaults
   const maxAttempts = config.maxAttempts ?? 5;
   const backoffType = config.backoffType ?? 'exponential';
   const backoffDelayMs = config.backoffDelayMs ?? 1000;
-
-  // Stalled-job recovery defaults (BullMQ v5 handles this internally)
+  const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
   const stalledInterval = config.stalledInterval ?? 30_000;
   const maxStalledCount = config.maxStalledCount ?? 1;
+  const idempotencyTtlMs = config.idempotencyTtlMs ?? 60_000;
 
-  // Create BullMQ connection options from Redis instance
+  // BullMQ requires maxRetriesPerRequest: null on the connection.
   const connectionOptions = {
     host: redis.options.host,
     port: redis.options.port,
     password: redis.options.password,
     db: redis.options.db,
+    maxRetriesPerRequest: null as null,
   };
 
-  // Create BullMQ queues eagerly to avoid cold-start delays on first job add
-  const bullQueues = new Map<string, Queue>();
-  const workers = new Map<string, Worker>();
+  const bullQueues = new Map<QueuePrefix, Queue<QueueJobData>>();
+  const workers = new Map<QueuePrefix, Worker<QueueJobData>>();
 
-  for (const queueName of Object.values(Queues)) {
-    bullQueues.set(queueName, new Queue(queueName, { connection: connectionOptions }));
+  for (const [queuePrefix, jobName] of Object.entries(Queues) as [QueuePrefix, string][]) {
+    bullQueues.set(
+      queuePrefix,
+      new Queue<QueueJobData>(jobName, { connection: connectionOptions }),
+    );
   }
 
-  function getQueue(name: string): Queue {
-    let queue = bullQueues.get(name);
-    if (!queue) {
-      queue = new Queue(name, {
-        connection: connectionOptions,
-      });
-      bullQueues.set(name, queue);
-    }
-    return queue;
-  }
+  const queue: QueueInterface['queue'] = async (queueName, message, opts) => {
+    const queuePrefix = parseQueuePrefix(queueName);
+    const bullQueue = bullQueues.get(queuePrefix);
+    if (!bullQueue) throw new Error(`No BullMQ queue registered for prefix ${queuePrefix}`);
 
-  const createQueueHandler = embeddedWorld.createQueueHandler;
-
-  const getDeploymentId: QueueInterface['getDeploymentId'] = async () => {
-    return 'redis';
-  };
-
-  const queue: QueueInterface['queue'] = async (
-    queueName: ValidQueueName,
-    message: unknown,
-    opts?: QueueOptions,
-  ) => {
-    const [queuePrefix, queueId] = parseQueueName(queueName);
-    const jobName = Queues[queuePrefix] as string;
-    const bullQueue = getQueue(jobName);
-
-    const body = transport.serialize(message);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-
-    const messageData: MessageData = {
-      id: queueId,
-      data: body,
-      attempt: 1,
-      messageId,
-      idempotencyKey: opts?.idempotencyKey,
-    };
-
-    // Compute delay from delaySeconds (BullMQ expects milliseconds)
     const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
 
-    // BullMQ uses jobId for deduplication — passing the messageId as the
-    // jobId means re-submitting the same message is a no-op while the job
-    // is still in the queue, giving us free idempotency.
-    await bullQueue.add(
-      jobName,
-      {
-        ...messageData,
-        data: messageData.data.toString('base64'),
-      },
-      {
-        jobId: opts?.idempotencyKey ?? messageId,
-        delay: delayMs,
-        attempts: maxAttempts,
-        backoff: {
-          type: backoffType,
-          delay: backoffDelayMs,
+    try {
+      await bullQueue.add(
+        queueName,
+        { queueName, message },
+        {
+          jobId: messageId,
+          delay: delayMs,
+          attempts: maxAttempts,
+          backoff: { type: backoffType, delay: backoffDelayMs },
+          // BullMQ native deduplication with TTL — re-submitting within the
+          // window returns the original job id without enqueuing again.
+          ...(opts?.idempotencyKey && {
+            deduplication: { id: opts.idempotencyKey, ttl: idempotencyTtlMs },
+          }),
+          removeOnComplete: { age: 86_400, count: 1000 },
+          removeOnFail: { age: 7 * 86_400 },
         },
-        removeOnComplete: { age: 86_400, count: 1000 },
-        removeOnFail: { age: 7 * 86_400 },
-      },
-    );
+      );
+    } catch (err) {
+      // BullMQ throws on dedup hits — that's fine, return the messageId anyway.
+      debug('queue add returned:', err);
+    }
 
     return { messageId };
   };
 
-  async function setupListener(queuePrefix: QueuePrefix, jobName: string) {
+  function createProcessor(queuePrefix: QueuePrefix) {
+    const pathname = QUEUE_PATHNAMES[queuePrefix];
+    return async (job: Job<QueueJobData>) => {
+      const baseUrl = resolveBaseUrl(config);
+      const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+      const messageId = job.id ?? `msg_${generateMessageId()}`;
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-vqs-queue-name': job.data.queueName,
+          'x-vqs-message-id': messageId,
+          'x-vqs-message-attempt': String(job.attemptsMade + 1),
+        },
+        body: JSON.stringify(job.data.message),
+        signal: AbortSignal.timeout(httpTimeoutMs),
+      });
+
+      if (response.ok) return;
+
+      const text = await response.text();
+
+      // 503 with { timeoutSeconds } means "retry later without consuming an
+      // attempt" — defer the job via BullMQ's delayed queue.
+      if (response.status === 503) {
+        try {
+          const parsed = JSON.parse(text);
+          if (typeof parsed?.timeoutSeconds === 'number') {
+            const delayMs = parsed.timeoutSeconds * 1000;
+            // moveToDelayed is the documented BullMQ recipe for "soft retry".
+            await job.moveToDelayed(Date.now() + delayMs, job.token);
+            return;
+          }
+        } catch {
+          // fall through to generic failure
+        }
+      }
+
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    };
+  }
+
+  const createQueueHandler: QueueInterface['createQueueHandler'] = (queueNamePrefix, handler) => {
+    return async (req) => {
+      const queueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
+      const messageId = req.headers.get('x-vqs-message-id') as MessageId | null;
+      const attemptStr = req.headers.get('x-vqs-message-attempt');
+
+      if (!queueName || !messageId || !attemptStr || !req.body) {
+        return Response.json({ error: 'Missing required headers or body' }, { status: 400 });
+      }
+      if (!queueName.startsWith(queueNamePrefix)) {
+        return Response.json({ error: 'Unhandled queue' }, { status: 400 });
+      }
+
+      const attempt = Number.parseInt(attemptStr, 10);
+
+      try {
+        const body = await req.json();
+        const result = await handler(body, { attempt, queueName, messageId });
+
+        if (result && typeof result.timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        }
+        return Response.json({ ok: true });
+      } catch (error) {
+        debug('queue handler error:', error);
+        return Response.json({ error: String(error) }, { status: 500 });
+      }
+    };
+  };
+
+  const getDeploymentId: QueueInterface['getDeploymentId'] = async () => 'redis';
+
+  async function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
 
-    const worker = new Worker(
-      jobName,
-      async (job) => {
-        const messageData = {
-          ...job.data,
-          data: Buffer.from(job.data.data as string, 'base64'),
-        } as MessageData;
-
-        const bodyStream = Stream.Readable.toWeb(Stream.Readable.from([messageData.data]));
-        const body = await transport.deserialize(bodyStream as ReadableStream<Uint8Array>);
-        const message = QueuePayloadSchema.parse(body);
-        const queueName = `${queuePrefix}${messageData.id}` as const;
-        await embeddedWorld.queue(queueName, message, {
-          idempotencyKey: messageData.idempotencyKey,
-        });
-      },
-      {
+    for (const [queuePrefix] of Object.entries(Queues) as [QueuePrefix, string][]) {
+      const jobName = Queues[queuePrefix];
+      const worker = new Worker<QueueJobData>(jobName, createProcessor(queuePrefix), {
         connection: connectionOptions,
         concurrency,
         stalledInterval,
         maxStalledCount,
-        // Use a low drainDelay to ensure fast job pickup when the queue is idle.
-        // The default of 5000ms causes unnecessary latency for health checks and
-        // other time-sensitive operations.
+        // Low drainDelay reduces idle pickup latency.
         drainDelay: 300,
-      },
-    );
+      });
 
-    workers.set(jobName, worker);
+      worker.on('failed', (job, err) => {
+        console.error(`Job ${job?.id} failed:`, err);
+      });
+      worker.on('error', (err) => {
+        console.error('Worker error:', err);
+      });
 
-    // Set up error handlers
-    worker.on('failed', (job, err) => {
-      console.error(`Job ${job?.id} failed:`, err);
-    });
-
-    worker.on('error', (err) => {
-      console.error('Worker error:', err);
-    });
-  }
-
-  async function setupListeners() {
-    for (const [queuePrefix, jobName] of Object.entries(Queues) as [QueuePrefix, string][]) {
-      await setupListener(queuePrefix, jobName);
+      workers.set(queuePrefix, worker);
     }
+
+    await Promise.all(Array.from(workers.values()).map((worker) => worker.waitUntilReady()));
   }
 
-  /**
-   * Returns aggregate job counts across all BullMQ queues.
-   * Useful for monitoring dashboards and health checks.
-   */
   async function getQueueStats(): Promise<QueueStats> {
     const totals: QueueStats = {
       waiting: 0,
@@ -224,7 +247,6 @@ export function createQueue(
         'failed',
         'delayed',
       );
-
       totals.waiting += counts.waiting;
       totals.active += counts.active;
       totals.completed += counts.completed;
@@ -241,17 +263,15 @@ export function createQueue(
     queue,
     getQueueStats,
     async start() {
-      await setupListeners();
+      await startWorkers();
     },
   };
 }
 
-const parseQueueName = (name: ValidQueueName): [QueuePrefix, string] => {
+const parseQueuePrefix = (name: ValidQueueName): QueuePrefix => {
   const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
   for (const prefix of prefixes) {
-    if (name.startsWith(prefix)) {
-      return [prefix, name.slice(prefix.length)];
-    }
+    if (name.startsWith(prefix)) return prefix;
   }
   throw new Error(`Invalid queue name: ${name}`);
 };

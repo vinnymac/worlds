@@ -41,7 +41,6 @@
   "dependencies": {
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "ulid": "catalog:"
   },
   "devDependencies": {

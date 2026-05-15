@@ -1,7 +1,6 @@
 import { EventEmitter } from 'node:events';
 import type { Streamer } from '@workflow/world';
 import type { Redis } from 'ioredis';
-import * as z from 'zod';
 import { debug, Mutex, Rc } from './util.js';
 
 /**
@@ -15,10 +14,23 @@ export interface StreamStats {
   activeListeners: number;
 }
 
-const StreamPublishMessage = z.object({
-  streamId: z.string(),
-  entryId: z.string(),
-});
+interface StreamPublishMessage {
+  streamId: string;
+  entryId: string;
+}
+
+function parseStreamPublishMessage(raw: string): StreamPublishMessage | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const { streamId, entryId } = parsed as Record<string, unknown>;
+  if (typeof streamId !== 'string' || typeof entryId !== 'string') return null;
+  return { streamId, entryId };
+}
 
 interface StreamChunkEvent {
   id: string;
@@ -76,9 +88,8 @@ export function createStreamer(
     if (channel !== STREAM_CHANNEL) return;
 
     try {
-      const parsed = await Promise.resolve(message)
-        .then(JSON.parse)
-        .then(StreamPublishMessage.parse);
+      const parsed = parseStreamPublishMessage(message);
+      if (!parsed) return;
 
       const key = `strm:${parsed.streamId}` as const;
       if (!events.listenerCount(key)) {
@@ -169,12 +180,7 @@ export function createStreamer(
       // Notify subscribers with the auto-generated entry ID
       await redis.publish(
         STREAM_CHANNEL,
-        JSON.stringify(
-          StreamPublishMessage.encode({
-            entryId,
-            streamId: name,
-          }),
-        ),
+        JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
       );
     },
 
@@ -192,12 +198,7 @@ export function createStreamer(
       // Notify subscribers with the auto-generated entry ID
       await redis.publish(
         STREAM_CHANNEL,
-        JSON.stringify(
-          StreamPublishMessage.encode({
-            streamId: name,
-            entryId,
-          }),
-        ),
+        JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
       );
     },
 

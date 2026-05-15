@@ -41,7 +41,6 @@
     "@azure/service-bus": "^7.9.5",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "cbor-x": "^1.6.0",
     "ulid": "catalog:"
   },

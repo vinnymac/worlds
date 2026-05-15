@@ -1,23 +1,26 @@
-import { setTimeout } from 'node:timers/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
   type Queue,
   type QueueOptions,
   type QueuePayload,
-  QueuePayloadSchema,
   type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
-import { createLocalWorld } from '@workflow/world-local';
 import { decode, encode } from 'cbor-x';
 import { eq, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { monotonicFactory } from 'ulid';
-import { debug } from './util.js';
 import { type QueueMetrics, metrics } from './metrics.js';
 import * as schema from './schema.js';
+import { debug } from './util.js';
 
 type Drizzle = MySql2Database<typeof schema>;
+
+const QUEUE_PATHNAMES = {
+  __wkf_workflow_: 'flow',
+  __wkf_step_: 'step',
+} as const satisfies Record<QueuePrefix, string>;
 
 export interface MysqlQueueConfig {
   /** Poll interval in milliseconds (default: 100) */
@@ -32,6 +35,18 @@ export interface MysqlQueueConfig {
   idempotencyTtlMs?: number;
   /** How often to run idempotency cleanup in milliseconds (default: 60 seconds) */
   cleanupIntervalMs?: number;
+  /**
+   * Base URL the worker uses to dispatch jobs back to the user's HTTP server.
+   * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
+   */
+  baseUrl?: string;
+  /** Per-job HTTP request timeout (ms). Default: 300_000 */
+  httpTimeoutMs?: number;
+}
+
+interface JobEnvelope {
+  queueName: ValidQueueName;
+  message: QueuePayload;
 }
 
 /** Row shape returned by raw SQL SELECT on workflow_jobs (snake_case columns) */
@@ -51,10 +66,13 @@ interface RawJobRow {
   scheduled_for: Date | null;
 }
 
-/**
- * Delete idempotency records older than the given TTL.
- * Returns the number of records removed.
- */
+function resolveBaseUrl(config: MysqlQueueConfig): string {
+  if (config.baseUrl) return config.baseUrl;
+  if (process.env.WORKFLOW_BASE_URL) return process.env.WORKFLOW_BASE_URL;
+  const port = process.env.PORT ?? '3000';
+  return `http://localhost:${port}`;
+}
+
 async function cleanupExpiredIdempotencyKeys(db: Drizzle, ttlMs: number): Promise<number> {
   const cutoff = new Date(Date.now() - ttlMs);
 
@@ -72,17 +90,12 @@ async function cleanupExpiredIdempotencyKeys(db: Drizzle, ttlMs: number): Promis
   return affectedRows;
 }
 
-/**
- * Fetch the next available pending job using FOR UPDATE SKIP LOCKED.
- * This guarantees no two workers ever process the same job.
- */
 async function fetchJob(
   db: Drizzle,
   queueName: string,
   workerId: string,
 ): Promise<RawJobRow | null> {
   return await db.transaction(async (tx) => {
-    // Select the oldest pending job that is ready to execute
     const rawResult = await tx.execute(sql`
       SELECT * FROM \`workflow\`.\`workflow_jobs\`
       WHERE \`queue_name\` = ${queueName}
@@ -93,14 +106,12 @@ async function fetchJob(
       FOR UPDATE SKIP LOCKED
     `);
 
-    // drizzle execute with mysql2 returns [[rows], [fields]]
     const outerResult = rawResult as unknown as [RawJobRow[], unknown];
     const rows = outerResult[0];
     if (!rows || rows.length === 0) return null;
     const job = rows[0];
     if (!job || !job.id) return null;
 
-    // Mark as processing
     await tx.execute(sql`
       UPDATE \`workflow\`.\`workflow_jobs\`
       SET \`status\` = 'processing',
@@ -120,14 +131,10 @@ async function fetchJob(
   });
 }
 
-/**
- * Enqueue a job with idempotency support.
- * Uses a transaction to atomically check the idempotency table and insert the job.
- */
 async function enqueueJob(
   db: Drizzle,
   queueName: string,
-  message: QueuePayload,
+  envelope: JobEnvelope,
   opts?: { idempotencyKey?: string; delaySeconds?: number; maxAttempts?: number },
 ): Promise<{ messageId: MessageId }> {
   const generateId = monotonicFactory();
@@ -135,8 +142,7 @@ async function enqueueJob(
   const idempotencyKey = opts?.idempotencyKey ?? messageId;
 
   try {
-    const result = await db.transaction(async (tx) => {
-      // Check idempotency
+    return await db.transaction(async (tx) => {
       const [existing] = await tx
         .select()
         .from(schema.idempotency)
@@ -147,12 +153,10 @@ async function enqueueJob(
         return { messageId: MessageId.parse(existing.messageId) };
       }
 
-      // Compute scheduled time if delay is specified
       const scheduledFor = opts?.delaySeconds
         ? new Date(Date.now() + opts.delaySeconds * 1000)
         : null;
 
-      // Insert atomically
       await tx.insert(schema.idempotency).values({
         idempotencyKey,
         messageId,
@@ -162,7 +166,7 @@ async function enqueueJob(
       await tx.insert(schema.jobs).values({
         jobId: messageId,
         queueName,
-        payload: Buffer.from(encode(message)),
+        payload: Buffer.from(encode(envelope)),
         status: 'pending',
         maxAttempts: opts?.maxAttempts ?? 3,
         scheduledFor,
@@ -170,16 +174,14 @@ async function enqueueJob(
 
       return { messageId };
     });
-
-    return result;
   } catch (error: unknown) {
-    // Handle duplicate key error as an idempotency hit (race condition between
-    // SELECT and INSERT in concurrent requests with the same idempotencyKey)
-    // Check both error.code and error.cause.code (Drizzle wraps the MySQL error)
-    const errorCode = (error as any)?.code || (error as any)?.cause?.code;
+    // Concurrent INSERTs racing on the same idempotency key — treat the
+    // duplicate-key error as a hit.
+    const errorCode =
+      (error as { code?: string; cause?: { code?: string } })?.code ??
+      (error as { cause?: { code?: string } })?.cause?.code;
 
     if (errorCode === 'ER_DUP_ENTRY') {
-      // Fetch the existing record to return its messageId
       const [existing] = await db
         .select()
         .from(schema.idempotency)
@@ -189,17 +191,12 @@ async function enqueueJob(
       if (existing) {
         return { messageId: MessageId.parse(existing.messageId) };
       }
-      // If the record was already cleaned up, return current messageId
       return { messageId };
     }
     throw error;
   }
 }
 
-/**
- * Handle job failure with exponential backoff retry.
- * If max attempts reached, marks as permanently failed.
- */
 async function handleJobFailure(
   db: Drizzle,
   jobId: number,
@@ -210,7 +207,6 @@ async function handleJobFailure(
   const errorMessage = error instanceof Error ? error.message : String(error);
 
   if (attempt >= maxAttempts) {
-    // Permanently failed
     await db
       .update(schema.jobs)
       .set({
@@ -221,8 +217,7 @@ async function handleJobFailure(
       })
       .where(eq(schema.jobs.id, jobId));
   } else {
-    // Exponential backoff: 1s, 2s, 4s, 8s...
-    const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+    const backoffMs = Math.min(1000 * 2 ** (attempt - 1), 30000);
     const scheduledFor = new Date(Date.now() + backoffMs);
 
     await db
@@ -238,12 +233,8 @@ async function handleJobFailure(
   }
 }
 
-/**
- * Mark a job as successfully completed (delete it).
- */
 async function completeJob(db: Drizzle, jobId: number, idempotencyKey?: string): Promise<void> {
   await db.delete(schema.jobs).where(eq(schema.jobs.id, jobId));
-  // Clean up idempotency entry after successful processing
   if (idempotencyKey) {
     await db
       .delete(schema.idempotency)
@@ -252,8 +243,8 @@ async function completeJob(db: Drizzle, jobId: number, idempotencyKey?: string):
 }
 
 /**
- * Creates a pure MySQL queue implementation.
- * Uses FOR UPDATE SKIP LOCKED for concurrent, safe job processing.
+ * Pure MySQL queue: jobs are rows in `workflow_jobs`, picked with FOR UPDATE
+ * SKIP LOCKED. Worker dispatches via HTTP fetch to the user's server.
  */
 export function createQueue(
   db: Drizzle,
@@ -270,12 +261,10 @@ export function createQueue(
     workerId = `worker_${monotonicFactory()()}`,
     idempotencyTtlMs = 5 * 60 * 1000,
     cleanupIntervalMs = 60 * 1000,
+    httpTimeoutMs = 300_000,
   } = config;
 
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
-
-  const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
 
   const prefix = 'workflow_';
   const Queues = {
@@ -285,57 +274,129 @@ export function createQueue(
 
   let running = false;
 
-  const createQueueHandler = embeddedWorld.createQueueHandler;
-
-  const getDeploymentId: Queue['getDeploymentId'] = async () => {
-    return 'mysql';
-  };
+  const getDeploymentId: Queue['getDeploymentId'] = async () => 'mysql';
 
   const queue: Queue['queue'] = async (
     queueName: ValidQueueName,
     message: QueuePayload,
     opts?: QueueOptions,
   ) => {
-    const [qPrefix] = parseQueueName(queueName);
+    const qPrefix = parseQueuePrefix(queueName);
     const listKey = Queues[qPrefix];
 
-    // Store the full original queue name in the payload envelope so workers can
-    // reconstruct it when forwarding to the embedded world
-    const envelope = { __queueName: queueName, __payload: message };
+    const envelope: JobEnvelope = { queueName, message };
 
-    const result = await enqueueJob(db, listKey, envelope as unknown as QueuePayload, {
+    return enqueueJob(db, listKey, envelope, {
       idempotencyKey: opts?.idempotencyKey,
       delaySeconds: opts?.delaySeconds,
       maxAttempts,
     });
-
-    return result;
   };
+
+  const createQueueHandler: Queue['createQueueHandler'] = (queueNamePrefix, handler) => {
+    return async (req) => {
+      const reqQueueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
+      const reqMessageId = req.headers.get('x-vqs-message-id') as MessageId | null;
+      const attemptStr = req.headers.get('x-vqs-message-attempt');
+
+      if (!reqQueueName || !reqMessageId || !attemptStr || !req.body) {
+        return Response.json({ error: 'Missing required headers or body' }, { status: 400 });
+      }
+      if (!reqQueueName.startsWith(queueNamePrefix)) {
+        return Response.json({ error: 'Unhandled queue' }, { status: 400 });
+      }
+
+      const attempt = Number.parseInt(attemptStr, 10);
+      try {
+        const body = await req.json();
+        const result = await handler(body, {
+          attempt,
+          queueName: reqQueueName,
+          messageId: reqMessageId,
+        });
+        if (result && typeof result.timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        }
+        return Response.json({ ok: true });
+      } catch (error) {
+        return Response.json({ error: String(error) }, { status: 500 });
+      }
+    };
+  };
+
+  async function dispatch(
+    envelope: JobEnvelope,
+    messageId: string,
+    attempt: number,
+    pathname: string,
+  ): Promise<Response> {
+    const baseUrl = resolveBaseUrl(config);
+    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    return fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vqs-queue-name': envelope.queueName,
+        'x-vqs-message-id': messageId,
+        'x-vqs-message-attempt': String(attempt),
+      },
+      body: JSON.stringify(envelope.message),
+      signal: AbortSignal.timeout(httpTimeoutMs),
+    });
+  }
 
   async function processJob(
     job: RawJobRow,
     listKey: string,
-    _queuePrefix: QueuePrefix,
+    queuePrefix: QueuePrefix,
   ): Promise<void> {
     const startTime = Date.now();
     try {
-      // Decode CBOR payload - contains our envelope with original queue name
-      const envelope = decode(job.payload) as {
-        __queueName: ValidQueueName;
-        __payload: unknown;
-      };
+      const envelope = decode(job.payload) as JobEnvelope;
+      const response = await dispatch(
+        envelope,
+        job.job_id,
+        job.attempt ?? 1,
+        QUEUE_PATHNAMES[queuePrefix],
+      );
 
-      const queueName = envelope.__queueName;
-      const message = QueuePayloadSchema.parse(envelope.__payload);
+      if (response.ok) {
+        await completeJob(db, job.id, job.job_id);
+        metrics.recordProcessed(listKey, Date.now() - startTime);
+        return;
+      }
 
-      // Forward to embedded world for processing with the original queue name
-      await embeddedWorld.queue(queueName, message, {
-        idempotencyKey: job.job_id,
-      });
+      const text = await response.text();
 
-      // Success - remove the job
-      await completeJob(db, job.id, job.job_id);
-      metrics.recordProcessed(listKey, Date.now() - startTime);
+      if (response.status === 503) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = null;
+        }
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
+        ) {
+          const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
+          // Re-schedule without consuming an attempt.
+          await db
+            .update(schema.jobs)
+            .set({
+              status: 'pending',
+              lockedAt: null,
+              lockedBy: null,
+              scheduledFor: new Date(Date.now() + timeoutMs),
+              attempt: Math.max(0, (job.attempt ?? 1) - 1),
+            })
+            .where(eq(schema.jobs.id, job.id));
+          return;
+        }
+      }
+
+      throw new Error(`HTTP ${response.status}: ${text}`);
     } catch (error) {
       const isRetry = (job.attempt ?? 1) < (job.max_attempts ?? maxAttempts);
       metrics.recordError(listKey, isRetry);
@@ -353,24 +414,20 @@ export function createQueue(
     while (running) {
       try {
         const job = await fetchJob(db, listKey, wId);
-
         if (job) {
           await processJob(job, listKey, queuePrefix);
         } else {
-          // No jobs available, wait before polling again
-          await setTimeout(pollIntervalMs);
+          await delay(pollIntervalMs);
         }
       } catch (error) {
-        // Connection error or similar - back off
         console.error(`[world-mysql worker ${wId}] Error:`, error);
-        await setTimeout(1000);
+        await delay(1000);
       }
     }
   }
 
   function startWorkers() {
     const entries = Object.entries(Queues) as [QueuePrefix, string][];
-
     for (const [queuePrefix, listKey] of entries) {
       for (let i = 0; i < concurrency; i++) {
         worker(queuePrefix, listKey, i).catch((error) => {
@@ -388,7 +445,6 @@ export function createQueue(
       running = true;
       startWorkers();
 
-      // Start periodic idempotency cleanup
       cleanupTimer = setInterval(async () => {
         try {
           await cleanupExpiredIdempotencyKeys(db, idempotencyTtlMs);
@@ -418,12 +474,10 @@ export function createQueue(
   };
 }
 
-const parseQueueName = (name: ValidQueueName): [QueuePrefix, string] => {
+const parseQueuePrefix = (name: ValidQueueName): QueuePrefix => {
   const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
   for (const p of prefixes) {
-    if (name.startsWith(p)) {
-      return [p, name.slice(p.length)];
-    }
+    if (name.startsWith(p)) return p;
   }
   throw new Error(`Invalid queue name: ${name}`);
 };

@@ -18,16 +18,10 @@ catalogs:
     '@types/node':
       specifier: ^22.19.0
       version: 22.19.17
-    '@vercel/queue':
-      specifier: 0.0.0-alpha.36
-      version: 0.0.0-alpha.36
     '@workflow/errors':
       specifier: 4.1.1
       version: 4.1.1
     '@workflow/world':
-      specifier: 4.1.1
-      version: 4.1.1
-    '@workflow/world-local':
       specifier: 4.1.1
       version: 4.1.1
     '@workflow/world-testing':
@@ -69,9 +63,6 @@ catalogs:
     vitest:
       specifier: ^3.2.4
       version: 3.2.4
-    zod:
-      specifier: 4.3.6
-      version: 4.3.6
 
 importers:
 
@@ -133,9 +124,6 @@ importers:
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       cbor-x:
         specifier: ^1.6.0
         version: 1.6.4
@@ -176,9 +164,6 @@ importers:
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
@@ -228,9 +213,6 @@ importers:
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
@@ -271,9 +253,6 @@ importers:
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       cbor-x:
         specifier: 'catalog:'
         version: 1.6.4
@@ -286,9 +265,6 @@ importers:
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
     devDependencies:
       '@fantasticfour/shared':
         specifier: workspace:*
@@ -326,18 +302,12 @@ importers:
       '@fantasticfour/shared':
         specifier: workspace:*
         version: link:../shared
-      '@vercel/queue':
-        specifier: 'catalog:'
-        version: 0.0.0-alpha.36
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.1.1
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       cbor-x:
         specifier: 'catalog:'
         version: 1.6.4
@@ -353,9 +323,6 @@ importers:
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
     devDependencies:
       '@testcontainers/mysql':
         specifier: 'catalog:'
@@ -387,27 +354,18 @@ importers:
 
   packages/world-nats-jetstream:
     dependencies:
-      '@vercel/queue':
-        specifier: 'catalog:'
-        version: 0.0.0-alpha.36
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.1.1
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       nats:
         specifier: ^2.28.2
         version: 2.29.3
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
     devDependencies:
       '@fantasticfour/shared':
         specifier: workspace:*
@@ -433,18 +391,12 @@ importers:
 
   packages/world-postgres-redis:
     dependencies:
-      '@vercel/queue':
-        specifier: 'catalog:'
-        version: 0.0.0-alpha.36
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.1.1
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       cbor-x:
         specifier: 'catalog:'
         version: 1.6.4
@@ -460,9 +412,6 @@ importers:
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
     devDependencies:
       '@fantasticfour/shared':
         specifier: workspace:*
@@ -497,27 +446,18 @@ importers:
 
   packages/world-redis:
     dependencies:
-      '@vercel/queue':
-        specifier: 'catalog:'
-        version: 0.0.0-alpha.36
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.1.1
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       ioredis:
         specifier: 'catalog:'
         version: 5.10.1
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
     devDependencies:
       '@fantasticfour/shared':
         specifier: workspace:*
@@ -546,18 +486,12 @@ importers:
 
   packages/world-redis-bullmq:
     dependencies:
-      '@vercel/queue':
-        specifier: 'catalog:'
-        version: 0.0.0-alpha.36
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.1.1
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.1.1(zod@4.3.6)
-      '@workflow/world-local':
-        specifier: 'catalog:'
-        version: 4.1.1(@opentelemetry/api@1.9.1)
       bullmq:
         specifier: ^5.64.1
         version: 5.76.5
@@ -567,9 +501,6 @@ importers:
       ulid:
         specifier: 'catalog:'
         version: 3.0.2
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
     devDependencies:
       '@fantasticfour/shared':
         specifier: workspace:*
@@ -3453,14 +3384,6 @@ packages:
     resolution: {integrity: sha512-xy5MNbsAoN9W1gtjNkKEg8SHEsnoEj3KbQQH7EaAtqJ0ZfdPo13XLOdqvAR5IO+4X5F0nyPENMVFilzzaSAYiA==}
     engines: {node: '>=20.0.0'}
 
-  '@vercel/queue@0.0.0-alpha.36':
-    resolution: {integrity: sha512-+0RWV/ljyK0lXH7LYUbTJ02UJLhPfZIvzMOjhMdD6tEm8o+VzJGJY9KwIljohtdfeep78cFUGuWvNmT+bi29Wg==}
-    engines: {node: '>=20.0.0'}
-
-  '@vercel/queue@0.1.4':
-    resolution: {integrity: sha512-wo+jCycmCX078vQSbkX+RcLvySONDCK0f9aQp5UMKQD1+B+xKt3YVbIYbZukvoHQpbm5nnk6If+ADSeK/PmCgQ==}
-    engines: {node: '>=20.0.0'}
-
   '@vitest/expect@3.2.4':
     resolution: {integrity: sha512-Io0yyORnB6sikFlt8QW5K7slY4OjqNX9jmJQ02QDda8lyM6B5oNgVWoSoKPac8/kgnCUzuHQKrSLtu/uOqqrig==}
 
@@ -3582,14 +3505,6 @@ packages:
 
   '@workflow/world-local@4.1.0-beta.28':
     resolution: {integrity: sha512-9kL6PG4oq4KYuRftcincUaf9Rkvsh9UIKI4UsdfufTiea7aYsAVBzWBZIyalsDmSoPy3M76YqmZK8eN9bPjtzw==}
-    peerDependencies:
-      '@opentelemetry/api': '1'
-    peerDependenciesMeta:
-      '@opentelemetry/api':
-        optional: true
-
-  '@workflow/world-local@4.1.1':
-    resolution: {integrity: sha512-qQznGPy15nPD+CO0THxMDwozIrvEOkZuAkpI2S3/+hrvUF07mSHGsGCVp6eVaECSTi3dGseep9rKUXZhU/HGYw==}
     peerDependencies:
       '@opentelemetry/api': '1'
     peerDependenciesMeta:
@@ -5295,10 +5210,6 @@ packages:
     resolution: {integrity: sha512-RAoaOSXnMLrfUfmFbNynRYjeMru/bhgAYRy/GQVI8gmRq7vm9V9c2gGVYnYoQ008X6YTmRIu5b0397U7vb0bIA==}
     engines: {node: '>=22.0.0'}
 
-  mixpart@0.0.5:
-    resolution: {integrity: sha512-TpWi9/2UIr7VWCVAM7NB4WR4yOglAetBkuKfxs3K0vFcUukqAaW1xsgX0v1gNGiDKzYhPHFcHgarC7jmnaOy4w==}
-    engines: {node: '>=20.0.0'}
-
   mixpart@0.0.5-alpha.1:
     resolution: {integrity: sha512-2ZfG/NO2SVE9HLk1/W+yOrIOA0d674ljZExLdievZQpYjbJYQjIdye8vNMR63yF7nN/NbO9q8mp16JUEYBCilg==}
     engines: {node: '>=20.0.0'}
@@ -6331,10 +6242,6 @@ packages:
 
   undici@7.14.0:
     resolution: {integrity: sha512-Vqs8HTzjpQXZeXdpsfChQTlafcMQaaIwnGwLam1wudSSjlJeQ3bw1j+TLPePgrCnCpUXx7Ba5Pdpf5OBih62NQ==}
-    engines: {node: '>=20.18.1'}
-
-  undici@7.22.0:
-    resolution: {integrity: sha512-RqslV2Us5BrllB+JeiZnK4peryVTndy9Dnqq62S3yYRRTj0tFQCwEniUy2167skdGOy3vqRzEvl1Dm4sV2ReDg==}
     engines: {node: '>=20.18.1'}
 
   undici@7.25.0:
@@ -9255,18 +9162,6 @@ snapshots:
       '@vercel/oidc': 3.4.0
       mixpart: 0.0.5-alpha.1
 
-  '@vercel/queue@0.0.0-alpha.36':
-    dependencies:
-      '@vercel/oidc': 3.4.0
-      mixpart: 0.0.5-alpha.1
-
-  '@vercel/queue@0.1.4':
-    dependencies:
-      '@vercel/oidc': 3.4.0
-      minimatch: 10.2.5
-      mixpart: 0.0.5
-      picocolors: 1.1.1
-
   '@vitest/expect@3.2.4':
     dependencies:
       '@types/chai': 5.2.3
@@ -9572,19 +9467,6 @@ snapshots:
       ulid: 3.0.1
       undici: 6.22.0
       zod: 4.1.11
-    optionalDependencies:
-      '@opentelemetry/api': 1.9.1
-
-  '@workflow/world-local@4.1.1(@opentelemetry/api@1.9.1)':
-    dependencies:
-      '@vercel/queue': 0.1.4
-      '@workflow/errors': 4.1.1
-      '@workflow/utils': 4.1.1
-      '@workflow/world': 4.1.1(zod@4.3.6)
-      async-sema: 3.1.1
-      ulid: 3.0.2
-      undici: 7.22.0
-      zod: 4.3.6
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
 
@@ -11416,8 +11298,6 @@ snapshots:
 
   mixpart@0.0.4: {}
 
-  mixpart@0.0.5: {}
-
   mixpart@0.0.5-alpha.1: {}
 
   mkdirp-classic@0.5.3: {}
@@ -12582,8 +12462,6 @@ snapshots:
   undici@6.22.0: {}
 
   undici@7.14.0: {}
-
-  undici@7.22.0: {}
 
   undici@7.25.0: {}
 

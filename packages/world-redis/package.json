@@ -44,13 +44,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "ioredis": "catalog:",
-    "ulid": "catalog:",
-    "zod": "catalog:"
+    "ulid": "catalog:"
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",

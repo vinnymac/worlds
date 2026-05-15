@@ -1,52 +1,64 @@
-import { setTimeout } from 'node:timers/promises';
-import { JsonTransport } from '@vercel/queue';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
   type Queue,
-  QueuePayloadSchema,
+  type QueuePayload,
   type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
-import { createLocalWorld } from '@workflow/world-local';
 import { eq } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
-import type { Drizzle } from './drizzle/index.js';
-import { Schema } from './drizzle/index.js';
+import type { PostgresWorldConfig } from './config.js';
+import { type Drizzle, Schema } from './drizzle/index.js';
 import { createOutboxRelay, type OutboxRelay } from './outbox.js';
 import { debug } from './util.js';
 
-interface MessageData {
-  id: string;
-  data: string; // base64-encoded
-  idempotencyKey?: string;
+interface MessageEnvelope {
   messageId: string;
+  idempotencyKey?: string;
+  queueName: ValidQueueName;
   attempt: number;
+  message: QueuePayload;
+}
+
+const QUEUE_PATHNAMES = {
+  __wkf_workflow_: 'flow',
+  __wkf_step_: 'step',
+} as const satisfies Record<QueuePrefix, string>;
+
+function resolveBaseUrl(config: PostgresWorldConfig): string {
+  if (config.baseUrl) return config.baseUrl;
+  if (process.env.WORKFLOW_BASE_URL) return process.env.WORKFLOW_BASE_URL;
+  const port = process.env.PORT ?? '3000';
+  return `http://localhost:${port}`;
+}
+
+function computeBackoffMs(attempt: number, config: PostgresWorldConfig): number {
+  const base = config.backoffDelayMs ?? 1000;
+  if (config.backoffType === 'fixed') return base;
+  return base * 2 ** Math.max(0, attempt - 1);
 }
 
 /**
- * The Postgres-Redis queue works by creating two Redis lists:
- * - `${prefix}flows` for workflow jobs
- * - `${prefix}steps` for step jobs
+ * Postgres-Redis queue.
  *
- * When a message is queued, it is written to a Postgres outbox table first
- * for atomicity. An outbox relay worker polls the outbox and pushes to Redis,
- * deleting outbox rows once Redis confirms receipt. This ensures no messages
- * are lost if Redis is temporarily unavailable.
- *
- * Workers use BRPOPLPUSH to atomically move messages to a processing list,
- * then forward them to the _embedded world_.
+ * - `queue()` writes the envelope to a Postgres outbox table first (atomic
+ *   with any user transaction the caller wraps around it), then optimistically
+ *   LPUSHes to a Redis list. If the Redis push fails, the outbox relay drains
+ *   the row asynchronously.
+ * - Workers BRPOPLPUSH to a processing list, then dispatch the payload via
+ *   HTTP fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`. Retries
+ *   and 503-soft-retry are implemented manually.
  */
 export function createQueue(
   redis: Redis,
   drizzle: Drizzle,
-  config: { jobPrefix?: string; queueConcurrency?: number },
+  config: PostgresWorldConfig,
 ): Queue & { start(): Promise<void>; outboxRelay: OutboxRelay } {
-  const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
-
-  const transport = new JsonTransport();
   const generateMessageId = monotonicFactory();
+  const maxAttempts = config.maxAttempts ?? 5;
+  const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
 
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
@@ -54,188 +66,179 @@ export function createQueue(
     __wkf_step_: `${prefix}steps`,
   } as const satisfies Record<QueuePrefix, string>;
 
-  const createQueueHandler = embeddedWorld.createQueueHandler;
+  const getDeploymentId: Queue['getDeploymentId'] = async () => 'postgres-redis';
 
-  const getDeploymentId: Queue['getDeploymentId'] = async () => {
-    return 'postgres-redis';
-  };
-
-  /**
-   * Push a message payload directly to Redis (used by the outbox relay).
-   * Idempotency is handled by the outbox's UNIQUE(message_id) constraint,
-   * so we skip Redis-side idempotency tracking entirely (Enhancement 6).
-   */
   async function pushToRedis(listKey: string, payload: string): Promise<void> {
     await redis.multi().lpush(listKey, payload).publish(`chan:${listKey}`, 'new').exec();
   }
 
-  // Create the outbox relay that drains Postgres outbox -> Redis
   const outboxRelay = createOutboxRelay(drizzle, async (entry) => {
-    const outboxPayload = entry.payload as { listKey: string; messageData: string };
-    await pushToRedis(outboxPayload.listKey, outboxPayload.messageData);
+    const outboxPayload = entry.payload as { listKey: string; envelope: string };
+    await pushToRedis(outboxPayload.listKey, outboxPayload.envelope);
   });
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const [qPrefix, id] = parseQueueName(queueName);
-    const listKey = Queues[qPrefix];
-    const body = transport.serialize(message);
+    const queuePrefix = parseQueuePrefix(queueName);
+    const listKey = Queues[queuePrefix];
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-
-    // Use idempotency key to prevent duplicate processing
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
 
-    const messageData: MessageData = {
-      id,
-      data: Buffer.from(body).toString('base64'),
-      idempotencyKey: opts?.idempotencyKey,
+    const envelope: MessageEnvelope = {
       messageId,
+      idempotencyKey: opts?.idempotencyKey,
+      queueName,
       attempt: 1,
+      message,
     };
+    const serialized = JSON.stringify(envelope);
 
-    const serializedMessage = JSON.stringify(messageData);
-
-    // Write to Postgres outbox for guaranteed delivery.
-    // The UNIQUE(message_id) constraint handles idempotency -- if this
-    // idempotency key was already written, onConflictDoNothing ensures
-    // we don't duplicate and we return early.
+    // Outbox idempotency via UNIQUE(message_id) constraint.
     const [inserted] = await drizzle
       .insert(Schema.outbox)
       .values({
         id: messageId,
         messageId: idempotencyKey,
-        payload: { listKey, messageData: serializedMessage },
+        payload: { listKey, envelope: serialized },
       })
       .onConflictDoNothing()
       .returning({ id: Schema.outbox.id });
 
     if (!inserted) {
-      // Idempotency: this message was already queued
       debug(`Queue: idempotent skip for ${idempotencyKey}`);
       return { messageId };
     }
 
-    // Optimistic fast path: try to push to Redis immediately.
-    // If this fails, the outbox relay will pick it up.
+    // Optimistic Redis push. Failure is recovered by the outbox relay.
     try {
-      await pushToRedis(listKey, serializedMessage);
-      // Success: remove from outbox immediately
+      await pushToRedis(listKey, serialized);
       await drizzle.delete(Schema.outbox).where(eq(Schema.outbox.id, messageId));
     } catch (err) {
       debug(`Queue: Redis push failed for ${messageId}, outbox relay will retry:`, err);
-      // Leave in outbox for relay to handle
     }
 
     return { messageId };
   };
 
-  // Helper: Fetch message from queue with error handling
-  async function fetchMessage(
-    workerRedis: Redis,
-    listKey: string,
-    processingListKey: string,
-  ): Promise<string | null> {
-    try {
-      return await workerRedis.brpoplpush(listKey, processingListKey, 0);
-    } catch (error) {
-      console.error(`[world-postgres-redis worker] Error calling brpoplpush on ${listKey}:`, error);
-      await setTimeout(1000);
-      return null;
-    }
+  const createQueueHandler: Queue['createQueueHandler'] = (queueNamePrefix, handler) => {
+    return async (req) => {
+      const reqQueueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
+      const reqMessageId = req.headers.get('x-vqs-message-id') as MessageId | null;
+      const attemptStr = req.headers.get('x-vqs-message-attempt');
+
+      if (!reqQueueName || !reqMessageId || !attemptStr || !req.body) {
+        return Response.json({ error: 'Missing required headers or body' }, { status: 400 });
+      }
+      if (!reqQueueName.startsWith(queueNamePrefix)) {
+        return Response.json({ error: 'Unhandled queue' }, { status: 400 });
+      }
+
+      const attempt = Number.parseInt(attemptStr, 10);
+      try {
+        const body = await req.json();
+        const result = await handler(body, {
+          attempt,
+          queueName: reqQueueName,
+          messageId: reqMessageId,
+        });
+        if (result && typeof result.timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        }
+        return Response.json({ ok: true });
+      } catch (error) {
+        debug('queue handler error:', error);
+        return Response.json({ error: String(error) }, { status: 500 });
+      }
+    };
+  };
+
+  async function dispatch(envelope: MessageEnvelope, pathname: string): Promise<Response> {
+    const baseUrl = resolveBaseUrl(config);
+    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    return fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vqs-queue-name': envelope.queueName,
+        'x-vqs-message-id': envelope.messageId,
+        'x-vqs-message-attempt': String(envelope.attempt),
+      },
+      body: JSON.stringify(envelope.message),
+      signal: AbortSignal.timeout(httpTimeoutMs),
+    });
   }
 
-  // Helper: Parse and decode message
-  async function parseMessage(
-    item: string,
-    queuePrefix: QueuePrefix,
-  ): Promise<{
-    parsed: MessageData;
-    message: ReturnType<typeof QueuePayloadSchema.parse>;
-    queueName: ValidQueueName;
-  }> {
-    const parsed: MessageData = JSON.parse(item);
-    const body = Buffer.from(parsed.data, 'base64');
-    const decoded = await transport.deserialize(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(body);
-          controller.close();
-        },
-      }),
-    );
-    const message = QueuePayloadSchema.parse(decoded);
-    const queueName = `${queuePrefix}${parsed.id}` as ValidQueueName;
-    return { parsed, message, queueName };
-  }
-
-  // Helper: Clean up successful message
-  async function processMessageSuccess(
-    workerRedis: Redis,
-    _listKey: string,
-    processingListKey: string,
-    item: string,
-    _idempotencyKey?: string,
-  ) {
-    await workerRedis.lrem(processingListKey, 1, item);
-    // Idempotency is now handled by the Postgres outbox UNIQUE(message_id)
-    // constraint (Enhancement 6), so no Redis-side dedup set to clean up.
-  }
-
-  // Helper: Requeue message after error
-  async function requeueMessage(
-    workerRedis: Redis,
-    listKey: string,
-    processingListKey: string,
-    item: string,
-    errorType: string,
-    error: any,
-  ) {
-    console.error(`[world-postgres-redis worker] ${errorType} error on ${listKey}:`, error);
-    await workerRedis.lrem(processingListKey, 1, item);
-    await workerRedis.rpush(listKey, item);
-    await setTimeout(1000);
-  }
-
-  // Helper: Process single message with error handling
-  async function processSingleMessage(
+  async function processItem(
     workerRedis: Redis,
     listKey: string,
     processingListKey: string,
     item: string,
     queuePrefix: QueuePrefix,
   ): Promise<void> {
+    let envelope: MessageEnvelope;
     try {
-      const { parsed, message, queueName } = await parseMessage(item, queuePrefix);
+      envelope = JSON.parse(item) as MessageEnvelope;
+    } catch (error) {
+      console.error(`[world-postgres-redis worker] invalid envelope on ${listKey}:`, error);
+      await workerRedis.lrem(processingListKey, 1, item);
+      return;
+    }
 
-      try {
-        await embeddedWorld.queue(queueName, message, {
-          idempotencyKey: parsed.idempotencyKey,
+    try {
+      const response = await dispatch(envelope, QUEUE_PATHNAMES[queuePrefix]);
+
+      if (response.ok) {
+        await workerRedis.lrem(processingListKey, 1, item);
+        return;
+      }
+
+      const text = await response.text();
+
+      if (response.status === 503) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = null;
+        }
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
+        ) {
+          const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
+          await workerRedis.lrem(processingListKey, 1, item);
+          void delay(timeoutMs).then(() => {
+            void redis.lpush(listKey, item);
+          });
+          return;
+        }
+      }
+
+      // Hard failure: increment attempt, re-LPUSH with backoff, or drop.
+      await workerRedis.lrem(processingListKey, 1, item);
+      if (envelope.attempt < maxAttempts) {
+        const next: MessageEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
+        const backoffMs = computeBackoffMs(next.attempt, config);
+        const payload = JSON.stringify(next);
+        void delay(backoffMs).then(() => {
+          void redis.lpush(listKey, payload);
         });
-        await processMessageSuccess(
-          workerRedis,
-          listKey,
-          processingListKey,
-          item,
-          parsed.idempotencyKey,
-        );
-      } catch (httpError) {
-        await requeueMessage(
-          workerRedis,
-          listKey,
-          processingListKey,
-          item,
-          'HTTP request failed',
-          httpError,
+      } else {
+        console.error(
+          `[world-postgres-redis worker] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
         );
       }
-    } catch (parseError) {
-      await requeueMessage(
-        workerRedis,
-        listKey,
-        processingListKey,
-        item,
-        'Error processing message',
-        parseError,
-      );
+    } catch (error) {
+      console.error(`[world-postgres-redis worker] dispatch error on ${listKey}:`, error);
+      await workerRedis.lrem(processingListKey, 1, item);
+      if (envelope.attempt < maxAttempts) {
+        const next: MessageEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
+        const backoffMs = computeBackoffMs(next.attempt, config);
+        const payload = JSON.stringify(next);
+        void delay(backoffMs).then(() => {
+          void redis.lpush(listKey, payload);
+        });
+      }
     }
   }
 
@@ -245,11 +248,16 @@ export function createQueue(
 
     try {
       while (true) {
-        const item = await fetchMessage(workerRedis, listKey, processingListKey);
-
-        if (item) {
-          await processSingleMessage(workerRedis, listKey, processingListKey, item, queuePrefix);
+        let item: string | null;
+        try {
+          item = await workerRedis.brpoplpush(listKey, processingListKey, 0);
+        } catch (error) {
+          console.error(`[world-postgres-redis worker] brpoplpush error on ${listKey}:`, error);
+          await delay(1000);
+          continue;
         }
+        if (!item) continue;
+        await processItem(workerRedis, listKey, processingListKey, item, queuePrefix);
       }
     } finally {
       await workerRedis.quit();
@@ -260,10 +268,8 @@ export function createQueue(
     const concurrency = config.queueConcurrency || 10;
     const entries = Object.entries(Queues) as [QueuePrefix, string][];
 
-    // Start all workers (they run forever in background)
     entries.forEach(([queuePrefix, listKey]) => {
       for (let i = 0; i < concurrency; i++) {
-        // Start worker in background (don't await)
         worker(queuePrefix, listKey).catch((error) => {
           console.error(`[world-postgres-redis] Worker for ${listKey} crashed:`, error);
         });
@@ -277,20 +283,16 @@ export function createQueue(
     queue,
     outboxRelay,
     async start() {
-      // Start outbox relay (polls Postgres outbox -> Redis)
       outboxRelay.start();
-      // Start workers (runs in background)
       startWorkers();
     },
   };
 }
 
-const parseQueueName = (name: ValidQueueName): [QueuePrefix, string] => {
+const parseQueuePrefix = (name: ValidQueueName): QueuePrefix => {
   const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
   for (const prefix of prefixes) {
-    if (name.startsWith(prefix)) {
-      return [prefix, name.slice(prefix.length)];
-    }
+    if (name.startsWith(prefix)) return prefix;
   }
   throw new Error(`Invalid queue name: ${name}`);
 };
