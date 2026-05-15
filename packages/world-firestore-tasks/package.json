@@ -41,7 +41,6 @@
     "@google-cloud/tasks": "^6.2.1",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "ulid": "catalog:"
   },
   "devDependencies": {

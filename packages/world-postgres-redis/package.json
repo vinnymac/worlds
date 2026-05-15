@@ -53,16 +53,13 @@
     "db:push": "node dist/cli.js"
   },
   "dependencies": {
-    "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "cbor-x": "catalog:",
     "drizzle-orm": "catalog:",
     "ioredis": "catalog:",
     "postgres": "catalog:",
-    "ulid": "catalog:",
-    "zod": "catalog:"
+    "ulid": "catalog:"
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",

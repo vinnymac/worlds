@@ -59,12 +59,10 @@
   "dependencies": {
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "cbor-x": "catalog:",
     "drizzle-orm": "catalog:",
     "mysql2": "catalog:",
-    "ulid": "catalog:",
-    "zod": "catalog:"
+    "ulid": "catalog:"
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",

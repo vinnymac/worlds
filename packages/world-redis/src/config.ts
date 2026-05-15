@@ -28,4 +28,41 @@ export interface RedisWorldConfig {
    * Default: 'workflow:'
    */
   keyPrefix?: string;
+
+  /**
+   * Base URL the worker uses to dispatch jobs back to the user's HTTP server,
+   * which must mount `world.createQueueHandler(...)` at
+   * `/.well-known/workflow/v1/flow` and `/.well-known/workflow/v1/step`.
+   * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
+   */
+  baseUrl?: string;
+
+  /**
+   * Per-job HTTP request timeout (ms).
+   * Default: 300_000 (5 minutes)
+   */
+  httpTimeoutMs?: number;
+
+  /**
+   * Maximum retry attempts before dropping a job. Each hard failure
+   * (non-2xx, non-503) increments the attempt counter and re-LPUSHes with
+   * backoff. 503 + { timeoutSeconds } is a "soft" retry and does not consume
+   * an attempt.
+   * Default: 5
+   */
+  maxAttempts?: number;
+
+  /**
+   * Backoff strategy for retries: 'fixed' replays at the same interval,
+   * 'exponential' doubles the delay on each attempt.
+   * Default: 'exponential'
+   */
+  backoffType?: 'fixed' | 'exponential';
+
+  /**
+   * Base delay for backoff (ms). For exponential backoff this is multiplied
+   * by 2^(attempt - 1).
+   * Default: 1000
+   */
+  backoffDelayMs?: number;
 }

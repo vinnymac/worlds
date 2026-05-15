@@ -62,4 +62,27 @@ export interface RedisWorldConfig {
    * Default: 1
    */
   maxStalledCount?: number;
+
+  /**
+   * Base URL the BullMQ worker uses to dispatch jobs back to the user's HTTP
+   * server, which must mount `world.createQueueHandler(...)` at
+   * `/.well-known/workflow/v1/flow` and `/.well-known/workflow/v1/step`.
+   * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
+   */
+  baseUrl?: string;
+
+  /**
+   * Per-job HTTP request timeout (ms). Long-running workflow steps may need a
+   * higher value.
+   * Default: 300_000 (5 minutes)
+   */
+  httpTimeoutMs?: number;
+
+  /**
+   * Idempotency deduplication window (ms) for BullMQ native deduplication.
+   * When `idempotencyKey` is supplied to `queue()`, a duplicate enqueue within
+   * this window is dropped.
+   * Default: 60_000 (1 minute)
+   */
+  idempotencyTtlMs?: number;
 }

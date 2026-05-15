@@ -45,14 +45,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@vercel/queue": "catalog:",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
-    "@workflow/world-local": "catalog:",
     "bullmq": "^5.64.1",
     "ioredis": "catalog:",
-    "ulid": "catalog:",
-    "zod": "catalog:"
+    "ulid": "catalog:"
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",

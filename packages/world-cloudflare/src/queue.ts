@@ -1,7 +1,12 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
-import type { Queue, ValidQueueName } from '@workflow/world';
-import { MessageId } from '@workflow/world';
-import { createLocalWorld } from '@workflow/world-local';
+import {
+  MessageId,
+  type Queue,
+  type QueuePayload,
+  type QueuePrefix,
+  type ValidQueueName,
+} from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
 
@@ -16,10 +21,6 @@ import { debug } from './util.js';
  */
 const PERMANENT_ERROR_STATUSES = new Set([404, 409, 410, 422]);
 
-/**
- * Determine whether an error is permanent (should not be retried).
- * Permanent errors are acked immediately; transient errors bubble up for retry.
- */
 function isPermanentError(err: unknown): boolean {
   if (err instanceof WorkflowWorldError && err.status !== undefined) {
     return PERMANENT_ERROR_STATUSES.has(err.status);
@@ -27,10 +28,7 @@ function isPermanentError(err: unknown): boolean {
   return false;
 }
 
-/**
- * Compute exponential backoff delay in seconds for transient retries.
- * Caps at 60 seconds.
- */
+/** Caps at 60 seconds. */
 function computeBackoff(attempt: number): number {
   return Math.min(60, 2 ** attempt);
 }
@@ -40,6 +38,19 @@ export interface CloudflareQueueConfig {
     WORKFLOW_QUEUE: CloudflareQueue;
   };
   deploymentId: string;
+  /**
+   * Base URL the in-process test pump uses to dispatch jobs back to the user's
+   * HTTP server in test mode. Has no effect in production (Cloudflare Queues
+   * is push-based).
+   * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
+   */
+  baseUrl?: string;
+  /** Per-job HTTP request timeout (ms) for the test pump. Default: 300_000 */
+  httpTimeoutMs?: number;
+  /** Maximum retry attempts in the test pump before dropping a job. Default: 5 */
+  maxAttempts?: number;
+  /** Base backoff delay (ms) for test pump retries. Default: 1000 */
+  backoffDelayMs?: number;
 }
 
 interface CloudflareQueue {
@@ -47,28 +58,159 @@ interface CloudflareQueue {
   sendBatch(messages: Array<{ body: unknown }>): Promise<void>;
 }
 
+interface PumpEnvelope {
+  messageId: string;
+  queueName: ValidQueueName;
+  attempt: number;
+  message: QueuePayload;
+}
+
+type Pathname = 'flow' | 'step';
+
+const QUEUE_PATHNAMES = {
+  __wkf_workflow_: 'flow',
+  __wkf_step_: 'step',
+} as const satisfies Record<QueuePrefix, Pathname>;
+
+function resolveBaseUrl(config: CloudflareQueueConfig): string {
+  if (config.baseUrl) return config.baseUrl;
+  if (process.env.WORKFLOW_BASE_URL) return process.env.WORKFLOW_BASE_URL;
+  const port = process.env.PORT ?? '3000';
+  return `http://localhost:${port}`;
+}
+
+/**
+ * In-process test pump. Replaces the previous `@workflow/world-local` fallback.
+ * Holds two in-memory FIFOs and HTTP-dispatches envelopes to the user's server
+ * at `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ */
+function createTestPump(config: CloudflareQueueConfig) {
+  const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
+  const maxAttempts = config.maxAttempts ?? 5;
+  const baseBackoffMs = config.backoffDelayMs ?? 1000;
+
+  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
+  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  let running = false;
+
+  function enqueue(pathname: Pathname, envelope: PumpEnvelope) {
+    queues[pathname].push(envelope);
+    wakers[pathname].shift()?.();
+  }
+
+  async function take(pathname: Pathname): Promise<PumpEnvelope | null> {
+    const existing = queues[pathname].shift();
+    if (existing) return existing;
+    return new Promise((resolve) => {
+      wakers[pathname].push(() => resolve(queues[pathname].shift() ?? null));
+    });
+  }
+
+  async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
+    const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vqs-queue-name': envelope.queueName,
+        'x-vqs-message-id': envelope.messageId,
+        'x-vqs-message-attempt': String(envelope.attempt),
+      },
+      body: JSON.stringify(envelope.message),
+      signal: AbortSignal.timeout(httpTimeoutMs),
+    });
+
+    if (response.ok) return;
+
+    const text = await response.text();
+
+    if (response.status === 503) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+      const timeoutSeconds = (parsed as { timeoutSeconds?: number } | null)?.timeoutSeconds;
+      if (typeof timeoutSeconds === 'number') {
+        void delay(timeoutSeconds * 1000).then(() => enqueue(pathname, envelope));
+        return;
+      }
+    }
+
+    if (envelope.attempt < maxAttempts) {
+      const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
+      const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
+      void delay(backoff).then(() => enqueue(pathname, next));
+    } else {
+      console.error(
+        `[world-cloudflare test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
+      );
+    }
+  }
+
+  async function loop(pathname: Pathname) {
+    while (running) {
+      const envelope = await take(pathname);
+      if (!envelope) continue;
+      try {
+        await dispatch(envelope, pathname);
+      } catch (err) {
+        console.error(`[world-cloudflare test pump] dispatch error on ${pathname}:`, err);
+      }
+    }
+  }
+
+  return {
+    push(pathname: Pathname, envelope: PumpEnvelope) {
+      enqueue(pathname, envelope);
+    },
+    async start() {
+      if (running) return;
+      running = true;
+      void loop('flow');
+      void loop('step');
+    },
+    stop() {
+      running = false;
+      for (const list of Object.values(wakers)) for (const w of list) w();
+    },
+  };
+}
+
+function parseQueuePrefix(name: ValidQueueName): QueuePrefix {
+  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
+  for (const p of prefixes) {
+    if (name.startsWith(p)) return p;
+  }
+  throw new Error(`Invalid queue name: ${name}`);
+}
+
 export function createQueue(config: CloudflareQueueConfig): Queue & { start(): Promise<void> } {
   const { env, deploymentId } = config;
 
-  // Create embedded world for test orchestration (like upstream world-postgres)
-  const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const embeddedWorld = createLocalWorld({ dataDir: undefined, port });
+  const generateMessageId = monotonicFactory();
+  const testPump = createTestPump(config);
 
-  // Detect test mode
-  const isTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
-
-  const _generateMessageId = monotonicFactory();
+  function isTestMode(): boolean {
+    return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
+  }
 
   return {
     async queue(queueName, message, opts) {
-      // Re-check test mode on each call (for tests that set env after createQueue)
-      const currentIsTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
-      if (currentIsTest) {
-        // In tests: forward directly to embedded world for orchestration
-        return await embeddedWorld.queue(queueName, message as any, opts);
+      if (isTestMode()) {
+        const queuePrefix = parseQueuePrefix(queueName);
+        const messageId = MessageId.parse(`msg_${generateMessageId()}`);
+        testPump.push(QUEUE_PATHNAMES[queuePrefix], {
+          messageId,
+          queueName,
+          attempt: 1,
+          message,
+        });
+        return { messageId };
       }
 
-      // In production: use Cloudflare Queue
+      // Production: Cloudflare Queue.
       const wrappedMessage = {
         queueName,
         message,
@@ -79,25 +221,49 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
       await env.WORKFLOW_QUEUE.send(wrappedMessage);
 
       const messageId = MessageId.parse(`msg_${opts?.idempotencyKey || Date.now().toString()}`);
-
       return { messageId };
     },
 
     createQueueHandler(queueNamePrefix, handler) {
-      if (isTest) {
-        // In tests: use embedded world's handler (like upstream)
-        return embeddedWorld.createQueueHandler(queueNamePrefix, handler);
+      if (isTestMode()) {
+        // Test mode: x-vqs-* dialect, matches the in-process pump and
+        // @workflow/world-testing's mounted routes.
+        return async (req: Request) => {
+          const reqQueueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
+          const reqMessageId = req.headers.get('x-vqs-message-id') as MessageId | null;
+          const attemptStr = req.headers.get('x-vqs-message-attempt');
+
+          if (!reqQueueName || !reqMessageId || !attemptStr || !req.body) {
+            return Response.json({ error: 'Missing required headers or body' }, { status: 400 });
+          }
+          if (!reqQueueName.startsWith(queueNamePrefix)) {
+            return Response.json({ error: 'Unhandled queue' }, { status: 400 });
+          }
+          const attempt = Number.parseInt(attemptStr, 10);
+          try {
+            const body = await req.json();
+            const result = await handler(body, {
+              attempt,
+              queueName: reqQueueName,
+              messageId: reqMessageId,
+            });
+            if (result && typeof result.timeoutSeconds === 'number') {
+              return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+            }
+            return Response.json({ ok: true });
+          } catch (error) {
+            return Response.json({ error: String(error) }, { status: 500 });
+          }
+        };
       }
 
-      // In production: create Cloudflare Queue handler
-      const handlerFn = async (req: Request) => {
-        // Extract attempt count from Cloudflare headers (hoisted for use in catch)
+      // Production: Cloudflare Queues delivery wire format.
+      return async (req: Request) => {
         const retryCount = Number.parseInt(req.headers.get('CF-Queue-Retry-Count') || '0', 10);
 
         try {
           const body = (await req.json()) as unknown;
 
-          // Validate message structure
           if (
             typeof body !== 'object' ||
             body === null ||
@@ -115,18 +281,15 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
 
           const { queueName, message, idempotencyKey } = body as QueueMessage;
 
-          // Validate queue name prefix
           if (!queueName?.startsWith(queueNamePrefix)) {
             return new Response('Invalid queue', { status: 400 });
           }
 
           const attempt = retryCount + 1;
 
-          // Generate or extract message ID
           const messageIdStr =
             req.headers.get('CF-Queue-Message-Id') || `msg_${idempotencyKey || Date.now()}`;
 
-          // Invoke the handler with the message
           await handler(message, {
             attempt,
             queueName: queueName as ValidQueueName,
@@ -135,9 +298,7 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
 
           return new Response('OK', { status: 200 });
         } catch (error) {
-          // Differentiate permanent vs. transient failures.
-          // Permanent errors (404, 409, 410, 422) are acked to avoid wasting retry budget.
-          // Transient errors bubble up so Cloudflare Queues can retry with backoff.
+          // Permanent vs transient distinction. Permanent errors ack to skip retries.
           if (isPermanentError(error)) {
             const status = (error as WorkflowWorldError).status;
             debug('[Cloudflare Queue Handler] Permanent error, acking message:', {
@@ -145,7 +306,7 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
               error: String(error),
             });
             return new Response(JSON.stringify({ error: String(error), permanent: true }), {
-              status: 200, // 200 signals "handled" -- Cloudflare won't retry
+              status: 200,
             });
           }
 
@@ -166,8 +327,6 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
           );
         }
       };
-
-      return handlerFn;
     },
 
     async getDeploymentId() {
@@ -175,11 +334,10 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
     },
 
     async start() {
-      if (isTest && embeddedWorld.start) {
-        // In test mode: start embedded world's HTTP server
-        await embeddedWorld.start();
+      if (isTestMode()) {
+        await testPump.start();
       }
-      // In production: Cloudflare Queues is push-based, no polling needed
+      // Production: Cloudflare Queues is push-based, nothing to start.
     },
   };
 }

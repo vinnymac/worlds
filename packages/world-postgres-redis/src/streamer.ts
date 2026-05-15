@@ -8,14 +8,27 @@ import type {
 import { and, eq } from 'drizzle-orm';
 import type { Sql } from 'postgres';
 import { monotonicFactory } from 'ulid';
-import * as z from 'zod';
 import { type Drizzle, Schema } from './drizzle/index.js';
 import { Mutex } from './util.js';
 
-const StreamPublishMessage = z.object({
-  streamId: z.string(),
-  chunkId: z.templateLiteral(['chnk_', z.string()]),
-});
+interface StreamPublishMessage {
+  streamId: string;
+  chunkId: `chnk_${string}`;
+}
+
+function parseStreamPublishMessage(raw: string): StreamPublishMessage | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const { streamId, chunkId } = parsed as Record<string, unknown>;
+  if (typeof streamId !== 'string' || typeof chunkId !== 'string') return null;
+  if (!chunkId.startsWith('chnk_')) return null;
+  return { streamId, chunkId: chunkId as `chnk_${string}` };
+}
 
 interface StreamChunkEvent {
   id: `chnk_${string}`;
@@ -65,7 +78,8 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
 
   const STREAM_TOPIC = 'workflow_event_chunk';
   postgres.listen(STREAM_TOPIC, async (msg) => {
-    const parsed = await Promise.resolve(msg).then(JSON.parse).then(StreamPublishMessage.parse);
+    const parsed = parseStreamPublishMessage(msg);
+    if (!parsed) return;
 
     const key = `strm:${parsed.streamId}` as const;
     if (!events.listenerCount(key)) {
@@ -103,12 +117,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
       });
       postgres.notify(
         STREAM_TOPIC,
-        JSON.stringify(
-          StreamPublishMessage.encode({
-            chunkId,
-            streamId: name,
-          }),
-        ),
+        JSON.stringify({ streamId: name, chunkId } satisfies StreamPublishMessage),
       );
     },
     async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
@@ -124,12 +133,7 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
       });
       postgres.notify(
         'workflow_event_chunk',
-        JSON.stringify(
-          StreamPublishMessage.encode({
-            streamId: name,
-            chunkId,
-          }),
-        ),
+        JSON.stringify({ streamId: name, chunkId } satisfies StreamPublishMessage),
       );
     },
     async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {

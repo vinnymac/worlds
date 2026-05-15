@@ -7,11 +7,9 @@ catalog:
   '@testcontainers/postgresql': ^11.8.1
   '@testcontainers/redis': ^11.8.1
   '@types/node': ^22.19.0
-  '@vercel/queue': 0.0.0-alpha.36
   '@workflow/core': 4.2.4
   '@workflow/errors': 4.1.1
   '@workflow/world': 4.1.1
-  '@workflow/world-local': 4.1.1
   '@workflow/world-testing': 4.1.0-beta.53
   cbor-x: ^1.6.0
   dotenv: ^17.2.3
@@ -25,7 +23,6 @@ catalog:
   typescript: ^5.9.3
   ulid: ^3.0.2
   vitest: ^3.2.4
-  zod: 4.3.6
 
 # pnpm v11: Allow build scripts for required native dependencies
 # See: https://pnpm.io/11.x/migration#build-scripts-blocking
