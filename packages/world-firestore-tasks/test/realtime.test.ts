@@ -4,6 +4,7 @@ import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
+import { createStreamer } from '../src/streamer.js';
 
 describe('Firestore Real-time Listeners', () => {
   // Skip these tests on Windows since it relies on a docker container
@@ -555,8 +556,9 @@ describe('Firestore Real-time Listeners', () => {
           updatedAt: new Date(),
         });
 
-        // Create event in same transaction
-        const eventRef = runRef.collection('events').doc();
+        // Create event in same transaction. Events are ordered by eventId
+        // (monotonic ULID); use a doc ID that sorts after existing wevt_ ids.
+        const eventRef = runRef.collection('events').doc('wevt_zzzzzzzzzzzzzzzzzzzzzzzzzz');
         transaction.set(eventRef, {
           runId: run.runId,
           eventId: eventRef.id,
@@ -605,6 +607,122 @@ describe('Firestore Real-time Listeners', () => {
       // Verify status was NOT updated (transaction rolled back)
       const unchangedRun = await storage.runs.get(run.runId);
       expect(unchangedRun.status).toBe('pending');
+    });
+  });
+
+  describe('streamer', () => {
+    async function collectStream(stream: ReadableStream<Uint8Array>): Promise<string[]> {
+      const decoder = new TextDecoder();
+      const chunks: string[] = [];
+      const reader = stream.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) chunks.push(decoder.decode(value));
+      }
+      return chunks;
+    }
+
+    async function writeStream(streamer: ReturnType<typeof createStreamer>, name: string) {
+      // Write chunks back-to-back so several land in the same millisecond —
+      // the ordering key must not collide (previously it was the truncated
+      // ULID ms-timestamp, which deadlocked/skipped same-ms chunks).
+      for (let i = 0; i < 10; i++) {
+        await streamer.writeToStream(name, 'run-stream-test', `chunk-${i}`);
+      }
+      await streamer.closeStream(name, 'run-stream-test');
+    }
+
+    for (const mode of ['listener', 'polling'] as const) {
+      it(`should deliver same-millisecond chunks in order and terminate (${mode})`, async () => {
+        const streamer = createStreamer({ firestore, mode, pollIntervalMs: 50 });
+        const name = `stream-${mode}-${Date.now()}`;
+        await writeStream(streamer, name);
+
+        const chunks = await collectStream(await streamer.readFromStream(name));
+        expect(chunks).toEqual(Array.from({ length: 10 }, (_, i) => `chunk-${i}`));
+      });
+
+      it(`should honor positive and negative startIndex (${mode})`, async () => {
+        const streamer = createStreamer({ firestore, mode, pollIntervalMs: 50 });
+        const name = `stream-${mode}-start-${Date.now()}`;
+        await writeStream(streamer, name);
+
+        const fromSeven = await collectStream(await streamer.readFromStream(name, 7));
+        expect(fromSeven).toEqual(['chunk-7', 'chunk-8', 'chunk-9']);
+
+        const lastThree = await collectStream(await streamer.readFromStream(name, -3));
+        expect(lastThree).toEqual(['chunk-7', 'chunk-8', 'chunk-9']);
+      });
+    }
+
+    it('should stream chunks written after the reader attached (listener)', async () => {
+      const streamer = createStreamer({ firestore, mode: 'listener' });
+      const name = `stream-live-${Date.now()}`;
+      await streamer.writeToStream(name, 'run-stream-test', 'early');
+
+      const collected = collectStream(await streamer.readFromStream(name));
+      await setTimeout(300);
+      await streamer.writeToStream(name, 'run-stream-test', 'late-1');
+      await streamer.writeToStream(name, 'run-stream-test', 'late-2');
+      await streamer.closeStream(name, 'run-stream-test');
+
+      expect(await collected).toEqual(['early', 'late-1', 'late-2']);
+    });
+
+    it('should report stream info and paginated chunks', async () => {
+      const streamer = createStreamer({ firestore });
+      const name = `stream-info-${Date.now()}`;
+
+      expect(await streamer.getStreamInfo(name, 'run-stream-test')).toEqual({
+        tailIndex: -1,
+        done: false,
+      });
+
+      await writeStream(streamer, name);
+
+      expect(await streamer.getStreamInfo(name, 'run-stream-test')).toEqual({
+        tailIndex: 9,
+        done: true,
+      });
+
+      const decoder = new TextDecoder();
+      const page1 = await streamer.getStreamChunks(name, 'run-stream-test', { limit: 4 });
+      expect(page1.data.map((c) => decoder.decode(c.data))).toEqual([
+        'chunk-0',
+        'chunk-1',
+        'chunk-2',
+        'chunk-3',
+      ]);
+      expect(page1.data.map((c) => c.index)).toEqual([0, 1, 2, 3]);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.done).toBe(false);
+
+      const page2 = await streamer.getStreamChunks(name, 'run-stream-test', {
+        limit: 100,
+        cursor: page1.cursor ?? undefined,
+      });
+      expect(page2.data.map((c) => decoder.decode(c.data))).toEqual([
+        'chunk-4',
+        'chunk-5',
+        'chunk-6',
+        'chunk-7',
+        'chunk-8',
+        'chunk-9',
+      ]);
+      expect(page2.data.map((c) => c.index)).toEqual([4, 5, 6, 7, 8, 9]);
+      expect(page2.hasMore).toBe(false);
+      expect(page2.done).toBe(true);
+    });
+
+    it('should list streams by runId', async () => {
+      const streamer = createStreamer({ firestore });
+      const runId = `run-list-${Date.now()}`;
+      await streamer.writeToStream(`${runId}-stream-a`, runId, 'a');
+      await streamer.writeToStream(`${runId}-stream-b`, runId, 'b');
+
+      const streams = await streamer.listStreamsByRunId(runId);
+      expect(streams.sort()).toEqual([`${runId}-stream-a`, `${runId}-stream-b`]);
     });
   });
 });

@@ -1,5 +1,13 @@
 import type { Firestore, Query } from '@google-cloud/firestore';
-import { WorkflowWorldError } from '@workflow/errors';
+import { FieldValue } from '@google-cloud/firestore';
+import {
+  EntityConflictError,
+  HookNotFoundError,
+  RunExpiredError,
+  TooEarlyError,
+  WorkflowRunNotFoundError,
+  WorkflowWorldError,
+} from '@workflow/errors';
 import type {
   CreateEventParams,
   CreateEventRequest,
@@ -21,10 +29,19 @@ import type {
   StepWithoutData,
   Storage,
   UpdateStepRequest,
+  Wait,
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
-import { EventSchema, HookSchema, SPEC_VERSION_CURRENT } from '@workflow/world';
+import {
+  EventSchema,
+  HookSchema,
+  isTerminalStepStatus,
+  isTerminalWorkflowRunStatus,
+  SPEC_VERSION_CURRENT,
+  validateUlidTimestamp,
+  WaitSchema,
+} from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { compact, debug } from './util.js';
 
@@ -138,6 +155,9 @@ function isFirestoreTimestamp(value: unknown): value is FirestoreTimestamp {
 
 function fromFirestoreTimestamp(timestamp: unknown): Date | undefined {
   if (!timestamp) return undefined;
+  if (timestamp instanceof Date) {
+    return timestamp;
+  }
   if (isFirestoreTimestamp(timestamp)) {
     return timestamp.toDate();
   }
@@ -292,6 +312,73 @@ function serializeError(error: unknown): SerializedError | undefined {
   };
 }
 
+/** Deserialize a run entity from a Firestore document. */
+function runFromDoc(data: FirebaseFirestore.DocumentData): WorkflowRun {
+  return deserializeRunError({
+    ...data,
+    input: deserializeNestedArrays(data.input),
+    output: deserializeNestedArrays(data.output),
+    createdAt: fromFirestoreTimestamp(data.createdAt),
+    updatedAt: fromFirestoreTimestamp(data.updatedAt),
+    startedAt: fromFirestoreTimestamp(data.startedAt),
+    completedAt: fromFirestoreTimestamp(data.completedAt),
+  });
+}
+
+/** Deserialize a step entity from a Firestore document. */
+function stepFromDoc(data: FirebaseFirestore.DocumentData): Step {
+  return deserializeStepError({
+    ...data,
+    input: deserializeNestedArrays(data.input),
+    output: deserializeNestedArrays(data.output),
+    createdAt: fromFirestoreTimestamp(data.createdAt),
+    updatedAt: fromFirestoreTimestamp(data.updatedAt),
+    startedAt: fromFirestoreTimestamp(data.startedAt),
+    completedAt: fromFirestoreTimestamp(data.completedAt),
+    retryAfter: fromFirestoreTimestamp(data.retryAfter),
+  });
+}
+
+/** Deserialize a hook entity from a Firestore document. */
+function hookFromDoc(data: FirebaseFirestore.DocumentData): Hook {
+  return HookSchema.parse({
+    runId: data.runId,
+    hookId: data.hookId,
+    token: data.token,
+    ownerId: data.ownerId || '',
+    projectId: data.projectId || '',
+    environment: data.environment || '',
+    specVersion: data.specVersion,
+    createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
+    metadata: deserializeNestedArrays(data.metadata),
+  });
+}
+
+/** Deserialize a wait entity from a Firestore document. */
+function waitFromDoc(data: FirebaseFirestore.DocumentData): Wait {
+  return WaitSchema.parse(
+    compact({
+      waitId: data.waitId,
+      runId: data.runId,
+      status: data.status,
+      resumeAt: fromFirestoreTimestamp(data.resumeAt),
+      completedAt: fromFirestoreTimestamp(data.completedAt),
+      createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
+      updatedAt: fromFirestoreTimestamp(data.updatedAt) || new Date(),
+      specVersion: data.specVersion,
+    }),
+  );
+}
+
+/** Deserialize an event from a Firestore document. */
+function eventFromDoc(data: FirebaseFirestore.DocumentData): Event {
+  return {
+    ...data,
+    eventData: convertBuffersToUint8Array(data.eventData),
+    createdAt: fromFirestoreTimestamp(data.createdAt),
+  } as Event;
+}
+
 export function createStorage(config: FirestoreStorageConfig): Storage {
   const { firestore } = config;
   const ulid = monotonicFactory();
@@ -304,25 +391,19 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     const doc = await docRef.get();
 
     if (!doc.exists) {
-      throw new WorkflowWorldError(`Run not found: ${runId}`, {
-        status: 404,
-      });
+      // Typed error: @workflow/core matches this by name via
+      // WorkflowRunNotFoundError.is() (Run.exists, resilient polling).
+      throw new WorkflowRunNotFoundError(runId);
     }
 
-    const data = doc.data() as FirebaseFirestore.DocumentData;
-    return deserializeRunError({
-      ...data,
-      input: deserializeNestedArrays(data.input),
-      output: deserializeNestedArrays(data.output),
-      createdAt: fromFirestoreTimestamp(data.createdAt),
-      updatedAt: fromFirestoreTimestamp(data.updatedAt),
-      startedAt: fromFirestoreTimestamp(data.startedAt),
-      completedAt: fromFirestoreTimestamp(data.completedAt),
-    });
+    return runFromDoc(doc.data() as FirebaseFirestore.DocumentData);
   }
 
   /**
    * Internal helper to get a step from Firestore.
+   *
+   * Note: @workflow/errors has no StepNotFoundError; upstream world-postgres
+   * throws a generic WorkflowWorldError for missing steps, so we match that.
    */
   async function getStep(runId: string, stepId: string): Promise<Step> {
     const docRef = firestore.collection('workflow_runs').doc(runId).collection('steps').doc(stepId);
@@ -334,383 +415,43 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       });
     }
 
-    const data = doc.data() as FirebaseFirestore.DocumentData;
-    return deserializeStepError({
-      ...data,
-      input: deserializeNestedArrays(data.input),
-      output: deserializeNestedArrays(data.output),
-      createdAt: fromFirestoreTimestamp(data.createdAt),
-      updatedAt: fromFirestoreTimestamp(data.updatedAt),
-      startedAt: fromFirestoreTimestamp(data.startedAt),
-      completedAt: fromFirestoreTimestamp(data.completedAt),
-      retryAfter: fromFirestoreTimestamp(data.retryAfter),
-    });
+    return stepFromDoc(doc.data() as FirebaseFirestore.DocumentData);
   }
 
   /**
-   * Internal: create a run entity in Firestore (called from events.create for run_created).
-   * Uses a batch write for atomicity without read locks.
-   * Idempotency: if the run already exists, return the existing one.
+   * Internal: cleanup (delete) all hooks and waits for a run when it reaches
+   * a terminal state, releasing hook tokens for reuse.
+   *
+   * Firestore limits batches to 500 operations and each hook costs two
+   * deletes (entity + token index), so deletes are chunked.
    */
-  async function createRunFromEvent(
-    runId: string,
-    data: RunCreatedEventRequest['eventData'],
-    eventRecord: Record<string, unknown>,
-    eventId: string,
-  ): Promise<WorkflowRun> {
+  async function cleanupHooksAndWaits(runId: string): Promise<void> {
     const runRef = firestore.collection('workflow_runs').doc(runId);
-    const eventRef = firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('events')
-      .doc(eventId);
+    const [hooksSnapshot, waitsSnapshot] = await Promise.all([
+      runRef.collection('hooks').get(),
+      runRef.collection('waits').get(),
+    ]);
 
-    // Idempotency check: if the run already exists, return it
-    const existing = await runRef.get();
-    if (existing.exists) {
-      const existingData = existing.data() as FirebaseFirestore.DocumentData;
-      // Still write the event (idempotent via doc ID)
-      await eventRef.set(eventRecord);
-      return deserializeRunError({
-        ...existingData,
-        input: deserializeNestedArrays(existingData.input),
-        output: deserializeNestedArrays(existingData.output),
-        createdAt: fromFirestoreTimestamp(existingData.createdAt),
-        updatedAt: fromFirestoreTimestamp(existingData.updatedAt),
-        startedAt: fromFirestoreTimestamp(existingData.startedAt),
-        completedAt: fromFirestoreTimestamp(existingData.completedAt),
-      });
-    }
-
-    const now = new Date();
-    const run = {
-      runId,
-      workflowName: data.workflowName,
-      specVersion: SPEC_VERSION_CURRENT,
-      status: 'pending',
-      input: serializeNestedArrays(data.input),
-      executionContext: data.executionContext as Record<string, unknown> | undefined,
-      deploymentId: data.deploymentId,
-      createdAt: now,
-      updatedAt: now,
-    } as any;
-
-    // Atomic batch write: event + run together
-    const batch = firestore.batch();
-    batch.set(eventRef, eventRecord);
-    batch.set(runRef, run);
-    await batch.commit();
-
-    return {
-      ...run,
-      input: data.input,
-    } as WorkflowRun;
-  }
-
-  /**
-   * Internal: update a run entity in Firestore (called from events.create for run_* events).
-   * Uses a batch write for atomicity without read locks.
-   */
-  async function updateRunFromEvent(
-    runId: string,
-    eventType: string,
-    eventRecord: Record<string, unknown>,
-    eventId: string,
-    eventData?: Record<string, unknown>,
-  ): Promise<WorkflowRun> {
-    const runRef = firestore.collection('workflow_runs').doc(runId);
-    const eventRef = firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('events')
-      .doc(eventId);
-
-    // Read current run state (non-transactional)
-    const currentRun = await getRun(runId);
-
-    // Idempotency: for run_started, if run is already past pending, this is a replay.
-    // Return existing run state without creating a duplicate event.
-    if (eventType === 'run_started' && currentRun.status === 'running') {
-      return currentRun;
-    }
-
-    const now = new Date();
-    const updates: Record<string, unknown> = { updatedAt: now };
-
-    switch (eventType) {
-      case 'run_started': {
-        updates.status = 'running';
-        if (!currentRun.startedAt) {
-          updates.startedAt = now;
-        }
-        if (eventData?.input !== undefined) {
-          updates.input = serializeNestedArrays(eventData.input);
-        }
-        if (eventData?.deploymentId !== undefined) {
-          updates.deploymentId = eventData.deploymentId;
-        }
-        break;
-      }
-      case 'run_completed': {
-        updates.status = 'completed';
-        updates.completedAt = now;
-        if (eventData?.output !== undefined) {
-          updates.output = serializeNestedArrays(eventData.output);
-        }
-        break;
-      }
-      case 'run_failed': {
-        updates.status = 'failed';
-        updates.completedAt = now;
-        if (eventData?.error !== undefined) {
-          updates.error = serializeError(eventData.error);
-        }
-        break;
-      }
-      case 'run_cancelled': {
-        updates.status = 'cancelled';
-        updates.completedAt = now;
-        break;
-      }
-    }
-
-    // Atomic batch write: event + run update together
-    const batch = firestore.batch();
-    batch.set(eventRef, eventRecord);
-    batch.update(runRef, updates);
-    await batch.commit();
-
-    // Cleanup hooks when run reaches terminal state
-    if (
-      eventType === 'run_completed' ||
-      eventType === 'run_failed' ||
-      eventType === 'run_cancelled'
-    ) {
-      await cleanupHooks(runId);
-    }
-
-    // Read the updated run
-    return getRun(runId);
-  }
-
-  /**
-   * Internal: create a step entity in Firestore (called from events.create for step_created).
-   * Uses a batch write for atomicity without read locks.
-   * Idempotency: if the step already exists, return the existing one.
-   */
-  async function createStepFromEvent(
-    runId: string,
-    stepId: string,
-    data: { stepName: string; input: unknown },
-    eventRecord: Record<string, unknown>,
-    eventId: string,
-  ): Promise<Step> {
-    const stepRef = firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('steps')
-      .doc(stepId);
-    const eventRef = firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('events')
-      .doc(eventId);
-
-    // Idempotency check: if the step already exists, return it
-    const existing = await stepRef.get();
-    if (existing.exists) {
-      const existingData = existing.data() as FirebaseFirestore.DocumentData;
-      // Still write the event (idempotent via doc ID)
-      await eventRef.set(eventRecord);
-      return deserializeStepError({
-        ...existingData,
-        input: deserializeNestedArrays(existingData.input),
-        output: deserializeNestedArrays(existingData.output),
-        createdAt: fromFirestoreTimestamp(existingData.createdAt),
-        updatedAt: fromFirestoreTimestamp(existingData.updatedAt),
-        startedAt: fromFirestoreTimestamp(existingData.startedAt),
-        completedAt: fromFirestoreTimestamp(existingData.completedAt),
-        retryAfter: fromFirestoreTimestamp(existingData.retryAfter),
-      });
-    }
-
-    const now = new Date();
-    const step = {
-      runId,
-      stepId,
-      stepName: data.stepName,
-      status: 'pending',
-      input: serializeNestedArrays(data.input),
-      attempt: 1,
-      createdAt: now,
-      updatedAt: now,
-    } as any;
-
-    // Atomic batch write: event + step together
-    const batch = firestore.batch();
-    batch.set(eventRef, eventRecord);
-    batch.set(stepRef, step);
-    await batch.commit();
-
-    return {
-      ...step,
-      input: data.input,
-    } as Step;
-  }
-
-  /**
-   * Internal: update a step entity in Firestore (called from events.create for step_* events).
-   * Uses a batch write for atomicity without read locks.
-   */
-  async function updateStepFromEvent(
-    runId: string,
-    stepId: string,
-    eventType: string,
-    eventRecord: Record<string, unknown>,
-    eventId: string,
-    eventData?: Record<string, unknown>,
-  ): Promise<Step> {
-    const stepRef = firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('steps')
-      .doc(stepId);
-    const eventRef = firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('events')
-      .doc(eventId);
-
-    // Read current step state (non-transactional)
-    const currentStep = await getStep(runId, stepId);
-    const now = new Date();
-    const updates: Record<string, unknown> = { updatedAt: now };
-
-    switch (eventType) {
-      case 'step_started': {
-        updates.status = 'running';
-        if (!currentStep.startedAt) {
-          updates.startedAt = now;
-        }
-        if (eventData?.attempt !== undefined) {
-          updates.attempt = eventData.attempt;
-        }
-        break;
-      }
-      case 'step_completed': {
-        updates.status = 'completed';
-        updates.completedAt = now;
-        if (eventData?.result !== undefined) {
-          updates.output = serializeNestedArrays(eventData.result);
-        }
-        break;
-      }
-      case 'step_failed': {
-        updates.status = 'failed';
-        updates.completedAt = now;
-        if (eventData?.error !== undefined) {
-          updates.error = serializeError(eventData.error);
-        }
-        break;
-      }
-      case 'step_retrying': {
-        updates.status = 'pending';
-        if (eventData?.error !== undefined) {
-          updates.error = serializeError(eventData.error);
-        }
-        if (eventData?.retryAfter !== undefined) {
-          updates.retryAfter = new Date(eventData.retryAfter as string);
-        }
-        updates.attempt = (currentStep.attempt || 1) + 1;
-        break;
-      }
-    }
-
-    // Atomic batch write: event + step update together
-    const batch = firestore.batch();
-    batch.set(eventRef, eventRecord);
-    batch.update(stepRef, updates);
-    await batch.commit();
-
-    // Read the updated step
-    return getStep(runId, stepId);
-  }
-
-  /**
-   * Internal: create a hook entity in Firestore (called from events.create for hook_created).
-   * Uses a batch write for atomicity without read locks.
-   */
-  async function createHookFromEvent(
-    runId: string,
-    hookId: string,
-    data: { token: string; metadata?: unknown },
-    specVersion: number,
-    eventRecord: Record<string, unknown>,
-    eventId: string,
-  ): Promise<Hook> {
-    const now = new Date();
-
-    const hook = {
-      runId,
-      hookId,
-      token: data.token,
-      ownerId: '',
-      projectId: '',
-      environment: '',
-      specVersion,
-      createdAt: now,
-      metadata: serializeNestedArrays(data.metadata),
-    };
-
-    try {
-      const hookRef = firestore
-        .collection('workflow_runs')
-        .doc(runId)
-        .collection('hooks')
-        .doc(hookId);
-      const tokenRef = firestore.collection('hooks_by_token').doc(data.token);
-      const eventRef = firestore
-        .collection('workflow_runs')
-        .doc(runId)
-        .collection('events')
-        .doc(eventId);
-
-      // Atomic batch write: event + hook + token index together
-      const batch = firestore.batch();
-      batch.set(eventRef, eventRecord);
-      batch.set(hookRef, hook);
-      batch.set(tokenRef, hook);
-      await batch.commit();
-
-      const parsed = HookSchema.parse(compact(hook));
-      return parsed;
-    } catch (error) {
-      debug('[createHookFromEvent] Error creating hook:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Internal: cleanup (delete) all hooks for a run when it reaches a terminal state.
-   */
-  async function cleanupHooks(runId: string): Promise<void> {
-    const hooksSnapshot = await firestore
-      .collection('workflow_runs')
-      .doc(runId)
-      .collection('hooks')
-      .get();
-
-    const batch = firestore.batch();
+    const refs: FirebaseFirestore.DocumentReference[] = [];
     for (const doc of hooksSnapshot.docs) {
-      const hookData = doc.data();
-      // Delete from subcollection
-      batch.delete(doc.ref);
-      // Delete from hooks_by_token index
-      if (hookData.token) {
-        batch.delete(firestore.collection('hooks_by_token').doc(hookData.token));
+      refs.push(doc.ref);
+      const token = doc.data().token;
+      if (typeof token === 'string' && token.length > 0) {
+        refs.push(firestore.collection('hooks_by_token').doc(token));
       }
     }
-    await batch.commit();
+    for (const doc of waitsSnapshot.docs) {
+      refs.push(doc.ref);
+    }
+
+    const MAX_BATCH_OPS = 500;
+    for (let i = 0; i < refs.length; i += MAX_BATCH_OPS) {
+      const batch = firestore.batch();
+      for (const ref of refs.slice(i, i + MAX_BATCH_OPS)) {
+        batch.delete(ref);
+      }
+      await batch.commit();
+    }
   }
 
   return {
@@ -753,16 +494,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
         return {
           data: values.map((doc) => {
-            const data = doc.data();
-            const run = deserializeRunError({
-              ...data,
-              input: deserializeNestedArrays(data.input),
-              output: deserializeNestedArrays(data.output),
-              createdAt: fromFirestoreTimestamp(data.createdAt),
-              updatedAt: fromFirestoreTimestamp(data.updatedAt),
-              startedAt: fromFirestoreTimestamp(data.startedAt),
-              completedAt: fromFirestoreTimestamp(data.completedAt),
-            });
+            const run = runFromDoc(doc.data());
             return filterData(run, params?.resolveData, ['input', 'output']);
           }),
           cursor: values.at(-1)?.id ?? null,
@@ -777,220 +509,780 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         data: RunCreatedEventRequest | CreateEventRequest,
         _params?: CreateEventParams,
       ): Promise<EventResult> {
-        const eventId = `wevt_${ulid()}`;
-        const now = new Date();
-
         // For run_created events, generate a runId if null
         const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
+        if (!effectiveRunId) {
+          throw new WorkflowWorldError('runId is required for non-run_created events', {
+            status: 400,
+          });
+        }
+
+        // Validate client-provided runId timestamp is within acceptable threshold
+        if (data.eventType === 'run_created' && runId) {
+          const validationError = validateUlidTimestamp(effectiveRunId, 'wrun_');
+          if (validationError) {
+            throw new WorkflowWorldError(validationError, { status: 400 });
+          }
+        }
 
         const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
+        const correlationId =
+          'correlationId' in data && typeof data.correlationId === 'string'
+            ? data.correlationId
+            : undefined;
+        const eventData =
+          'eventData' in data && data.eventData !== undefined
+            ? (data.eventData as Record<string, unknown>)
+            : undefined;
 
-        // Build event record matching Postgres/Redis pattern
-        // EventSchema requires eventData to be an object (can be empty {})
-        const eventRecord: Record<string, unknown> = {
-          runId: effectiveRunId,
-          eventId,
-          eventType: data.eventType,
-          eventData: (data as any).eventData || {}, // EventSchema requires this to be an object, default to {}
-          specVersion: effectiveSpecVersion,
-          createdAt: now,
-        };
+        const runRef = firestore.collection('workflow_runs').doc(effectiveRunId);
+        const eventsCol = runRef.collection('events');
 
-        // Strip eventData from run_started events before storage
-        if (data.eventType === 'run_started') {
-          delete eventRecord.eventData;
-        }
-
-        // Add optional correlationId if present
-        if ('correlationId' in data && (data as any).correlationId !== undefined) {
-          eventRecord.correlationId = (data as any).correlationId;
-        }
-
-        // Process entity side effects based on event type.
-        // Entity-mutating events use Firestore transactions to atomically write
-        // the event + entity together, preventing partial writes on failure.
-        const eventData = (data as any).eventData;
-
-        // Track whether the event was written inside a transaction
-        let eventWrittenInTransaction = false;
-
-        // ============================================================
-        // RESILIENT START: Bootstrap run from run_started eventData
-        // ============================================================
-        if (data.eventType === 'run_started' && eventData) {
-          const runInputData = eventData as {
-            deploymentId?: string;
-            workflowName?: string;
-            input?: any;
-            executionContext?: any;
+        /**
+         * Allocate the event record. Called INSIDE transactions AFTER all
+         * validation reads have passed, so a writer blocked on contended
+         * documents never carries a stale (older) eventId into a later
+         * commit — replays observe events in eventId order.
+         */
+        function allocateEvent(overrides?: Partial<Record<string, unknown>>): {
+          eventId: string;
+          eventRef: FirebaseFirestore.DocumentReference;
+          record: Record<string, unknown>;
+        } {
+          const eventId = `wevt_${ulid()}`;
+          const record: Record<string, unknown> = {
+            runId: effectiveRunId,
+            eventId,
+            eventType: data.eventType,
+            // EventSchema requires eventData to be an object, default to {}
+            eventData: eventData ?? {},
+            specVersion: effectiveSpecVersion,
+            createdAt: new Date(),
+            ...overrides,
           };
-          if (
-            runInputData.deploymentId &&
-            runInputData.workflowName &&
-            runInputData.input !== undefined
-          ) {
-            const runRef = firestore.collection('workflow_runs').doc(effectiveRunId);
-            const existingDoc = await runRef.get();
-            if (!existingDoc.exists) {
-              // Create run + synthetic run_created event atomically
-              const runCreatedEventId = `wevt_${ulid()}`;
-              const syntheticEventRecord: Record<string, unknown> = {
-                runId: effectiveRunId,
-                eventId: runCreatedEventId,
-                eventType: 'run_created',
-                eventData: {
-                  deploymentId: runInputData.deploymentId,
-                  workflowName: runInputData.workflowName,
-                  input: runInputData.input,
-                  executionContext: runInputData.executionContext,
-                },
-                specVersion: effectiveSpecVersion,
-                createdAt: now,
-              };
-              const newRun = {
-                runId: effectiveRunId,
-                workflowName: runInputData.workflowName,
-                specVersion: effectiveSpecVersion,
-                status: 'pending',
-                input: serializeNestedArrays(runInputData.input),
-                executionContext: runInputData.executionContext as
-                  | Record<string, unknown>
-                  | undefined,
-                deploymentId: runInputData.deploymentId,
-                createdAt: now,
-                updatedAt: now,
-              } as any;
-              const syntheticEventRef = firestore
-                .collection('workflow_runs')
-                .doc(effectiveRunId)
-                .collection('events')
-                .doc(runCreatedEventId);
-              const batch = firestore.batch();
-              batch.set(syntheticEventRef, syntheticEventRecord);
-              batch.set(runRef, newRun);
-              await batch.commit();
-            }
+          // Strip eventData from run_started events before storage — the run
+          // input belongs on run_created only.
+          if (record.eventType === 'run_started') {
+            delete record.eventData;
           }
+          if (correlationId !== undefined && record.correlationId === undefined) {
+            record.correlationId = correlationId;
+          }
+          return { eventId, eventRef: eventsCol.doc(eventId), record };
         }
 
-        // Parse and validate using EventSchema like other implementations
-        const parsed = EventSchema.parse(eventRecord);
-        const result: EventResult = { event: parsed };
+        const isRunTerminalEvent =
+          data.eventType === 'run_completed' ||
+          data.eventType === 'run_failed' ||
+          data.eventType === 'run_cancelled';
+
+        let result: EventResult;
 
         switch (data.eventType) {
+          // ============================================================
+          // run_created: create the run entity + event atomically.
+          // Duplicate creation is rejected with EntityConflictError, which
+          // core start() treats as "run already exists".
+          // ============================================================
           case 'run_created': {
-            eventWrittenInTransaction = true;
-            result.run = await createRunFromEvent(
-              effectiveRunId,
-              eventData as RunCreatedEventRequest['eventData'],
-              eventRecord,
-              eventId,
-            );
+            const runData = eventData as RunCreatedEventRequest['eventData'];
+            result = await firestore.runTransaction(async (tx) => {
+              const existing = await tx.get(runRef);
+              if (existing.exists) {
+                throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
+              }
+
+              const now = new Date();
+              const { eventRef, record } = allocateEvent();
+              const runDoc: Record<string, unknown> = {
+                runId: effectiveRunId,
+                workflowName: runData.workflowName,
+                specVersion: effectiveSpecVersion,
+                status: 'pending',
+                input: serializeNestedArrays(runData.input),
+                executionContext: runData.executionContext,
+                deploymentId: runData.deploymentId,
+                createdAt: now,
+                updatedAt: now,
+              };
+              tx.set(eventRef, record);
+              tx.set(runRef, runDoc);
+
+              const run: WorkflowRun = {
+                runId: effectiveRunId,
+                workflowName: runData.workflowName,
+                specVersion: effectiveSpecVersion,
+                status: 'pending',
+                input: runData.input,
+                executionContext: runData.executionContext,
+                deploymentId: runData.deploymentId,
+                createdAt: now,
+                updatedAt: now,
+              };
+              return { event: EventSchema.parse(record), run };
+            });
             break;
           }
+
+          // ============================================================
+          // Run lifecycle transitions. All guards run inside a Firestore
+          // transaction so concurrent terminal transitions cannot both pass
+          // (read-then-blind-batch TOCTOU).
+          // ============================================================
           case 'run_started':
           case 'run_completed':
           case 'run_failed':
           case 'run_cancelled': {
-            eventWrittenInTransaction = true;
-            result.run = await updateRunFromEvent(
-              effectiveRunId,
-              data.eventType,
-              eventRecord,
-              eventId,
-              eventData,
+            const eventType = data.eventType;
+            const txResult = await firestore.runTransaction(
+              async (
+                tx,
+              ): Promise<{
+                record: Record<string, unknown> | null;
+                bootstrappedRun?: WorkflowRun;
+                unchangedRun?: WorkflowRun;
+              }> => {
+                const runSnap = await tx.get(runRef);
+
+                if (!runSnap.exists) {
+                  // ============================================================
+                  // RESILIENT START: bootstrap run from run_started eventData
+                  // (queue message carried runInput because run_created lost
+                  // the race or failed).
+                  // ============================================================
+                  const runInput = eventData as
+                    | {
+                        deploymentId?: string;
+                        workflowName?: string;
+                        input?: unknown;
+                        executionContext?: Record<string, unknown>;
+                      }
+                    | undefined;
+                  if (
+                    eventType === 'run_started' &&
+                    runInput?.deploymentId &&
+                    runInput.workflowName &&
+                    runInput.input !== undefined
+                  ) {
+                    const now = new Date();
+                    // Synthetic run_created is allocated BEFORE run_started so
+                    // the journal replays in causal order.
+                    const created = allocateEvent({
+                      eventType: 'run_created',
+                      eventData: {
+                        deploymentId: runInput.deploymentId,
+                        workflowName: runInput.workflowName,
+                        input: runInput.input,
+                        executionContext: runInput.executionContext,
+                      },
+                    });
+                    const started = allocateEvent();
+                    const runDoc: Record<string, unknown> = {
+                      runId: effectiveRunId,
+                      workflowName: runInput.workflowName,
+                      specVersion: effectiveSpecVersion,
+                      status: 'running',
+                      input: serializeNestedArrays(runInput.input),
+                      executionContext: runInput.executionContext,
+                      deploymentId: runInput.deploymentId,
+                      startedAt: now,
+                      createdAt: now,
+                      updatedAt: now,
+                    };
+                    tx.set(created.eventRef, created.record);
+                    tx.set(started.eventRef, started.record);
+                    tx.set(runRef, runDoc);
+                    const run: WorkflowRun = {
+                      runId: effectiveRunId,
+                      workflowName: runInput.workflowName,
+                      specVersion: effectiveSpecVersion,
+                      status: 'running',
+                      input: runInput.input,
+                      executionContext: runInput.executionContext,
+                      deploymentId: runInput.deploymentId,
+                      startedAt: now,
+                      createdAt: now,
+                      updatedAt: now,
+                    };
+                    return { record: started.record, bootstrappedRun: run };
+                  }
+
+                  throw new WorkflowRunNotFoundError(effectiveRunId);
+                }
+
+                const currentRun = runFromDoc(runSnap.data() as FirebaseFirestore.DocumentData);
+
+                // Terminal-state validation: runs cannot transition out of a
+                // terminal state.
+                if (isTerminalWorkflowRunStatus(currentRun.status)) {
+                  // Idempotent operation: run_cancelled on an already cancelled
+                  // run is allowed — record the event and return the run
+                  // unchanged.
+                  if (eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
+                    const { eventRef, record } = allocateEvent();
+                    tx.set(eventRef, record);
+                    return { record, unchangedRun: currentRun };
+                  }
+                  // For run_started on terminal runs, use RunExpiredError so
+                  // the runtime knows to exit without retrying.
+                  if (eventType === 'run_started') {
+                    throw new RunExpiredError(
+                      `Workflow run "${effectiveRunId}" is already in terminal state "${currentRun.status}"`,
+                    );
+                  }
+                  throw new EntityConflictError(
+                    `Cannot transition run from terminal state "${currentRun.status}"`,
+                  );
+                }
+
+                // Idempotency: for run_started, if run is already running this
+                // is a replay. Return existing run state without creating a
+                // duplicate event.
+                if (eventType === 'run_started' && currentRun.status === 'running') {
+                  return { record: null, unchangedRun: currentRun };
+                }
+
+                const now = new Date();
+                const updates: Record<string, unknown> = { updatedAt: now };
+
+                switch (eventType) {
+                  case 'run_started': {
+                    updates.status = 'running';
+                    if (!currentRun.startedAt) {
+                      updates.startedAt = now;
+                    }
+                    // Non-final snapshots must not carry error/output/completedAt
+                    // (WorkflowRunSchema is a discriminated union on status).
+                    updates.output = FieldValue.delete();
+                    updates.error = FieldValue.delete();
+                    updates.completedAt = FieldValue.delete();
+                    if (eventData?.input !== undefined) {
+                      updates.input = serializeNestedArrays(eventData.input);
+                    }
+                    if (eventData?.deploymentId !== undefined) {
+                      updates.deploymentId = eventData.deploymentId;
+                    }
+                    break;
+                  }
+                  case 'run_completed': {
+                    updates.status = 'completed';
+                    updates.completedAt = now;
+                    updates.error = FieldValue.delete();
+                    if (eventData?.output !== undefined) {
+                      updates.output = serializeNestedArrays(eventData.output);
+                    }
+                    break;
+                  }
+                  case 'run_failed': {
+                    updates.status = 'failed';
+                    updates.completedAt = now;
+                    updates.output = FieldValue.delete();
+                    if (eventData?.error !== undefined) {
+                      updates.error = serializeError(eventData.error);
+                    }
+                    break;
+                  }
+                  case 'run_cancelled': {
+                    updates.status = 'cancelled';
+                    updates.completedAt = now;
+                    updates.output = FieldValue.delete();
+                    updates.error = FieldValue.delete();
+                    break;
+                  }
+                }
+
+                const { eventRef, record } = allocateEvent();
+                tx.set(eventRef, record);
+                tx.update(runRef, updates);
+                return { record };
+              },
             );
+
+            // Cleanup hooks and waits when run reaches terminal state
+            if (isRunTerminalEvent && !txResult.unchangedRun) {
+              await cleanupHooksAndWaits(effectiveRunId);
+            }
+
+            if (txResult.record === null) {
+              // Idempotent run_started replay: no event was written.
+              result = { run: txResult.unchangedRun };
+            } else {
+              result = {
+                event: EventSchema.parse(txResult.record),
+                run:
+                  txResult.bootstrappedRun ??
+                  txResult.unchangedRun ??
+                  (await getRun(effectiveRunId)),
+              };
+            }
             break;
           }
+
+          // ============================================================
+          // step_created: create the step entity + event atomically.
+          // Duplicates are rejected with EntityConflictError (matching the
+          // postgres unique index on entity-creation events); the runtime's
+          // concurrent-replay catch path swallows it.
+          // ============================================================
           case 'step_created': {
-            eventWrittenInTransaction = true;
-            const correlationId = (data as any).correlationId;
-            result.step = await createStepFromEvent(
-              effectiveRunId,
-              correlationId,
-              eventData as { stepName: string; input: unknown },
-              eventRecord,
-              eventId,
-            );
+            if (!correlationId) {
+              throw new WorkflowWorldError('correlationId is required for step_created', {
+                status: 400,
+              });
+            }
+            const stepData = eventData as { stepName: string; input: unknown };
+            const stepRef = runRef.collection('steps').doc(correlationId);
+
+            result = await firestore.runTransaction(async (tx) => {
+              const [runSnap, stepSnap] = await tx.getAll(runRef, stepRef);
+
+              const runStatus = runSnap.exists
+                ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
+                : undefined;
+              if (runStatus && isTerminalWorkflowRunStatus(runStatus)) {
+                throw new EntityConflictError(
+                  `Cannot create new entities on run in terminal state "${runStatus}"`,
+                );
+              }
+
+              if (stepSnap.exists) {
+                throw new EntityConflictError(
+                  `step_created for correlationId "${correlationId}" already exists in run "${effectiveRunId}"`,
+                );
+              }
+
+              const now = new Date();
+              const { eventRef, record } = allocateEvent();
+              const stepDoc: Record<string, unknown> = {
+                runId: effectiveRunId,
+                stepId: correlationId,
+                stepName: stepData.stepName,
+                status: 'pending',
+                input: serializeNestedArrays(stepData.input),
+                attempt: 1,
+                specVersion: effectiveSpecVersion,
+                createdAt: now,
+                updatedAt: now,
+              };
+              tx.set(eventRef, record);
+              tx.set(stepRef, stepDoc);
+
+              const step: Step = {
+                runId: effectiveRunId,
+                stepId: correlationId,
+                stepName: stepData.stepName,
+                status: 'pending',
+                input: stepData.input,
+                attempt: 1,
+                specVersion: effectiveSpecVersion,
+                createdAt: now,
+                updatedAt: now,
+              };
+              return { event: EventSchema.parse(record), step };
+            });
             break;
           }
+
+          // ============================================================
+          // Step lifecycle transitions. Terminal-state / retryAfter guards
+          // and the event write all happen inside one transaction so a
+          // concurrent terminal event aborts the loser instead of being
+          // silently overwritten.
+          // ============================================================
           case 'step_started':
           case 'step_completed':
           case 'step_failed':
           case 'step_retrying': {
-            eventWrittenInTransaction = true;
-            const correlationId = (data as any).correlationId;
-            result.step = await updateStepFromEvent(
-              effectiveRunId,
-              correlationId,
-              data.eventType,
-              eventRecord,
-              eventId,
-              eventData,
-            );
+            const eventType = data.eventType;
+            if (!correlationId) {
+              throw new WorkflowWorldError(`correlationId is required for ${eventType}`, {
+                status: 400,
+              });
+            }
+            const stepRef = runRef.collection('steps').doc(correlationId);
+
+            const record = await firestore.runTransaction(async (tx) => {
+              const stepSnap = await tx.get(stepRef);
+              if (!stepSnap.exists) {
+                throw new WorkflowWorldError(`Step "${correlationId}" not found`, {
+                  status: 404,
+                });
+              }
+              const currentStep = stepFromDoc(stepSnap.data() as FirebaseFirestore.DocumentData);
+
+              // Terminal-state validation: steps cannot be modified once
+              // completed or failed. The runtime relies on this to dedupe
+              // redelivered step messages — without it, a late step_started
+              // lands in the event log after step_completed and corrupts
+              // replay.
+              if (isTerminalStepStatus(currentStep.status)) {
+                throw new EntityConflictError(
+                  `Cannot modify step in terminal state "${currentStep.status}"`,
+                );
+              }
+
+              if (eventType === 'step_started') {
+                // Retried steps may be scheduled for later. The runtime turns
+                // TooEarlyError into a delayed queue retry.
+                if (currentStep.retryAfter && currentStep.retryAfter.getTime() > Date.now()) {
+                  throw new TooEarlyError(
+                    `Cannot start step "${correlationId}": retryAfter timestamp has not been reached yet`,
+                    {
+                      retryAfter: Math.ceil((currentStep.retryAfter.getTime() - Date.now()) / 1000),
+                    },
+                  );
+                }
+
+                // On terminal runs, only steps that are already running may
+                // proceed (to record their completion); new work must not
+                // start on a cancelled run.
+                const runSnap = await tx.get(runRef);
+                if (runSnap.exists) {
+                  const runStatus = String(
+                    (runSnap.data() as FirebaseFirestore.DocumentData).status,
+                  );
+                  if (isTerminalWorkflowRunStatus(runStatus) && currentStep.status !== 'running') {
+                    throw new RunExpiredError(
+                      `Cannot modify non-running step on run in terminal state "${runStatus}"`,
+                    );
+                  }
+                }
+              }
+
+              const now = new Date();
+              const updates: Record<string, unknown> = { updatedAt: now };
+
+              switch (eventType) {
+                case 'step_started': {
+                  updates.status = 'running';
+                  if (!currentStep.startedAt) {
+                    updates.startedAt = now;
+                  }
+                  // Clear retryAfter now that the step has started
+                  updates.retryAfter = FieldValue.delete();
+                  if (eventData?.attempt !== undefined) {
+                    updates.attempt = eventData.attempt;
+                  }
+                  break;
+                }
+                case 'step_completed': {
+                  updates.status = 'completed';
+                  updates.completedAt = now;
+                  if (eventData?.result !== undefined) {
+                    updates.output = serializeNestedArrays(eventData.result);
+                  }
+                  break;
+                }
+                case 'step_failed': {
+                  updates.status = 'failed';
+                  updates.completedAt = now;
+                  if (eventData?.error !== undefined) {
+                    updates.error = serializeError(eventData.error);
+                  }
+                  break;
+                }
+                case 'step_retrying': {
+                  updates.status = 'pending';
+                  if (eventData?.error !== undefined) {
+                    updates.error = serializeError(eventData.error);
+                  }
+                  if (eventData?.retryAfter !== undefined) {
+                    updates.retryAfter = new Date(eventData.retryAfter as string);
+                  }
+                  updates.attempt = (currentStep.attempt || 1) + 1;
+                  break;
+                }
+              }
+
+              const { eventRef, record } = allocateEvent();
+              tx.set(eventRef, record);
+              tx.update(stepRef, updates);
+              return record;
+            });
+
+            result = {
+              event: EventSchema.parse(record),
+              step: await getStep(effectiveRunId, correlationId),
+            };
             break;
           }
-          case 'hook_created': {
-            eventWrittenInTransaction = true;
-            const correlationId = (data as any).correlationId;
-            const hookEventData = eventData as {
-              token: string;
-              metadata?: unknown;
-            };
 
-            // Debug logging for CI troubleshooting
+          // ============================================================
+          // hook_created: create hook entity + token index + event
+          // atomically.
+          //
+          // Token uniqueness semantics:
+          // - Same (runId, hookId) already owns the token and its
+          //   hook_created event is in the log → duplicate/replayed
+          //   processing: throw EntityConflictError so the runtime's
+          //   concurrent-replay catch path swallows it (matching
+          //   step_created).
+          // - Same (runId, hookId) without a hook_created event →
+          //   crash-orphaned hook entity from a pre-transactional version:
+          //   complete the partial write by publishing the missing event.
+          // - A different (runId, hookId) owns the token → record a
+          //   hook_conflict event so the workflow can fail gracefully when
+          //   the hook is awaited.
+          // ============================================================
+          case 'hook_created': {
             if (!correlationId) {
-              debug('[hook_created] Missing correlationId');
+              throw new WorkflowWorldError('correlationId is required for hook_created', {
+                status: 400,
+              });
             }
-            if (!hookEventData.token) {
+            const hookData = eventData as { token: string; metadata?: unknown };
+            if (!hookData.token) {
               debug('[hook_created] Missing token in eventData');
             }
+            const hookRef = runRef.collection('hooks').doc(correlationId);
+            const tokenRef = firestore.collection('hooks_by_token').doc(hookData.token);
 
-            result.hook = await createHookFromEvent(
-              effectiveRunId,
-              correlationId,
-              hookEventData,
-              effectiveSpecVersion,
-              eventRecord,
-              eventId,
-            );
+            result = await firestore.runTransaction(async (tx) => {
+              const [runSnap, tokenSnap] = await tx.getAll(runRef, tokenRef);
 
-            // Verify hook was created
-            if (!result.hook) {
-              debug('[hook_created] Hook creation returned undefined');
-            }
+              // A hook_created landing after the terminal transition's
+              // cleanup would orphan the token index forever — reject it.
+              const runStatus = runSnap.exists
+                ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
+                : undefined;
+              if (runStatus && isTerminalWorkflowRunStatus(runStatus)) {
+                throw new EntityConflictError(
+                  `Cannot create new entities on run in terminal state "${runStatus}"`,
+                );
+              }
+
+              if (tokenSnap.exists) {
+                const existing = tokenSnap.data() as FirebaseFirestore.DocumentData;
+
+                if (existing.runId === effectiveRunId && existing.hookId === correlationId) {
+                  const existingEvent = await tx.get(
+                    eventsCol
+                      .where('correlationId', '==', correlationId)
+                      .where('eventType', '==', 'hook_created')
+                      .limit(1),
+                  );
+
+                  if (!existingEvent.empty) {
+                    throw new EntityConflictError(`Hook "${correlationId}" already created`);
+                  }
+
+                  // Orphaned hook entity: publish the missing hook_created
+                  // event and return the persisted hook rather than mutating
+                  // it with this retry's payload.
+                  const { eventRef, record } = allocateEvent();
+                  tx.set(eventRef, record);
+                  return { event: EventSchema.parse(record), hook: hookFromDoc(existing) };
+                }
+
+                // Cross-hook / cross-run conflict: a different (runId, hookId)
+                // holds this token. Record a hook_conflict event instead of
+                // throwing.
+                const { eventRef, record } = allocateEvent({
+                  eventType: 'hook_conflict',
+                  eventData: { token: hookData.token, conflictingRunId: existing.runId },
+                });
+                tx.set(eventRef, record);
+                return { event: EventSchema.parse(record) };
+              }
+
+              const now = new Date();
+              const { eventRef, record } = allocateEvent();
+              const hookDoc = {
+                runId: effectiveRunId,
+                hookId: correlationId,
+                token: hookData.token,
+                ownerId: '',
+                projectId: '',
+                environment: '',
+                specVersion: effectiveSpecVersion,
+                createdAt: now,
+                metadata: serializeNestedArrays(hookData.metadata),
+              };
+              tx.set(eventRef, record);
+              tx.set(hookRef, hookDoc);
+              tx.set(tokenRef, hookDoc);
+
+              return {
+                event: EventSchema.parse(record),
+                hook: HookSchema.parse(compact({ ...hookDoc, metadata: hookData.metadata })),
+              };
+            });
             break;
           }
-          // hook_received, hook_disposed, hook_conflict, wait_created, wait_completed
-          // are event-only; no entity mutation needed at the storage level
-        }
 
-        // For event-only types (no entity mutation), write the event standalone
-        if (!eventWrittenInTransaction) {
-          await firestore
-            .collection('workflow_runs')
-            .doc(effectiveRunId)
-            .collection('events')
-            .doc(eventId)
-            .set(eventRecord);
+          // ============================================================
+          // hook_disposed: delete hook entity + token index atomically,
+          // releasing the token for reuse by other hooks.
+          // ============================================================
+          case 'hook_disposed': {
+            if (!correlationId) {
+              throw new WorkflowWorldError('correlationId is required for hook_disposed', {
+                status: 400,
+              });
+            }
+            const hookRef = runRef.collection('hooks').doc(correlationId);
+
+            result = await firestore.runTransaction(async (tx) => {
+              const hookSnap = await tx.get(hookRef);
+              if (!hookSnap.exists) {
+                // Typed error: core's resume-or-start pattern matches this by
+                // name via HookNotFoundError.is().
+                throw new HookNotFoundError(correlationId);
+              }
+              const hookDoc = hookSnap.data() as FirebaseFirestore.DocumentData;
+
+              const { eventRef, record } = allocateEvent();
+              tx.set(eventRef, record);
+              tx.delete(hookRef);
+              if (typeof hookDoc.token === 'string' && hookDoc.token.length > 0) {
+                tx.delete(firestore.collection('hooks_by_token').doc(hookDoc.token));
+              }
+              return { event: EventSchema.parse(record) };
+            });
+            break;
+          }
+
+          // ============================================================
+          // hook_received: event-only, but the hook must still exist —
+          // a payload delivered concurrently with disposal must not be
+          // silently appended to the event log.
+          // ============================================================
+          case 'hook_received': {
+            if (!correlationId) {
+              throw new WorkflowWorldError('correlationId is required for hook_received', {
+                status: 400,
+              });
+            }
+            result = await firestore.runTransaction(async (tx) => {
+              // Hooks live in per-run subcollections; match postgres semantics
+              // (global lookup by hookId) with a collection-group query.
+              const hookQuery = await tx.get(
+                firestore.collectionGroup('hooks').where('hookId', '==', correlationId).limit(1),
+              );
+              if (hookQuery.empty) {
+                throw new HookNotFoundError(correlationId);
+              }
+              const { eventRef, record } = allocateEvent();
+              tx.set(eventRef, record);
+              return { event: EventSchema.parse(record) };
+            });
+            break;
+          }
+
+          // ============================================================
+          // wait_created: create wait entity + event atomically. Duplicates
+          // are rejected with EntityConflictError — core relies on this to
+          // dedupe concurrent replays.
+          // ============================================================
+          case 'wait_created': {
+            if (!correlationId) {
+              throw new WorkflowWorldError('correlationId is required for wait_created', {
+                status: 400,
+              });
+            }
+            const waitRef = runRef.collection('waits').doc(correlationId);
+            const waitId = `${effectiveRunId}-${correlationId}`;
+
+            result = await firestore.runTransaction(async (tx) => {
+              const [runSnap, waitSnap] = await tx.getAll(runRef, waitRef);
+
+              const runStatus = runSnap.exists
+                ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
+                : undefined;
+              if (runStatus && isTerminalWorkflowRunStatus(runStatus)) {
+                throw new EntityConflictError(
+                  `Cannot create new entities on run in terminal state "${runStatus}"`,
+                );
+              }
+
+              if (waitSnap.exists) {
+                throw new EntityConflictError(`Wait "${correlationId}" already exists`);
+              }
+
+              const now = new Date();
+              const resumeAt = eventData?.resumeAt
+                ? new Date(eventData.resumeAt as string | number | Date)
+                : undefined;
+              const { eventRef, record } = allocateEvent();
+              const waitDoc: Record<string, unknown> = {
+                waitId,
+                runId: effectiveRunId,
+                status: 'waiting',
+                resumeAt,
+                specVersion: effectiveSpecVersion,
+                createdAt: now,
+                updatedAt: now,
+              };
+              tx.set(eventRef, record);
+              tx.set(waitRef, waitDoc);
+
+              return {
+                event: EventSchema.parse(record),
+                wait: WaitSchema.parse(compact(waitDoc)),
+              };
+            });
+            break;
+          }
+
+          // ============================================================
+          // wait_completed: transition wait to 'completed'; duplicate
+          // completions (wakeUpRun racing natural wake) are rejected with
+          // EntityConflictError, which core swallows.
+          // ============================================================
+          case 'wait_completed': {
+            if (!correlationId) {
+              throw new WorkflowWorldError('correlationId is required for wait_completed', {
+                status: 400,
+              });
+            }
+            const waitRef = runRef.collection('waits').doc(correlationId);
+
+            result = await firestore.runTransaction(async (tx) => {
+              const waitSnap = await tx.get(waitRef);
+              if (!waitSnap.exists) {
+                throw new WorkflowWorldError(`Wait "${correlationId}" not found`, {
+                  status: 404,
+                });
+              }
+              const waitDoc = waitSnap.data() as FirebaseFirestore.DocumentData;
+              if (waitDoc.status === 'completed') {
+                throw new EntityConflictError(`Wait "${correlationId}" already completed`);
+              }
+
+              const now = new Date();
+              const { eventRef, record } = allocateEvent();
+              tx.set(eventRef, record);
+              tx.update(waitRef, { status: 'completed', completedAt: now, updatedAt: now });
+
+              return {
+                event: EventSchema.parse(record),
+                wait: waitFromDoc({
+                  ...waitDoc,
+                  status: 'completed',
+                  completedAt: now,
+                  updatedAt: now,
+                }),
+              };
+            });
+            break;
+          }
+
+          // hook_conflict (and any future event-only types): standalone
+          // event write, no entity mutation.
+          default: {
+            const { eventRef, record } = allocateEvent();
+            await eventRef.set(record);
+            result = { event: EventSchema.parse(record) };
+            break;
+          }
         }
 
         // Preload all events for run_started to reduce TTFB
-        if (data.eventType === 'run_started' && result.run) {
-          const eventsSnapshot = await firestore
-            .collection('workflow_runs')
-            .doc(effectiveRunId)
-            .collection('events')
-            .orderBy('createdAt', 'asc')
-            .get();
-          result.events = eventsSnapshot.docs.map((doc) => {
-            const eData = doc.data();
-            return {
-              ...eData,
-              eventData: convertBuffersToUint8Array(eData.eventData),
-              createdAt: fromFirestoreTimestamp(eData.createdAt),
-            } as Event;
-          });
+        if (data.eventType === 'run_started' && result.run && result.event) {
+          const eventsSnapshot = await eventsCol.orderBy('eventId', 'asc').get();
+          result.events = eventsSnapshot.docs.map((doc) => eventFromDoc(doc.data()));
+          result.cursor = result.events.at(-1)?.eventId ?? null;
+          result.hasMore = false;
         }
 
         return result;
@@ -1010,12 +1302,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           });
         }
 
-        const data = doc.data() as FirebaseFirestore.DocumentData;
-        return {
-          ...data,
-          eventData: convertBuffersToUint8Array(data.eventData),
-          createdAt: fromFirestoreTimestamp(data.createdAt),
-        } as Event;
+        return eventFromDoc(doc.data() as FirebaseFirestore.DocumentData);
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -1023,23 +1310,18 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
 
+        // Order and paginate by the monotonic eventId (ULID) — never
+        // createdAt, whose millisecond ties and out-of-commit-order writes
+        // make cursors skip events.
         let query: Query = firestore
           .collection('workflow_runs')
           .doc(runId)
           .collection('events')
-          .orderBy('createdAt', sortOrder)
+          .orderBy('eventId', sortOrder)
           .limit(limit + 1);
 
         if (params?.pagination?.cursor) {
-          const cursorDoc = await firestore
-            .collection('workflow_runs')
-            .doc(runId)
-            .collection('events')
-            .doc(params.pagination.cursor)
-            .get();
-          if (cursorDoc.exists) {
-            query = query.startAfter(cursorDoc);
-          }
+          query = query.startAfter(params.pagination.cursor);
         }
 
         const snapshot = await query.get();
@@ -1048,14 +1330,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const hasMore = all.length > limit;
 
         return {
-          data: values.map((doc) => {
-            const data = doc.data();
-            return {
-              ...data,
-              eventData: convertBuffersToUint8Array(data.eventData),
-              createdAt: fromFirestoreTimestamp(data.createdAt),
-            } as Event;
-          }),
+          data: values.map((doc) => eventFromDoc(doc.data())),
           cursor: values.at(-1)?.id ?? null,
           hasMore,
         };
@@ -1066,36 +1341,27 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
 
-        // Query across all runs for this correlationId
+        // Query across all runs for this correlationId, ordered and
+        // paginated by the monotonic eventId (see events.list).
         let query: Query = firestore
           .collectionGroup('events')
           .where('correlationId', '==', correlationId)
-          .orderBy('createdAt', sortOrder)
+          .orderBy('eventId', sortOrder)
           .limit(limit + 1);
 
         if (params?.pagination?.cursor) {
-          // For collection group queries, use the timestamp value directly
-          // Cursor is a serialized ISO timestamp string
-          const cursorDate = new Date(params.pagination.cursor);
-          query = query.startAfter(cursorDate);
+          query = query.startAfter(params.pagination.cursor);
         }
 
         const snapshot = await query.get();
         const all = snapshot.docs;
         const values = all.slice(0, limit);
         const hasMore = all.length > limit;
+        const lastEventId = values.at(-1)?.data().eventId;
 
         return {
-          data: values.map((doc) => {
-            const data = doc.data();
-            return {
-              ...data,
-              eventData: convertBuffersToUint8Array(data.eventData),
-              createdAt: fromFirestoreTimestamp(data.createdAt),
-            } as Event;
-          }),
-          // Use the createdAt timestamp as cursor for collection group queries
-          cursor: values.at(-1)?.data().createdAt?.toDate().toISOString() ?? null,
+          data: values.map((doc) => eventFromDoc(doc.data())),
+          cursor: typeof lastEventId === 'string' ? lastEventId : null,
           hasMore,
         };
       },
@@ -1144,17 +1410,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
         return {
           data: values.map((doc) => {
-            const data = doc.data();
-            const step = deserializeStepError({
-              ...data,
-              input: deserializeNestedArrays(data.input),
-              output: deserializeNestedArrays(data.output),
-              createdAt: fromFirestoreTimestamp(data.createdAt),
-              updatedAt: fromFirestoreTimestamp(data.updatedAt),
-              startedAt: fromFirestoreTimestamp(data.startedAt),
-              completedAt: fromFirestoreTimestamp(data.completedAt),
-              retryAfter: fromFirestoreTimestamp(data.retryAfter),
-            });
+            const step = stepFromDoc(doc.data());
             return filterData(step, params?.resolveData, ['input', 'output']);
           }),
           cursor: values.at(-1)?.id ?? null,
@@ -1179,24 +1435,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             .get();
 
           if (hooksQuery.empty) {
-            throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
-              status: 404,
-            });
+            throw new HookNotFoundError(hookId);
           }
 
           const doc = hooksQuery.docs[0];
-          const data = doc.data() as FirebaseFirestore.DocumentData;
-          const parsed = HookSchema.parse({
-            runId: data.runId,
-            hookId: data.hookId,
-            token: data.token,
-            ownerId: data.ownerId || '',
-            projectId: data.projectId || '',
-            environment: data.environment || '',
-            specVersion: data.specVersion,
-            createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
-            metadata: deserializeNestedArrays(data.metadata),
-          });
+          const parsed = hookFromDoc(doc.data());
           const resolveData = params?.resolveData ?? 'all';
           return filterHookData(parsed, resolveData);
         } catch (error) {
@@ -1210,23 +1453,12 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const doc = await firestore.collection('hooks_by_token').doc(token).get();
 
         if (!doc.exists) {
-          throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
-            status: 404,
-          });
+          // Typed error: core's documented resume-or-start pattern matches
+          // this by name via HookNotFoundError.is().
+          throw new HookNotFoundError(token);
         }
 
-        const data = doc.data() as FirebaseFirestore.DocumentData;
-        const parsed = HookSchema.parse({
-          runId: data.runId,
-          hookId: data.hookId,
-          token: data.token,
-          ownerId: data.ownerId || '',
-          projectId: data.projectId || '',
-          environment: data.environment || '',
-          specVersion: data.specVersion,
-          createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
-          metadata: deserializeNestedArrays(data.metadata),
-        });
+        const parsed = hookFromDoc(doc.data() as FirebaseFirestore.DocumentData);
         const resolveData = params?.resolveData ?? 'all';
         return filterHookData(parsed, resolveData);
       },
@@ -1266,18 +1498,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
         return {
           data: values.map((doc) => {
-            const data = doc.data();
-            const parsed = HookSchema.parse({
-              runId: data.runId,
-              hookId: data.hookId,
-              token: data.token,
-              ownerId: data.ownerId || '',
-              projectId: data.projectId || '',
-              environment: data.environment || '',
-              specVersion: data.specVersion,
-              createdAt: fromFirestoreTimestamp(data.createdAt) || new Date(),
-              metadata: deserializeNestedArrays(data.metadata),
-            });
+            const parsed = hookFromDoc(doc.data());
             return filterHookData(parsed, params?.resolveData ?? 'all');
           }),
           cursor: values.at(-1)?.id ?? null,

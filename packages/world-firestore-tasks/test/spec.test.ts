@@ -54,11 +54,7 @@ if (process.platform === 'win32') {
 
   // Wrap createTestSuite in a describe block with extended timeout
   // to handle slow CI environments (especially Firestore emulator)
-  describe(
-    '@fantasticfour/world-firestore-tasks spec tests',
-    () => {
-      createTestSuite('@fantasticfour/world-firestore-tasks');
-    },
-    { timeout: 120_000 },
-  );
+  describe('@fantasticfour/world-firestore-tasks spec tests', { timeout: 120_000 }, () => {
+    createTestSuite('@fantasticfour/world-firestore-tasks');
+  });
 }

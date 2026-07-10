@@ -1,11 +1,13 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { parse, stringify } from '@fantasticfour/shared';
 import type { Firestore } from '@google-cloud/firestore';
 import type { CloudTasksClient } from '@google-cloud/tasks';
 import type { Queue } from '@workflow/world';
 import {
   MessageId,
+  parseQueueName,
+  type QueueKind,
   type QueuePayload,
-  type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
@@ -39,14 +41,24 @@ interface PumpEnvelope {
   queueName: ValidQueueName;
   attempt: number;
   message: QueuePayload;
+  /** Dedup key held while the message is inflight (queued, dispatching, or backing off). */
+  idempotencyKey?: string;
 }
 
 type Pathname = 'flow' | 'step';
 
 const QUEUE_PATHNAMES = {
-  __wkf_workflow_: 'flow',
-  __wkf_step_: 'step',
-} as const satisfies Record<QueuePrefix, Pathname>;
+  workflow: 'flow',
+  step: 'step',
+} as const satisfies Record<QueueKind, Pathname>;
+
+/**
+ * How long processed-task dedup markers stay relevant. Cloud Tasks only
+ * deduplicates task names for ~1h after completion, so 24h of marker
+ * retention is comfortably conservative. Configure a Firestore TTL policy
+ * on `processed_tasks.expiresAt` to garbage-collect markers.
+ */
+const PROCESSED_TASK_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Sanitize a string for use as a Cloud Tasks task name.
@@ -89,6 +101,21 @@ function createTestPump(config: CloudTasksConfig) {
   const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
   let running = false;
 
+  /**
+   * Inflight messages by idempotency key. The runtime re-enqueues pending
+   * steps on every workflow replay with `idempotencyKey: stepId` and relies
+   * on the queue to dedupe — without this, a step gets delivered (and
+   * executed) concurrently multiple times, appending duplicate step events
+   * that corrupt the event log on replay.
+   */
+  const inflightMessages = new Map<string, string>();
+
+  function settle(envelope: PumpEnvelope) {
+    if (envelope.idempotencyKey) {
+      inflightMessages.delete(envelope.idempotencyKey);
+    }
+  }
+
   function enqueue(pathname: Pathname, envelope: PumpEnvelope) {
     queues[pathname].push(envelope);
     wakers[pathname].shift()?.();
@@ -102,21 +129,51 @@ function createTestPump(config: CloudTasksConfig) {
     });
   }
 
+  /**
+   * Retry a failed delivery with exponential backoff, or drop it once
+   * maxAttempts is exhausted. Fetch-level exceptions (connection refused,
+   * timeouts) take this path too — a transient network error must not
+   * permanently swallow the message.
+   */
+  function retryOrDrop(envelope: PumpEnvelope, pathname: Pathname, reason: string) {
+    if (envelope.attempt < maxAttempts) {
+      const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
+      const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
+      void delay(backoff).then(() => enqueue(pathname, next));
+    } else {
+      settle(envelope);
+      console.error(
+        `[world-firestore-tasks test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
+      );
+    }
+  }
+
   async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
     const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-vqs-queue-name': envelope.queueName,
-        'x-vqs-message-id': envelope.messageId,
-        'x-vqs-message-attempt': String(envelope.attempt),
-      },
-      body: JSON.stringify(envelope.message),
-      signal: AbortSignal.timeout(httpTimeoutMs),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-vqs-queue-name': envelope.queueName,
+          'x-vqs-message-id': envelope.messageId,
+          'x-vqs-message-attempt': String(envelope.attempt),
+        },
+        // Tagged-JSON transport: preserves Uint8Array payloads (runInput)
+        // across the queue boundary, required for SPEC_VERSION_CURRENT.
+        body: stringify(envelope.message),
+        signal: AbortSignal.timeout(httpTimeoutMs),
+      });
+    } catch (err) {
+      retryOrDrop(envelope, pathname, `fetch error: ${String(err)}`);
+      return;
+    }
 
-    if (response.ok) return;
+    if (response.ok) {
+      settle(envelope);
+      return;
+    }
 
     const text = await response.text();
 
@@ -134,15 +191,7 @@ function createTestPump(config: CloudTasksConfig) {
       }
     }
 
-    if (envelope.attempt < maxAttempts) {
-      const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
-      const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
-      void delay(backoff).then(() => enqueue(pathname, next));
-    } else {
-      console.error(
-        `[world-firestore-tasks test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
-      );
-    }
+    retryOrDrop(envelope, pathname, `HTTP ${response.status}: ${text}`);
   }
 
   async function loop(pathname: Pathname) {
@@ -152,14 +201,27 @@ function createTestPump(config: CloudTasksConfig) {
       try {
         await dispatch(envelope, pathname);
       } catch (err) {
+        // dispatch handles fetch errors itself; anything reaching here is a
+        // bug in the pump. Re-queue rather than silently dropping.
         console.error(`[world-firestore-tasks test pump] dispatch error on ${pathname}:`, err);
+        retryOrDrop(envelope, pathname, `pump error: ${String(err)}`);
       }
     }
   }
 
   return {
-    push(pathname: Pathname, envelope: PumpEnvelope) {
-      enqueue(pathname, envelope);
+    getInflight(idempotencyKey: string): string | undefined {
+      return inflightMessages.get(idempotencyKey);
+    },
+    push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number) {
+      if (envelope.idempotencyKey) {
+        inflightMessages.set(envelope.idempotencyKey, envelope.messageId);
+      }
+      if (delaySeconds && delaySeconds > 0) {
+        void delay(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
+      } else {
+        enqueue(pathname, envelope);
+      }
     },
     async start() {
       if (running) return;
@@ -172,14 +234,6 @@ function createTestPump(config: CloudTasksConfig) {
       for (const list of Object.values(wakers)) for (const w of list) w();
     },
   };
-}
-
-function parseQueuePrefix(name: ValidQueueName): QueuePrefix {
-  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
-  for (const p of prefixes) {
-    if (name.startsWith(p)) return p;
-  }
-  throw new Error(`Invalid queue name: ${name}`);
 }
 
 export function createQueue(config: CloudTasksConfig): Queue & {
@@ -213,7 +267,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
         }
         const attempt = Number.parseInt(attemptStr, 10);
         try {
-          const body = await req.json();
+          const body = parse<unknown>(await req.text());
           const result = await handler(body, {
             attempt,
             queueName: reqQueueName,
@@ -234,48 +288,79 @@ export function createQueue(config: CloudTasksConfig): Queue & {
     return async (req: Request) => {
       try {
         const url = new URL(req.url);
-        const receivedQueueName = url.pathname.split('/').pop() as
-          | `__wkf_workflow_${string}`
-          | `__wkf_step_${string}`;
+        const receivedQueueName = url.pathname.split('/').pop() as ValidQueueName;
 
         if (!receivedQueueName.startsWith(queueNamePrefix)) {
           return new Response('Invalid queue', { status: 400 });
         }
 
-        const message = await req.json();
+        const message = parse<unknown>(await req.text());
 
         const taskName = req.headers.get('X-CloudTasks-TaskName') || '';
         const taskId = taskName.split('/').pop() || Date.now().toString();
         const attemptStr = req.headers.get('X-CloudTasks-TaskExecutionCount') || '0';
         const attempt = Number.parseInt(attemptStr, 10) + 1;
 
-        if (firestore && taskName) {
-          const wasProcessed = await firestore.runTransaction(async (tx) => {
-            const ref = firestore.collection('processed_tasks').doc(sanitizeTaskName(taskId));
-            const snap = await tx.get(ref);
-            if (snap.exists) return true;
-
-            tx.set(ref, {
-              taskName,
-              processedAt: new Date(),
-            });
-            return false;
-          });
-
-          if (wasProcessed) {
+        // Dedup check only — the marker is written AFTER the handler
+        // succeeds. Writing it up front would permanently swallow the
+        // message when the handler fails: Cloud Tasks redelivers, the guard
+        // sees the marker, and acks without running the handler.
+        const processedRef =
+          firestore && taskName
+            ? firestore.collection('processed_tasks').doc(sanitizeTaskName(taskId))
+            : undefined;
+        if (processedRef) {
+          const snap = await processedRef.get();
+          if (snap.exists) {
             debug('duplicate task delivery, ignoring', { taskName, taskId });
             return new Response('OK', { status: 200 });
           }
         }
 
-        await handler(message, {
+        const result = await handler(message, {
           attempt,
           queueName: receivedQueueName,
           messageId: MessageId.parse(`msg_${taskId}`),
         });
 
+        // { timeoutSeconds } is core's retry/sleep signal: the message must
+        // be redelivered after the delay (workflow suspension, step retry
+        // backoff, TooEarlyError). Schedule a fresh task — an unnamed task
+        // is not subject to name-based dedup, and the original delivery can
+        // safely be acked below.
+        if (result && typeof result.timeoutSeconds === 'number') {
+          if (!client) throw new Error('Cloud Tasks client not initialized');
+          const delaySeconds = Math.max(0, Math.ceil(result.timeoutSeconds));
+          await client.createTask({
+            parent,
+            task: {
+              httpRequest: {
+                url: req.url,
+                httpMethod: 'POST' as const,
+                headers: { 'Content-Type': 'application/json' },
+                body: Buffer.from(stringify(message)).toString('base64'),
+              },
+              scheduleTime: {
+                seconds: Math.floor(Date.now() / 1000) + delaySeconds,
+              },
+            },
+          });
+        }
+
+        // Mark this delivery processed only now that the handler (and any
+        // redelivery scheduling) has succeeded, so failed deliveries retry.
+        if (processedRef) {
+          await processedRef.set({
+            taskName,
+            processedAt: new Date(),
+            expiresAt: new Date(Date.now() + PROCESSED_TASK_TTL_MS),
+          });
+        }
+
         return new Response('OK', { status: 200 });
       } catch (error) {
+        // Non-2xx → Cloud Tasks redelivers with backoff. The processed_tasks
+        // marker was not written, so the retry will run the handler again.
         return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
       }
     };
@@ -284,14 +369,25 @@ export function createQueue(config: CloudTasksConfig): Queue & {
   return {
     async queue(name, message, opts) {
       if (isTestMode()) {
-        const queuePrefix = parseQueuePrefix(name);
+        const { kind } = parseQueueName(name);
+        if (opts?.idempotencyKey) {
+          const existing = testPump.getInflight(opts.idempotencyKey);
+          if (existing) {
+            return { messageId: MessageId.parse(existing) };
+          }
+        }
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-        testPump.push(QUEUE_PATHNAMES[queuePrefix], {
-          messageId,
-          queueName: name,
-          attempt: 1,
-          message,
-        });
+        testPump.push(
+          QUEUE_PATHNAMES[kind],
+          {
+            messageId,
+            queueName: name,
+            attempt: 1,
+            message,
+            idempotencyKey: opts?.idempotencyKey,
+          },
+          opts?.delaySeconds,
+        );
         return { messageId };
       }
 
@@ -305,10 +401,15 @@ export function createQueue(config: CloudTasksConfig): Queue & {
           url: `${targetUrl}/queue/${name}`,
           httpMethod: 'POST' as const,
           headers: { 'Content-Type': 'application/json' },
-          body: Buffer.from(JSON.stringify(message)).toString('base64'),
+          // Tagged-JSON transport: preserves Uint8Array payloads (runInput)
+          // across the queue boundary, required for SPEC_VERSION_CURRENT.
+          body: Buffer.from(stringify(message)).toString('base64'),
         },
         name: sanitizedKey
           ? client.taskPath(project, location, queueName, sanitizedKey)
+          : undefined,
+        scheduleTime: opts?.delaySeconds
+          ? { seconds: Math.floor(Date.now() / 1000) + opts.delaySeconds }
           : undefined,
       };
 
