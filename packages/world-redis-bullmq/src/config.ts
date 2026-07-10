@@ -79,10 +79,15 @@ export interface RedisWorldConfig {
   httpTimeoutMs?: number;
 
   /**
-   * Idempotency deduplication window (ms) for BullMQ native deduplication.
-   * When `idempotencyKey` is supplied to `queue()`, a duplicate enqueue within
-   * this window is dropped.
-   * Default: 60_000 (1 minute)
+   * Optional TTL (ms) for BullMQ native deduplication when `idempotencyKey`
+   * is supplied to `queue()`. By default no TTL is applied: the dedup key
+   * lives until the job completes or fails, so duplicate enqueues are dropped
+   * for the entire lifetime of the pending/delayed job (the semantics the
+   * workflow runtime relies on when re-enqueuing pending steps on replay).
+   * Only set this if you need the dedup guard to expire on wall-clock time —
+   * it must be much larger than the longest expected queue delay/backlog,
+   * otherwise duplicate step executions become possible.
+   * Default: undefined (dedup key released on job completion)
    */
   idempotencyTtlMs?: number;
 }

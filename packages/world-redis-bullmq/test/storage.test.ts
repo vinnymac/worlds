@@ -8,6 +8,7 @@ import {
   createRunsStorage,
   createStepsStorage,
 } from '../src/storage.js';
+import { createStreamer } from '../src/streamer.js';
 
 describe('Storage (Redis integration)', () => {
   if (process.platform === 'win32') {
@@ -143,9 +144,9 @@ describe('Storage (Redis integration)', () => {
         expect(retrieved.input).toEqual(['arg']);
       });
 
-      it('should throw error for non-existent run', async () => {
+      it('should throw WorkflowRunNotFoundError for non-existent run', async () => {
         await expect(runs.get('missing')).rejects.toMatchObject({
-          status: 404,
+          name: 'WorkflowRunNotFoundError',
         });
       });
     });
@@ -607,6 +608,303 @@ describe('Storage (Redis integration)', () => {
       });
       const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
+    });
+
+    it('should throw WorkflowRunNotFoundError for run_started on missing run without bootstrap data', async () => {
+      await expect(
+        events.create('wrun_missing_run', { eventType: 'run_started' }),
+      ).rejects.toMatchObject({ name: 'WorkflowRunNotFoundError' });
+    });
+  });
+
+  describe('Error taxonomy (core matches errors by name)', () => {
+    it('should throw EntityConflictError for step_started on a terminal step', async () => {
+      const run = await createRun();
+      const stepId = 'step-terminal-guard';
+      await createStep(run.runId, { stepId });
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: { result: 'ok' },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_started',
+          correlationId: stepId,
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+    });
+
+    it('should throw EntityConflictError for duplicate step_completed', async () => {
+      const run = await createRun();
+      const stepId = 'step-double-complete';
+      await createStep(run.runId, { stepId });
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: { result: 'ok' },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_completed',
+          correlationId: stepId,
+          eventData: { result: 'ok again' },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+    });
+
+    it('should throw HookNotFoundError for hook_disposed on a missing hook', async () => {
+      const run = await createRun();
+      await expect(
+        events.create(run.runId, {
+          eventType: 'hook_disposed',
+          correlationId: 'hook-never-created',
+        }),
+      ).rejects.toMatchObject({ name: 'HookNotFoundError' });
+    });
+
+    it('should throw HookNotFoundError from hooks.get and hooks.getByToken', async () => {
+      await expect(_hooks.get('missing-hook')).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+      await expect(_hooks.getByToken('missing-token')).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+    });
+  });
+
+  describe('step retry backoff (retryAfter)', () => {
+    it('should reject early step_started with TooEarlyError while retryAfter is in the future', async () => {
+      const run = await createRun();
+      const stepId = 'step-backoff';
+      await createStep(run.runId, { stepId });
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: stepId,
+        eventData: { error: 'boom', retryAfter: new Date(Date.now() + 60_000) },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_started',
+          correlationId: stepId,
+        }),
+      ).rejects.toMatchObject({ name: 'TooEarlyError' });
+    });
+
+    it('should clear retryAfter once the step starts after the backoff window', async () => {
+      const run = await createRun();
+      const stepId = 'step-backoff-elapsed';
+      await createStep(run.runId, { stepId });
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: stepId,
+        eventData: { error: 'boom', retryAfter: new Date(Date.now() - 1000) },
+      });
+
+      const beforeRestart = await steps.get(run.runId, stepId);
+      expect(beforeRestart.retryAfter).toBeInstanceOf(Date);
+
+      const result = await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: stepId,
+      });
+      expect(result.step?.status).toBe('running');
+      expect(result.step?.retryAfter).toBeUndefined();
+
+      const persisted = await steps.get(run.runId, stepId);
+      expect(persisted.retryAfter).toBeUndefined();
+    });
+  });
+
+  describe('hook_created duplicate semantics', () => {
+    it('should throw EntityConflictError for a duplicate hook_created of the same hook', async () => {
+      const run = await createRun();
+      const hookId = 'hook-duplicate-same';
+      const token = 'token-duplicate-same';
+
+      const first = await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId,
+        eventData: { token },
+      });
+      expect(first.hook).toBeDefined();
+
+      // Duplicate delivery of the SAME (runId, hookId): must be an
+      // EntityConflictError, NOT a self hook_conflict event that would
+      // poison later replays with HookConflictError.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'hook_created',
+          correlationId: hookId,
+          eventData: { token },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      const eventList = await events.listByCorrelationId({
+        correlationId: hookId,
+        pagination: {},
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'hook_conflict')).toHaveLength(0);
+    });
+
+    it('should recover a crash orphan (hook entity without hook_created event)', async () => {
+      const run = await createRun();
+      const hookId = 'hook-orphan';
+      const token = 'token-orphan';
+
+      // Simulate a crash between the hook entity write and the event write:
+      // create the hook entity + indexes directly, with no hook_created event.
+      const orphanHook = {
+        runId: run.runId,
+        hookId,
+        token,
+        ownerId: '',
+        projectId: '',
+        environment: '',
+        specVersion: 4,
+        createdAt: new Date(),
+      };
+      await redis.set(`${keyPrefix}hook:${hookId}`, JSON.stringify(orphanHook));
+      await redis.set(`${keyPrefix}hooks:by_token:${token}`, hookId);
+      await redis.zadd(`${keyPrefix}hooks:by_run:${run.runId}`, Date.now(), hookId);
+
+      // Replayed hook_created completes the partial write instead of
+      // recording a self hook_conflict.
+      const result = await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId,
+        eventData: { token },
+      });
+      expect(result.hook?.hookId).toBe(hookId);
+      expect(result.event?.eventType).toBe('hook_created');
+
+      const eventList = await events.listByCorrelationId({
+        correlationId: hookId,
+        pagination: {},
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'hook_created')).toHaveLength(1);
+      expect(eventList.data.filter((e) => e.eventType === 'hook_conflict')).toHaveLength(0);
+    });
+
+    it('should record hook_conflict with conflictingRunId when another run holds the token', async () => {
+      const runA = await createRun();
+      const runB = await createRun();
+      const token = 'token-cross-run';
+
+      await events.create(runA.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-owner',
+        eventData: { token },
+      });
+
+      const result = await events.create(runB.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-intruder',
+        eventData: { token },
+      });
+
+      expect(result.hook).toBeUndefined();
+      expect(result.event?.eventType).toBe('hook_conflict');
+      expect(
+        (result.event as { eventData?: { conflictingRunId?: string } }).eventData,
+      ).toMatchObject({
+        token,
+        conflictingRunId: runA.runId,
+      });
+    });
+  });
+
+  describe('runs.list combined filtering', () => {
+    it('should paginate correctly when combining workflowName and status filters', async () => {
+      const workflowName = 'combined-filter-workflow';
+
+      // 12 runs of the same workflow; complete every other one, so 6 remain
+      // pending. With limit 3 the pending runs span multiple index pages.
+      const runIds: string[] = [];
+      for (let i = 0; i < 12; i++) {
+        const run = await createRun({ workflowName });
+        runIds.push(run.runId);
+        if (i % 2 === 0) {
+          await events.create(run.runId, { eventType: 'run_started' });
+          await events.create(run.runId, {
+            eventType: 'run_completed',
+            eventData: { output: ['done'] },
+          });
+        }
+        await setTimeout(2);
+      }
+
+      const collected: string[] = [];
+      let cursor: string | null | undefined;
+      for (let page = 0; page < 10; page++) {
+        const result = await runs.list({
+          workflowName,
+          status: 'pending',
+          pagination: { limit: 3, ...(cursor ? { cursor } : {}) },
+        });
+        collected.push(...result.data.map((r) => r.runId));
+        if (!result.hasMore) break;
+        cursor = result.cursor;
+      }
+
+      const expectedPending = runIds.filter((_, i) => i % 2 === 1);
+      expect(new Set(collected)).toEqual(new Set(expectedPending));
+    });
+  });
+
+  describe('streamer', () => {
+    it('should not drop chunks when stream sequence numbers cross a digit boundary', async () => {
+      const streamer = createStreamer({ redis, keyPrefix });
+      try {
+        // Pre-populate a stream with entries in the same millisecond whose
+        // sequence numbers cross the 9 → 10 digit boundary. Lexicographic ID
+        // comparison would drop entries 7-10 through 7-12 and the eof marker.
+        const streamName = 'digit-boundary-stream';
+        const key = `${keyPrefix}stream:${streamName}`;
+        for (let seq = 1; seq <= 12; seq++) {
+          await redis.xadd(
+            key,
+            `7-${seq}`,
+            'data',
+            Buffer.from(`chunk-${seq}`).toString('base64'),
+            'eof',
+            'false',
+          );
+        }
+        await redis.xadd(key, '7-13', 'data', '', 'eof', 'true');
+
+        const stream = await streamer.readFromStream(streamName);
+        const reader = stream.getReader();
+        const chunks: string[] = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) chunks.push(Buffer.from(value).toString());
+        }
+
+        expect(chunks).toEqual(Array.from({ length: 12 }, (_, i) => `chunk-${i + 1}`));
+      } finally {
+        await streamer.close();
+      }
     });
   });
 });
