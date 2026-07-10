@@ -22,6 +22,20 @@
       "when": 1778300000000,
       "tag": "0002_outbox_and_notify",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1783652629667,
+      "tag": "0003_events_occurred_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1783900000000,
+      "tag": "0004_hooks_token_unique_stream_run_id",
+      "breakpoints": true
     }
   ]
 }

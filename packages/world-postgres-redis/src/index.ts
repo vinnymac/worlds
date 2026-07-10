@@ -1,4 +1,5 @@
 import type { Storage, World } from '@workflow/world';
+import { reenqueueActiveRuns, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { Redis } from 'ioredis';
 import createPostgres from 'postgres';
 import type { PostgresWorldConfig } from './config.js';
@@ -34,6 +35,7 @@ export function createWorld(
   },
 ): World & {
   start(): Promise<void>;
+  close(): Promise<void>;
   getHealth(): Promise<PostgresRedisHealthResult>;
   subscribeToRunUpdates(listener: RunUpdateListener): () => void;
 } {
@@ -54,6 +56,11 @@ export function createWorld(
   const runUpdateSubscriber = createRunUpdateSubscriber(postgres);
 
   return {
+    // Declares support for the current spec (CBOR queue transport +
+    // resilient-start runInput bootstrap). Without this, core creates runs at
+    // the baseline spec and never sends runInput through the queue, so a
+    // transiently failed run_created can never be recovered.
+    specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,
     ...queue,
@@ -61,6 +68,14 @@ export function createWorld(
     subscribeToRunUpdates: (listener: RunUpdateListener) => runUpdateSubscriber.subscribe(listener),
     async start() {
       await queue.start();
+      await reenqueueActiveRuns(storage.runs, queue.queue, 'world-postgres-redis');
+    },
+    async close() {
+      await queue.close();
+      await postgres.end({ timeout: 5 });
+      await redis.quit().catch(() => {
+        redis.disconnect();
+      });
     },
   };
 }

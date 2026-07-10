@@ -17,6 +17,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  uniqueIndex,
   varchar,
 } from 'drizzle-orm/pg-core';
 import { Cbor, type Cborized } from './cbor.js';
@@ -91,6 +92,7 @@ export const events = schema.table(
     eventType: varchar('type').$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
+    occurredAt: timestamp('occurred_at'),
     runId: varchar('run_id').notNull(),
     /** @deprecated */
     eventDataJson: jsonb('payload'),
@@ -144,7 +146,10 @@ export const hooks = schema.table(
     specVersion: integer('spec_version'),
     isWebhook: boolean('is_webhook'),
   } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
-  (tb) => [index().on(tb.runId), index().on(tb.token)],
+  // token is UNIQUE so concurrent hook_created calls for the same token
+  // cannot both insert (the hook_created handler routes the loser to the
+  // duplicate / hook_conflict paths).
+  (tb) => [index().on(tb.runId), uniqueIndex('workflow_hooks_token_index').on(tb.token)],
 );
 
 export const outbox = schema.table(
@@ -171,11 +176,11 @@ export const streams = schema.table(
   {
     chunkId: varchar('id').$type<`chnk_${string}`>().notNull(),
     streamId: varchar('stream_id').notNull(),
+    /** Owning workflow run — nullable because pre-existing rows predate it. */
+    runId: varchar('run_id'),
     chunkData: bytea('data').notNull(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     eof: boolean('eof').notNull(),
   },
-  (tb) => ({
-    primaryKey: primaryKey({ columns: [tb.streamId, tb.chunkId] }),
-  }),
+  (tb) => [primaryKey({ columns: [tb.streamId, tb.chunkId] }), index().on(tb.runId)],
 );

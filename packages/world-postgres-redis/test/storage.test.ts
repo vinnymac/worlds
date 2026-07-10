@@ -1,6 +1,7 @@
 import { execSync } from 'node:child_process';
 import { setTimeout } from 'node:timers/promises';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import { EntityConflictError, TooEarlyError, WorkflowRunNotFoundError } from '@workflow/errors';
 import type { Hook, Step, WorkflowRun } from '@workflow/world';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
@@ -209,10 +210,10 @@ describe('Storage (Postgres integration)', () => {
         expect(retrieved.input).toEqual(['arg']);
       });
 
-      it('should throw error for non-existent run', async () => {
-        await expect(runs.get('missing')).rejects.toMatchObject({
-          status: 404,
-        });
+      it('should throw WorkflowRunNotFoundError for non-existent run', async () => {
+        await expect(runs.get('missing')).rejects.toSatisfy((error) =>
+          WorkflowRunNotFoundError.is(error),
+        );
       });
     });
 
@@ -951,6 +952,43 @@ describe('Storage (Postgres integration)', () => {
       ).rejects.toThrow(/terminal/i);
     });
 
+    it('should throw EntityConflictError when failing a completed run', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_completed', { output: ['done'] });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'run_failed',
+          eventData: { error: 'boom' },
+        }),
+      ).rejects.toSatisfy((error) => EntityConflictError.is(error));
+
+      const persisted = await runs.get(run.runId);
+      expect(persisted.status).toBe('completed');
+      expect(persisted.output).toEqual(['done']);
+    });
+
+    it('should throw EntityConflictError when cancelling a completed run', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_completed', { output: ['done'] });
+
+      await expect(events.create(run.runId, { eventType: 'run_cancelled' })).rejects.toSatisfy(
+        (error) => EntityConflictError.is(error),
+      );
+
+      // Run stays parseable and completed — never a cancelled run with output
+      const persisted = await runs.get(run.runId);
+      expect(persisted.status).toBe('completed');
+    });
+
     it('should allow run_cancelled on already cancelled run (idempotent)', async () => {
       const run = await createRun(events, {
         deploymentId: 'deployment-123',
@@ -1051,6 +1089,50 @@ describe('Storage (Postgres integration)', () => {
       expect(result.step?.retryAfter).toBeInstanceOf(Date);
     });
 
+    it('should throw TooEarlyError when step_started arrives before retryAfter', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_too_early',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_too_early', 'step_started');
+
+      await events.create(testRunId, {
+        eventType: 'step_retrying',
+        correlationId: 'step_too_early',
+        eventData: {
+          error: 'Temporary failure',
+          retryAfter: new Date(Date.now() + 60_000),
+        },
+      });
+
+      await expect(
+        updateStep(events, testRunId, 'step_too_early', 'step_started'),
+      ).rejects.toSatisfy((error) => TooEarlyError.is(error));
+    });
+
+    it('should clear retryAfter once the step starts again', async () => {
+      await createStep(events, testRunId, {
+        stepId: 'step_retry_clear',
+        stepName: 'test-step',
+        input: [],
+      });
+      await updateStep(events, testRunId, 'step_retry_clear', 'step_started');
+
+      await events.create(testRunId, {
+        eventType: 'step_retrying',
+        correlationId: 'step_retry_clear',
+        eventData: {
+          error: 'Temporary failure',
+          retryAfter: new Date(Date.now() - 1000),
+        },
+      });
+
+      const restarted = await updateStep(events, testRunId, 'step_retry_clear', 'step_started');
+      expect(restarted.retryAfter).toBeUndefined();
+      expect(restarted.attempt).toBe(2);
+    });
+
     it('should increment attempt when step_started is called after step_retrying', async () => {
       await createStep(events, testRunId, {
         stepId: 'step_retry_2',
@@ -1084,7 +1166,7 @@ describe('Storage (Postgres integration)', () => {
       testRunId = run.runId;
     });
 
-    it('should return hook_conflict event for duplicate token', async () => {
+    it('should return hook_conflict event with conflictingRunId for duplicate token', async () => {
       const token = 'unique-token-test';
 
       await events.create(testRunId, {
@@ -1106,7 +1188,30 @@ describe('Storage (Postgres integration)', () => {
       });
 
       expect(result.event?.eventType).toBe('hook_conflict');
+      expect(result.event?.eventData).toMatchObject({ token, conflictingRunId: testRunId });
       expect(result.hook).toBeUndefined();
+    });
+
+    it('should throw EntityConflictError for a re-delivered hook_created of the same hook', async () => {
+      const token = 'same-hook-duplicate-token';
+
+      await events.create(testRunId, {
+        eventType: 'hook_created' as const,
+        correlationId: 'hook_same',
+        eventData: { token },
+      });
+
+      await expect(
+        events.create(testRunId, {
+          eventType: 'hook_created' as const,
+          correlationId: 'hook_same',
+          eventData: { token },
+        }),
+      ).rejects.toSatisfy((error) => EntityConflictError.is(error));
+
+      // No hook_conflict event may be written into the run's log
+      const eventList = await events.list({ runId: testRunId, pagination: { sortOrder: 'asc' } });
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
     });
 
     it('should allow token reuse after hook is disposed', async () => {
@@ -1263,6 +1368,31 @@ describe('Storage (Postgres integration)', () => {
       });
       const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
+    });
+  });
+
+  describe('resilient start (run_started bootstrap)', () => {
+    it('should bootstrap the run from run_started eventData and return the run entity', async () => {
+      const runId = `wrun_bootstrap_${Date.now()}`;
+
+      const result = await events.create(runId, {
+        eventType: 'run_started',
+        eventData: {
+          deploymentId: 'deployment-bootstrap',
+          workflowName: 'bootstrap-workflow',
+          input: ['arg1'],
+        },
+      } as Parameters<EventsStorage['create']>[1]);
+
+      expect(result.run).toBeDefined();
+      expect(result.run?.runId).toBe(runId);
+      expect(result.run?.status).toBe('running');
+
+      // The synthetic run_created must sort before run_started
+      const eventList = await events.list({ runId, pagination: { sortOrder: 'asc' } });
+      const types = eventList.data.map((e) => e.eventType);
+      expect(types.indexOf('run_created')).toBeGreaterThanOrEqual(0);
+      expect(types.indexOf('run_created')).toBeLessThan(types.indexOf('run_started'));
     });
   });
 });
