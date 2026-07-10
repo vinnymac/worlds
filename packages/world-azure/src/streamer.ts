@@ -1,4 +1,4 @@
-import type { Container } from '@azure/cosmos';
+import type { Container, SqlQuerySpec } from '@azure/cosmos';
 import type {
   GetChunksOptions,
   StreamChunksResponse,
@@ -13,9 +13,100 @@ interface StreamerConfig {
   streamsContainer: Container;
 }
 
+interface ChunkDoc {
+  id: string;
+  streamId: string;
+  runId: string;
+  /**
+   * Full monotonic ULID (prefixed) — the ordering and pagination key.
+   * ULIDs generated in the same millisecond still sort correctly because the
+   * monotonic factory increments the random suffix, unlike a numeric sequence
+   * derived from the millisecond timestamp alone.
+   */
+  chunkId: string;
+  /** Base64-encoded chunk payload (empty string for eof markers). */
+  chunkData: string;
+  eof: boolean;
+  createdAt: string;
+}
+
+/** Opaque cursor payload for getStreamChunks pagination. */
+interface ChunksCursor {
+  /** Last chunkId of the previous page (exclusive lower bound). */
+  c: string;
+  /** 0-based data index of the first chunk on the next page. */
+  i: number;
+}
+
+function encodeChunksCursor(cursor: ChunksCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64');
+}
+
+function decodeChunksCursor(cursor: string): ChunksCursor | undefined {
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+    if (
+      typeof decoded === 'object' &&
+      decoded !== null &&
+      typeof (decoded as ChunksCursor).c === 'string' &&
+      typeof (decoded as ChunksCursor).i === 'number'
+    ) {
+      return decoded as ChunksCursor;
+    }
+  } catch {
+    // Malformed cursor — treat as start-of-stream (matches world-local).
+  }
+  return undefined;
+}
+
+function decodeChunkData(doc: ChunkDoc): Uint8Array {
+  return new Uint8Array(Buffer.from(doc.chunkData, 'base64'));
+}
+
 export function createStreamer(config: StreamerConfig): Streamer {
   const { streamsContainer } = config;
   const ulid = monotonicFactory();
+
+  async function insertChunk(
+    name: string,
+    runId: string,
+    chunkId: string,
+    data: Buffer,
+    eof: boolean,
+  ): Promise<void> {
+    await withCosmosRetry(() =>
+      streamsContainer.items.create({
+        id: chunkId,
+        streamId: name,
+        runId,
+        chunkId,
+        chunkData: data.toString('base64'),
+        eof,
+        createdAt: new Date().toISOString(),
+      }),
+    );
+  }
+
+  /**
+   * Fetch chunks for a stream in chunkId (ULID) order, strictly after the
+   * given cursor. Passing `null` fetches from the start of the stream.
+   */
+  async function fetchChunksAfter(name: string, afterChunkId: string | null): Promise<ChunkDoc[]> {
+    const conditions = ['c.streamId = @streamId'];
+    const parameters: { name: string; value: string }[] = [{ name: '@streamId', value: name }];
+    if (afterChunkId !== null) {
+      conditions.push('c.chunkId > @cursor');
+      parameters.push({ name: '@cursor', value: afterChunkId });
+    }
+    const querySpec: SqlQuerySpec = {
+      query: `SELECT * FROM c WHERE ${conditions.join(' AND ')} ORDER BY c.chunkId ASC`,
+      parameters,
+    };
+    const { resources } = await withCosmosRetry(() =>
+      streamsContainer.items.query<ChunkDoc>(querySpec, { partitionKey: name }).fetchAll(),
+    );
+    return resources;
+  }
 
   return {
     async writeToStream(
@@ -23,161 +114,81 @@ export function createStreamer(config: StreamerConfig): Streamer {
       _runId: string | Promise<string>,
       chunk: string | Uint8Array,
     ) {
-      // Await runId if it's a promise to ensure proper flushing
-      await _runId;
-
+      // Allocate the chunkId BEFORE awaiting runId so chunks written in
+      // sequence keep their order even when multiple writes await the same
+      // pending runId promise.
       const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const sequence = Number.parseInt(ulid().substring(0, 10), 36);
+      const runId = await _runId;
 
-      const buffer =
-        typeof chunk === 'string'
-          ? Buffer.from(chunk)
-          : Buffer.isBuffer(chunk)
-            ? chunk
-            : Buffer.from(chunk);
-
-      await withCosmosRetry(() =>
-        streamsContainer.items.create({
-          id: chunkId,
-          streamId: name,
-          chunkId,
-          sequence,
-          chunkData: buffer.toString('base64'),
-          eof: false,
-          createdAt: new Date().toISOString(),
-        }),
-      );
+      const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
+      await insertChunk(name, runId, chunkId, buffer, false);
     },
 
     async closeStream(name: string, _runId: string | Promise<string>) {
-      await _runId;
-
       const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const sequence = Number.parseInt(ulid().substring(0, 10), 36);
+      const runId = await _runId;
 
-      await withCosmosRetry(() =>
-        streamsContainer.items.create({
-          id: chunkId,
-          streamId: name,
-          chunkId,
-          sequence,
-          chunkData: '',
-          eof: true,
-          createdAt: new Date().toISOString(),
-        }),
-      );
+      await insertChunk(name, runId, chunkId, Buffer.from([]), true);
     },
 
-    async readFromStream(streamName: string) {
+    async readFromStream(streamName: string, startIndex = 0) {
       let closed = false;
       let pollTimer: ReturnType<typeof setTimeout> | undefined;
-      const chunkBuffer: Array<{ sequence: number; data: Uint8Array }> = [];
-      let nextExpectedSequence = 0;
-      let waitingForData: (() => void) | undefined;
-
-      // Helper: Process a new chunk
-      function handleNewChunk(
-        chunk: Record<string, unknown>,
-        controller: ReadableStreamDefaultController<Uint8Array>,
-      ): 'eof' | 'continue' {
-        if (chunk.eof) {
-          closed = true;
-          controller.close();
-          if (pollTimer) clearTimeout(pollTimer);
-          return 'eof';
-        }
-
-        const data = Buffer.from(chunk.chunkData as string, 'base64');
-        chunkBuffer.push({
-          sequence: chunk.sequence as number,
-          data: new Uint8Array(data),
-        });
-
-        chunkBuffer.sort((a, b) => a.sequence - b.sequence);
-        return 'continue';
-      }
-
-      // Helper: Flush ordered chunks from buffer
-      function flushOrderedChunks(controller: ReadableStreamDefaultController<Uint8Array>) {
-        while (chunkBuffer.length > 0 && chunkBuffer[0].sequence >= nextExpectedSequence) {
-          const nextChunk = chunkBuffer.shift();
-          if (nextChunk) {
-            controller.enqueue(nextChunk.data);
-            nextExpectedSequence = nextChunk.sequence + 1;
-          }
-        }
-      }
-
-      // Helper: Wake any waiting readers
-      function notifyWaitingReaders() {
-        if (waitingForData) {
-          waitingForData();
-          waitingForData = undefined;
-        }
-      }
+      // Exclusive lower bound for the poll query: the last chunkId we have
+      // seen (data or eof). Full-ULID comparison never collides, unlike a
+      // millisecond-derived numeric sequence.
+      let lastSeenChunkId: string | null = null;
 
       return new ReadableStream<Uint8Array>({
         async start(controller) {
-          // First, fetch any historical chunks that already exist
-          const { resources: historicalChunks } = await streamsContainer.items
-            .query(
-              {
-                query: 'SELECT * FROM c WHERE c.streamId = @streamId ORDER BY c.sequence ASC',
-                parameters: [{ name: '@streamId', value: streamName }],
-              },
-              { partitionKey: streamName },
-            )
-            .fetchAll();
-
-          // Process historical chunks in order
-          for (const chunk of historicalChunks) {
-            if (chunk.eof) {
-              closed = true;
-              controller.close();
-              return;
-            }
-
-            const data = Buffer.from(chunk.chunkData, 'base64');
-            controller.enqueue(new Uint8Array(data));
-            nextExpectedSequence = chunk.sequence + 1;
+          function finish() {
+            closed = true;
+            if (pollTimer) clearTimeout(pollTimer);
+            controller.close();
           }
 
-          if (closed) return;
+          /**
+           * Enqueue chunks in order, skipping the first `skipCount` data
+           * chunks. Returns 'eof' when the stream-end marker is reached —
+           * anything ordered after the marker is never delivered.
+           */
+          function deliver(docs: ChunkDoc[], skipCount: number): 'eof' | 'continue' {
+            let skipped = 0;
+            for (const doc of docs) {
+              lastSeenChunkId = doc.chunkId;
+              if (doc.eof) {
+                finish();
+                return 'eof';
+              }
+              if (skipped < skipCount) {
+                skipped++;
+                continue;
+              }
+              controller.enqueue(decodeChunkData(doc));
+            }
+            return 'continue';
+          }
 
-          // Set up polling for new chunks (Cosmos DB Change Feed alternative)
-          // Polling is simpler and more reliable for this use case than the Change Feed
-          // processor which requires leases and is designed for multi-consumer scenarios.
+          // Deliver the existing backlog, resolving a negative startIndex
+          // against the number of data chunks currently written.
+          const initial = await fetchChunksAfter(streamName, null);
+          const initialDataCount = initial.filter((doc) => !doc.eof).length;
+          const resolvedStartIndex =
+            startIndex < 0 ? Math.max(0, initialDataCount + startIndex) : startIndex;
+          if (deliver(initial, resolvedStartIndex) === 'eof') return;
+
+          // Poll for new chunks (Cosmos DB Change Feed alternative). Polling
+          // is simpler and more reliable for this use case than the Change
+          // Feed processor, which requires leases and is designed for
+          // multi-consumer scenarios.
           function poll() {
             if (closed) return;
 
-            streamsContainer.items
-              .query(
-                {
-                  query:
-                    'SELECT * FROM c WHERE c.streamId = @streamId AND c.sequence >= @seq ORDER BY c.sequence ASC',
-                  parameters: [
-                    { name: '@streamId', value: streamName },
-                    { name: '@seq', value: nextExpectedSequence },
-                  ],
-                },
-                { partitionKey: streamName },
-              )
-              .fetchAll()
-              .then(({ resources }) => {
+            fetchChunksAfter(streamName, lastSeenChunkId)
+              .then((docs) => {
                 if (closed) return;
-
-                for (const chunk of resources) {
-                  const action = handleNewChunk(chunk, controller);
-                  if (action === 'eof') return;
-                }
-
-                flushOrderedChunks(controller);
-                notifyWaitingReaders();
-
-                // Continue polling
-                if (!closed) {
-                  pollTimer = setTimeout(poll, 100);
-                }
+                if (deliver(docs, 0) === 'eof') return;
+                pollTimer = setTimeout(poll, 100);
               })
               .catch((err) => {
                 if (!closed) {
@@ -187,32 +198,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
               });
           }
 
-          // Start polling
           pollTimer = setTimeout(poll, 100);
-        },
-
-        async pull(controller) {
-          if (closed) {
-            controller.close();
-            return;
-          }
-
-          // If we have buffered chunks ready, process them
-          if (chunkBuffer.length > 0 && chunkBuffer[0].sequence >= nextExpectedSequence) {
-            const chunk = chunkBuffer.shift();
-            if (chunk) {
-              controller.enqueue(chunk.data);
-              nextExpectedSequence = chunk.sequence + 1;
-            }
-            return;
-          }
-
-          // Wait for new data from polling
-          await new Promise<void>((resolve) => {
-            waitingForData = resolve;
-            // Timeout after 30 seconds to prevent indefinite hanging
-            setTimeout(resolve, 30000);
-          });
         },
 
         cancel() {
@@ -224,23 +210,97 @@ export function createStreamer(config: StreamerConfig): Streamer {
       });
     },
 
-    async listStreamsByRunId(_runId: string): Promise<string[]> {
-      // Not implemented for Cosmos DB
-      return [];
+    async listStreamsByRunId(runId: string): Promise<string[]> {
+      // Cross-partition query: chunk docs carry the owning runId.
+      const querySpec: SqlQuerySpec = {
+        query: 'SELECT DISTINCT VALUE c.streamId FROM c WHERE c.runId = @runId',
+        parameters: [{ name: '@runId', value: runId }],
+      };
+      const { resources } = await withCosmosRetry(() =>
+        streamsContainer.items.query<string>(querySpec).fetchAll(),
+      );
+      return resources;
     },
 
     async getStreamChunks(
-      _name: string,
+      name: string,
       _runId: string,
-      _options?: GetChunksOptions,
+      options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
-      // Not implemented for Cosmos DB
-      return { data: [], hasMore: false, cursor: null, done: true };
+      const limit = Math.min(options?.limit ?? 100, 1000);
+      const cursor = options?.cursor ? decodeChunksCursor(options.cursor) : undefined;
+      const startAfter = cursor?.c ?? null;
+      const startDataIndex = cursor?.i ?? 0;
+
+      // Fetch one extra doc beyond the page so eof/hasMore can be detected
+      // without another round-trip (the extra doc is either the eof marker
+      // or proof that more data chunks exist).
+      const conditions = ['c.streamId = @streamId'];
+      const parameters: { name: string; value: string | number }[] = [
+        { name: '@streamId', value: name },
+      ];
+      if (startAfter !== null) {
+        conditions.push('c.chunkId > @cursor');
+        parameters.push({ name: '@cursor', value: startAfter });
+      }
+      const querySpec: SqlQuerySpec = {
+        query: `SELECT * FROM c WHERE ${conditions.join(' AND ')} ORDER BY c.chunkId ASC OFFSET 0 LIMIT @limit`,
+        parameters: [...parameters, { name: '@limit', value: limit + 1 }],
+      };
+      const { resources } = await withCosmosRetry(() =>
+        streamsContainer.items.query<ChunkDoc>(querySpec, { partitionKey: name }).fetchAll(),
+      );
+
+      let done = false;
+      let hasMore = false;
+      let lastChunkId = startAfter;
+      const chunks: StreamChunksResponse['data'] = [];
+      for (const doc of resources) {
+        if (doc.eof) {
+          done = true;
+          break;
+        }
+        if (chunks.length === limit) {
+          hasMore = true;
+          break;
+        }
+        chunks.push({ index: startDataIndex + chunks.length, data: decodeChunkData(doc) });
+        lastChunkId = doc.chunkId;
+      }
+
+      return {
+        data: chunks,
+        cursor:
+          hasMore && lastChunkId !== null
+            ? encodeChunksCursor({ c: lastChunkId, i: startDataIndex + chunks.length })
+            : null,
+        hasMore,
+        done,
+      };
     },
 
-    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Not implemented for Cosmos DB
-      return { tailIndex: -1, done: false };
+    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
+      // Only the eof flags are needed — never fetch chunk payloads.
+      const querySpec: SqlQuerySpec = {
+        query: 'SELECT c.eof FROM c WHERE c.streamId = @streamId ORDER BY c.chunkId ASC',
+        parameters: [{ name: '@streamId', value: name }],
+      };
+      const { resources } = await withCosmosRetry(() =>
+        streamsContainer.items
+          .query<{ eof: boolean }>(querySpec, { partitionKey: name })
+          .fetchAll(),
+      );
+
+      let dataCount = 0;
+      let done = false;
+      for (const doc of resources) {
+        if (doc.eof) {
+          done = true;
+          break;
+        }
+        dataCount++;
+      }
+      return { tailIndex: dataCount - 1, done };
     },
   };
 }

@@ -3,6 +3,7 @@ import { CosmosClient as CosmosClientClass } from '@azure/cosmos';
 import type { ServiceBusClient } from '@azure/service-bus';
 import { ServiceBusClient as ServiceBusClientClass } from '@azure/service-bus';
 import type { World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
@@ -60,7 +61,7 @@ async function ensureInfrastructure(
 
 export function createAzureWorld(
   config: AzureWorldConfig = {},
-): World & { start(): Promise<void> } {
+): World & { start(): Promise<void>; close(): Promise<void> } {
   const databaseName = config.databaseName || process.env.COSMOS_DATABASE || 'workflow';
   const queueName = config.queueName || process.env.SERVICE_BUS_QUEUE || 'workflow-queue';
   const deploymentId = config.deploymentId || process.env.WORKFLOW_DEPLOYMENT_ID || 'azure-default';
@@ -140,8 +141,10 @@ export function createAzureWorld(
 
   // Service Bus client (optional for test mode)
   let serviceBusClient: ServiceBusClient | undefined = config.serviceBusClient;
+  let serviceBusConnectionString: string | undefined;
   if (!serviceBusClient && process.env.SERVICE_BUS_CONNECTION_STRING) {
-    serviceBusClient = new ServiceBusClientClass(process.env.SERVICE_BUS_CONNECTION_STRING);
+    serviceBusConnectionString = process.env.SERVICE_BUS_CONNECTION_STRING;
+    serviceBusClient = new ServiceBusClientClass(serviceBusConnectionString);
   }
 
   // Lazy-initialized database reference
@@ -163,9 +166,14 @@ export function createAzureWorld(
     client: serviceBusClient,
     queueName,
     deploymentId,
+    connectionString: serviceBusConnectionString,
   });
 
   return {
+    // Runs are created at the current spec version so resilient start
+    // (CBOR queue transport + run_started bootstrap) is enabled.
+    specVersion: SPEC_VERSION_CURRENT,
+
     get runs() {
       if (!storageInstance) {
         throw new Error('Azure world not started. Call start() first.');
@@ -256,6 +264,18 @@ export function createAzureWorld(
       // Start the queue (embedded world in test mode)
       if (queue.start) {
         await queue.start();
+      }
+    },
+
+    async close() {
+      await queue.close();
+      // Only tear down clients this world created itself — injected clients
+      // stay owned by the caller.
+      if (!config.serviceBusClient && serviceBusClient) {
+        await serviceBusClient.close();
+      }
+      if (!config.cosmosClient) {
+        cosmosClient.dispose();
       }
     },
   };

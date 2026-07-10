@@ -9,14 +9,48 @@ export const debug = createDebugLogger('azure-world');
 const DEFAULT_MAX_RETRIES = 5;
 
 /**
- * Check if an error is a Cosmos DB throttle (HTTP 429 Too Many Requests) error.
- * Cosmos DB returns 429 when provisioned RU/s are exhausted.
+ * `Items.batch()` in @azure/cosmos catches every failure and rethrows
+ * `new Error("Batch request error: <server message>")` — a plain Error with
+ * no `.code`/`.statusCode`. Detect that wrapper so callers can translate
+ * batch failures (conflict re-reads, throttle retries, etag races).
  */
-function isThrottleError(err: unknown): boolean {
+const BATCH_ERROR_PREFIX = 'Batch request error:';
+
+export function isWrappedBatchError(err: unknown): err is Error {
+  return err instanceof Error && err.message.startsWith(BATCH_ERROR_PREFIX);
+}
+
+function hasStatus(err: unknown, status: number): boolean {
   if (typeof err !== 'object' || err === null) return false;
   const code = (err as Record<string, unknown>).code;
   const statusCode = (err as Record<string, unknown>).statusCode;
-  return code === 429 || statusCode === 429;
+  return code === status || statusCode === status;
+}
+
+/** HTTP 409 Conflict (duplicate id) from a non-batch Cosmos DB operation. */
+export function isConflictError(err: unknown): boolean {
+  return hasStatus(err, 409);
+}
+
+/** HTTP 404 Not Found from a non-batch Cosmos DB operation. */
+export function isNotFoundError(err: unknown): boolean {
+  return hasStatus(err, 404);
+}
+
+/** HTTP 412 Precondition Failed (etag mismatch) from a Cosmos DB operation. */
+export function isPreconditionFailedError(err: unknown): boolean {
+  return hasStatus(err, 412);
+}
+
+/**
+ * Check if an error is a Cosmos DB throttle (HTTP 429 Too Many Requests) error.
+ * Cosmos DB returns 429 when provisioned RU/s are exhausted. Transactional
+ * batch failures lose the status code (see isWrappedBatchError), so fall back
+ * to matching the server's throttle message on wrapped errors.
+ */
+function isThrottleError(err: unknown): boolean {
+  if (hasStatus(err, 429)) return true;
+  return isWrappedBatchError(err) && /TooManyRequests|Request rate is large/i.test(err.message);
 }
 
 /**

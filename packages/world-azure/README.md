@@ -99,13 +99,23 @@ await world.start();
 | `SERVICE_BUS_QUEUE`             | Service Bus queue name        | `workflow-queue`         |
 | `WORKFLOW_DEPLOYMENT_ID`        | Deployment identifier         | `azure-default`          |
 
+### Service Bus queue requirements
+
+The runtime relies on queue-level deduplication of `idempotencyKey` (mapped to
+the Service Bus `messageId`), which only works when the queue was created with
+**duplicate detection** enabled. When a connection string is available,
+`start()` creates the queue with `requiresDuplicateDetection: true` (or fails
+loudly if an existing queue lacks it — the setting cannot be changed after
+creation). When only a `ServiceBusClient` is injected, the configuration cannot
+be introspected; ensure the queue was provisioned with duplicate detection.
+
 ## Indexing
 
-The `cosmos-indexes.json` file contains the recommended indexing policy with composite indexes for common query patterns:
+The `cosmos-indexes.json` file contains the recommended indexing policy with composite indexes for common query patterns. Listings order and paginate on monotonic ULID ids (`runId`, `eventId`, `stepId`, `hookId`) — never `createdAt`, whose millisecond ties can skip or duplicate rows at page boundaries:
 
-- `workflowName + createdAt` (run listings filtered by workflow)
-- `status + createdAt` (run listings filtered by status)
-- `correlationId + createdAt` (event correlation lookups)
+- `workflowName + runId` (run listings filtered by workflow)
+- `status + runId` (run listings filtered by status)
+- `correlationId + eventId` (event correlation lookups)
 
 Apply via the Azure CLI:
 
