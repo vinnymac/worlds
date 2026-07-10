@@ -1,5 +1,6 @@
 import mysql from 'mysql2/promise';
 import type { World } from '@workflow/world';
+import { reenqueueActiveRuns, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { createQueue, type MysqlQueueConfig } from './queue.js';
 import * as schema from './schema.js';
@@ -35,7 +36,7 @@ export function createMysqlWorld(
   config: MysqlWorldConfig = {
     databaseUrl: process.env.DATABASE_URL || 'mysql://root:root@localhost:3306/mysql_test',
   },
-): World & { start(): Promise<void>; stop(): void } {
+): World & { start(): Promise<void>; stop(): void; close(): Promise<void> } {
   const { databaseUrl, queue: queueConfig = {}, connectionLimit = 25 } = config;
 
   // Create MySQL connection pool
@@ -52,9 +53,24 @@ export function createMysqlWorld(
   const streamer = createStreamer(db);
 
   return {
+    // Declaring SPEC_VERSION_CURRENT enables the resilient-start path:
+    // runs are created at the current spec version and queue messages carry
+    // runInput, which requires the binary-safe tagged-JSON queue transport.
+    specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...queue,
     ...streamer,
+    async start() {
+      await queue.start();
+      await reenqueueActiveRuns(storage.runs, queue.queue, 'world-mysql');
+    },
+    stop() {
+      queue.stop();
+    },
+    async close() {
+      queue.stop();
+      await pool.end();
+    },
   };
 }
 

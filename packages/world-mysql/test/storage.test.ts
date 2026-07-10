@@ -1,4 +1,5 @@
 import { MySqlContainer } from '@testcontainers/mysql';
+import { EntityConflictError, TooEarlyError } from '@workflow/errors';
 import type { Step, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
@@ -11,6 +12,7 @@ import {
   createRunsStorage,
   createStepsStorage,
 } from '../src/storage.js';
+import { applyMigrations } from './migrate.js';
 
 describe('Storage (MySQL integration)', () => {
   if (process.platform === 'win32') {
@@ -70,85 +72,7 @@ describe('Storage (MySQL integration)', () => {
     const dbUrl = `mysql://root:root@${container.getHost()}:${container.getPort()}/main`;
     connection = await mysql.createConnection(dbUrl);
 
-    await connection.query('CREATE SCHEMA IF NOT EXISTS `workflow`');
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_runs\` (
-      \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`output\` JSON,
-      \`output_cbor\` BLOB,
-      \`deployment_id\` VARCHAR(255) NOT NULL,
-      \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
-      \`name\` VARCHAR(255) NOT NULL,
-      \`execution_context\` JSON,
-      \`execution_context_cbor\` BLOB,
-      \`input\` JSON,
-      \`input_cbor\` BLOB,
-      \`error\` TEXT,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      \`completed_at\` TIMESTAMP NULL,
-      \`started_at\` TIMESTAMP NULL,
-      \`spec_version\` INT,
-      \`expired_at\` TIMESTAMP NULL,
-      INDEX \`idx_workflow_runs_name\` (\`name\`),
-      INDEX \`idx_workflow_runs_status\` (\`status\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_events\` (
-      \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`type\` VARCHAR(255) NOT NULL,
-      \`correlation_id\` VARCHAR(255),
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`run_id\` VARCHAR(255) NOT NULL,
-      \`payload\` JSON,
-      \`payload_cbor\` BLOB,
-      \`spec_version\` INT,
-      INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
-      INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_steps\` (
-      \`run_id\` VARCHAR(255) NOT NULL,
-      \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`step_name\` VARCHAR(255) NOT NULL,
-      \`status\` ENUM('pending','running','completed','failed') NOT NULL,
-      \`input\` JSON,
-      \`input_cbor\` BLOB,
-      \`output\` JSON,
-      \`output_cbor\` BLOB,
-      \`error\` TEXT,
-      \`attempt\` INT NOT NULL,
-      \`started_at\` TIMESTAMP NULL,
-      \`completed_at\` TIMESTAMP NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      \`retry_after\` TIMESTAMP NULL,
-      \`spec_version\` INT,
-      INDEX \`idx_workflow_steps_run_id\` (\`run_id\`),
-      INDEX \`idx_workflow_steps_status\` (\`status\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_hooks\` (
-      \`run_id\` VARCHAR(255) NOT NULL,
-      \`hook_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`token\` VARCHAR(255) NOT NULL,
-      \`owner_id\` VARCHAR(255) NOT NULL,
-      \`project_id\` VARCHAR(255) NOT NULL,
-      \`environment\` VARCHAR(255) NOT NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`metadata\` JSON,
-      \`metadata_cbor\` BLOB,
-      \`spec_version\` INT,
-      \`is_webhook\` BOOLEAN,
-      INDEX \`idx_workflow_hooks_run_id\` (\`run_id\`),
-      INDEX \`idx_workflow_hooks_token\` (\`token\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
-      \`id\` VARCHAR(255) NOT NULL,
-      \`stream_id\` VARCHAR(255) NOT NULL,
-      \`data\` BLOB NOT NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`eof\` BOOLEAN NOT NULL,
-      \`sequence\` BIGINT NOT NULL,
-      PRIMARY KEY (\`stream_id\`, \`id\`),
-      INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`)
-    )`);
+    await applyMigrations(connection);
 
     db = drizzle(connection, { schema, mode: 'default' });
     runs = createRunsStorage(db);
@@ -274,5 +198,187 @@ describe('Storage (MySQL integration)', () => {
 
     const retrievedStep = await steps.get(run.runId, step.stepId);
     expect(retrievedStep.stepId).toBe(step.stepId);
+  });
+
+  it('persists specVersion on runs, steps, hooks and events', async () => {
+    const run = await createRun();
+    expect(run.specVersion).toBeTypeOf('number');
+
+    const step = await createStep(run.runId, 'step-spec-version');
+    expect(step.specVersion).toBeTypeOf('number');
+
+    const hookResult = await events.create(run.runId, {
+      eventType: 'hook_created',
+      correlationId: 'hook-spec-version',
+      eventData: { token: 'token-spec-version' },
+    });
+    expect(hookResult.hook?.specVersion).toBeTypeOf('number');
+  });
+
+  describe('Terminal transition guards', () => {
+    it('rejects run_failed after run_completed with EntityConflictError', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      await events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: ['done'] },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'run_failed',
+          eventData: { error: 'boom' },
+        }),
+      ).rejects.toSatisfy((err: unknown) => EntityConflictError.is(err));
+
+      const retrieved = await runs.get(run.runId);
+      expect(retrieved.status).toBe('completed');
+    });
+
+    it('rejects step_completed on a terminal step with EntityConflictError', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-terminal');
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: step.stepId,
+        eventData: { result: ['ok'] },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_completed',
+          correlationId: step.stepId,
+          eventData: { result: ['dup'] },
+        }),
+      ).rejects.toSatisfy((err: unknown) => EntityConflictError.is(err));
+    });
+  });
+
+  describe('retryAfter backoff', () => {
+    it('throws TooEarlyError when step_started arrives before retryAfter', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-retry');
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: step.stepId,
+        eventData: {
+          error: 'transient',
+          retryAfter: new Date(Date.now() + 60_000),
+        },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_started',
+          correlationId: step.stepId,
+        }),
+      ).rejects.toSatisfy(
+        (err: unknown) => TooEarlyError.is(err) && (err as TooEarlyError).retryAfter! > 0,
+      );
+    });
+
+    it('clears retryAfter once the step starts after the backoff window', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-retry-clear');
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: step.stepId,
+        eventData: {
+          error: 'transient',
+          retryAfter: new Date(Date.now() - 1_000),
+        },
+      });
+
+      const restarted = await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      expect(restarted.step?.status).toBe('running');
+      expect(restarted.step?.retryAfter).toBeUndefined();
+      expect(restarted.step?.attempt).toBe(2);
+    });
+  });
+
+  describe('hook_created semantics', () => {
+    it('throws EntityConflictError on a replayed hook_created for the same hook', async () => {
+      const run = await createRun();
+      const create = () =>
+        events.create(run.runId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-replay',
+          eventData: { token: 'token-replay' },
+        });
+
+      const first = await create();
+      expect(first.hook?.hookId).toBe('hook-replay');
+
+      await expect(create()).rejects.toSatisfy((err: unknown) => EntityConflictError.is(err));
+
+      // No hook_conflict event may be persisted for the run's own hook
+      const eventList = await events.list({ runId: run.runId });
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+    });
+
+    it('completes the partial write when the hook row exists without its event', async () => {
+      const run = await createRun();
+      // Simulate a crash between the hook INSERT and the event INSERT
+      await db.insert(schema.hooks).values({
+        runId: run.runId,
+        hookId: 'hook-orphan',
+        token: 'token-orphan',
+        ownerId: '',
+        projectId: '',
+        environment: '',
+      });
+
+      const result = await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-orphan',
+        eventData: { token: 'token-orphan' },
+      });
+      expect(result.event?.eventType).toBe('hook_created');
+      expect(result.hook?.hookId).toBe('hook-orphan');
+
+      const eventList = await events.list({ runId: run.runId });
+      expect(eventList.data.filter((e) => e.eventType === 'hook_created')).toHaveLength(1);
+    });
+
+    it('emits hook_conflict with conflictingRunId when another run holds the token', async () => {
+      const runA = await createRun();
+      const runB = await createRun();
+
+      await events.create(runA.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-owner',
+        eventData: { token: 'token-contested' },
+      });
+
+      const result = await events.create(runB.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-contender',
+        eventData: { token: 'token-contested' },
+      });
+      expect(result.hook).toBeUndefined();
+      expect(result.event?.eventType).toBe('hook_conflict');
+      expect(result.event?.eventData).toMatchObject({
+        token: 'token-contested',
+        conflictingRunId: runA.runId,
+      });
+    });
   });
 });
