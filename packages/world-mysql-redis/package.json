@@ -52,7 +52,6 @@
     "db:push": "node dist/cli.js"
   },
   "dependencies": {
-    "@fantasticfour/shared": "workspace:*",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "cbor-x": "catalog:",
@@ -62,6 +61,7 @@
     "ulid": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/mysql": "catalog:",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",

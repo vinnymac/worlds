@@ -6,10 +6,6 @@ export interface MysqlRedisWorldConfig {
   jobPrefix?: string;
   queueConcurrency?: number;
   deploymentId?: string;
-  /** Outbox relay polling interval in milliseconds. Default: 500 */
-  outboxPollIntervalMs?: number;
-  /** Number of outbox rows to process per relay batch. Default: 100 */
-  outboxBatchSize?: number;
   /**
    * Base URL the worker uses to dispatch jobs back to the user's HTTP server.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`

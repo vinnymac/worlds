@@ -1,11 +1,10 @@
 import type { HealthCheckable } from '@fantasticfour/shared';
-import type { World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { Redis } from 'ioredis';
 import mysql from 'mysql2/promise';
 import type { MysqlRedisWorldConfig } from './config.js';
 import { getHealth, type MysqlRedisHealthResult } from './health.js';
-import { startOutboxRelay } from './outbox.js';
 import { createQueue } from './queue.js';
 import * as schema from './schema.js';
 import { createStorage } from './storage.js';
@@ -38,40 +37,28 @@ export function createWorld(
   const db = drizzle(pool, { schema, mode: 'default' });
 
   const queue = createQueue(redis, config);
-  const storage = createStorage(db as any);
-  const streamer = createStreamer(db as any);
-
-  let outboxAbort: AbortController | undefined;
+  const storage = createStorage(db);
+  const streamer = createStreamer(db);
 
   return {
+    // Declare the highest spec version this world supports. With spec
+    // version 3+, `start()` includes the run input in the queue message
+    // (binary-safe queue transport), which enables the resilient-start
+    // path in `events.create('run_started')`. That path is required for
+    // correctness: the runtime creates `run_created` and enqueues the
+    // workflow message in parallel, so `run_started` can win the race.
+    specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,
     ...queue,
     async health(): Promise<MysqlRedisHealthResult> {
-      return getHealth(db as any, redis);
+      return getHealth(db, redis);
     },
     async start() {
       await queue.start();
-
-      // Start the outbox relay loop to drain pending outbox messages to Redis
-      outboxAbort = startOutboxRelay(
-        db as any,
-        async (payload, messageId) => {
-          // Relay outbox messages through the queue's push mechanism
-          const queueName = (payload as any)?.queueName;
-          const message = (payload as any)?.message;
-          if (queueName && message) {
-            await queue.queue(queueName, message, { idempotencyKey: messageId });
-          }
-        },
-        {
-          pollIntervalMs: config.outboxPollIntervalMs,
-          batchSize: config.outboxBatchSize,
-        },
-      );
     },
     stop() {
-      outboxAbort?.abort();
+      queue.stop();
     },
   };
 }
@@ -81,5 +68,4 @@ export type { MysqlRedisWorldConfig } from './config.js';
 export type { MysqlRedisHealthResult } from './health.js';
 export { getHealth } from './health.js';
 export { withDeadlockRetry, isDeadlockError } from './util.js';
-export { insertOutboxMessage, relayOutbox, getOutboxStats, startOutboxRelay } from './outbox.js';
 export * from './schema.js';

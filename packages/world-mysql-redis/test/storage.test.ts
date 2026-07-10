@@ -1,11 +1,13 @@
 import { MySqlContainer } from '@testcontainers/mysql';
 import { RedisContainer } from '@testcontainers/redis';
-import type { Step, WorkflowRun } from '@workflow/world';
+import type { Step, Streamer, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
+import { parse } from '@fantasticfour/shared';
+import { createQueue } from '../src/queue.js';
 import * as schema from '../src/schema.js';
 import {
   createEventsStorage,
@@ -13,6 +15,7 @@ import {
   createRunsStorage,
   createStepsStorage,
 } from '../src/storage.js';
+import { createStreamer } from '../src/streamer.js';
 
 describe('Storage (MySQL + Redis integration)', () => {
   if (process.platform === 'win32') {
@@ -29,6 +32,7 @@ describe('Storage (MySQL + Redis integration)', () => {
   let steps: ReturnType<typeof createStepsStorage>;
   let hooks: ReturnType<typeof createHooksStorage>;
   let events: ReturnType<typeof createEventsStorage>;
+  let streamer: Streamer;
 
   async function truncateTables() {
     await connection.query('SET FOREIGN_KEY_CHECKS = 0');
@@ -107,6 +111,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       \`type\` VARCHAR(255) NOT NULL,
       \`correlation_id\` VARCHAR(255),
       \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`occurred_at\` TIMESTAMP NULL,
       \`run_id\` VARCHAR(255) NOT NULL,
       \`payload\` JSON,
       \`payload_cbor\` BLOB,
@@ -118,7 +123,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       \`run_id\` VARCHAR(255) NOT NULL,
       \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
       \`step_name\` VARCHAR(255) NOT NULL,
-      \`status\` ENUM('pending','running','completed','failed') NOT NULL,
+      \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
       \`input\` JSON,
       \`input_cbor\` BLOB,
       \`output\` JSON,
@@ -152,12 +157,14 @@ describe('Storage (MySQL + Redis integration)', () => {
     await connection.query(`CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
       \`id\` VARCHAR(255) NOT NULL,
       \`stream_id\` VARCHAR(255) NOT NULL,
+      \`run_id\` VARCHAR(255) NULL,
       \`data\` BLOB NOT NULL,
       \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       \`eof\` BOOLEAN NOT NULL,
       \`sequence\` BIGINT NOT NULL,
       PRIMARY KEY (\`stream_id\`, \`id\`),
-      INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`)
+      INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`),
+      INDEX \`idx_stream_chunks_run_id\` (\`run_id\`)
     )`);
 
     redisContainer = await new RedisContainer('redis:7-alpine').start();
@@ -166,10 +173,11 @@ describe('Storage (MySQL + Redis integration)', () => {
     redisClient = new Redis(`redis://${redisHost}:${redisPort}`);
 
     db = drizzle(connection, { schema, mode: 'default' });
-    runs = createRunsStorage(db, redisClient);
-    steps = createStepsStorage(db, redisClient);
-    hooks = createHooksStorage(db, redisClient);
-    events = createEventsStorage(db, redisClient);
+    runs = createRunsStorage(db);
+    steps = createStepsStorage(db);
+    hooks = createHooksStorage(db);
+    events = createEventsStorage(db);
+    streamer = createStreamer(db);
   }, 120_000);
 
   beforeEach(truncateTables);
@@ -291,5 +299,345 @@ describe('Storage (MySQL + Redis integration)', () => {
 
     const retrievedStep = await steps.get(run.runId, step.stepId);
     expect(retrievedStep.stepId).toBe(step.stepId);
+  });
+
+  describe('Error taxonomy', () => {
+    it('throws WorkflowRunNotFoundError from runs.get for a missing run', async () => {
+      await expect(runs.get('wrun_missing')).rejects.toMatchObject({
+        name: 'WorkflowRunNotFoundError',
+      });
+    });
+
+    it('throws HookNotFoundError from hooks.get and hooks.getByToken', async () => {
+      await expect(hooks.get('hook-missing')).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+      await expect(hooks.getByToken('token-missing')).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+    });
+
+    it('throws WorkflowRunNotFoundError for lifecycle events on a missing run', async () => {
+      await expect(
+        events.create('wrun_missing', { eventType: 'run_started' }),
+      ).rejects.toMatchObject({ name: 'WorkflowRunNotFoundError' });
+      await expect(
+        events.create('wrun_missing', { eventType: 'run_completed', eventData: { output: [] } }),
+      ).rejects.toMatchObject({ name: 'WorkflowRunNotFoundError' });
+    });
+
+    it('throws RunExpiredError for run_started on a terminal run', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_cancelled' });
+      await expect(events.create(run.runId, { eventType: 'run_started' })).rejects.toMatchObject({
+        name: 'RunExpiredError',
+      });
+    });
+
+    it('throws EntityConflictError when modifying a terminal step', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-terminal');
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: step.stepId,
+        eventData: { result: ['done'] },
+      });
+
+      // Re-delivered step_completed must be rejected with EntityConflictError
+      // so core's replay path can swallow it and re-enqueue the workflow.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_completed',
+          correlationId: step.stepId,
+          eventData: { result: ['done'] },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_started',
+          correlationId: step.stepId,
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+    });
+  });
+
+  describe('Resilient start (run_started bootstrap)', () => {
+    it('bootstraps the run from run_started eventData when the run row is missing', async () => {
+      const runId = 'wrun_bootstrap_test';
+      const result = await events.create(runId, {
+        eventType: 'run_started',
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'bootstrap-flow',
+          input: ['a'],
+        },
+      });
+
+      expect(result.run).toBeDefined();
+      expect(result.run!.runId).toBe(runId);
+      expect(result.run!.status).toBe('running');
+
+      const log = await events.list({ runId, pagination: { sortOrder: 'asc' } });
+      const types = log.data.map((e) => e.eventType);
+      expect(types).toEqual(['run_created', 'run_started']);
+    });
+  });
+
+  describe('step retryAfter', () => {
+    it('rejects step_started with TooEarlyError until retryAfter is reached', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-backoff');
+
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: step.stepId,
+        eventData: { error: 'boom', retryAfter: new Date(Date.now() + 60_000) },
+      });
+
+      await expect(
+        events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId }),
+      ).rejects.toMatchObject({ name: 'TooEarlyError' });
+    });
+
+    it('clears retryAfter when the step starts', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-clear');
+
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: step.stepId,
+        eventData: { error: 'boom', retryAfter: new Date(Date.now() - 5_000) },
+      });
+      const retrying = await steps.get(run.runId, step.stepId);
+      expect(retrying.retryAfter).toBeInstanceOf(Date);
+
+      const started = await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      expect(started.step?.status).toBe('running');
+      expect(started.step?.retryAfter).toBeUndefined();
+
+      const retrieved = await steps.get(run.runId, step.stepId);
+      expect(retrieved.retryAfter).toBeUndefined();
+    });
+  });
+
+  describe('hook_created semantics', () => {
+    it('throws EntityConflictError for a duplicate hook_created of the same hook', async () => {
+      const run = await createRun();
+      await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-dup',
+        eventData: { token: 'token-dup' },
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-dup',
+          eventData: { token: 'token-dup' },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      // No hook_conflict event must be logged against the run's own hook
+      const log = await events.list({ runId: run.runId });
+      expect(log.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+    });
+
+    it('completes the partial write for an orphaned hook row (crash recovery)', async () => {
+      const run = await createRun();
+      // Simulate a crash between the hook INSERT and the events INSERT
+      await db.insert(schema.hooks).values({
+        runId: run.runId,
+        hookId: 'hook-orphan',
+        token: 'token-orphan',
+        ownerId: '',
+        projectId: '',
+        environment: '',
+      });
+
+      const result = await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-orphan',
+        eventData: { token: 'token-orphan' },
+      });
+
+      expect(result.event?.eventType).toBe('hook_created');
+      expect(result.hook?.hookId).toBe('hook-orphan');
+
+      const log = await events.list({ runId: run.runId });
+      expect(log.data.filter((e) => e.eventType === 'hook_created')).toHaveLength(1);
+    });
+
+    it('logs hook_conflict with conflictingRunId when another run holds the token', async () => {
+      const runA = await createRun();
+      const runB = await createRun();
+
+      await events.create(runA.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-a',
+        eventData: { token: 'token-shared' },
+      });
+
+      const result = await events.create(runB.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-b',
+        eventData: { token: 'token-shared' },
+      });
+
+      expect(result.hook).toBeUndefined();
+      expect(result.event?.eventType).toBe('hook_conflict');
+      expect(result.event?.eventData).toMatchObject({
+        token: 'token-shared',
+        conflictingRunId: runA.runId,
+      });
+    });
+
+    it('throws HookNotFoundError when disposing an already-disposed hook', async () => {
+      const run = await createRun();
+      await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-dispose',
+        eventData: { token: 'token-dispose' },
+      });
+
+      await events.create(run.runId, {
+        eventType: 'hook_disposed',
+        correlationId: 'hook-dispose',
+      });
+
+      await expect(
+        events.create(run.runId, {
+          eventType: 'hook_disposed',
+          correlationId: 'hook-dispose',
+        }),
+      ).rejects.toMatchObject({ name: 'HookNotFoundError' });
+    });
+  });
+
+  describe('Streamer', () => {
+    async function readAll(stream: ReadableStream<Uint8Array>): Promise<string[]> {
+      const reader = stream.getReader();
+      const out: string[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        out.push(Buffer.from(value).toString('utf-8'));
+      }
+      return out;
+    }
+
+    async function writeStream(name: string, runId: string, count: number): Promise<string[]> {
+      const expected: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const chunk = `chunk-${String(i).padStart(2, '0')}`;
+        expected.push(chunk);
+        await streamer.writeToStream(name, runId, chunk);
+      }
+      await streamer.closeStream(name, runId);
+      return expected;
+    }
+
+    it('delivers bursty same-millisecond chunks in order without loss', async () => {
+      const run = await createRun();
+      const expected = await writeStream('strm-order', run.runId, 25);
+
+      const received = await readAll(await streamer.readFromStream('strm-order'));
+      expect(received).toEqual(expected);
+    });
+
+    it('honors positive and negative startIndex', async () => {
+      const run = await createRun();
+      const expected = await writeStream('strm-offset', run.runId, 12);
+
+      const fromTen = await readAll(await streamer.readFromStream('strm-offset', 10));
+      expect(fromTen).toEqual(expected.slice(10));
+
+      const lastFive = await readAll(await streamer.readFromStream('strm-offset', -5));
+      expect(lastFive).toEqual(expected.slice(-5));
+    });
+
+    it('implements getStreamInfo, getStreamChunks pagination, and listStreamsByRunId', async () => {
+      const run = await createRun();
+      const expected = await writeStream('strm-meta', run.runId, 15);
+
+      expect(await streamer.getStreamInfo('strm-meta', run.runId)).toEqual({
+        tailIndex: 14,
+        done: true,
+      });
+
+      const pageOne = await streamer.getStreamChunks('strm-meta', run.runId, { limit: 10 });
+      expect(pageOne.hasMore).toBe(true);
+      expect(pageOne.done).toBe(true);
+      expect(pageOne.data.map((c) => c.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      expect(pageOne.data.map((c) => Buffer.from(c.data).toString('utf-8'))).toEqual(
+        expected.slice(0, 10),
+      );
+
+      const pageTwo = await streamer.getStreamChunks('strm-meta', run.runId, {
+        limit: 10,
+        cursor: pageOne.cursor ?? undefined,
+      });
+      expect(pageTwo.hasMore).toBe(false);
+      expect(pageTwo.data.map((c) => c.index)).toEqual([10, 11, 12, 13, 14]);
+      expect(pageTwo.data.map((c) => Buffer.from(c.data).toString('utf-8'))).toEqual(
+        expected.slice(10),
+      );
+
+      expect(await streamer.listStreamsByRunId(run.runId)).toEqual(['strm-meta']);
+    });
+  });
+
+  describe('Queue durability', () => {
+    it('deduplicates idempotency keys, stores delays durably, and round-trips binary payloads', async () => {
+      const queue = createQueue(redisClient, {
+        databaseUrl: 'mysql://unused',
+        redis: 'redis://unused',
+        jobPrefix: 'testq_',
+      });
+
+      const input = new Uint8Array([1, 2, 3, 255]);
+      const message = {
+        runId: 'wrun_queue_test',
+        runInput: {
+          input,
+          deploymentId: 'test-deployment',
+          workflowName: 'queue-flow',
+          specVersion: 3,
+        },
+      };
+
+      await queue.queue('__wkf_workflow_wrun_queue_test', message, {
+        idempotencyKey: 'idem-1',
+      });
+      // Duplicate enqueue with the same idempotency key is dropped
+      await queue.queue('__wkf_workflow_wrun_queue_test', message, {
+        idempotencyKey: 'idem-1',
+      });
+      expect(await redisClient.llen('testq_flows')).toBe(1);
+
+      // The reservation is a per-key TTL'd string, not an immortal set member
+      const ttl = await redisClient.ttl('testq_flows:idempotent:idem-1');
+      expect(ttl).toBeGreaterThan(0);
+
+      // The stored envelope round-trips Uint8Array values intact
+      const payload = await redisClient.lindex('testq_flows', 0);
+      const envelope = parse<{ message: { runInput?: { input: unknown } } }>(payload!);
+      expect(envelope.message.runInput?.input).toBeInstanceOf(Uint8Array);
+      expect(Array.from(envelope.message.runInput?.input as Uint8Array)).toEqual([1, 2, 3, 255]);
+
+      // Delayed deliveries are persisted in the delayed sorted set, not an
+      // in-process timer.
+      await queue.queue('__wkf_workflow_wrun_queue_test', message, {
+        idempotencyKey: 'idem-2',
+        delaySeconds: 60,
+      });
+      expect(await redisClient.zcard('testq_flows:delayed')).toBe(1);
+      expect(await redisClient.llen('testq_flows')).toBe(1);
+    });
   });
 });
