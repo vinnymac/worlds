@@ -1,14 +1,16 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
+  parseQueueName,
   type Queue,
+  type QueueKind,
   type QueuePayload,
-  type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
 import type { JetStreamClient } from 'nats';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
 import { monotonicFactory } from 'ulid';
+import { parse, stringify } from '@fantasticfour/shared';
 import type { NatsJetStreamWorldConfig } from './config.js';
 import { debug } from './util.js';
 
@@ -16,7 +18,6 @@ interface MessageEnvelope {
   messageId: string;
   idempotencyKey?: string;
   queueName: ValidQueueName;
-  attempt: number;
   message: QueuePayload;
 }
 
@@ -35,10 +36,36 @@ const DEFAULT_DEDUP_WINDOW_MS = 15 * 60 * 1000;
 const BASE_BACKOFF_MS = 100;
 const MAX_BACKOFF_MS = 30_000;
 
+/**
+ * How long JetStream waits for an ack before redelivering. Kept short so a
+ * crashed worker's messages come back quickly; long-running handlers extend
+ * the deadline via `msg.working()` heartbeats (see ACK_PROGRESS_INTERVAL_MS).
+ */
+const ACK_WAIT_NANOS = 30 * 1_000_000_000; // 30 seconds
+
+/**
+ * Interval at which in-flight deliveries send `working()` progress heartbeats
+ * to extend the ack deadline. Must be comfortably below ACK_WAIT_NANOS so a
+ * handler that outlives ack_wait (HTTP dispatch allows up to httpTimeoutMs)
+ * is never redelivered — and executed concurrently — while still running.
+ */
+const ACK_PROGRESS_INTERVAL_MS = 10_000;
+
+/**
+ * JetStream delivery cap. Core's poison-pill escalation triggers at
+ * MAX_QUEUE_DELIVERIES (48) attempts and marks the run/step failed; this cap
+ * only exists as a backstop above that so JetStream never silently drops a
+ * message before core has had a chance to record the failure.
+ */
+const MAX_DELIVER = 64;
+
+/** Redelivery delay for failed dispatches (matches world-local's 5s linear backoff). */
+const NAK_DELAY_MS = 5_000;
+
 const QUEUE_PATHNAMES = {
-  __wkf_workflow_: 'flow',
-  __wkf_step_: 'step',
-} as const satisfies Record<QueuePrefix, string>;
+  workflow: 'flow',
+  step: 'step',
+} as const satisfies Record<QueueKind, string>;
 
 function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -54,6 +81,10 @@ function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
  * Worker delivery: messages are pulled from JetStream and dispatched via HTTP
  * fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`. JetStream itself
  * handles redelivery via `max_deliver` and `nak()`.
+ *
+ * Message payloads are serialized with the shared tagged-JSON codec so that
+ * Uint8Array values (e.g. the CBOR-transport `runInput.input` on workflow
+ * messages) survive the queue round-trip intact.
  */
 export function createQueue(
   getJetStream: () => Promise<JetStreamClient>,
@@ -64,9 +95,9 @@ export function createQueue(
 
   const prefix = config.jobPrefix || 'workflow_';
   const Streams = {
-    __wkf_workflow_: `${prefix}flows`,
-    __wkf_step_: `${prefix}steps`,
-  } as const satisfies Record<QueuePrefix, string>;
+    workflow: `${prefix}flows`,
+    step: `${prefix}steps`,
+  } as const satisfies Record<QueueKind, string>;
 
   const dedupWindowMs = config.dedupWindowMs ?? DEFAULT_DEDUP_WINDOW_MS;
   // JetStream takes nanoseconds for its time fields.
@@ -113,9 +144,8 @@ export function createQueue(
   const queue: Queue['queue'] = async (queueName, message, opts) => {
     await initStreams();
 
-    const queuePrefix = parseQueuePrefix(queueName);
-    const streamName = Streams[queuePrefix];
-    const id = queueName.slice(queuePrefix.length);
+    const { kind, id } = parseQueueName(queueName);
+    const streamName = Streams[kind];
     const subject = `${streamName}.${id}`;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
@@ -124,10 +154,9 @@ export function createQueue(
       messageId,
       idempotencyKey: opts?.idempotencyKey,
       queueName,
-      attempt: 1,
       message,
     };
-    const payload = JSON.stringify(envelope);
+    const payload = stringify(envelope);
 
     const js = await getJetStream();
     await js.publish(subject, new TextEncoder().encode(payload), {
@@ -152,7 +181,7 @@ export function createQueue(
 
       const attempt = Number.parseInt(attemptStr, 10);
       try {
-        const body = await req.json();
+        const body = parse<unknown>(await req.text());
         const result = await handler(body, {
           attempt,
           queueName: reqQueueName,
@@ -168,7 +197,11 @@ export function createQueue(
     };
   };
 
-  async function dispatch(envelope: MessageEnvelope, pathname: string): Promise<Response> {
+  async function dispatch(
+    envelope: MessageEnvelope,
+    attempt: number,
+    pathname: string,
+  ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
     const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
     return fetch(url, {
@@ -177,14 +210,14 @@ export function createQueue(
         'content-type': 'application/json',
         'x-vqs-queue-name': envelope.queueName,
         'x-vqs-message-id': envelope.messageId,
-        'x-vqs-message-attempt': String(envelope.attempt),
+        'x-vqs-message-attempt': String(attempt),
       },
-      body: JSON.stringify(envelope.message),
+      body: stringify(envelope.message),
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
   }
 
-  async function worker(workerQueuePrefix: QueuePrefix, streamName: string) {
+  async function worker(kind: QueueKind, streamName: string) {
     try {
       const jetstream = await getJetStream();
       const jsm = await jetstream.jetstreamManager();
@@ -195,28 +228,34 @@ export function createQueue(
           durable_name: consumerName,
           ack_policy: AckPolicy.Explicit,
           deliver_policy: DeliverPolicy.All,
-          max_deliver: 3,
-          ack_wait: 30 * 1_000_000_000, // 30 seconds
+          max_deliver: MAX_DELIVER,
+          ack_wait: ACK_WAIT_NANOS,
           filter_subject: `${streamName}.>`,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!message.includes('already in use')) {
+        if (!message.includes('already') && !message.includes('in use')) {
           throw err;
         }
+        // The durable already exists with an older configuration (e.g. the
+        // previous max_deliver: 3) — reconcile the retry policy in place.
+        await jsm.consumers.update(streamName, consumerName, {
+          max_deliver: MAX_DELIVER,
+          ack_wait: ACK_WAIT_NANOS,
+        });
       }
 
       const consumer = await jetstream.consumers.get(streamName, consumerName);
       const messages = await consumer.consume();
 
       health.consecutiveFailures = 0;
-      const pathname = QUEUE_PATHNAMES[workerQueuePrefix];
+      const pathname = QUEUE_PATHNAMES[kind];
 
       for await (const msg of messages) {
         let envelope: MessageEnvelope;
         try {
           const data = new TextDecoder().decode(msg.data);
-          envelope = JSON.parse(data) as MessageEnvelope;
+          envelope = parse<MessageEnvelope>(data);
         } catch (error) {
           console.error(
             `[world-nats-jetstream worker] invalid envelope from ${streamName}:`,
@@ -227,8 +266,19 @@ export function createQueue(
           continue;
         }
 
+        // Extend the ack deadline while the dispatch is in flight. HTTP
+        // handlers may legitimately run up to httpTimeoutMs (default 300s),
+        // far beyond ack_wait (30s) — without heartbeats JetStream would
+        // redeliver the message mid-execution and run it concurrently.
+        const progressTimer = setInterval(() => {
+          msg.working();
+        }, ACK_PROGRESS_INTERVAL_MS);
+
         try {
-          const response = await dispatch(envelope, pathname);
+          // Derive the attempt from JetStream's delivery count (1-based) so
+          // redeliveries surface as attempt 2, 3, ... and core's poison-pill
+          // escalation (attempt > MAX_QUEUE_DELIVERIES) can trigger.
+          const response = await dispatch(envelope, msg.info.deliveryCount, pathname);
 
           if (response.ok) {
             msg.ack();
@@ -251,22 +301,24 @@ export function createQueue(
               typeof parsed === 'object' &&
               typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
             ) {
-              // JetStream supports a custom nak delay (in ns).
+              // JetStream supports a custom nak delay (in ms).
               const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
               msg.nak(timeoutMs);
               continue;
             }
           }
 
-          msg.nak();
+          msg.nak(NAK_DELAY_MS);
           health.totalFailed++;
           console.error(
             `[world-nats-jetstream worker] HTTP ${response.status} on ${streamName}: ${text}`,
           );
         } catch (error) {
           console.error(`[world-nats-jetstream worker] dispatch error from ${streamName}:`, error);
-          msg.nak();
+          msg.nak(NAK_DELAY_MS);
           health.totalFailed++;
+        } finally {
+          clearInterval(progressTimer);
         }
       }
     } catch (error) {
@@ -283,7 +335,7 @@ export function createQueue(
       console.error(`[world-nats-jetstream worker] Error in worker for ${streamName}:`, error);
 
       await delay(backoff);
-      void worker(workerQueuePrefix, streamName);
+      void worker(kind, streamName);
     }
   }
 
@@ -291,11 +343,11 @@ export function createQueue(
     await initStreams();
 
     const concurrency = config.queueConcurrency || 10;
-    const entries = Object.entries(Streams) as [QueuePrefix, string][];
+    const entries = Object.entries(Streams) as [QueueKind, string][];
 
-    for (const [queuePrefix, streamName] of entries) {
+    for (const [kind, streamName] of entries) {
       for (let i = 0; i < concurrency; i++) {
-        void worker(queuePrefix, streamName);
+        void worker(kind, streamName);
       }
     }
   }
@@ -312,11 +364,3 @@ export function createQueue(
     },
   };
 }
-
-const parseQueuePrefix = (name: ValidQueueName): QueuePrefix => {
-  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
-  for (const prefix of prefixes) {
-    if (name.startsWith(prefix)) return prefix;
-  }
-  throw new Error(`Invalid queue name: ${name}`);
-};
