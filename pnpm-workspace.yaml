@@ -7,10 +7,10 @@ catalog:
   '@testcontainers/postgresql': ^11.8.1
   '@testcontainers/redis': ^11.8.1
   '@types/node': ^22.19.0
-  '@workflow/core': 4.2.4
-  '@workflow/errors': 4.1.1
-  '@workflow/world': 4.1.1
-  '@workflow/world-testing': 4.1.0-beta.53
+  '@workflow/core': 4.6.0
+  '@workflow/errors': 4.1.4
+  '@workflow/world': 4.2.1
+  '@workflow/world-testing': 4.1.11
   cbor-x: ^1.6.0
   dotenv: ^17.2.3
   drizzle-kit: ^0.31.7
@@ -22,7 +22,7 @@ catalog:
   tsdown: ^0.22.0
   typescript: ^5.9.3
   ulid: ^3.0.2
-  vitest: ^3.2.4
+  vitest: ^4.1.10
 
 # pnpm v11: Allow build scripts for required native dependencies
 # See: https://pnpm.io/11.x/migration#build-scripts-blocking
@@ -33,15 +33,15 @@ allowBuilds:
   'msgpackr-extract': true
 
   # Build/test tooling
-  'esbuild': true          # JavaScript bundler used by vitest and other dev tools
-  '@swc/core': true        # TypeScript compiler used by test frameworks
+  'esbuild': true # JavaScript bundler used by vitest and other dev tools
+  '@swc/core': true # TypeScript compiler used by test frameworks
 
   # Testing infrastructure dependencies
-  'ssh2': true             # Testcontainers Docker communication
-  '@nestjs/core': true     # Used by testcontainers
-  'protobufjs': true       # Protocol buffers (gRPC/Azure/GCP SDKs)
-  'sharp': true            # Image processing (transitive from GCP/Azure SDKs)
-  'cpu-features': true     # CPU detection (required by sharp)
+  'ssh2': true # Testcontainers Docker communication
+  '@nestjs/core': true # Used by testcontainers
+  'protobufjs': true # Protocol buffers (gRPC/Azure/GCP SDKs)
+  'sharp': true # Image processing (transitive from GCP/Azure SDKs)
+  'cpu-features': true # CPU detection (required by sharp)
 
   # Cloudflare Workers runtime - world-cloudflare tests
   'workerd': true
@@ -51,3 +51,8 @@ pnpm:
     zod: 4.3.6
 
 savePrefix: ''
+
+minimumReleaseAgeExclude:
+  - '@cloudflare/vitest-pool-workers@0.18.4'
+  - miniflare@4.20260708.1
+  - wrangler@4.110.0
