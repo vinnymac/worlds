@@ -1,5 +1,37 @@
 # @fantasticfour/world-mysql
 
+## 1.4.0
+
+### Minor Changes
+
+- ee02f27: Align `world-mysql` with `@workflow/world` 4.2.1 and fix the reliability bugs
+  surfaced by a full correctness review.
+
+  Every entity-and-event write pair now commits inside a single drizzle
+  transaction with `notInArray`-guarded UPDATEs, closing the resurrection race
+  where a replay could overwrite a terminal state. `hook_created` gains the
+  4.2.1 conflict semantics: a same-entity duplicate from the owning run is a
+  no-op, a crash orphan is healed in place, and a foreign holder emits a
+  `hook_conflict` event carrying `conflictingRunId`. Error classes are now the
+  typed names that `@workflow/core` matches via static `.is()` (such as
+  `EntityConflictError` and `RunExpiredError`) instead of the generic
+  `WorkflowWorldError`, so core's replay tolerance and recoverable-condition
+  handling work correctly. The world also declares `specVersion: SPEC_VERSION_CURRENT`
+  and handles the resilient-start path introduced in core 4.6.0.
+
+  The polling queue reclaims stale `processing` locks via `visibilityTimeoutMs`
+  so crashes no longer strand runs indefinitely. The idempotency key is stored
+  on the job row rather than as a separate record, so release and TTL cleanup
+  cannot free a key that still belongs to a live job. The streamer now orders by
+  ULID `chunkId` (eliminating same-millisecond chunk collisions) and implements
+  the full contract surface including `getStreamChunks`, `getStreamInfo`, and
+  `listStreamsByRunId`. Payload columns are widened to `MEDIUMBLOB` and
+  timestamps gain millisecond precision via `TIMESTAMP(3)`.
+
+  Migrations `0000` through `0002` must be applied. The CLI migration runner is
+  one-shot (no tracking table), so fresh databases pick them up automatically.
+  Existing databases must apply any new migrations manually.
+
 ## 1.3.0
 
 ### Minor Changes
@@ -92,6 +124,7 @@
 - e2d3f2e: Reliability and observability enhancements across all world packages, plus event-idempotency bug fixes and a new shared utilities package.
 
   ## New Package
+
   - `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
   ## Critical Bug Fixes — Event Idempotency
@@ -109,16 +142,19 @@
   ## Reliability & Observability
 
   ### `world-azure`
+
   - Cosmos DB transactional batches for multi-document writes
   - RU/s throttling retry with backoff
   - Service Bus session support
 
   ### `world-cloudflare`
+
   - Durable Object storage transactions
   - Permanent vs. transient error handling in queue consumers
   - Schema migration framework for DO storage
 
   ### `world-firestore-tasks`
+
   - Batched writes for atomic multi-document mutations
   - Cloud Tasks idempotency keys
   - Idempotent consumer pattern
@@ -126,21 +162,25 @@
   - Polling-mode streamer
 
   ### `world-mysql`
+
   - TTL-based cleanup of idempotency rows
   - Queue processing metrics (`src/metrics.ts`)
 
   ### `world-mysql-redis`
+
   - Outbox pattern (`src/outbox.ts`, `migrations/0001_outbox.sql`)
   - Deadlock retry logic
   - Cross-backend health check
 
   ### `world-nats-jetstream`
+
   - Secondary indexes for query patterns
   - Configurable JetStream dedup window
   - Worker health checks + exponential backoff
   - Bucket TTL/compaction configuration
 
   ### `world-postgres-redis`
+
   - Outbox pattern (`src/outbox.ts`)
   - LISTEN/NOTIFY pub/sub (`src/notify.ts`, migration `0002_outbox_and_notify.sql`)
   - Cross-backend health check (`src/health.ts`)
@@ -148,17 +188,20 @@
   - Unified idempotency handling
 
   ### `world-redis`
+
   - Atomic Lua scripts for multi-key writes
   - Queue/stream metrics
   - Streams-based event log
 
   ### `world-redis-bullmq`
+
   - Stalled-job recovery
   - Configurable retry/backoff
   - Queue metrics
   - Delayed-job support
 
   ### `world-upstash`
+
   - QStash signature verification
   - Request deduplication
   - Request-budget monitoring

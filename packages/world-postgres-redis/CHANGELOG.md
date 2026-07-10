@@ -1,5 +1,41 @@
 # @fantasticfour/world-postgres-redis
 
+## 2.3.0
+
+### Minor Changes
+
+- ee02f27: Align with `@workflow/world` 4.2.1 and fix durable-queue reliability across
+  dedup, redelivery, reclaim, and migration tracking.
+
+  Specversion is now declared with a binary-safe queue transport, and the
+  resilient-start path (core 4.6.0 fires `run_created` and the queue publish in
+  parallel) is fully supported. The typed error taxonomy matches what
+  `@workflow/core` expects: `EntityConflictError`, `RunExpiredError`,
+  `TooEarlyError`, `WorkflowRunNotFoundError`, and `HookNotFoundError` are all
+  thrown where the contract requires them, so core's replay tolerance and
+  recoverable-condition handling work correctly instead of collapsing into
+  retry-drop loops. `hook_created` now follows 4.2.1 conflict semantics: a run's
+  own replay is allowed through, a crash orphan completes the partial write, and
+  a foreign holder gets a `hook_conflict` event carrying `conflictingRunId`.
+  `hooks.token` gains a UNIQUE constraint with the insert-race loser routed
+  through that same path.
+
+  The queue's durability story is rewritten end-to-end. Dedup keys are held for
+  the full message lifetime (not released on first delivery), so a re-queued
+  message cannot race its own idempotency key. Delayed redelivery (honoring
+  `{ timeoutSeconds }` from the handler) goes through a Redis sorted set with an
+  atomic Lua promotion loop instead of an in-process `setTimeout`, so delayed
+  messages survive worker restarts. Crashed workers' in-flight messages are
+  reclaimed via visibility deadlines, and messages that exhaust all attempts write
+  `run_failed` against the owning run rather than dropping silently.
+
+  Migration tracking is now durable: a `workflow.__migrations` table records
+  every applied file inside the same transaction, early migrations are made
+  idempotent so pre-tracking databases upgrade cleanly, and the orphaned
+  `0000_redundant_smasher.sql` file is deleted. The `cli.ts` runner applies and
+  records each file transactionally so a partial upgrade leaves the tracking table
+  consistent.
+
 ## 2.2.0
 
 ### Minor Changes
@@ -92,6 +128,7 @@
 - e2d3f2e: Reliability and observability enhancements across all world packages, plus event-idempotency bug fixes and a new shared utilities package.
 
   ## New Package
+
   - `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
   ## Critical Bug Fixes — Event Idempotency
@@ -109,16 +146,19 @@
   ## Reliability & Observability
 
   ### `world-azure`
+
   - Cosmos DB transactional batches for multi-document writes
   - RU/s throttling retry with backoff
   - Service Bus session support
 
   ### `world-cloudflare`
+
   - Durable Object storage transactions
   - Permanent vs. transient error handling in queue consumers
   - Schema migration framework for DO storage
 
   ### `world-firestore-tasks`
+
   - Batched writes for atomic multi-document mutations
   - Cloud Tasks idempotency keys
   - Idempotent consumer pattern
@@ -126,21 +166,25 @@
   - Polling-mode streamer
 
   ### `world-mysql`
+
   - TTL-based cleanup of idempotency rows
   - Queue processing metrics (`src/metrics.ts`)
 
   ### `world-mysql-redis`
+
   - Outbox pattern (`src/outbox.ts`, `migrations/0001_outbox.sql`)
   - Deadlock retry logic
   - Cross-backend health check
 
   ### `world-nats-jetstream`
+
   - Secondary indexes for query patterns
   - Configurable JetStream dedup window
   - Worker health checks + exponential backoff
   - Bucket TTL/compaction configuration
 
   ### `world-postgres-redis`
+
   - Outbox pattern (`src/outbox.ts`)
   - LISTEN/NOTIFY pub/sub (`src/notify.ts`, migration `0002_outbox_and_notify.sql`)
   - Cross-backend health check (`src/health.ts`)
@@ -148,17 +192,20 @@
   - Unified idempotency handling
 
   ### `world-redis`
+
   - Atomic Lua scripts for multi-key writes
   - Queue/stream metrics
   - Streams-based event log
 
   ### `world-redis-bullmq`
+
   - Stalled-job recovery
   - Configurable retry/backoff
   - Queue metrics
   - Delayed-job support
 
   ### `world-upstash`
+
   - QStash signature verification
   - Request deduplication
   - Request-budget monitoring
@@ -241,16 +288,19 @@
   - Updated: `events.create()` now accepts `runId: string | null` and returns `EventResult` containing the event plus affected entities
 
   ### API Signature Changes
+
   - `Events.create()` return type changed from `Event` to `EventResult`
   - `runs.get()` and `runs.list()` now support `resolveData` parameter ('all' | 'none')
   - `steps.get()` and `steps.list()` now support `resolveData` parameter ('all' | 'none')
 
   ### New Types
+
   - `EventResult` - contains event + affected run/step/hook/wait entities
   - `WorkflowRunWithoutData` / `StepWithoutData` - for `resolveData: 'none'`
   - `RunCreatedEventRequest` - for creating runs via events
 
   ### Dependency Updates
+
   - @workflow/errors: 4.0.1-beta.5 → 4.1.0-beta.20
   - @workflow/world: 4.0.1-beta.6 → 4.1.0-beta.17
   - @workflow/world-local: 4.0.1-beta.11 → 4.1.0-beta.51
@@ -295,7 +345,7 @@
 
   // After (4.1.0-beta)
   const { run, event } = await world.events.create(null, {
-    eventType: 'run_created',
+    eventType: "run_created",
     eventData: { deploymentId, workflowName, input: serializedInput },
   });
   ```
@@ -305,13 +355,13 @@
   ```typescript
   // Before (4.0.1-beta)
   const run = await world.runs.update(runId, {
-    status: 'completed',
+    status: "completed",
     output: serializedOutput,
   });
 
   // After (4.1.0-beta)
   const { run, event } = await world.events.create(runId, {
-    eventType: 'run_completed',
+    eventType: "run_completed",
     eventData: { output: serializedOutput },
   });
   ```
@@ -328,13 +378,14 @@
 
   // After (4.1.0-beta)
   const { hook, event } = await world.events.create(runId, {
-    eventType: 'hook_created',
+    eventType: "hook_created",
     correlationId: hookId,
     eventData: { token, metadata },
   });
   ```
 
   ## Test Status
+
   - world-redis: 21/21 storage tests passing
   - world-redis-bullmq: 21/21 storage tests passing
   - world-postgres-redis: TypeScript compiles, requires database migration

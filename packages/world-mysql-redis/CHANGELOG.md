@@ -1,5 +1,45 @@
 # @fantasticfour/world-mysql-redis
 
+## 1.4.0
+
+### Minor Changes
+
+- ee02f27: Rewrite the Redis delay queue for durability and align the package with the
+  @workflow/world 4.2.1 contract.
+
+  The queue is rebuilt around a delayed sorted set with atomic Lua promotion,
+  per-message leases with orphan reclaim, and a dead-letter queue that releases
+  the idempotency key on exhaustion so core's replay self-heals the run. The
+  inert transactional outbox is removed: storage and queue are invoked
+  independently by the contract so no shared transaction ever existed for a true
+  outbox, and the durable queue now provides the actual guarantee. Migrations
+  0002-0005 ship with this release, covering `events.occurred_at`, the outbox
+  table drop, `cancelled` in the `steps.status` enum, and a per-run index on
+  `stream_chunks`.
+
+  `specVersion` is transported with a binary-safe encoding so it survives round
+  trips through MySQL string columns. The typed error taxonomy now matches the
+  names `@workflow/core` checks by name, `hook_created` conflict semantics match
+  upstream (race loser routes through the conflict path rather than throwing), and
+  dense per-stream sequences use `FOR UPDATE` to eliminate phantom gaps. A
+  pre-allocation bug that caused the synthetic `run_created` event to sort after
+  `run_started` is fixed by porting upstream's lazy `eventId` allocation.
+
+  Note: the CLI migration runner is one-shot and has no tracking table, so
+  existing databases must apply migrations 0002-0005 manually. See `cli.ts` for
+  the documented procedure.
+
+### Patch Changes
+
+- 1b8fae6: Bundle `@fantasticfour/shared` into the published output instead of importing it
+  at runtime.
+
+  `@fantasticfour/shared` is a private, unpublished workspace package, but
+  `world-mysql-redis` listed it under `dependencies`, so tsdown left it external
+  and the published bundle (and its `.d.ts`) imported a package that does not
+  exist on npm — breaking `npm install`. Moving it to `devDependencies` (matching
+  every other world) lets tsdown inline it, producing a self-contained artifact.
+
 ## 1.3.0
 
 ### Minor Changes
@@ -92,6 +132,7 @@
 - e2d3f2e: Reliability and observability enhancements across all world packages, plus event-idempotency bug fixes and a new shared utilities package.
 
   ## New Package
+
   - `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
   ## Critical Bug Fixes — Event Idempotency
@@ -109,16 +150,19 @@
   ## Reliability & Observability
 
   ### `world-azure`
+
   - Cosmos DB transactional batches for multi-document writes
   - RU/s throttling retry with backoff
   - Service Bus session support
 
   ### `world-cloudflare`
+
   - Durable Object storage transactions
   - Permanent vs. transient error handling in queue consumers
   - Schema migration framework for DO storage
 
   ### `world-firestore-tasks`
+
   - Batched writes for atomic multi-document mutations
   - Cloud Tasks idempotency keys
   - Idempotent consumer pattern
@@ -126,21 +170,25 @@
   - Polling-mode streamer
 
   ### `world-mysql`
+
   - TTL-based cleanup of idempotency rows
   - Queue processing metrics (`src/metrics.ts`)
 
   ### `world-mysql-redis`
+
   - Outbox pattern (`src/outbox.ts`, `migrations/0001_outbox.sql`)
   - Deadlock retry logic
   - Cross-backend health check
 
   ### `world-nats-jetstream`
+
   - Secondary indexes for query patterns
   - Configurable JetStream dedup window
   - Worker health checks + exponential backoff
   - Bucket TTL/compaction configuration
 
   ### `world-postgres-redis`
+
   - Outbox pattern (`src/outbox.ts`)
   - LISTEN/NOTIFY pub/sub (`src/notify.ts`, migration `0002_outbox_and_notify.sql`)
   - Cross-backend health check (`src/health.ts`)
@@ -148,17 +196,20 @@
   - Unified idempotency handling
 
   ### `world-redis`
+
   - Atomic Lua scripts for multi-key writes
   - Queue/stream metrics
   - Streams-based event log
 
   ### `world-redis-bullmq`
+
   - Stalled-job recovery
   - Configurable retry/backoff
   - Queue metrics
   - Delayed-job support
 
   ### `world-upstash`
+
   - QStash signature verification
   - Request deduplication
   - Request-budget monitoring
