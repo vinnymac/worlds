@@ -6,7 +6,6 @@ export default defineConfig({
     schema: 'src/schema.ts',
     cli: 'src/cli.ts',
     health: 'src/health.ts',
-    outbox: 'src/outbox.ts',
   },
   format: 'esm',
   dts: true,

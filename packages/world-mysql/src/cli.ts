@@ -23,20 +23,29 @@ async function setupDatabase() {
     const migrationsDir = join(__dirname, '..', 'migrations');
 
     // Read migration files in order
-    const migrationFiles = ['0000_initial.sql'];
+    const migrationFiles = [
+      '0000_initial.sql',
+      '0001_events_occurred_at.sql',
+      '0002_spec_current_queue_streams.sql',
+    ];
 
     for (const file of migrationFiles) {
       const migrationPath = join(migrationsDir, file);
       const migrationSQL = await readFile(migrationPath, 'utf-8');
 
-      // MySQL doesn't support multi-statement by default, split on semicolons
+      // MySQL doesn't support multi-statement by default, split on semicolons.
+      // Skip chunks that contain only `--` comments (e.g. a trailing comment).
       const statements = migrationSQL
         .split(';')
         .map((s) => s.trim())
-        .filter((s) => s.length > 0);
+        .filter((s) =>
+          s.split('\n').some((line) => line.trim().length > 0 && !line.trim().startsWith('--')),
+        );
 
       for (const statement of statements) {
-        await connection.execute(statement);
+        // query() (text protocol) — some DDL is not supported by the
+        // prepared statement protocol that execute() uses.
+        await connection.query(statement);
       }
     }
 

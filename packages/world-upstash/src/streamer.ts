@@ -24,6 +24,48 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Encode a chunk for storage. Both string and binary chunks are stored
+ * base64-encoded so reads can decode unconditionally — Node's base64 decoder
+ * never throws on invalid input (it silently skips non-alphabet characters),
+ * so a "decode, fall back to utf-8" strategy silently corrupts string chunks.
+ */
+function encodeChunk(chunk: string | Uint8Array): string {
+  const buffer = typeof chunk === 'string' ? Buffer.from(chunk, 'utf-8') : Buffer.from(chunk);
+  return buffer.toString('base64');
+}
+
+/**
+ * Decode a stored chunk back to bytes.
+ *
+ * The `String()` coercion guards against @upstash/redis auto-deserialization:
+ * a base64 value that happens to parse as JSON (e.g. "1234" or "true") comes
+ * back as a number/boolean; the client only auto-parses numbers whose
+ * canonical string form matches the raw value, so coercion restores the
+ * original base64 text exactly.
+ */
+function decodeChunk(raw: unknown): Uint8Array {
+  return new Uint8Array(Buffer.from(String(raw), 'base64'));
+}
+
+/** Read the stream-closed marker, tolerating auto-deserialization ('1' → 1). */
+async function readClosedFlag(redis: Redis, closedKey: string): Promise<boolean> {
+  const value = await redis.get(closedKey);
+  return value != null && String(value) === '1';
+}
+
+/**
+ * The Streamer contract, plus the Upstash-specific `runId` parameter on
+ * `readFromStream` (chunk lists are keyed by run, so polling requires it).
+ */
+export interface UpstashStreamer extends Omit<Streamer, 'readFromStream'> {
+  readFromStream(
+    name: string,
+    startIndex?: number,
+    runId?: string,
+  ): Promise<ReadableStream<Uint8Array>>;
+}
+
+/**
  * Create a streamer for Upstash world using Redis as storage.
  *
  * Because Upstash Redis is HTTP-based, there is no long-lived connection for
@@ -31,7 +73,7 @@ function sleep(ms: number): Promise<void> {
  * For serverless environments where long-running responses are not practical,
  * prefer getStreamChunks() for explicit polling from the client side.
  */
-export function createStreamer(config: UpstashStreamerConfig): Streamer {
+export function createStreamer(config: UpstashStreamerConfig): UpstashStreamer {
   const { redis, keyPrefix } = config;
   const defaultPollIntervalMs = config.pollIntervalMs ?? 500;
 
@@ -46,8 +88,7 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
 
     async writeToStream(name: string, runId: string, chunk: string | Uint8Array): Promise<void> {
       const key = streamChunksKey(name, runId);
-      const value = chunk instanceof Uint8Array ? Buffer.from(chunk).toString('base64') : chunk;
-      await redis.rpush(key, value);
+      await redis.rpush(key, encodeChunk(chunk));
 
       // Track stream name for this run
       await redis.sadd(streamsByRunKey(runId), name);
@@ -79,8 +120,20 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
 
       const chunksKey = streamChunksKey(name, runId);
       const closedKey = streamClosedKey(name, runId);
-      let currentIndex = startIndex ?? 0;
       const pollInterval = defaultPollIntervalMs;
+
+      // Resolve a negative startIndex relative to the current end of the
+      // stream (interface contract: -3 on a 10-chunk stream starts at 7,
+      // clamped to 0). LRANGE would otherwise interpret negative indices
+      // end-relative per chunk fetch, duplicating/skipping chunks as the
+      // index is incremented.
+      let currentIndex: number;
+      if (startIndex !== undefined && startIndex < 0) {
+        const length = await redis.llen(chunksKey);
+        currentIndex = Math.max(0, length + startIndex);
+      } else {
+        currentIndex = startIndex ?? 0;
+      }
 
       return new ReadableStream<Uint8Array>({
         async pull(controller) {
@@ -88,19 +141,15 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
           // eslint-disable-next-line no-constant-condition
           while (true) {
             try {
-              const rawChunks = (await redis.lrange(
+              const rawChunks = await redis.lrange<string>(
                 chunksKey,
                 currentIndex,
                 currentIndex + 99,
-              )) as string[];
+              );
 
               if (rawChunks.length > 0) {
                 for (const chunk of rawChunks) {
-                  try {
-                    controller.enqueue(new Uint8Array(Buffer.from(chunk, 'base64')));
-                  } catch {
-                    controller.enqueue(new Uint8Array(Buffer.from(chunk, 'utf-8')));
-                  }
+                  controller.enqueue(decodeChunk(chunk));
                   currentIndex++;
                 }
                 // Yield control after enqueuing a batch
@@ -108,8 +157,7 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
               }
 
               // No new data -- check if stream is closed
-              const isClosed = (await redis.get(closedKey)) === '1';
-              if (isClosed) {
+              if (await readClosedFlag(redis, closedKey)) {
                 controller.close();
                 return;
               }
@@ -142,29 +190,15 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
       const chunksKey = streamChunksKey(name, runId);
       const closedKey = streamClosedKey(name, runId);
 
-      const rawChunks = (await redis.lrange(
-        chunksKey,
-        fromIndex,
-        fromIndex + limit - 1,
-      )) as string[];
-      const isClosed = (await redis.get(closedKey)) === '1';
+      const rawChunks = await redis.lrange<string>(chunksKey, fromIndex, fromIndex + limit - 1);
+      const isClosed = await readClosedFlag(redis, closedKey);
       const totalLength = await redis.llen(chunksKey);
 
       // Decode base64 back to Uint8Array and create StreamChunk objects
-      const data = (rawChunks || []).map((chunk: string, offset: number) => {
-        try {
-          return {
-            index: fromIndex + offset,
-            data: new Uint8Array(Buffer.from(chunk, 'base64')),
-          };
-        } catch {
-          // If not base64, treat as text
-          return {
-            index: fromIndex + offset,
-            data: new Uint8Array(Buffer.from(chunk, 'utf-8')),
-          };
-        }
-      });
+      const data = (rawChunks || []).map((chunk: string, offset: number) => ({
+        index: fromIndex + offset,
+        data: decodeChunk(chunk),
+      }));
 
       const hasMore = fromIndex + rawChunks.length < totalLength;
       const nextCursor = hasMore ? String(fromIndex + rawChunks.length) : null;
@@ -182,7 +216,7 @@ export function createStreamer(config: UpstashStreamerConfig): Streamer {
       const closedKey = streamClosedKey(name, runId);
 
       const length = await redis.llen(chunksKey);
-      const isClosed = (await redis.get(closedKey)) === '1';
+      const isClosed = await readClosedFlag(redis, closedKey);
 
       return {
         tailIndex: Math.max(0, length - 1),

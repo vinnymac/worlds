@@ -1,4 +1,4 @@
-import type { Storage, World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type Storage, type World } from '@workflow/world';
 import { connect, type NatsConnection, type JetStreamClient } from 'nats';
 import type { NatsJetStreamWorldConfig } from './config.js';
 import { createQueue, type WorkerHealth } from './queue.js';
@@ -65,6 +65,14 @@ export function createWorld(
   const queue = createQueue(getJetStream, config);
 
   return {
+    // Declare the highest spec version this world supports. With spec
+    // version 3+, `start()` includes the run input in the queue message
+    // (CBOR queue transport), which enables the resilient-start path in
+    // `events.create('run_started')`. That path is required for
+    // correctness here: the runtime creates `run_created` and enqueues
+    // the workflow message in parallel, and JetStream delivers to the
+    // in-process worker fast enough that `run_started` can win the race.
+    specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,
     ...queue,

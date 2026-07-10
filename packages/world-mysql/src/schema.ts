@@ -63,15 +63,15 @@ export const runs = schema.table(
     inputJson: json('input').$type<SerializedContent>(),
     input: Cbor<SerializedContent>()('input_cbor'),
     error: text('error'),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-    updatedAt: timestamp('updated_at')
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { fsp: 3 })
       .defaultNow()
       .$onUpdateFn(() => new Date())
       .notNull(),
-    completedAt: timestamp('completed_at'),
-    startedAt: timestamp('started_at'),
+    completedAt: timestamp('completed_at', { fsp: 3 }),
+    startedAt: timestamp('started_at', { fsp: 3 }),
     specVersion: int('spec_version'),
-    expiredAt: timestamp('expired_at'),
+    expiredAt: timestamp('expired_at', { fsp: 3 }),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
@@ -90,7 +90,8 @@ export const events = schema.table(
     eventId: varchar('id', { length: 255 }).primaryKey(),
     eventType: varchar('type', { length: 255 }).$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id', { length: 255 }),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    occurredAt: timestamp('occurred_at', { fsp: 3 }),
     runId: varchar('run_id', { length: 255 }).notNull(),
     /** @deprecated */
     eventDataJson: json('payload'),
@@ -118,14 +119,14 @@ export const steps = schema.table(
     output: Cbor<SerializedContent>()('output_cbor'),
     error: text('error'),
     attempt: int('attempt').notNull(),
-    startedAt: timestamp('started_at'),
-    completedAt: timestamp('completed_at'),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-    updatedAt: timestamp('updated_at')
+    startedAt: timestamp('started_at', { fsp: 3 }),
+    completedAt: timestamp('completed_at', { fsp: 3 }),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { fsp: 3 })
       .defaultNow()
       .$onUpdateFn(() => new Date())
       .notNull(),
-    retryAfter: timestamp('retry_after'),
+    retryAfter: timestamp('retry_after', { fsp: 3 }),
     specVersion: int('spec_version'),
   } satisfies DrizzlishOfType<
     Cborized<Omit<Step, 'input'> & { input?: unknown }, 'output' | 'input'>
@@ -145,7 +146,7 @@ export const hooks = schema.table(
     ownerId: varchar('owner_id', { length: 255 }).notNull(),
     projectId: varchar('project_id', { length: 255 }).notNull(),
     environment: varchar('environment', { length: 255 }).notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
     /** @deprecated */
     metadataJson: json('metadata').$type<SerializedContent>(),
     metadata: Cbor<SerializedContent>()('metadata_cbor'),
@@ -160,7 +161,7 @@ export const hooks = schema.table(
 
 const blob = customType<{ data: Buffer; notNull: false; default: false }>({
   dataType() {
-    return 'blob';
+    return 'mediumblob';
   },
 });
 
@@ -169,14 +170,17 @@ export const streams = schema.table(
   {
     chunkId: varchar('id', { length: 255 }).$type<`chnk_${string}`>().notNull(),
     streamId: varchar('stream_id', { length: 255 }).notNull(),
+    runId: varchar('run_id', { length: 255 }),
     chunkData: blob('data').notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
     eof: boolean('eof').notNull(),
+    /** @deprecated ordering uses the monotonic ULID chunkId; kept for legacy rows */
     sequence: bigint('sequence', { mode: 'number' }).notNull(),
   },
   (tb) => [
     primaryKey({ columns: [tb.streamId, tb.chunkId] }),
     index('idx_stream_chunks_sequence').on(tb.streamId, tb.sequence),
+    index('idx_stream_chunks_run_id').on(tb.runId),
   ],
 );
 
@@ -190,19 +194,21 @@ export const jobs = schema.table(
     id: bigint('id', { mode: 'number' }).autoincrement().primaryKey(),
     jobId: varchar('job_id', { length: 255 }).notNull().unique(),
     queueName: varchar('queue_name', { length: 255 }).notNull(),
+    /** The effective enqueue idempotency key, released when the job completes */
+    idempotencyKey: varchar('idempotency_key', { length: 255 }),
     payload: blob('payload').notNull(),
     status: mysqlEnum('status', ['pending', 'processing', 'failed']).notNull().default('pending'),
     attempt: int('attempt').notNull().default(0),
     maxAttempts: int('max_attempts').notNull().default(3),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-    updatedAt: timestamp('updated_at')
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { fsp: 3 })
       .defaultNow()
       .$onUpdateFn(() => new Date())
       .notNull(),
-    lockedAt: timestamp('locked_at'),
+    lockedAt: timestamp('locked_at', { fsp: 3 }),
     lockedBy: varchar('locked_by', { length: 255 }),
     error: text('error'),
-    scheduledFor: timestamp('scheduled_for'),
+    scheduledFor: timestamp('scheduled_for', { fsp: 3 }),
   },
   (tb) => [
     index('idx_jobs_queue_status').on(tb.queueName, tb.status, tb.id),
@@ -216,7 +222,7 @@ export const idempotency = schema.table(
     idempotencyKey: varchar('idempotency_key', { length: 255 }).primaryKey(),
     messageId: varchar('message_id', { length: 255 }).notNull(),
     queueName: varchar('queue_name', { length: 255 }).notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
   },
   (tb) => [index('idx_idempotency_created').on(tb.createdAt)],
 );

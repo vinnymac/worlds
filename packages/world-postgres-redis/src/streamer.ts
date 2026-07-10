@@ -1,11 +1,12 @@
 import { EventEmitter } from 'node:events';
 import type {
   GetChunksOptions,
+  StreamChunk,
   StreamChunksResponse,
   StreamInfoResponse,
   Streamer,
 } from '@workflow/world';
-import { and, eq } from 'drizzle-orm';
+import { and, asc, eq, gt, sql } from 'drizzle-orm';
 import type { Sql } from 'postgres';
 import { monotonicFactory } from 'ulid';
 import { type Drizzle, Schema } from './drizzle/index.js';
@@ -106,12 +107,13 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
       chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
-      await _runId;
+      const runId = await _runId;
 
       const chunkId = genChunkId();
       await drizzle.insert(streams).values({
         chunkId,
         streamId: name,
+        runId,
         chunkData: !Buffer.isBuffer(chunk) ? Buffer.from(chunk) : chunk,
         eof: false,
       });
@@ -122,12 +124,13 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
     },
     async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
-      await _runId;
+      const runId = await _runId;
 
       const chunkId = genChunkId();
       await drizzle.insert(streams).values({
         chunkId,
         streamId: name,
+        runId,
         chunkData: Buffer.from([]),
         eof: true,
       });
@@ -210,23 +213,101 @@ export function createStreamer(postgres: Sql, drizzle: Drizzle): Streamer {
       });
     },
 
-    async listStreamsByRunId(_runId: string): Promise<string[]> {
-      // Not implemented for Postgres-Redis
-      return [];
+    async listStreamsByRunId(runId: string): Promise<string[]> {
+      const results = await drizzle
+        .selectDistinct({ streamId: streams.streamId })
+        .from(streams)
+        .where(eq(streams.runId, runId));
+      return results.map((r) => r.streamId);
     },
 
     async getStreamChunks(
-      _name: string,
+      name: string,
       _runId: string,
-      _options?: GetChunksOptions,
+      options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
-      // Not implemented for Postgres-Redis
-      return { data: [], hasMore: false, cursor: null, done: true };
+      const limit = options?.limit ?? 100;
+
+      // Decode cursor: { c: last seen chunkId, i: running chunk index }
+      let cursorChunkId: `chnk_${string}` | null = null;
+      let baseIndex = 0;
+      if (options?.cursor) {
+        try {
+          const decoded: unknown = JSON.parse(
+            Buffer.from(options.cursor, 'base64').toString('utf-8'),
+          );
+          if (decoded && typeof decoded === 'object') {
+            const { c, i } = decoded as { c?: unknown; i?: unknown };
+            if (typeof c === 'string' && c.startsWith('chnk_')) {
+              cursorChunkId = c as `chnk_${string}`;
+            }
+            if (typeof i === 'number') baseIndex = i;
+          }
+        } catch {
+          // Invalid cursor, start from beginning
+        }
+      }
+
+      // Fetch only data rows (exclude EOF) with limit + 1 to detect hasMore.
+      const rows = await drizzle
+        .select({ chunkId: streams.chunkId, data: streams.chunkData })
+        .from(streams)
+        .where(
+          and(
+            eq(streams.streamId, name),
+            eq(streams.eof, false),
+            cursorChunkId ? gt(streams.chunkId, cursorChunkId) : undefined,
+          ),
+        )
+        .orderBy(asc(streams.chunkId))
+        .limit(limit + 1);
+      const hasMore = rows.length > limit;
+      const pageRows = rows.slice(0, limit);
+
+      // Check if stream is complete via a separate EOF query
+      const [eofRow] = await drizzle
+        .select({ eof: streams.eof })
+        .from(streams)
+        .where(and(eq(streams.streamId, name), eq(streams.eof, true)))
+        .limit(1);
+
+      const chunks: StreamChunk[] = pageRows.map((row, i) => ({
+        index: baseIndex + i,
+        data: new Uint8Array(row.data),
+      }));
+      const lastRow = pageRows.at(-1);
+      const nextCursor =
+        hasMore && lastRow
+          ? Buffer.from(
+              JSON.stringify({ c: lastRow.chunkId, i: baseIndex + pageRows.length }),
+            ).toString('base64')
+          : null;
+
+      return {
+        data: chunks,
+        cursor: nextCursor,
+        hasMore,
+        done: !!eofRow,
+      };
     },
 
-    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Not implemented for Postgres-Redis
-      return { tailIndex: -1, done: false };
+    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
+      const [countResult] = await drizzle
+        .select({ count: sql<number>`count(*)::int` })
+        .from(streams)
+        .where(and(eq(streams.streamId, name), eq(streams.eof, false)));
+      const dataCount = countResult?.count ?? 0;
+
+      const [eofRow] = await drizzle
+        .select({ eof: streams.eof })
+        .from(streams)
+        .where(and(eq(streams.streamId, name), eq(streams.eof, true)))
+        .limit(1);
+
+      return {
+        tailIndex: dataCount - 1,
+        done: !!eofRow,
+      };
     },
   };
 }

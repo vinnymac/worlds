@@ -143,9 +143,9 @@ describe('Storage (Redis integration)', () => {
         expect(retrieved.input).toEqual(['arg']);
       });
 
-      it('should throw error for non-existent run', async () => {
+      it('should throw WorkflowRunNotFoundError for non-existent run', async () => {
         await expect(runs.get('missing')).rejects.toMatchObject({
-          status: 404,
+          name: 'WorkflowRunNotFoundError',
         });
       });
     });
@@ -497,7 +497,7 @@ describe('Storage (Redis integration)', () => {
   });
 
   describe('Event idempotency', () => {
-    it('should handle duplicate step_created events', async () => {
+    it('should reject duplicate step_created events with EntityConflictError', async () => {
       const run = await createRun();
       const stepId = 'step-idempotent-test';
 
@@ -510,22 +510,29 @@ describe('Storage (Redis integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario)
-      const result2 = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: stepId,
-        eventData: { stepName: 'test-step', input: ['input1'] },
-      });
-      expect(result2.step).toBeDefined();
-      expect(result2.step!.stepId).toBe(stepId);
+      // Duplicate step_created event (replay scenario) — must reject so the
+      // log ends with exactly one creation event. Core matches this error by
+      // name and treats it as benign.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: stepId,
+          eventData: { stepName: 'test-step', input: ['input1'] },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       // Verify step appears in list query (critical!)
       const listResult = await steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
+
+      // Exactly ONE step_created event in the correlation log
+      const eventList = await events.listByCorrelationId({ correlationId: stepId });
+      const created = eventList.data.filter((e) => e.eventType === 'step_created');
+      expect(created).toHaveLength(1);
     });
 
-    it('should handle duplicate run_created events', async () => {
+    it('should reject duplicate run_created events with EntityConflictError', async () => {
       // First run_created event
       const result1 = await events.create(null, {
         eventType: 'run_created',
@@ -539,19 +546,56 @@ describe('Storage (Redis integration)', () => {
       const runId = result1.run!.runId;
 
       // Duplicate run_created event (replay scenario)
-      const result2 = await events.create(runId, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-idempotent',
-          input: [],
-        },
-      });
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      await expect(
+        events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'test-workflow-idempotent',
+            input: [],
+          },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const listResult = await runs.list({ workflowName: 'test-workflow-idempotent' });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      // Exactly ONE run_created event in the run's log
+      const eventList = await events.list({ runId, pagination: { sortOrder: 'asc' } });
+      const created = eventList.data.filter((e) => e.eventType === 'run_created');
+      expect(created).toHaveLength(1);
+    });
+
+    it('should not re-add a run to the pending status index on duplicate run_created', async () => {
+      const result = await events.create(null, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'index-corruption-test',
+          input: [],
+        },
+      });
+      const runId = result.run!.runId;
+
+      await events.create(runId, { eventType: 'run_started' });
+
+      // Duplicate run_created after the run has moved on — must not
+      // resurrect the run in the pending index.
+      await expect(
+        events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'index-corruption-test',
+            input: [],
+          },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      const pending = await runs.list({ status: 'pending' });
+      expect(pending.data.some((r) => r.runId === runId)).toBe(false);
+      const running = await runs.list({ status: 'running' });
+      expect(running.data.some((r) => r.runId === runId)).toBe(true);
     });
 
     it('should handle duplicate hook_created events with different tokens', async () => {
@@ -607,6 +651,390 @@ describe('Storage (Redis integration)', () => {
       });
       const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
+    });
+  });
+
+  describe('waits', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun();
+      testRunId = run.runId;
+    });
+
+    it('should create a wait entity via wait_created', async () => {
+      const resumeAt = new Date(Date.now() + 60_000);
+      const result = await events.create(testRunId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-1',
+        eventData: { resumeAt },
+      });
+
+      expect(result.event?.eventType).toBe('wait_created');
+      expect(result.wait).toMatchObject({ runId: testRunId, status: 'waiting' });
+      expect(result.wait?.resumeAt?.getTime()).toBe(resumeAt.getTime());
+    });
+
+    it('should reject duplicate wait_created with EntityConflictError', async () => {
+      await events.create(testRunId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-dup',
+        eventData: { resumeAt: new Date() },
+      });
+
+      await expect(
+        events.create(testRunId, {
+          eventType: 'wait_created',
+          correlationId: 'wait-dup',
+          eventData: { resumeAt: new Date() },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      const eventList = await events.listByCorrelationId({ correlationId: 'wait-dup' });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
+    });
+
+    it('should complete a wait exactly once', async () => {
+      await events.create(testRunId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-once',
+        eventData: { resumeAt: new Date() },
+      });
+
+      const completed = await events.create(testRunId, {
+        eventType: 'wait_completed',
+        correlationId: 'wait-once',
+      });
+      expect(completed.wait?.status).toBe('completed');
+      expect(completed.wait?.completedAt).toBeInstanceOf(Date);
+
+      // Replay: a second wait_completed must reject instead of appending a
+      // duplicate event that would corrupt the log on future replays.
+      await expect(
+        events.create(testRunId, {
+          eventType: 'wait_completed',
+          correlationId: 'wait-once',
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      const eventList = await events.listByCorrelationId({ correlationId: 'wait-once' });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_completed')).toHaveLength(1);
+    });
+
+    it('should reject concurrent duplicate wait_completed replays', async () => {
+      await events.create(testRunId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-race',
+        eventData: { resumeAt: new Date() },
+      });
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          events.create(testRunId, {
+            eventType: 'wait_completed',
+            correlationId: 'wait-race',
+          }),
+        ),
+      );
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      expect(fulfilled).toHaveLength(1);
+      for (const rejection of results.filter((r) => r.status === 'rejected')) {
+        expect((rejection as PromiseRejectedResult).reason).toMatchObject({
+          name: 'EntityConflictError',
+        });
+      }
+
+      const eventList = await events.listByCorrelationId({ correlationId: 'wait-race' });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_completed')).toHaveLength(1);
+    });
+
+    it('should throw 404 for wait_completed on unknown wait', async () => {
+      await expect(
+        events.create(testRunId, {
+          eventType: 'wait_completed',
+          correlationId: 'wait-missing',
+        }),
+      ).rejects.toMatchObject({ status: 404 });
+    });
+  });
+
+  describe('hook_created semantics', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun();
+      testRunId = run.runId;
+    });
+
+    it('should reject a duplicate hook_created for the same run+hook+token', async () => {
+      await events.create(testRunId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-same-claim',
+        eventData: { token: 'same-claim-token' },
+      });
+
+      // A redelivered hook_created for the SAME claim must NOT emit a
+      // hook_conflict against its own token — that would fail the workflow.
+      await expect(
+        events.create(testRunId, {
+          eventType: 'hook_created',
+          correlationId: 'hook-same-claim',
+          eventData: { token: 'same-claim-token' },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      const eventList = await events.listByCorrelationId({ correlationId: 'hook-same-claim' });
+      expect(eventList.data.map((e) => e.eventType)).toEqual(['hook_created']);
+
+      // The token mapping still resolves to the original hook
+      const byToken = await _hooks.getByToken('same-claim-token');
+      expect(byToken.hookId).toBe('hook-same-claim');
+      expect(byToken.runId).toBe(testRunId);
+    });
+
+    it('should emit hook_conflict with conflictingRunId when a different run claims the token', async () => {
+      await events.create(testRunId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-owner',
+        eventData: { token: 'contested-token' },
+      });
+
+      const otherRun = await createRun({ workflowName: 'other-workflow' });
+      const result = await events.create(otherRun.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-challenger',
+        eventData: { token: 'contested-token' },
+      });
+
+      expect(result.hook).toBeUndefined();
+      expect(result.event?.eventType).toBe('hook_conflict');
+      expect(
+        result.event && 'eventData' in result.event ? result.event.eventData : null,
+      ).toMatchObject({
+        token: 'contested-token',
+        conflictingRunId: testRunId,
+      });
+
+      // The rightful owner's token mapping must be untouched
+      const byToken = await _hooks.getByToken('contested-token');
+      expect(byToken.hookId).toBe('hook-owner');
+      expect(byToken.runId).toBe(testRunId);
+    });
+  });
+
+  describe('error taxonomy', () => {
+    let testRunId: string;
+
+    beforeEach(async () => {
+      const run = await createRun();
+      testRunId = run.runId;
+    });
+
+    it('should throw EntityConflictError when modifying a terminal step', async () => {
+      await createStep(testRunId, { stepId: 'step-terminal' });
+      await events.create(testRunId, {
+        eventType: 'step_started',
+        correlationId: 'step-terminal',
+      });
+      await events.create(testRunId, {
+        eventType: 'step_completed',
+        correlationId: 'step-terminal',
+        eventData: { result: ['done'] },
+      });
+
+      // Redelivered step_completed after the step finished — core swallows
+      // EntityConflictError and re-enqueues the workflow.
+      await expect(
+        events.create(testRunId, {
+          eventType: 'step_completed',
+          correlationId: 'step-terminal',
+          eventData: { result: ['done'] },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      await expect(
+        events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'step-terminal',
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+    });
+
+    it('should reject concurrent terminal step transitions exactly once', async () => {
+      await createStep(testRunId, { stepId: 'step-race' });
+      await events.create(testRunId, {
+        eventType: 'step_started',
+        correlationId: 'step-race',
+      });
+
+      const results = await Promise.allSettled([
+        events.create(testRunId, {
+          eventType: 'step_completed',
+          correlationId: 'step-race',
+          eventData: { result: ['a'] },
+        }),
+        events.create(testRunId, {
+          eventType: 'step_failed',
+          correlationId: 'step-race',
+          eventData: { error: 'boom' },
+        }),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      expect(fulfilled).toHaveLength(1);
+
+      const step = await steps.get(testRunId, 'step-race');
+      expect(['completed', 'failed']).toContain(step.status);
+    });
+
+    it('should gate step_started behind retryAfter with TooEarlyError', async () => {
+      await createStep(testRunId, { stepId: 'step-backoff' });
+      await events.create(testRunId, {
+        eventType: 'step_started',
+        correlationId: 'step-backoff',
+      });
+      await events.create(testRunId, {
+        eventType: 'step_retrying',
+        correlationId: 'step-backoff',
+        eventData: { error: 'transient', retryAfter: new Date(Date.now() + 60_000) },
+      });
+
+      await expect(
+        events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'step-backoff',
+        }),
+      ).rejects.toMatchObject({ name: 'TooEarlyError' });
+    });
+
+    it('should clear retryAfter once the backoff has elapsed', async () => {
+      await createStep(testRunId, { stepId: 'step-backoff-elapsed' });
+      await events.create(testRunId, {
+        eventType: 'step_started',
+        correlationId: 'step-backoff-elapsed',
+      });
+      await events.create(testRunId, {
+        eventType: 'step_retrying',
+        correlationId: 'step-backoff-elapsed',
+        eventData: { error: 'transient', retryAfter: new Date(Date.now() - 1000) },
+      });
+
+      const result = await events.create(testRunId, {
+        eventType: 'step_started',
+        correlationId: 'step-backoff-elapsed',
+      });
+      expect(result.step?.status).toBe('running');
+      expect(result.step?.attempt).toBe(2);
+      expect(result.step?.retryAfter).toBeUndefined();
+    });
+
+    it('should throw RunExpiredError for run_started on a terminal run', async () => {
+      await events.create(testRunId, { eventType: 'run_started' });
+      await events.create(testRunId, {
+        eventType: 'run_completed',
+        eventData: { output: [] },
+      });
+
+      await expect(events.create(testRunId, { eventType: 'run_started' })).rejects.toMatchObject({
+        name: 'RunExpiredError',
+      });
+    });
+
+    it('should throw WorkflowRunNotFoundError for run_started without a run or runInput', async () => {
+      await expect(
+        events.create('wrun_does_not_exist', { eventType: 'run_started' }),
+      ).rejects.toMatchObject({ name: 'WorkflowRunNotFoundError' });
+    });
+
+    it('should throw HookNotFoundError for hook getters and hook events on unknown hooks', async () => {
+      await expect(_hooks.get('missing-hook')).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+      await expect(_hooks.getByToken('missing-token')).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+      await expect(
+        events.create(testRunId, {
+          eventType: 'hook_received',
+          correlationId: 'missing-hook',
+          eventData: { payload: {} },
+        }),
+      ).rejects.toMatchObject({ name: 'HookNotFoundError' });
+    });
+
+    it('should allow exactly one terminal run transition', async () => {
+      await events.create(testRunId, { eventType: 'run_started' });
+
+      const results = await Promise.allSettled([
+        events.create(testRunId, { eventType: 'run_completed', eventData: { output: [] } }),
+        events.create(testRunId, { eventType: 'run_cancelled' }),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      expect(fulfilled).toHaveLength(1);
+
+      const run = await runs.get(testRunId);
+      expect(['completed', 'cancelled']).toContain(run.status);
+
+      // The run must be a member of exactly one status index
+      const completed = await runs.list({ status: 'completed' });
+      const cancelled = await runs.list({ status: 'cancelled' });
+      const memberships = [
+        completed.data.some((r) => r.runId === testRunId),
+        cancelled.data.some((r) => r.runId === testRunId),
+      ].filter(Boolean);
+      expect(memberships).toHaveLength(1);
+    });
+  });
+
+  describe('pagination cursors', () => {
+    it('should throw on an invalid runs cursor instead of silently skipping', async () => {
+      await createRun();
+      await expect(
+        runs.list({ pagination: { cursor: 'wrun_bogus_cursor' } }),
+      ).rejects.toMatchObject({ status: 400 });
+    });
+
+    it('should throw on an invalid events cursor', async () => {
+      const run = await createRun();
+      await expect(
+        events.list({ runId: run.runId, pagination: { cursor: 'wevt_bogus' } }),
+      ).rejects.toMatchObject({ status: 400 });
+    });
+
+    it('should paginate combined workflowName+status listings without dropping runs', async () => {
+      // 5 completed + 5 pending runs interleaved under one workflow name
+      const completedIds: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        const run = await createRun({ workflowName: 'combined-filter' });
+        if (i % 2 === 0) {
+          await events.create(run.runId, { eventType: 'run_started' });
+          await events.create(run.runId, {
+            eventType: 'run_completed',
+            eventData: { output: [] },
+          });
+          completedIds.push(run.runId);
+        }
+        await setTimeout(2);
+      }
+
+      // Page size 2: naive limit+1 candidate fetches under-fetch because the
+      // in-memory status filter rejects interleaved pending runs.
+      const seen: string[] = [];
+      let cursor: string | null | undefined;
+      for (let page = 0; page < 10; page++) {
+        const result = await runs.list({
+          workflowName: 'combined-filter',
+          status: 'completed',
+          pagination: { limit: 2, ...(cursor ? { cursor } : {}) },
+        });
+        seen.push(...result.data.map((r) => r.runId));
+        if (!result.hasMore) break;
+        cursor = result.cursor;
+      }
+
+      expect(seen.toSorted()).toEqual(completedIds.toSorted());
     });
   });
 });

@@ -63,6 +63,7 @@ if (shouldSkipTests) {
         \`type\` VARCHAR(255) NOT NULL,
         \`correlation_id\` VARCHAR(255),
         \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`occurred_at\` TIMESTAMP NULL,
         \`run_id\` VARCHAR(255) NOT NULL,
         \`payload\` JSON,
         \`payload_cbor\` BLOB,
@@ -75,7 +76,7 @@ if (shouldSkipTests) {
         \`run_id\` VARCHAR(255) NOT NULL,
         \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
         \`step_name\` VARCHAR(255) NOT NULL,
-        \`status\` ENUM('pending','running','completed','failed') NOT NULL,
+        \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
         \`input\` JSON,
         \`input_cbor\` BLOB,
         \`output\` JSON,
@@ -111,12 +112,14 @@ if (shouldSkipTests) {
       `CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
         \`id\` VARCHAR(255) NOT NULL,
         \`stream_id\` VARCHAR(255) NOT NULL,
+        \`run_id\` VARCHAR(255) NULL,
         \`data\` BLOB NOT NULL,
         \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         \`eof\` BOOLEAN NOT NULL,
         \`sequence\` BIGINT NOT NULL,
         PRIMARY KEY (\`stream_id\`, \`id\`),
-        INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`)
+        INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`),
+        INDEX \`idx_stream_chunks_run_id\` (\`run_id\`)
       )`,
     ];
 

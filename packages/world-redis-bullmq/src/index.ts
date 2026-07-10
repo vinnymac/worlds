@@ -1,4 +1,4 @@
-import type { Storage, World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type Storage, type World } from '@workflow/world';
 import { Redis } from 'ioredis';
 import type { RedisWorldConfig } from './config.js';
 import { createQueue, type QueueStats } from './queue.js';
@@ -43,8 +43,18 @@ export function createWorld(
     ...storage,
     ...streamer,
     ...queue,
+    // Declares support for the CBOR/binary-safe queue transport so core
+    // attaches runInput to workflow messages (resilient start). The queue
+    // serializes payloads with a tagged-JSON transport that round-trips
+    // Uint8Array values through BullMQ job data.
+    specVersion: SPEC_VERSION_CURRENT,
     async start() {
       await queue.start();
+    },
+    async close() {
+      await queue.close();
+      await streamer.close();
+      await redis.quit();
     },
   };
 }

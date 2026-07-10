@@ -47,10 +47,24 @@ export interface UpstashWorldConfig {
 
   /**
    * Enable QStash deduplication via `deduplicationId` on publish.
-   * When enabled, the generated `messageId` is passed as the deduplication ID,
-   * providing free idempotency within QStash's 90-day dedup window.
+   * When enabled, the caller-provided `idempotencyKey` (sent by the workflow
+   * runtime on every step enqueue) is passed as the deduplication ID, so
+   * replayed enqueues of the same logical dispatch are collapsed within
+   * QStash's 90-day dedup window.
    * @default true
    * @see https://upstash.com/docs/qstash/features/deduplication
    */
   enableDeduplication?: boolean;
+
+  /**
+   * Number of times QStash redelivers a message whose handler responds with a
+   * status outside 200-299 (a hard failure). QStash's own default is small (3
+   * on the free plan), well below core's retry budget: core allows up to 48
+   * total deliveries (`MAX_QUEUE_DELIVERIES`) before marking a run failed.
+   * Defaults to 47 retries (48 total deliveries) so QStash's redelivery budget
+   * matches core's expectation. QStash clamps this to your plan's maximum.
+   * @default 47
+   * @see https://upstash.com/docs/qstash/features/retry
+   */
+  qstashRetries?: number;
 }

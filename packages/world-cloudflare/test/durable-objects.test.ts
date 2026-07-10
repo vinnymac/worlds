@@ -1,3 +1,4 @@
+import { WorkflowRunNotFoundError } from '@workflow/errors';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createStorage } from '../src/storage.js';
 import { clearMockData, createMockEnv } from '../src/test-mocks.js';
@@ -415,9 +416,9 @@ describe('Cloudflare Durable Objects Features', () => {
   describe('Error Handling in DO Operations', () => {
     it('should handle DO fetch failures gracefully', async () => {
       // Try to get non-existent run
-      await expect(storage.runs.get('wrun_nonexistent')).rejects.toMatchObject({
-        status: 404,
-      });
+      await expect(storage.runs.get('wrun_nonexistent')).rejects.toSatisfy((error) =>
+        WorkflowRunNotFoundError.is(error),
+      );
     });
 
     it('should handle invalid DO responses', async () => {

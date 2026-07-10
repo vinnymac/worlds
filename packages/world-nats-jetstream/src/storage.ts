@@ -1,9 +1,17 @@
-import { EntityConflictError, RunExpiredError, WorkflowWorldError } from '@workflow/errors';
+import {
+  EntityConflictError,
+  HookNotFoundError,
+  RunExpiredError,
+  TooEarlyError,
+  WorkflowRunNotFoundError,
+  WorkflowWorldError,
+} from '@workflow/errors';
 import type {
   CreateEventParams,
   CreateEventRequest,
   Event,
   EventResult,
+  GetEventParams,
   GetHookParams,
   GetStepParams,
   GetWorkflowRunParams,
@@ -19,6 +27,7 @@ import type {
   Step,
   StepWithoutData,
   Storage,
+  Wait,
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
@@ -29,9 +38,10 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
-import type { JetStreamClient, KV } from 'nats';
+import type { JetStreamClient, KV, KvEntry } from 'nats';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 import { compact, debug } from './util.js';
@@ -51,6 +61,99 @@ const DEFAULT_TERMINAL_RUN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 function kvValueToString(value: string | Uint8Array): string {
   if (typeof value === 'string') return value;
   return new TextDecoder().decode(value);
+}
+
+/**
+ * Get a KV entry, treating delete/purge tombstones as absent.
+ *
+ * NATS KV `get()` returns the latest entry for a key even when that entry
+ * is a DEL/PURGE marker, so a plain truthiness check would treat deleted
+ * keys as live and then crash parsing the empty tombstone value.
+ */
+async function getLiveEntry(bucket: KV, key: string): Promise<KvEntry | null> {
+  const entry = await bucket.get(key);
+  if (!entry || entry.operation !== 'PUT') return null;
+  return entry;
+}
+
+/**
+ * Iterate the live (latest, non-deleted) entries of a bucket.
+ *
+ * Unlike `history()`, which yields every retained revision of every key
+ * (duplicating entities once per update and resurrecting deleted entities
+ * via their older PUT revisions), this yields exactly one entry per live key.
+ */
+async function* listLiveEntries(bucket: KV): AsyncGenerator<KvEntry> {
+  // Drain the key listing before issuing any other KV requests: the keys()
+  // iterator is backed by a push subscription that drops buffered keys when
+  // the consumer awaits unrelated work between reads.
+  const keys: string[] = [];
+  const iter = await bucket.keys();
+  for await (const key of iter) {
+    keys.push(key);
+  }
+  for (const key of keys) {
+    const entry = await getLiveEntry(bucket, key);
+    if (entry) yield entry;
+  }
+}
+
+/** Max attempts for revision-checked (CAS) update loops. */
+const MAX_CAS_ATTEMPTS = 10;
+
+/** True when a KV update failed because the revision precondition was violated. */
+function isWrongLastSequence(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const apiError = (err as Error & { api_error?: { err_code?: number } }).api_error;
+  return apiError?.err_code === 10071 || err.message.includes('wrong last sequence');
+}
+
+type CasResult =
+  | { type: 'updated'; value: object }
+  | { type: 'unchanged'; value: object }
+  | { type: 'missing' };
+
+/**
+ * Revision-checked read-modify-write (compare-and-swap).
+ *
+ * `mutate` receives the current live value and either returns the next value
+ * (`write: true`), signals that no write is needed (`write: false`), or
+ * throws a domain error. Losing a CAS race re-reads and re-validates, so
+ * terminal-state guards inside `mutate` hold under concurrent writers.
+ *
+ * The returned value is intentionally loosely typed (`object`): callers
+ * re-validate through the relevant zod schema before use.
+ */
+async function casMutate<T>(
+  bucket: KV,
+  key: string,
+  mutate: (existing: T) => { write: boolean; value: object },
+): Promise<CasResult> {
+  for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+    const entry = await getLiveEntry(bucket, key);
+    if (!entry) return { type: 'missing' };
+    const existing = parse<T>(kvValueToString(entry.value));
+    const result = mutate(existing);
+    if (!result.write) return { type: 'unchanged', value: result.value };
+    try {
+      await bucket.update(key, stringify(result.value), entry.revision);
+      return { type: 'updated', value: result.value };
+    } catch (err) {
+      if (!isWrongLastSequence(err)) throw err;
+      // Lost the race — re-read and re-validate.
+    }
+  }
+  throw new WorkflowWorldError(
+    `Concurrent update on "${key}" did not settle after ${MAX_CAS_ATTEMPTS} attempts`,
+    { status: 409 },
+  );
+}
+
+/** Compare two ULID-suffixed IDs (e.g. eventId, runId) lexicographically. */
+function compareIds(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
 }
 
 /**
@@ -105,20 +208,21 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
 // ---------------------------------------------------------------------------
 
 /**
- * Collect all keys currently stored in a KV bucket that match a given prefix.
- * Returns the *values* (decoded as strings) for matching keys.
+ * Collect all keys currently stored in a KV bucket that match a given prefix
+ * (which must end with the `.` key separator). Returns the key suffixes.
+ *
+ * The prefix is pushed down as a server-side subject filter; an empty bucket
+ * or a prefix with no matches yields an empty list. Infrastructure failures
+ * (connection loss, etc.) propagate — swallowing them here would silently
+ * turn index lookups into empty results.
  */
 async function collectIndexKeys(bucket: KV, prefix: string): Promise<string[]> {
   const results: string[] = [];
-  try {
-    const keys = await bucket.keys();
-    for await (const key of keys) {
-      if (key.startsWith(prefix)) {
-        results.push(key.slice(prefix.length));
-      }
+  const keys = await bucket.keys(`${prefix}>`);
+  for await (const key of keys) {
+    if (key.startsWith(prefix)) {
+      results.push(key.slice(prefix.length));
     }
-  } catch {
-    // Bucket may be empty — that's fine
   }
   return results;
 }
@@ -153,9 +257,11 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
   return {
     get: (async (id: string, params?: GetWorkflowRunParams) => {
       await initBuckets();
-      const entry = await runsBucket.get(id);
+      const entry = await getLiveEntry(runsBucket, id);
       if (!entry) {
-        throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
+        // Core matches this by name (WorkflowRunNotFoundError.is) to drive
+        // run.exists() and pollReturnValue's not-found retry tolerance.
+        throw new WorkflowRunNotFoundError(id);
       }
       const data = kvValueToString(entry.value);
       const run = parse<WorkflowRun>(data);
@@ -183,8 +289,8 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
         // Fetch each run by primary key
         for (const runId of candidateRunIds) {
           try {
-            const entry = await runsBucket.get(runId);
-            if (!entry || entry.operation === 'DEL') continue;
+            const entry = await getLiveEntry(runsBucket, runId);
+            if (!entry) continue;
 
             const data = kvValueToString(entry.value);
             const run = parse<WorkflowRun>(data);
@@ -200,10 +306,8 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
           }
         }
       } else {
-        // No status filter — fall back to full bucket scan
-        for await (const entry of await runsBucket.history()) {
-          if (!entry || entry.operation === 'DEL') continue;
-
+        // No status filter — fall back to a scan of live entries
+        for await (const entry of listLiveEntries(runsBucket)) {
           const data = kvValueToString(entry.value);
           const run: WorkflowRun = parse<WorkflowRun>(data);
 
@@ -217,8 +321,8 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
         }
       }
 
-      // Sort by createdAt descending
-      runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      // Sort by runId descending (monotonic ULIDs; matches world-postgres)
+      runs.sort((a, b) => compareIds(b.runId, a.runId));
 
       // Apply cursor-based pagination
       let startIdx = 0;
@@ -257,10 +361,12 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   let stepsBucket: KV;
   let hooksBucket: KV;
   let hooksTokenBucket: KV;
+  let waitsBucket: KV;
   // Secondary index buckets
   let runsByStatusBucket: KV;
   let stepsByRunBucket: KV;
   let hooksByRunBucket: KV;
+  let eventsByRunBucket: KV;
 
   const initBuckets = async () => {
     if (!eventsBucket) {
@@ -280,6 +386,9 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
         history: 1,
       });
+      waitsBucket = await jetstream.views.kv(`${keyPrefix}waits`, {
+        history: 1,
+      });
       // Secondary indexes
       runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, {
         history: 1,
@@ -288,6 +397,9 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         history: 1,
       });
       hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, {
+        history: 1,
+      });
+      eventsByRunBucket = await jetstream.views.kv(`${keyPrefix}events_by_run`, {
         history: 1,
       });
     }
@@ -337,6 +449,35 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     }
   }
 
+  /** Persist an event and index it under its run for efficient per-run reads. */
+  async function putEvent(runId: string, eventId: string, event: unknown): Promise<void> {
+    await eventsBucket.put(eventId, stringify(event));
+    await eventsByRunBucket.put(`${runId}.${eventId}`, eventId);
+  }
+
+  /**
+   * Load all events for a run. Uses the events-by-run index when populated,
+   * falling back to a full live scan for events written before the index
+   * existed. Returned events are unsorted.
+   */
+  async function loadEventsForRun(runId: string): Promise<Event[]> {
+    const events: Event[] = [];
+    const eventIds = await collectIndexKeys(eventsByRunBucket, `${runId}.`);
+    if (eventIds.length > 0) {
+      for (const eventId of eventIds) {
+        const entry = await getLiveEntry(eventsBucket, eventId);
+        if (!entry) continue;
+        events.push(parse<Event>(kvValueToString(entry.value)));
+      }
+    } else {
+      for await (const entry of listLiveEntries(eventsBucket)) {
+        const event = parse<Event>(kvValueToString(entry.value));
+        if (event.runId === runId) events.push(event);
+      }
+    }
+    return events;
+  }
+
   // Helper: Clean up hooks when run reaches terminal status
   async function cleanupHooks(runId: string): Promise<void> {
     await initBuckets();
@@ -347,7 +488,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     if (hookIds.length > 0) {
       for (const hookId of hookIds) {
         try {
-          const hookEntry = await hooksBucket.get(hookId);
+          const hookEntry = await getLiveEntry(hooksBucket, hookId);
           if (hookEntry) {
             const hookData = kvValueToString(hookEntry.value);
             const hook = parse<Hook>(hookData);
@@ -361,9 +502,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       }
     } else {
       // Fallback: full scan (handles data created before indexes existed)
-      for await (const entry of await hooksBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
-
+      for await (const entry of listLiveEntries(hooksBucket)) {
         const data = kvValueToString(entry.value);
         const hook = parse<Hook>(data);
 
@@ -375,13 +514,26 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     }
   }
 
+  // Helper: Clean up wait entities when run reaches terminal status
+  async function cleanupWaits(runId: string): Promise<void> {
+    await initBuckets();
+    const correlationIds = await collectIndexKeys(waitsBucket, `${runId}.`);
+    for (const correlationId of correlationIds) {
+      try {
+        await waitsBucket.delete(`${runId}.${correlationId}`);
+      } catch {
+        debug(`Failed to clean up wait ${correlationId} for run ${runId}`);
+      }
+    }
+  }
+
   /**
    * Handle events for legacy runs (pre-event-sourcing, specVersion < 2).
    */
   async function handleLegacyEvent(
     runId: string,
     eventId: string,
-    data: any,
+    data: CreateEventRequest | RunCreatedEventRequest,
     currentRun: { status: string; specVersion?: number },
     params?: { resolveData?: ResolveData },
   ): Promise<EventResult> {
@@ -390,7 +542,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
     switch (data.eventType) {
       case 'run_cancelled': {
-        const entry = await runsBucket.get(runId);
+        const entry = await getLiveEntry(runsBucket, runId);
         if (entry) {
           const existingData = kvValueToString(entry.value);
           const existing = parse<WorkflowRun>(existingData);
@@ -424,7 +576,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await eventsBucket.put(eventId, stringify(event));
+        await putEvent(runId, eventId, event);
         const parsed = EventSchema.parse(event);
         return { event: filterEventData(parsed, resolveData) };
       }
@@ -464,6 +616,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       let run: WorkflowRun | undefined;
       let step: Step | undefined;
       let hook: Hook | undefined;
+      let wait: Wait | undefined;
 
       const isRunTerminal = (status: string) =>
         ['completed', 'failed', 'cancelled'].includes(status);
@@ -479,7 +632,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       const skipRunValidationEvents = ['step_completed', 'step_retrying'];
       if (data.eventType !== 'run_created' && !skipRunValidationEvents.includes(data.eventType)) {
-        const runEntry = await runsBucket.get(effectiveRunId);
+        const runEntry = await getLiveEntry(runsBucket, effectiveRunId);
         if (runEntry) {
           const runData = kvValueToString(runEntry.value);
           const parsed = parse<WorkflowRun>(runData);
@@ -499,11 +652,11 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         'eventData' in data &&
         data.eventData
       ) {
-        const runInputData = (data as any).eventData as {
+        const runInputData = data.eventData as {
           deploymentId?: string;
           workflowName?: string;
-          input?: any;
-          executionContext?: any;
+          input?: unknown;
+          executionContext?: Record<string, unknown>;
         };
         if (
           runInputData.deploymentId &&
@@ -525,10 +678,15 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             createdAt: now,
             updatedAt: now,
           };
-          // Check if run already exists (idempotent creation)
-          const existing = await runsBucket.get(effectiveRunId);
-          if (!existing) {
-            await runsBucket.put(effectiveRunId, stringify(newRun));
+          // Atomically create the run so only the first writer wins. This
+          // prevents a TOCTOU race where a concurrent run_created from
+          // start() (which runs in parallel with the queue publish) could
+          // overwrite a run that was already transitioned to 'running'.
+          const created = await runsBucket
+            .create(effectiveRunId, stringify(newRun))
+            .then(() => true)
+            .catch(() => false);
+          if (created) {
             await indexRunStatus(effectiveRunId, 'pending');
             // Create synthetic run_created event
             const runCreatedEventId = `wevt_${ulid()}`;
@@ -545,13 +703,17 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
               createdAt: now,
               specVersion: effectiveSpecVersion,
             };
-            await eventsBucket.put(runCreatedEventId, stringify(runCreatedEvent));
+            await putEvent(effectiveRunId, runCreatedEventId, runCreatedEvent);
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
           } else {
-            // Run already exists — re-read state
-            const existingData = kvValueToString(existing.value);
-            const parsed = parse<WorkflowRun>(existingData);
-            currentRun = { status: parsed.status, specVersion: parsed.specVersion };
+            // Run already exists (concurrent run_created won the race) —
+            // re-read so downstream logic sees the real state.
+            const existing = await getLiveEntry(runsBucket, effectiveRunId);
+            if (existing) {
+              const existingData = kvValueToString(existing.value);
+              const parsed = parse<WorkflowRun>(existingData);
+              currentRun = { status: parsed.status, specVersion: parsed.specVersion };
+            }
           }
         }
       }
@@ -576,7 +738,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
         // Idempotent operation
         if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
-          const fullRunEntry = await runsBucket.get(effectiveRunId);
+          const fullRunEntry = await getLiveEntry(runsBucket, effectiveRunId);
           const createdAt = new Date();
           const event = {
             ...data,
@@ -585,7 +747,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          await eventsBucket.put(eventId, stringify(event));
+          await putEvent(effectiveRunId, eventId, event);
 
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
@@ -613,65 +775,69 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         }
 
         // Creating new entities on terminal runs is not allowed
-        if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
+        if (
+          data.eventType === 'step_created' ||
+          data.eventType === 'hook_created' ||
+          data.eventType === 'wait_created'
+        ) {
           throw new EntityConflictError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
           );
         }
       }
 
-      // Step validation
-      let validatedStep: { status: string; startedAt?: Date } | null = null;
+      // Step validation. The CAS mutators below re-run these guards against
+      // the freshest revision; this pre-check exists to fail fast (and to
+      // reject events for steps that don't exist at all).
+      let validatedStep: { status: string } | null = null;
       const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
       if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
-        const stepEntry = await stepsBucket.get(stepKey);
+        const stepEntry = await getLiveEntry(stepsBucket, stepKey);
         if (stepEntry) {
           const stepData = kvValueToString(stepEntry.value);
           const parsed = parse<Step>(stepData);
-          validatedStep = {
-            status: parsed.status,
-            startedAt: parsed.startedAt,
-          };
+          validatedStep = { status: parsed.status };
         }
 
         if (!validatedStep) {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
 
+        // Core catches EntityConflictError by name to gracefully skip an
+        // already-terminal step and re-enqueue the workflow.
         if (isStepTerminal(validatedStep.status)) {
-          throw new WorkflowWorldError(
+          throw new EntityConflictError(
             `Cannot modify step in terminal state "${validatedStep.status}"`,
-            { status: 410 },
           );
         }
 
         if (currentRun && isRunTerminal(currentRun.status)) {
           if (validatedStep.status !== 'running') {
-            throw new WorkflowWorldError(
+            throw new RunExpiredError(
               `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-              { status: 410 },
             );
           }
         }
       }
 
-      // Hook validation
+      // Hook validation. Core treats HookNotFoundError as a benign
+      // "already disposed" signal during suspension replay.
       const hookEventsRequiringExistence = ['hook_disposed', 'hook_received'];
       if (hookEventsRequiringExistence.includes(data.eventType) && data.correlationId) {
-        const existingHook = await hooksBucket.get(data.correlationId);
+        const existingHook = await getLiveEntry(hooksBucket, data.correlationId);
         if (!existingHook) {
-          throw new WorkflowWorldError(`Hook "${data.correlationId}" not found`, { status: 404 });
+          throw new HookNotFoundError(data.correlationId);
         }
       }
 
       // Entity creation/updates
       if (data.eventType === 'run_created') {
-        const eventData = (data as any).eventData as {
+        const eventData = data.eventData as {
           deploymentId: string;
           workflowName: string;
-          input: any[];
-          executionContext?: Record<string, any>;
+          input: unknown[];
+          executionContext?: Record<string, unknown>;
         };
 
         const newRun = {
@@ -690,14 +856,26 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           updatedAt: now,
         };
 
-        // Check if run already exists
-        const existing = await runsBucket.get(effectiveRunId);
-        if (!existing) {
-          await runsBucket.put(effectiveRunId, stringify(newRun));
+        // Atomically create the run so only the first writer wins. A
+        // concurrent resilient-start (run_started on the queue) may have
+        // already created — and even started — this run; overwriting it
+        // here would reset a running run back to 'pending'.
+        const created = await runsBucket
+          .create(effectiveRunId, stringify(newRun))
+          .then(() => true)
+          .catch(() => false);
+        if (created) {
           await indexRunStatus(effectiveRunId, 'pending');
           run = WorkflowRunSchema.parse(compact(newRun));
         } else {
           // Event replay: return existing run
+          const existing = await getLiveEntry(runsBucket, effectiveRunId);
+          if (!existing) {
+            throw new WorkflowWorldError(
+              `Run "${effectiveRunId}" could not be created or read back`,
+              { status: 500 },
+            );
+          }
           const existingData = kvValueToString(existing.value);
           run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
         }
@@ -707,7 +885,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         // Idempotency: if run is already past pending, this is a replay.
         // Return existing run state without creating a duplicate event.
         if (currentRun?.status === 'running') {
-          const entry = await runsBucket.get(effectiveRunId);
+          const entry = await getLiveEntry(runsBucket, effectiveRunId);
           if (entry) {
             const existingData = kvValueToString(entry.value);
             run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
@@ -716,100 +894,152 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
         }
 
-        const entry = await runsBucket.get(effectiveRunId);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<WorkflowRun>(existingData);
-          const oldStatus = existing.status;
-          const updatedRun = {
-            ...existing,
-            status: 'running' as const,
-            startedAt: now,
-            updatedAt: now,
+        let oldStatus: string | undefined;
+        const result = await casMutate<WorkflowRun>(runsBucket, effectiveRunId, (existing) => {
+          if (isRunTerminal(existing.status)) {
+            throw new RunExpiredError(
+              `Workflow run "${effectiveRunId}" is already in terminal state "${existing.status}"`,
+            );
+          }
+          if (existing.status === 'running') {
+            return { write: false, value: existing };
+          }
+          oldStatus = existing.status;
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'running' as const,
+              // Only set startedAt on first start.
+              startedAt: existing.startedAt ?? now,
+              updatedAt: now,
+            },
           };
-          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+        });
+
+        if (result.type === 'unchanged') {
+          // A concurrent run_started won the CAS race — same replay
+          // semantics as the pre-check above: no duplicate event.
+          const parsedRun = WorkflowRunSchema.parse(compact(result.value));
+          const resolveData = params?.resolveData ?? 'all';
+          return { run: filterRunData(parsedRun, resolveData) as WorkflowRun };
+        }
+        if (result.type === 'updated') {
           await reindexRunStatus(effectiveRunId, oldStatus, 'running');
-          run = WorkflowRunSchema.parse(compact(updatedRun));
+          run = WorkflowRunSchema.parse(compact(result.value));
         }
       }
 
       if (data.eventType === 'run_completed') {
-        const eventData = (data as any).eventData as { output?: any };
-        const entry = await runsBucket.get(effectiveRunId);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<WorkflowRun>(existingData);
-          const oldStatus = existing.status;
-          const updatedRun = {
-            ...existing,
-            status: 'completed' as const,
-            output: eventData.output,
-            completedAt: now,
-            updatedAt: now,
+        const eventData = data.eventData as { output?: unknown };
+        let oldStatus: string | undefined;
+        const result = await casMutate<WorkflowRun>(runsBucket, effectiveRunId, (existing) => {
+          if (isRunTerminal(existing.status)) {
+            throw new EntityConflictError(
+              `Cannot transition run from terminal state "${existing.status}"`,
+            );
+          }
+          oldStatus = existing.status;
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'completed' as const,
+              output: eventData.output,
+              completedAt: now,
+              updatedAt: now,
+            },
           };
-          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+        });
+        if (result.type === 'updated') {
           await reindexRunStatus(effectiveRunId, oldStatus, 'completed');
           await cleanupHooks(effectiveRunId);
-          run = WorkflowRunSchema.parse(compact(updatedRun));
+          await cleanupWaits(effectiveRunId);
+          run = WorkflowRunSchema.parse(compact(result.value));
         }
       }
 
       if (data.eventType === 'run_failed') {
-        const eventData = (data as any).eventData as {
-          error: any;
+        const eventData = data.eventData as {
+          error: string | { message?: string; stack?: string };
           errorCode?: string;
         };
         const errorMessage =
           typeof eventData.error === 'string'
             ? eventData.error
             : (eventData.error?.message ?? 'Unknown error');
+        const errorStack = typeof eventData.error === 'string' ? undefined : eventData.error?.stack;
 
-        const entry = await runsBucket.get(effectiveRunId);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<WorkflowRun>(existingData);
-          const oldStatus = existing.status;
-          const updatedRun = {
-            ...existing,
-            status: 'failed' as const,
-            error: {
-              message: errorMessage,
-              stack: eventData.error?.stack,
-              code: eventData.errorCode,
+        let oldStatus: string | undefined;
+        const result = await casMutate<WorkflowRun>(runsBucket, effectiveRunId, (existing) => {
+          if (isRunTerminal(existing.status)) {
+            throw new EntityConflictError(
+              `Cannot transition run from terminal state "${existing.status}"`,
+            );
+          }
+          oldStatus = existing.status;
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'failed' as const,
+              error: {
+                message: errorMessage,
+                stack: errorStack,
+                code: eventData.errorCode,
+              },
+              completedAt: now,
+              updatedAt: now,
             },
-            completedAt: now,
-            updatedAt: now,
           };
-          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+        });
+        if (result.type === 'updated') {
           await reindexRunStatus(effectiveRunId, oldStatus, 'failed');
           await cleanupHooks(effectiveRunId);
-          run = WorkflowRunSchema.parse(compact(updatedRun));
+          await cleanupWaits(effectiveRunId);
+          run = WorkflowRunSchema.parse(compact(result.value));
         }
       }
 
       if (data.eventType === 'run_cancelled') {
-        const entry = await runsBucket.get(effectiveRunId);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<WorkflowRun>(existingData);
-          const oldStatus = existing.status;
-          const updatedRun = {
-            ...existing,
-            status: 'cancelled' as const,
-            completedAt: now,
-            updatedAt: now,
+        let oldStatus: string | undefined;
+        const result = await casMutate<WorkflowRun>(runsBucket, effectiveRunId, (existing) => {
+          // Idempotent: cancelling an already-cancelled run just records the
+          // event (the common case is handled in pre-validation; this guards
+          // the race where a concurrent cancel wins between read and write).
+          if (existing.status === 'cancelled') {
+            return { write: false, value: existing };
+          }
+          if (isRunTerminal(existing.status)) {
+            throw new EntityConflictError(
+              `Cannot transition run from terminal state "${existing.status}"`,
+            );
+          }
+          oldStatus = existing.status;
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'cancelled' as const,
+              completedAt: now,
+              updatedAt: now,
+            },
           };
-          await runsBucket.put(effectiveRunId, stringify(updatedRun));
+        });
+        if (result.type === 'updated') {
           await reindexRunStatus(effectiveRunId, oldStatus, 'cancelled');
           await cleanupHooks(effectiveRunId);
-          run = WorkflowRunSchema.parse(compact(updatedRun));
+          await cleanupWaits(effectiveRunId);
+          run = WorkflowRunSchema.parse(compact(result.value));
+        } else if (result.type === 'unchanged') {
+          run = WorkflowRunSchema.parse(compact(result.value));
         }
       }
 
       if (data.eventType === 'step_created') {
-        const eventData = (data as any).eventData as {
+        const eventData = data.eventData as {
           stepName: string;
-          input: any;
+          input: unknown;
         };
 
         const newStep = {
@@ -825,67 +1055,101 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         };
 
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
-        const existing = await stepsBucket.get(stepKey);
-        if (!existing) {
-          await stepsBucket.put(stepKey, stringify(newStep));
+        // Atomically create the step so only the first writer wins.
+        const created = await stepsBucket
+          .create(stepKey, stringify(newStep))
+          .then(() => true)
+          .catch(() => false);
+        if (created) {
           await indexStep(effectiveRunId, data.correlationId!);
           step = StepSchema.parse(compact(newStep));
         } else {
           // Event replay: return existing step
+          const existing = await getLiveEntry(stepsBucket, stepKey);
+          if (!existing) {
+            throw new WorkflowWorldError(
+              `Step "${data.correlationId}" could not be created or read back`,
+              { status: 500 },
+            );
+          }
           const existingData = kvValueToString(existing.value);
           step = StepSchema.parse(compact(parse<Step>(existingData)));
         }
       }
 
       if (data.eventType === 'step_started') {
-        const isFirstStart = !validatedStep?.startedAt;
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
-        const entry = await stepsBucket.get(stepKey);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<Step>(existingData);
-          const updatedStep = {
-            ...existing,
-            status: 'running' as const,
-            attempt: existing.attempt + 1,
-            ...(isFirstStart ? { startedAt: now } : {}),
-            updatedAt: now,
+        const result = await casMutate<Step>(stepsBucket, stepKey, (existing) => {
+          if (isStepTerminal(existing.status)) {
+            throw new EntityConflictError(
+              `Cannot modify step in terminal state "${existing.status}"`,
+            );
+          }
+          if (currentRun && isRunTerminal(currentRun.status) && existing.status !== 'running') {
+            throw new RunExpiredError(
+              `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
+            );
+          }
+          // Retried steps may be scheduled for later. Core handles
+          // TooEarlyError by re-enqueueing with the remaining backoff, so
+          // configured retry delays are enforced at the storage layer.
+          if (existing.retryAfter && existing.retryAfter.getTime() > Date.now()) {
+            throw new TooEarlyError(
+              `Cannot start step "${data.correlationId}": retryAfter timestamp has not been reached yet`,
+              {
+                retryAfter: Math.ceil((existing.retryAfter.getTime() - Date.now()) / 1000),
+              },
+            );
+          }
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'running' as const,
+              attempt: existing.attempt + 1,
+              // Only set startedAt on first start.
+              startedAt: existing.startedAt ?? now,
+              // Always clear retryAfter now that the step has started.
+              retryAfter: undefined,
+              updatedAt: now,
+            },
           };
-          await stepsBucket.put(stepKey, stringify(updatedStep));
-          step = StepSchema.parse(compact(updatedStep));
+        });
+        if (result.type === 'missing') {
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
+        step = StepSchema.parse(compact(result.value));
       }
 
       if (data.eventType === 'step_completed') {
-        const eventData = (data as any).eventData as { result?: any };
+        const eventData = data.eventData as { result?: unknown };
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
-        const entry = await stepsBucket.get(stepKey);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<Step>(existingData);
-          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
-            throw new WorkflowWorldError(
+        const result = await casMutate<Step>(stepsBucket, stepKey, (existing) => {
+          if (isStepTerminal(existing.status)) {
+            throw new EntityConflictError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 },
             );
           }
-          const updatedStep = {
-            ...existing,
-            status: 'completed' as const,
-            output: eventData.result,
-            completedAt: now,
-            updatedAt: now,
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'completed' as const,
+              output: eventData.result,
+              completedAt: now,
+              updatedAt: now,
+            },
           };
-          await stepsBucket.put(stepKey, stringify(updatedStep));
-          step = StepSchema.parse(compact(updatedStep));
-        } else {
+        });
+        if (result.type === 'missing') {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
+        step = StepSchema.parse(compact(result.value));
       }
 
       if (data.eventType === 'step_failed') {
-        const eventData = (data as any).eventData as {
-          error?: any;
+        const eventData = data.eventData as {
+          error?: string | { message?: string };
           stack?: string;
         };
         const errorMessage =
@@ -894,36 +1158,35 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             : (eventData.error?.message ?? 'Unknown error');
 
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
-        const entry = await stepsBucket.get(stepKey);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<Step>(existingData);
-          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
-            throw new WorkflowWorldError(
+        const result = await casMutate<Step>(stepsBucket, stepKey, (existing) => {
+          if (isStepTerminal(existing.status)) {
+            throw new EntityConflictError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 },
             );
           }
-          const updatedStep = {
-            ...existing,
-            status: 'failed' as const,
-            error: {
-              message: errorMessage,
-              stack: eventData.stack,
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'failed' as const,
+              error: {
+                message: errorMessage,
+                stack: eventData.stack,
+              },
+              completedAt: now,
+              updatedAt: now,
             },
-            completedAt: now,
-            updatedAt: now,
           };
-          await stepsBucket.put(stepKey, stringify(updatedStep));
-          step = StepSchema.parse(compact(updatedStep));
-        } else {
+        });
+        if (result.type === 'missing') {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
+        step = StepSchema.parse(compact(result.value));
       }
 
       if (data.eventType === 'step_retrying') {
-        const eventData = (data as any).eventData as {
-          error?: any;
+        const eventData = data.eventData as {
+          error?: string | { message?: string };
           stack?: string;
           retryAfter?: Date;
         };
@@ -933,92 +1196,180 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             : (eventData.error?.message ?? 'Unknown error');
 
         const stepKey = `${effectiveRunId}.${data.correlationId}`;
-        const entry = await stepsBucket.get(stepKey);
-        if (entry) {
-          const existingData = kvValueToString(entry.value);
-          const existing = parse<Step>(existingData);
-          const updatedStep = {
-            ...existing,
-            status: 'pending' as const,
-            error: {
-              message: errorMessage,
-              stack: eventData.stack,
+        const result = await casMutate<Step>(stepsBucket, stepKey, (existing) => {
+          if (isStepTerminal(existing.status)) {
+            throw new EntityConflictError(
+              `Cannot modify step in terminal state "${existing.status}"`,
+            );
+          }
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'pending' as const,
+              error: {
+                message: errorMessage,
+                stack: eventData.stack,
+              },
+              retryAfter: eventData.retryAfter,
+              updatedAt: now,
             },
-            retryAfter: eventData.retryAfter,
-            updatedAt: now,
           };
-          await stepsBucket.put(stepKey, stringify(updatedStep));
-          step = StepSchema.parse(compact(updatedStep));
+        });
+        if (result.type === 'missing') {
+          throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
+        step = StepSchema.parse(compact(result.value));
       }
 
       if (data.eventType === 'hook_created') {
-        const eventData = (data as any).eventData as {
+        const eventData = data.eventData as {
           token: string;
-          metadata?: any;
+          metadata?: unknown;
+          isWebhook?: boolean;
         };
+        const hookId = data.correlationId!;
 
         // Check for duplicate token
-        const existingHookId = await hooksTokenBucket.get(eventData.token);
-        if (existingHookId) {
-          const conflictEventData = { token: eventData.token };
-          const createdAt = new Date();
-          const conflictEvent = {
-            eventType: 'hook_conflict' as const,
-            correlationId: data.correlationId,
-            eventData: conflictEventData,
-            runId: effectiveRunId,
-            eventId,
-            createdAt,
-            specVersion: effectiveSpecVersion,
-          };
+        const tokenEntry = await getLiveEntry(hooksTokenBucket, eventData.token);
+        const existingHookId = tokenEntry ? kvValueToString(tokenEntry.value) : null;
+        const existingHookEntry = existingHookId
+          ? await getLiveEntry(hooksBucket, existingHookId)
+          : null;
 
-          await eventsBucket.put(eventId, stringify(conflictEvent));
+        if (existingHookEntry) {
+          const existingHook = parse<Hook>(kvValueToString(existingHookEntry.value));
 
-          const parsedConflict = EventSchema.parse(conflictEvent);
-          const resolveData = params?.resolveData ?? 'all';
-          return {
-            event: filterEventData(parsedConflict, resolveData),
-            run,
-            step,
-            hook: undefined,
-          };
-        }
+          if (existingHook.runId === effectiveRunId && existingHook.hookId === hookId) {
+            // The *same* (runId, hookId) already holds this token: either a
+            // replayed hook_created (duplicate queue delivery / crash-retry),
+            // or an orphaned hook entity from a crash between the entity
+            // write and the event write. Distinguish by checking whether the
+            // hook_created event actually exists in the log:
+            //   - exists → real duplicate: throw EntityConflictError so the
+            //     runtime's replay catch path swallows it, instead of
+            //     permanently logging a self hook_conflict that would replay
+            //     as HookTokenConflictError.
+            //   - missing → complete the partial write: fall through to the
+            //     event write below, returning the persisted hook.
+            const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
+              events.find((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
+            );
+            if (existingEvent) {
+              throw new EntityConflictError(`Hook "${hookId}" already created`);
+            }
+            hook = HookSchema.parse(compact(existingHook));
+          } else {
+            // Cross-run / cross-hook conflict: a different (runId, hookId)
+            // holds this token. Record a hook_conflict event (with the
+            // conflicting holder) so the workflow fails gracefully when the
+            // hook is awaited, instead of throwing here.
+            const conflictEventData = {
+              token: eventData.token,
+              conflictingRunId: existingHook.runId,
+            };
+            const createdAt = new Date();
+            const conflictEvent = {
+              eventType: 'hook_conflict' as const,
+              correlationId: data.correlationId,
+              eventData: conflictEventData,
+              runId: effectiveRunId,
+              eventId,
+              createdAt,
+              specVersion: effectiveSpecVersion,
+            };
 
-        const newHook: Hook = {
-          runId: effectiveRunId,
-          hookId: data.correlationId!,
-          token: eventData.token,
-          ownerId: '',
-          projectId: '',
-          environment: '',
-          metadata: eventData.metadata,
-          specVersion: effectiveSpecVersion,
-          createdAt: now,
-        };
+            await putEvent(effectiveRunId, eventId, conflictEvent);
 
-        const existing = await hooksBucket.get(data.correlationId!);
-        if (!existing) {
-          await hooksBucket.put(data.correlationId!, stringify(newHook));
-          await hooksTokenBucket.put(eventData.token, data.correlationId!);
-          await indexHook(effectiveRunId, data.correlationId!);
-          hook = HookSchema.parse(compact(newHook));
+            const parsedConflict = EventSchema.parse(conflictEvent);
+            const resolveData = params?.resolveData ?? 'all';
+            return {
+              event: filterEventData(parsedConflict, resolveData),
+              run,
+              step,
+              hook: undefined,
+            };
+          }
         } else {
-          // Event replay: return existing hook
-          const existingData = kvValueToString(existing.value);
-          hook = HookSchema.parse(compact(parse<Hook>(existingData)));
+          const newHook: Hook = {
+            runId: effectiveRunId,
+            hookId,
+            token: eventData.token,
+            ownerId: '',
+            projectId: '',
+            environment: '',
+            metadata: eventData.metadata,
+            isWebhook: eventData.isWebhook,
+            specVersion: effectiveSpecVersion,
+            createdAt: now,
+          };
+
+          await hooksBucket.put(hookId, stringify(newHook));
+          await hooksTokenBucket.put(eventData.token, hookId);
+          await indexHook(effectiveRunId, hookId);
+          hook = HookSchema.parse(compact(newHook));
         }
       }
 
       if (data.eventType === 'hook_disposed' && data.correlationId) {
-        const hookEntry = await hooksBucket.get(data.correlationId);
-        if (hookEntry) {
-          const hookData = kvValueToString(hookEntry.value);
-          const existingHook = parse<Hook>(hookData);
-          await hooksBucket.delete(data.correlationId);
-          await hooksTokenBucket.delete(existingHook.token);
-          await removeHookIndex(effectiveRunId, data.correlationId);
+        const hookEntry = await getLiveEntry(hooksBucket, data.correlationId);
+        if (!hookEntry) {
+          // The pre-validation above saw the hook; it vanished in between,
+          // so a concurrent disposal won the race.
+          throw new EntityConflictError(`Hook "${data.correlationId}" already disposed`);
         }
+        const hookData = kvValueToString(hookEntry.value);
+        const existingHook = parse<Hook>(hookData);
+        await hooksBucket.delete(data.correlationId);
+        await hooksTokenBucket.delete(existingHook.token);
+        await removeHookIndex(effectiveRunId, data.correlationId);
+      }
+
+      if (data.eventType === 'wait_created') {
+        const eventData = data.eventData as { resumeAt?: Date };
+        const waitKey = `${effectiveRunId}.${data.correlationId}`;
+        const newWait = {
+          waitId: `${effectiveRunId}-${data.correlationId}`,
+          runId: effectiveRunId,
+          status: 'waiting' as const,
+          resumeAt: eventData.resumeAt,
+          specVersion: effectiveSpecVersion,
+          createdAt: now,
+          updatedAt: now,
+        };
+        // Atomically create the wait so only the first writer wins.
+        const created = await waitsBucket
+          .create(waitKey, stringify(newWait))
+          .then(() => true)
+          .catch(() => false);
+        if (!created) {
+          throw new EntityConflictError(`Wait "${data.correlationId}" already exists`);
+        }
+        wait = WaitSchema.parse(compact(newWait));
+      }
+
+      if (data.eventType === 'wait_completed') {
+        const waitKey = `${effectiveRunId}.${data.correlationId}`;
+        const result = await casMutate<Wait>(waitsBucket, waitKey, (existing) => {
+          // Core catches EntityConflictError here as "wait already
+          // completed, skipping" during replay.
+          if (existing.status === 'completed') {
+            throw new EntityConflictError(`Wait "${data.correlationId}" already completed`);
+          }
+          return {
+            write: true,
+            value: {
+              ...existing,
+              status: 'completed' as const,
+              completedAt: now,
+              updatedAt: now,
+            },
+          };
+        });
+        if (result.type === 'missing') {
+          throw new WorkflowWorldError(`Wait "${data.correlationId}" not found`, { status: 404 });
+        }
+        wait = WaitSchema.parse(compact(result.value));
       }
 
       // Store the event
@@ -1033,10 +1384,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       // Strip eventData from run_started events before storage
       if (data.eventType === 'run_started') {
-        delete (event as any).eventData;
+        delete (event as { eventData?: unknown }).eventData;
       }
 
-      await eventsBucket.put(eventId, stringify(event));
+      await putEvent(effectiveRunId, eventId, event);
 
       const parsed = EventSchema.parse(event);
       const resolveData = params?.resolveData ?? 'all';
@@ -1044,19 +1395,12 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       // Preload all events for run_started to reduce TTFB
       let allEvents: Event[] | undefined;
       if (data.eventType === 'run_started' && run) {
-        const eventsList: Event[] = [];
-        for await (const entry of await eventsBucket.history()) {
-          if (!entry || entry.operation === 'DEL') continue;
-          const entryData = kvValueToString(entry.value);
-          const e = parse<Event>(entryData);
-          if (e.runId === effectiveRunId) {
-            const p = EventSchema.parse(compact(e));
-            eventsList.push(filterEventData(p, resolveData));
-          }
-        }
-        // Sort by createdAt ascending
-        eventsList.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-        allEvents = eventsList;
+        const eventsList = await loadEventsForRun(effectiveRunId);
+        // Sort by eventId ascending (monotonic ULIDs — the log order)
+        eventsList.sort((a, b) => compareIds(a.eventId, b.eventId));
+        allEvents = eventsList.map((e) =>
+          filterEventData(EventSchema.parse(compact(e)), resolveData),
+        );
       }
 
       return {
@@ -1064,20 +1408,31 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         run,
         step,
         hook,
+        wait,
         events: allEvents,
+        // Preloaded events are complete; expose a cursor with the same
+        // semantics as events.list so the runtime can reload incrementally.
+        ...(allEvents ? { cursor: allEvents.at(-1)?.eventId ?? null, hasMore: false } : {}),
       };
     },
 
-    async get(_runId: string, eventId: string): Promise<Event> {
+    async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {
       await initBuckets();
-      const entry = await eventsBucket.get(eventId);
+      const entry = await getLiveEntry(eventsBucket, eventId);
       if (!entry) {
         throw new WorkflowWorldError(`Event not found: ${eventId}`, {
           status: 404,
         });
       }
       const data = kvValueToString(entry.value);
-      return parse<Event>(data);
+      const event = parse<Event>(data);
+      if (event.runId !== runId) {
+        throw new WorkflowWorldError(`Event not found: ${eventId}`, {
+          status: 404,
+        });
+      }
+      const parsed = EventSchema.parse(compact(event));
+      return filterEventData(parsed, params?.resolveData ?? 'all');
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -1086,24 +1441,13 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       const sortOrder = params.pagination?.sortOrder || 'asc';
       const resolveData = params?.resolveData ?? 'all';
 
-      const events: Event[] = [];
+      const events = await loadEventsForRun(params.runId);
 
-      for await (const entry of await eventsBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
-
-        const data = kvValueToString(entry.value);
-        const event = parse<Event>(data);
-
-        if (event.runId === params.runId) {
-          events.push(event);
-        }
-      }
-
-      // Sort by createdAt
+      // Sort by eventId (monotonic ULIDs — the log order)
       if (sortOrder === 'asc') {
-        events.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        events.sort((a, b) => compareIds(a.eventId, b.eventId));
       } else {
-        events.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        events.sort((a, b) => compareIds(b.eventId, a.eventId));
       }
 
       // Apply cursor
@@ -1138,9 +1482,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       const events: Event[] = [];
 
-      for await (const entry of await eventsBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
-
+      // correlationIds are not indexed — scan live entries (one per event)
+      for await (const entry of listLiveEntries(eventsBucket)) {
         const data = kvValueToString(entry.value);
         const event = parse<Event>(data);
 
@@ -1149,11 +1492,11 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         }
       }
 
-      // Sort by createdAt
+      // Sort by eventId (monotonic ULIDs — the log order)
       if (sortOrder === 'asc') {
-        events.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        events.sort((a, b) => compareIds(a.eventId, b.eventId));
       } else {
-        events.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        events.sort((a, b) => compareIds(b.eventId, a.eventId));
       }
 
       // Apply cursor
@@ -1214,7 +1557,7 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
       // If runId provided, use direct lookup
       if (runId) {
         const stepKey = `${runId}.${stepId}`;
-        const entry = await stepsBucket.get(stepKey);
+        const entry = await getLiveEntry(stepsBucket, stepKey);
         if (!entry) {
           throw new WorkflowWorldError(`Step not found: ${stepId}`, {
             status: 404,
@@ -1227,10 +1570,8 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
         return filterStepData(parsed, resolveData);
       }
 
-      // Otherwise scan all steps
-      for await (const entry of await stepsBucket.history()) {
-        if (!entry || entry.operation === 'DEL') continue;
-
+      // Otherwise scan live entries (one per step, latest revision only)
+      for await (const entry of listLiveEntries(stepsBucket)) {
         const data = kvValueToString(entry.value);
         const step = parse<Step>(data);
 
@@ -1260,8 +1601,8 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
         for (const stepId of stepIds) {
           const stepKey = `${params.runId}.${stepId}`;
           try {
-            const entry = await stepsBucket.get(stepKey);
-            if (!entry || entry.operation === 'DEL') continue;
+            const entry = await getLiveEntry(stepsBucket, stepKey);
+            if (!entry) continue;
 
             const data = kvValueToString(entry.value);
             const step = parse<Step>(data);
@@ -1272,10 +1613,9 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
           }
         }
       } else {
-        // Fallback: full scan (handles data created before indexes existed)
-        for await (const entry of await stepsBucket.history()) {
-          if (!entry || entry.operation === 'DEL') continue;
-
+        // Fallback: full scan of live entries (handles data created before
+        // indexes existed)
+        for await (const entry of listLiveEntries(stepsBucket)) {
           const data = kvValueToString(entry.value);
           const step = parse<Step>(data);
 
@@ -1286,8 +1626,8 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
         }
       }
 
-      // Sort by createdAt descending
-      steps.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      // Sort by stepId descending (matches world-postgres)
+      steps.sort((a, b) => compareIds(b.stepId, a.stepId));
 
       // Apply cursor
       let startIdx = 0;
@@ -1344,11 +1684,10 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
   return {
     async get(hookId: string, params?: GetHookParams): Promise<Hook> {
       await initBuckets();
-      const entry = await hooksBucket.get(hookId);
+      const entry = await getLiveEntry(hooksBucket, hookId);
       if (!entry) {
-        throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
-          status: 404,
-        });
+        // Core treats HookNotFoundError as benign "already disposed".
+        throw new HookNotFoundError(hookId);
       }
       const data = kvValueToString(entry.value);
       const hook = parse<Hook>(data);
@@ -1359,11 +1698,9 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
 
     async getByToken(token: string, params?: GetHookParams): Promise<Hook> {
       await initBuckets();
-      const entry = await hooksTokenBucket.get(token);
+      const entry = await getLiveEntry(hooksTokenBucket, token);
       if (!entry) {
-        throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
-          status: 404,
-        });
+        throw new HookNotFoundError(token);
       }
       const hookId = kvValueToString(entry.value);
       return this.get(hookId, params);
@@ -1385,8 +1722,8 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
       if (hookIds.length > 0) {
         for (const hookId of hookIds) {
           try {
-            const entry = await hooksBucket.get(hookId);
-            if (!entry || entry.operation === 'DEL') continue;
+            const entry = await getLiveEntry(hooksBucket, hookId);
+            if (!entry) continue;
 
             const data = kvValueToString(entry.value);
             const hook = parse<Hook>(data);
@@ -1398,10 +1735,9 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
           }
         }
       } else {
-        // Fallback: full scan (handles data created before indexes existed)
-        for await (const entry of await hooksBucket.history()) {
-          if (!entry || entry.operation === 'DEL') continue;
-
+        // Fallback: full scan of live entries (handles data created before
+        // indexes existed)
+        for await (const entry of listLiveEntries(hooksBucket)) {
           const data = kvValueToString(entry.value);
           const hook = parse<Hook>(data);
 
@@ -1413,8 +1749,13 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
         }
       }
 
-      // Sort by createdAt descending
-      hooks.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      // Sort by hookId, ascending by default (matches world-postgres)
+      const sortOrder = params?.pagination?.sortOrder ?? 'asc';
+      if (sortOrder === 'asc') {
+        hooks.sort((a, b) => compareIds(a.hookId, b.hookId));
+      } else {
+        hooks.sort((a, b) => compareIds(b.hookId, a.hookId));
+      }
 
       // Apply cursor
       let startIdx = 0;
@@ -1467,6 +1808,8 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
   const hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, { history: 1 });
   const hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, { history: 1 });
   const eventsBucket = await jetstream.views.kv(`${keyPrefix}events`, { history: 10 });
+  const eventsByRunBucket = await jetstream.views.kv(`${keyPrefix}events_by_run`, { history: 1 });
+  const waitsBucket = await jetstream.views.kv(`${keyPrefix}waits`, { history: 1 });
 
   let compactedCount = 0;
 
@@ -1476,7 +1819,7 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
 
     for (const runId of runIds) {
       try {
-        const entry = await runsBucket.get(runId);
+        const entry = await getLiveEntry(runsBucket, runId);
         if (!entry) {
           // Stale index — clean up
           try {
@@ -1511,7 +1854,7 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
         const hookIds = await collectIndexKeys(hooksByRunBucket, `${runId}.`);
         for (const hookId of hookIds) {
           try {
-            const hookEntry = await hooksBucket.get(hookId);
+            const hookEntry = await getLiveEntry(hooksBucket, hookId);
             if (hookEntry) {
               const hookData = kvValueToString(hookEntry.value);
               const hook = parse<Hook>(hookData);
@@ -1532,16 +1875,42 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
           }
         }
 
-        // Delete associated events (full scan — events aren't indexed by run)
-        for await (const evtEntry of await eventsBucket.history()) {
-          if (!evtEntry || evtEntry.operation === 'DEL') continue;
-          const evtData = kvValueToString(evtEntry.value);
-          const evt = parse<Event>(evtData);
-          if (evt.runId === runId) {
+        // Delete associated waits
+        const waitCorrelationIds = await collectIndexKeys(waitsBucket, `${runId}.`);
+        for (const correlationId of waitCorrelationIds) {
+          try {
+            await waitsBucket.delete(`${runId}.${correlationId}`);
+          } catch {
+            /* noop */
+          }
+        }
+
+        // Delete associated events (via the per-run index; fall back to a
+        // live scan for events written before the index existed)
+        const eventIds = await collectIndexKeys(eventsByRunBucket, `${runId}.`);
+        if (eventIds.length > 0) {
+          for (const eventId of eventIds) {
             try {
-              await eventsBucket.delete(evt.eventId);
+              await eventsBucket.delete(eventId);
             } catch {
               /* noop */
+            }
+            try {
+              await eventsByRunBucket.delete(`${runId}.${eventId}`);
+            } catch {
+              /* noop */
+            }
+          }
+        } else {
+          for await (const evtEntry of listLiveEntries(eventsBucket)) {
+            const evtData = kvValueToString(evtEntry.value);
+            const evt = parse<Event>(evtData);
+            if (evt.runId === runId) {
+              try {
+                await eventsBucket.delete(evt.eventId);
+              } catch {
+                /* noop */
+              }
             }
           }
         }

@@ -3,6 +3,7 @@ import { Firestore as FirestoreClass } from '@google-cloud/firestore';
 import type { CloudTasksClient } from '@google-cloud/tasks';
 import { CloudTasksClient as CloudTasksClientClass } from '@google-cloud/tasks';
 import type { World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
@@ -93,6 +94,11 @@ export function createFirestoreTasksWorld(
     ...storage,
     ...queue,
     ...streamer,
+    // Declaring the current spec version enables resilient start: core
+    // attaches runInput to workflow queue messages so run_started can
+    // bootstrap the run when run_created lost the race. Requires the
+    // binary-safe (tagged-JSON) queue transport in queue.ts.
+    specVersion: SPEC_VERSION_CURRENT,
     async start() {
       // Explicitly call queue.start() to ensure embedded world starts in test mode
       if (queue.start) {

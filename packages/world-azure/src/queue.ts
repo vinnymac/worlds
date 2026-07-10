@@ -1,18 +1,27 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ServiceBusClient, ServiceBusSender } from '@azure/service-bus';
-import type { Queue } from '@workflow/world';
+import { ServiceBusAdministrationClient } from '@azure/service-bus';
+import type { Queue, QueueOptions } from '@workflow/world';
 import {
   MessageId,
+  parseQueueName,
+  type QueueKind,
   type QueuePayload,
-  type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
+import { parse, stringify } from '@fantasticfour/shared';
 
 interface ServiceBusConfig {
   client?: ServiceBusClient;
   queueName?: string;
   deploymentId: string;
+  /**
+   * Service Bus connection string, used by start() to provision/verify the
+   * queue via ServiceBusAdministrationClient. When only a client is injected
+   * the queue configuration cannot be introspected.
+   */
+  connectionString?: string;
   /**
    * Base URL the in-process test pump uses to dispatch jobs back to the user's
    * HTTP server in test mode. Has no effect in production (Service Bus is
@@ -30,6 +39,7 @@ interface ServiceBusConfig {
 
 interface PumpEnvelope {
   messageId: string;
+  idempotencyKey?: string;
   queueName: ValidQueueName;
   attempt: number;
   message: QueuePayload;
@@ -38,9 +48,12 @@ interface PumpEnvelope {
 type Pathname = 'flow' | 'step';
 
 const QUEUE_PATHNAMES = {
-  __wkf_workflow_: 'flow',
-  __wkf_step_: 'step',
-} as const satisfies Record<QueuePrefix, Pathname>;
+  workflow: 'flow',
+  step: 'step',
+} as const satisfies Record<QueueKind, Pathname>;
+
+/** Dedup window for Service Bus duplicate detection (ISO 8601 duration). */
+const DUPLICATE_DETECTION_WINDOW = 'PT15M';
 
 function resolveBaseUrl(config: ServiceBusConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -50,9 +63,26 @@ function resolveBaseUrl(config: ServiceBusConfig): string {
 }
 
 /**
+ * Extract the run id from a queue payload for session-based ordering.
+ * Workflow messages carry `runId`, step messages carry `workflowRunId`.
+ * https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions
+ */
+function extractRunId(message: unknown): string | undefined {
+  if (typeof message !== 'object' || message === null) return undefined;
+  const { runId, workflowRunId } = message as Record<string, unknown>;
+  if (typeof runId === 'string') return runId;
+  if (typeof workflowRunId === 'string') return workflowRunId;
+  return undefined;
+}
+
+/**
  * In-process test pump used when no Service Bus client is configured. Replaces
  * the previous `@workflow/world-local` fallback. Two in-memory FIFOs feed an
  * HTTP dispatcher that targets `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ *
+ * Message bodies round-trip through the shared tagged-JSON codec so binary
+ * payloads (e.g. the CBOR-transport `runInput.input` on workflow messages)
+ * survive the queue intact.
  */
 function createTestPump(config: ServiceBusConfig) {
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
@@ -61,7 +91,19 @@ function createTestPump(config: ServiceBusConfig) {
 
   const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
   const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  /**
+   * In-flight messages by idempotency key: enqueueing the same key while a
+   * prior message is still being processed returns the original messageId
+   * instead of queueing a duplicate (matching world-local semantics).
+   */
+  const inflightKeys = new Map<string, string>();
   let running = false;
+
+  function settle(envelope: PumpEnvelope) {
+    if (envelope.idempotencyKey) {
+      inflightKeys.delete(envelope.idempotencyKey);
+    }
+  }
 
   function enqueue(pathname: Pathname, envelope: PumpEnvelope) {
     queues[pathname].push(envelope);
@@ -86,11 +128,14 @@ function createTestPump(config: ServiceBusConfig) {
         'x-vqs-message-id': envelope.messageId,
         'x-vqs-message-attempt': String(envelope.attempt),
       },
-      body: JSON.stringify(envelope.message),
+      body: stringify(envelope.message),
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
 
-    if (response.ok) return;
+    if (response.ok) {
+      settle(envelope);
+      return;
+    }
 
     const text = await response.text();
 
@@ -113,6 +158,7 @@ function createTestPump(config: ServiceBusConfig) {
       const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
       void delay(backoff).then(() => enqueue(pathname, next));
     } else {
+      settle(envelope);
       console.error(
         `[world-azure test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
       );
@@ -126,14 +172,29 @@ function createTestPump(config: ServiceBusConfig) {
       try {
         await dispatch(envelope, pathname);
       } catch (err) {
+        settle(envelope);
         console.error(`[world-azure test pump] dispatch error on ${pathname}:`, err);
       }
     }
   }
 
   return {
-    push(pathname: Pathname, envelope: PumpEnvelope) {
-      enqueue(pathname, envelope);
+    /**
+     * Register + enqueue a message. Returns the previously registered
+     * messageId when the idempotency key is already in flight.
+     */
+    push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number): string {
+      if (envelope.idempotencyKey) {
+        const existing = inflightKeys.get(envelope.idempotencyKey);
+        if (existing) return existing;
+        inflightKeys.set(envelope.idempotencyKey, envelope.messageId);
+      }
+      if (delaySeconds && delaySeconds > 0) {
+        void delay(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
+      } else {
+        enqueue(pathname, envelope);
+      }
+      return envelope.messageId;
     },
     async start() {
       if (running) return;
@@ -148,38 +209,66 @@ function createTestPump(config: ServiceBusConfig) {
   };
 }
 
-function parseQueuePrefix(name: ValidQueueName): QueuePrefix {
-  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
-  for (const p of prefixes) {
-    if (name.startsWith(p)) return p;
-  }
-  throw new Error(`Invalid queue name: ${name}`);
-}
-
 export function createQueue(config: ServiceBusConfig): Queue & {
   start(): Promise<void>;
-  processAllQueuedTasks?: () => Promise<void>;
+  close(): Promise<void>;
 } {
   const { client, queueName = 'workflow-queue', deploymentId } = config;
 
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
 
-  // Test mode is determined once at construction time *and* re-evaluated per-call,
-  // matching the previous behaviour where tests could mutate env after createQueue.
-  function isTestMode(): boolean {
-    return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
-  }
-
-  const isTestAtConstruct = isTestMode();
+  // Test mode is decided once at construction so that queue(), the handler
+  // factory, and start() can never disagree about which transport is active.
+  const isTest = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test' || !client;
 
   let sender: ServiceBusSender | undefined;
-  if (client && !isTestAtConstruct) {
+  if (client && !isTest) {
     sender = client.createSender(queueName);
   }
 
+  /**
+   * Send a message to Service Bus. `idempotencyKey` maps to the Service Bus
+   * messageId, which deduplicates only when the queue has duplicate detection
+   * enabled — start() provisions/verifies that. The fallback id is a ULID so
+   * distinct messages can never collide (Date.now() ties within a millisecond
+   * would be silently dropped by duplicate detection).
+   */
+  async function sendToServiceBus(
+    name: ValidQueueName,
+    message: QueuePayload,
+    opts?: Pick<QueueOptions, 'idempotencyKey' | 'delaySeconds'>,
+  ): Promise<MessageId> {
+    if (!sender) {
+      throw new Error('Service Bus sender not initialized');
+    }
+
+    const messageIdValue = opts?.idempotencyKey || `msg_${generateMessageId()}`;
+    const messageRunId = extractRunId(message);
+
+    await sender.sendMessages({
+      // Tagged-JSON body so Uint8Array payloads (CBOR queue transport)
+      // round-trip through the queue intact.
+      body: stringify(message),
+      messageId: messageIdValue,
+      sessionId: messageRunId,
+      subject: name,
+      ...(opts?.delaySeconds && opts.delaySeconds > 0
+        ? { scheduledEnqueueTimeUtc: new Date(Date.now() + opts.delaySeconds * 1000) }
+        : {}),
+      applicationProperties: {
+        queueName: name,
+        deploymentId,
+      },
+    });
+
+    return MessageId.parse(
+      messageIdValue.startsWith('msg_') ? messageIdValue : `msg_${messageIdValue}`,
+    );
+  }
+
   const createQueueHandler: Queue['createQueueHandler'] = (queueNamePrefix, handler) => {
-    if (isTestAtConstruct) {
+    if (isTest) {
       return async (req: Request) => {
         const reqQueueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
         const reqMessageId = req.headers.get('x-vqs-message-id') as MessageId | null;
@@ -193,7 +282,7 @@ export function createQueue(config: ServiceBusConfig): Queue & {
         }
         const attempt = Number.parseInt(attemptStr, 10);
         try {
-          const body = await req.json();
+          const body = parse<unknown>(await req.text());
           const result = await handler(body, {
             attempt,
             queueName: reqQueueName,
@@ -213,25 +302,34 @@ export function createQueue(config: ServiceBusConfig): Queue & {
     return async (req: Request) => {
       try {
         const url = new URL(req.url);
-        const receivedQueueName = url.pathname.split('/').pop() as
-          | `__wkf_workflow_${string}`
-          | `__wkf_step_${string}`;
+        const receivedQueueName = url.pathname.split('/').pop() as ValidQueueName;
 
         if (!receivedQueueName.startsWith(queueNamePrefix)) {
           return new Response('Invalid queue', { status: 400 });
         }
 
-        const message = await req.json();
+        const message = parse<QueuePayload>(await req.text());
 
         const deliveryCount = req.headers.get('X-ServiceBus-DeliveryCount') || '0';
         const attempt = Number.parseInt(deliveryCount, 10) + 1;
-        const messageId = req.headers.get('X-ServiceBus-MessageId') || Date.now().toString();
+        const messageId = req.headers.get('X-ServiceBus-MessageId') || generateMessageId();
 
-        await handler(message, {
+        const result = await handler(message, {
           attempt,
           queueName: receivedQueueName,
           messageId: MessageId.parse(`msg_${messageId}`),
         });
+
+        // { timeoutSeconds } is the runtime's suspension/deferral signal
+        // (sleep(), TooEarlyError). Re-enqueue the payload with a scheduled
+        // delivery time before acking, otherwise the run would never resume.
+        // The re-enqueue uses a fresh messageId so duplicate detection does
+        // not swallow the deliberate redelivery.
+        if (result && typeof result.timeoutSeconds === 'number') {
+          await sendToServiceBus(receivedQueueName, message, {
+            delaySeconds: result.timeoutSeconds,
+          });
+        }
 
         return new Response('OK', { status: 200 });
       } catch (error) {
@@ -242,44 +340,25 @@ export function createQueue(config: ServiceBusConfig): Queue & {
 
   return {
     async queue(name, message, opts) {
-      if (isTestMode()) {
-        const queuePrefix = parseQueuePrefix(name);
+      if (isTest) {
+        const { kind } = parseQueueName(name);
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-        testPump.push(QUEUE_PATHNAMES[queuePrefix], {
-          messageId,
-          queueName: name,
-          attempt: 1,
-          message,
-        });
-        return { messageId };
+        const effectiveId = testPump.push(
+          QUEUE_PATHNAMES[kind],
+          {
+            messageId,
+            idempotencyKey: opts?.idempotencyKey,
+            queueName: name,
+            attempt: 1,
+            message,
+          },
+          opts?.delaySeconds,
+        );
+        return { messageId: MessageId.parse(effectiveId) };
       }
 
-      // Production: Service Bus.
-      if (!sender) {
-        throw new Error('Service Bus sender not initialized');
-      }
-
-      const messageIdValue = opts?.idempotencyKey || `msg_${Date.now()}`;
-
-      // Extract runId for session-based ordering.
-      // https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions
-      const messageRunId =
-        typeof message === 'object' && message !== null
-          ? (message as Record<string, unknown>).runId
-          : undefined;
-
-      await sender.sendMessages({
-        body: message,
-        messageId: messageIdValue,
-        sessionId: typeof messageRunId === 'string' ? messageRunId : undefined,
-        subject: name,
-        applicationProperties: {
-          queueName: name,
-          deploymentId,
-        },
-      });
-
-      return { messageId: MessageId.parse(`msg_${messageIdValue}`) };
+      const messageId = await sendToServiceBus(name, message, opts);
+      return { messageId };
     },
 
     createQueueHandler,
@@ -289,10 +368,45 @@ export function createQueue(config: ServiceBusConfig): Queue & {
     },
 
     async start() {
-      if (isTestAtConstruct) {
+      if (isTest) {
         await testPump.start();
+        return;
       }
-      // Production: Service Bus is push-based via receivers / Azure Functions triggers.
+
+      // Production: Service Bus is push-based via receivers / Azure Functions
+      // triggers. Idempotency keys only deduplicate when the queue was created
+      // with duplicate detection, so provision/verify it here.
+      if (config.connectionString) {
+        const admin = new ServiceBusAdministrationClient(config.connectionString);
+        if (await admin.queueExists(queueName)) {
+          const info = await admin.getQueue(queueName);
+          if (!info.requiresDuplicateDetection) {
+            throw new Error(
+              `[world-azure] Service Bus queue "${queueName}" does not have duplicate detection enabled. ` +
+                'Idempotency keys cannot deduplicate messages on this queue — recreate it with ' +
+                'requiresDuplicateDetection=true (duplicate detection cannot be enabled after creation).',
+            );
+          }
+        } else {
+          await admin.createQueue(queueName, {
+            requiresDuplicateDetection: true,
+            duplicateDetectionHistoryTimeWindow: DUPLICATE_DETECTION_WINDOW,
+          });
+        }
+      } else {
+        console.warn(
+          `[world-azure] Cannot verify duplicate detection on Service Bus queue "${queueName}" ` +
+            '(no connection string available for the administration client). Ensure the queue was ' +
+            'created with requiresDuplicateDetection=true, or idempotency keys will not deduplicate.',
+        );
+      }
+    },
+
+    async close() {
+      testPump.stop();
+      if (sender) {
+        await sender.close();
+      }
     },
   };
 }

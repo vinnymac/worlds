@@ -1,11 +1,12 @@
+import { uint8ArrayReplacer } from '@fantasticfour/shared';
 import {
   MessageId,
+  parseQueueName,
   type Queue as QueueInterface,
-  type QueuePayload,
-  type QueuePrefix,
+  type QueueKind,
   type ValidQueueName,
 } from '@workflow/world';
-import { type Job, Queue, Worker } from 'bullmq';
+import { DelayedError, type Job, Queue, Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import type { RedisWorldConfig } from './config.js';
@@ -28,15 +29,44 @@ export interface QueueStats {
 }
 
 const QUEUE_PATHNAMES = {
-  __wkf_workflow_: 'flow',
-  __wkf_step_: 'step',
-} as const satisfies Record<QueuePrefix, string>;
+  workflow: 'flow',
+  step: 'step',
+} as const satisfies Record<QueueKind, string>;
 
 interface QueueJobData {
   /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_…`) */
   queueName: ValidQueueName;
-  /** The opaque message payload — forwarded as the fetch body */
-  message: QueuePayload;
+  /**
+   * The queue payload, serialized with the tagged-JSON transport — forwarded
+   * verbatim as the fetch body. Pre-serializing keeps Uint8Array values (e.g.
+   * the resilient-start runInput.input) intact through BullMQ's own JSON
+   * serialization of job data.
+   */
+  message: string;
+}
+
+/**
+ * JSON transport that preserves Uint8Array values via a tagged envelope
+ * ({ __type: 'Uint8Array', data: '<base64>' }), matching the upstream
+ * world-local/world-postgres queue transports. Required because BullMQ
+ * JSON-serializes job data, which would otherwise mangle binary payloads.
+ */
+function serializeQueueMessage(message: unknown): string {
+  return JSON.stringify(message, uint8ArrayReplacer);
+}
+
+function queueMessageReviver(_key: string, value: unknown): unknown {
+  if (value !== null && typeof value === 'object') {
+    const tagged = value as { __type?: unknown; data?: unknown };
+    if (tagged.__type === 'Uint8Array' && typeof tagged.data === 'string') {
+      return new Uint8Array(Buffer.from(tagged.data, 'base64'));
+    }
+  }
+  return value;
+}
+
+function deserializeQueueMessage(text: string): unknown {
+  return JSON.parse(text, queueMessageReviver);
 }
 
 /**
@@ -58,14 +88,18 @@ function resolveBaseUrl(config: RedisWorldConfig): string {
 export function createQueue(
   redis: Redis,
   config: RedisWorldConfig,
-): QueueInterface & { start(): Promise<void>; getQueueStats(): Promise<QueueStats> } {
+): QueueInterface & {
+  start(): Promise<void>;
+  close(): Promise<void>;
+  getQueueStats(): Promise<QueueStats>;
+} {
   const generateMessageId = monotonicFactory();
 
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
-    __wkf_workflow_: `${prefix}flows`,
-    __wkf_step_: `${prefix}steps`,
-  } as const satisfies Record<QueuePrefix, string>;
+    workflow: `${prefix}flows`,
+    step: `${prefix}steps`,
+  } as const satisfies Record<QueueKind, string>;
 
   const maxAttempts = config.maxAttempts ?? 5;
   const backoffType = config.backoffType ?? 'exponential';
@@ -73,64 +107,69 @@ export function createQueue(
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
   const stalledInterval = config.stalledInterval ?? 30_000;
   const maxStalledCount = config.maxStalledCount ?? 1;
-  const idempotencyTtlMs = config.idempotencyTtlMs ?? 60_000;
+  const idempotencyTtlMs = config.idempotencyTtlMs;
 
-  // BullMQ requires maxRetriesPerRequest: null on the connection.
+  // Reuse the full ioredis options (tls, username, path, sentinels, …) so
+  // rediss:// and ACL setups work for the queue half too — an allowlist here
+  // would silently drop fields. BullMQ manages its own key prefixes and
+  // rejects ioredis keyPrefix, so strip it; maxRetriesPerRequest: null is
+  // required by BullMQ for blocking connections.
+  const { keyPrefix: _unsupportedByBullmq, ...redisOptions } = redis.options;
   const connectionOptions = {
-    host: redis.options.host,
-    port: redis.options.port,
-    password: redis.options.password,
-    db: redis.options.db,
-    maxRetriesPerRequest: null as null,
+    ...redisOptions,
+    maxRetriesPerRequest: null,
   };
 
-  const bullQueues = new Map<QueuePrefix, Queue<QueueJobData>>();
-  const workers = new Map<QueuePrefix, Worker<QueueJobData>>();
+  const bullQueues = new Map<QueueKind, Queue<QueueJobData>>();
+  const workers = new Map<QueueKind, Worker<QueueJobData>>();
 
-  for (const [queuePrefix, jobName] of Object.entries(Queues) as [QueuePrefix, string][]) {
-    bullQueues.set(
-      queuePrefix,
-      new Queue<QueueJobData>(jobName, { connection: connectionOptions }),
-    );
+  for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
+    bullQueues.set(kind, new Queue<QueueJobData>(jobName, { connection: connectionOptions }));
   }
 
   const queue: QueueInterface['queue'] = async (queueName, message, opts) => {
-    const queuePrefix = parseQueuePrefix(queueName);
-    const bullQueue = bullQueues.get(queuePrefix);
-    if (!bullQueue) throw new Error(`No BullMQ queue registered for prefix ${queuePrefix}`);
+    const { kind } = parseQueueName(queueName);
+    const bullQueue = bullQueues.get(kind);
+    if (!bullQueue) throw new Error(`No BullMQ queue registered for queue kind ${kind}`);
 
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
 
-    try {
-      await bullQueue.add(
-        queueName,
-        { queueName, message },
-        {
-          jobId: messageId,
-          delay: delayMs,
-          attempts: maxAttempts,
-          backoff: { type: backoffType, delay: backoffDelayMs },
-          // BullMQ native deduplication with TTL — re-submitting within the
-          // window returns the original job id without enqueuing again.
-          ...(opts?.idempotencyKey && {
-            deduplication: { id: opts.idempotencyKey, ttl: idempotencyTtlMs },
-          }),
-          removeOnComplete: { age: 86_400, count: 1000 },
-          removeOnFail: { age: 7 * 86_400 },
-        },
-      );
-    } catch (err) {
-      // BullMQ throws on dedup hits — that's fine, return the messageId anyway.
-      debug('queue add returned:', err);
-    }
+    // Core treats queue() success as a durability guarantee, so add()
+    // failures must propagate. BullMQ does NOT throw on dedup hits — the
+    // addJob script returns the existing job id — so any rejection here is a
+    // real failure (connection loss, OOM, …) and swallowing it would strand
+    // the run.
+    await bullQueue.add(
+      queueName,
+      { queueName, message: serializeQueueMessage(message) },
+      {
+        jobId: messageId,
+        delay: delayMs,
+        attempts: maxAttempts,
+        backoff: { type: backoffType, delay: backoffDelayMs },
+        // BullMQ native deduplication. Without a ttl the dedup key lives
+        // until the job completes or fails (BullMQ deletes it on
+        // finalization) — the release-on-completion semantics core relies on
+        // when it re-enqueues pending steps with the same idempotencyKey on
+        // every replay. A ttl is only applied when explicitly configured.
+        ...(opts?.idempotencyKey && {
+          deduplication: {
+            id: opts.idempotencyKey,
+            ...(idempotencyTtlMs !== undefined && { ttl: idempotencyTtlMs }),
+          },
+        }),
+        removeOnComplete: { age: 86_400, count: 1000 },
+        removeOnFail: { age: 7 * 86_400 },
+      },
+    );
 
     return { messageId };
   };
 
-  function createProcessor(queuePrefix: QueuePrefix) {
-    const pathname = QUEUE_PATHNAMES[queuePrefix];
-    return async (job: Job<QueueJobData>) => {
+  function createProcessor(kind: QueueKind) {
+    const pathname = QUEUE_PATHNAMES[kind];
+    return async (job: Job<QueueJobData>, token?: string) => {
       const baseUrl = resolveBaseUrl(config);
       const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
       const messageId = job.id ?? `msg_${generateMessageId()}`;
@@ -143,7 +182,7 @@ export function createQueue(
           'x-vqs-message-id': messageId,
           'x-vqs-message-attempt': String(job.attemptsMade + 1),
         },
-        body: JSON.stringify(job.data.message),
+        body: job.data.message,
         signal: AbortSignal.timeout(httpTimeoutMs),
       });
 
@@ -152,18 +191,23 @@ export function createQueue(
       const text = await response.text();
 
       // 503 with { timeoutSeconds } means "retry later without consuming an
-      // attempt" — defer the job via BullMQ's delayed queue.
+      // attempt" — defer the job via BullMQ's delayed queue. BullMQ requires
+      // throwing DelayedError after moveToDelayed so the worker skips its
+      // completion/failure machinery for this invocation.
       if (response.status === 503) {
+        let timeoutSeconds: number | undefined;
         try {
           const parsed = JSON.parse(text);
           if (typeof parsed?.timeoutSeconds === 'number') {
-            const delayMs = parsed.timeoutSeconds * 1000;
-            // moveToDelayed is the documented BullMQ recipe for "soft retry".
-            await job.moveToDelayed(Date.now() + delayMs, job.token);
-            return;
+            timeoutSeconds = parsed.timeoutSeconds;
           }
         } catch {
           // fall through to generic failure
+        }
+        if (timeoutSeconds !== undefined) {
+          const delayMs = timeoutSeconds * 1000;
+          await job.moveToDelayed(Date.now() + delayMs, token);
+          throw new DelayedError();
         }
       }
 
@@ -187,7 +231,7 @@ export function createQueue(
       const attempt = Number.parseInt(attemptStr, 10);
 
       try {
-        const body = await req.json();
+        const body = deserializeQueueMessage(await req.text());
         const result = await handler(body, { attempt, queueName, messageId });
 
         if (result && typeof result.timeoutSeconds === 'number') {
@@ -206,9 +250,8 @@ export function createQueue(
   async function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
 
-    for (const [queuePrefix] of Object.entries(Queues) as [QueuePrefix, string][]) {
-      const jobName = Queues[queuePrefix];
-      const worker = new Worker<QueueJobData>(jobName, createProcessor(queuePrefix), {
+    for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
+      const worker = new Worker<QueueJobData>(jobName, createProcessor(kind), {
         connection: connectionOptions,
         concurrency,
         stalledInterval,
@@ -224,7 +267,7 @@ export function createQueue(
         console.error('Worker error:', err);
       });
 
-      workers.set(queuePrefix, worker);
+      workers.set(kind, worker);
     }
 
     await Promise.all(Array.from(workers.values()).map((worker) => worker.waitUntilReady()));
@@ -265,13 +308,11 @@ export function createQueue(
     async start() {
       await startWorkers();
     },
+    async close() {
+      await Promise.all(Array.from(workers.values()).map((worker) => worker.close()));
+      workers.clear();
+      await Promise.all(Array.from(bullQueues.values()).map((bullQueue) => bullQueue.close()));
+      bullQueues.clear();
+    },
   };
 }
-
-const parseQueuePrefix = (name: ValidQueueName): QueuePrefix => {
-  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
-  for (const prefix of prefixes) {
-    if (name.startsWith(prefix)) return prefix;
-  }
-  throw new Error(`Invalid queue name: ${name}`);
-};

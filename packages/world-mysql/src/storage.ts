@@ -1,4 +1,11 @@
-import { EntityConflictError, RunExpiredError, WorkflowWorldError } from '@workflow/errors';
+import {
+  EntityConflictError,
+  HookNotFoundError,
+  RunExpiredError,
+  TooEarlyError,
+  WorkflowRunNotFoundError,
+  WorkflowWorldError,
+} from '@workflow/errors';
 import type {
   Event,
   EventResult,
@@ -14,7 +21,13 @@ import type {
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
-import { EventSchema, HookSchema, StepSchema, WorkflowRunSchema } from '@workflow/world';
+import {
+  EventSchema,
+  HookSchema,
+  SPEC_VERSION_CURRENT,
+  StepSchema,
+  WorkflowRunSchema,
+} from '@workflow/world';
 import { and, desc, eq, gt, lt, notInArray, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { monotonicFactory } from 'ulid';
@@ -24,6 +37,9 @@ import { compact } from './util.js';
 
 // Type for Drizzle client with our schema
 type Drizzle = MySql2Database<typeof schema>;
+// A drizzle client or an open transaction on one — lets helpers run inside
+// the events.create() transaction as well as standalone.
+type DrizzleOrTx = Drizzle | Parameters<Parameters<Drizzle['transaction']>[0]>[0];
 
 /**
  * Parse error JSON string into a StructuredError object.
@@ -123,7 +139,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
     get: (async (id: string, params?: any) => {
       const [value] = await drizzle.select().from(runs).where(eq(runs.runId, id)).limit(1);
       if (!value) {
-        throw new WorkflowWorldError(`Run not found: ${id}`, { status: 404 });
+        throw new WorkflowRunNotFoundError(id);
       }
       applyCborFallback(value);
       value.error = parseErrorJson(value.error);
@@ -171,13 +187,96 @@ function map<T, R>(obj: T | null | undefined, fn: (v: T) => R): undefined | R {
   return obj ? fn(obj) : undefined;
 }
 
+/** Server-generated columns of a freshly inserted event row. */
+interface InsertedEventRow {
+  createdAt: Date;
+  occurredAt: Date | null;
+}
+
+/** Result of the entity-mutation transaction inside events.create(). */
+type MutationOutcome =
+  | {
+      kind: 'event-created';
+      eventRow: InsertedEventRow;
+      run?: WorkflowRun;
+      step?: Step;
+      hook?: Hook;
+    }
+  | { kind: 'run-started-replay'; run?: WorkflowRun }
+  | {
+      kind: 'hook-conflict';
+      eventRow: InsertedEventRow;
+      conflictEventData: { token: string; conflictingRunId: string };
+    };
+
 export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
   const ulid = monotonicFactory();
   const events = schema.events;
 
+  // Terminal statuses, used both for JS checks and as atomic guards in
+  // UPDATE ... WHERE clauses (prevents TOCTOU races between validation
+  // reads and entity writes).
+  const terminalStatuses = ['completed', 'failed', 'cancelled'] as const;
+  const isTerminal = (status: string): boolean =>
+    (terminalStatuses as readonly string[]).includes(status);
+
+  async function fetchRun(db: DrizzleOrTx, runId: string): Promise<WorkflowRun | undefined> {
+    const [value] = await db
+      .select()
+      .from(schema.runs)
+      .where(eq(schema.runs.runId, runId))
+      .limit(1);
+    if (!value) return undefined;
+    applyCborFallback(value);
+    value.error = parseErrorJson(value.error);
+    return deserializeRunError(compact(value));
+  }
+
+  async function fetchStep(
+    db: DrizzleOrTx,
+    runId: string,
+    stepId: string,
+  ): Promise<Step | undefined> {
+    const [value] = await db
+      .select()
+      .from(schema.steps)
+      .where(and(eq(schema.steps.runId, runId), eq(schema.steps.stepId, stepId)))
+      .limit(1);
+    if (!value) return undefined;
+    applyCborFallbackStep(value);
+    value.error = parseErrorJson(value.error);
+    return deserializeStepError(compact(value));
+  }
+
+  interface EventRowInsert {
+    runId: string;
+    eventId: string;
+    correlationId?: string;
+    eventType: Event['eventType'];
+    eventData?: unknown;
+    occurredAt?: Date;
+    specVersion: number;
+  }
+
+  // MySQL has no INSERT ... RETURNING, so insert then re-read the
+  // server-generated timestamps for the event row.
+  async function insertEvent(db: DrizzleOrTx, values: EventRowInsert): Promise<InsertedEventRow> {
+    await db.insert(events).values(values);
+    const [created] = await db
+      .select({ createdAt: events.createdAt, occurredAt: events.occurredAt })
+      .from(events)
+      .where(eq(events.eventId, values.eventId))
+      .limit(1);
+    if (!created) {
+      throw new EntityConflictError(`Event ${values.eventId} could not be created`);
+    }
+    return created;
+  }
+
   return {
     async create(runId, data, params): Promise<EventResult> {
-      const eventId = `wevt_${ulid()}`;
+      let eventId: string | undefined;
+      const getEventId = () => (eventId ??= `wevt_${ulid()}`);
 
       // For run_created events, generate runId server-side if null or empty
       let effectiveRunId: string;
@@ -189,19 +288,10 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         effectiveRunId = runId;
       }
 
-      // Track entity created/updated for EventResult
-      let run: WorkflowRun | undefined;
-      let step: Step | undefined;
-      let hook: Hook | undefined;
+      // specVersion is always sent by the runtime, but we provide a fallback for safety
+      const effectiveSpecVersion: number = data.specVersion ?? SPEC_VERSION_CURRENT;
+      const resolveData = params?.resolveData ?? 'all';
       const now = new Date();
-
-      // Helper to check if run is in terminal state
-      const isRunTerminal = (status: string) =>
-        ['completed', 'failed', 'cancelled'].includes(status);
-
-      // Helper to check if step is in terminal state
-      const isStepTerminal = (status: string) =>
-        ['completed', 'failed', 'cancelled'].includes(status);
 
       // ============================================================
       // VALIDATION: Terminal state checks
@@ -218,112 +308,102 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .where(eq(schema.runs.runId, effectiveRunId))
           .limit(1);
         currentRun = runValue ?? null;
-      }
 
-      // ============================================================
-      // RESILIENT START: Bootstrap run from run_started eventData
-      // ============================================================
-      if (
-        data.eventType === 'run_started' &&
-        !currentRun &&
-        'eventData' in data &&
-        data.eventData
-      ) {
-        const runInputData = (data as any).eventData as {
-          deploymentId?: string;
-          workflowName?: string;
-          input?: any;
-          executionContext?: any;
-        };
+        // ============================================================
+        // RESILIENT START: Bootstrap run from run_started eventData
+        // ============================================================
         if (
-          runInputData.deploymentId &&
-          runInputData.workflowName &&
-          runInputData.input !== undefined
+          data.eventType === 'run_started' &&
+          !currentRun &&
+          'eventData' in data &&
+          data.eventData
         ) {
-          await drizzle
-            .insert(schema.runs)
-            .values({
-              runId: effectiveRunId,
-              deploymentId: runInputData.deploymentId,
-              workflowName: runInputData.workflowName,
-              input: runInputData.input as SerializedContent,
-              executionContext: runInputData.executionContext as SerializedContent | undefined,
-              status: 'pending',
-            })
-            .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
-          // Check if we created the run or it already existed
-          const [existingRun] = await drizzle
-            .select({ status: schema.runs.status })
-            .from(schema.runs)
-            .where(eq(schema.runs.runId, effectiveRunId))
-            .limit(1);
-          if (existingRun) {
-            if (existingRun.status === 'pending') {
-              // Create synthetic run_created event
-              const runCreatedEventId = `wevt_${ulid()}`;
-              await drizzle.insert(schema.events).values({
-                runId: effectiveRunId,
-                eventId: runCreatedEventId,
-                eventType: 'run_created',
-                eventData: {
-                  deploymentId: runInputData.deploymentId,
-                  workflowName: runInputData.workflowName,
-                  input: runInputData.input,
-                  executionContext: runInputData.executionContext,
-                },
-              });
-            }
-            currentRun = { status: existingRun.status };
+          const runInputData = (data as any).eventData as {
+            deploymentId?: string;
+            workflowName?: string;
+            input?: any;
+            executionContext?: any;
+          };
+          if (
+            runInputData.deploymentId &&
+            runInputData.workflowName &&
+            runInputData.input !== undefined
+          ) {
+            // Create run + run_created event atomically. The insert result's
+            // affectedRows tells us whether WE created the row (1) or lost the
+            // race to a concurrent run_created (0) — only the creator writes
+            // the synthetic run_created event.
+            currentRun = await drizzle.transaction(async (tx) => {
+              const [inserted] = await tx
+                .insert(schema.runs)
+                .values({
+                  runId: effectiveRunId,
+                  deploymentId: runInputData.deploymentId!,
+                  workflowName: runInputData.workflowName!,
+                  input: runInputData.input as SerializedContent,
+                  executionContext: runInputData.executionContext as SerializedContent | undefined,
+                  status: 'pending',
+                  specVersion: effectiveSpecVersion,
+                })
+                .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
+              if (inserted.affectedRows === 1) {
+                await tx.insert(events).values({
+                  runId: effectiveRunId,
+                  eventId: `wevt_${ulid()}`,
+                  eventType: 'run_created',
+                  eventData: {
+                    deploymentId: runInputData.deploymentId,
+                    workflowName: runInputData.workflowName,
+                    input: runInputData.input,
+                    executionContext: runInputData.executionContext,
+                  },
+                  specVersion: effectiveSpecVersion,
+                });
+                return { status: 'pending' };
+              }
+              // Run already exists (concurrent run_created won the race).
+              // Re-read so downstream logic sees the real state.
+              const [existing] = await tx
+                .select({ status: schema.runs.status })
+                .from(schema.runs)
+                .where(eq(schema.runs.runId, effectiveRunId))
+                .limit(1);
+              return existing ?? null;
+            });
           }
         }
       }
 
       // Run terminal state validation
-      if (currentRun && isRunTerminal(currentRun.status)) {
+      if (currentRun && isTerminal(currentRun.status)) {
         const runTerminalEvents = ['run_started', 'run_completed', 'run_failed'];
 
         // Idempotent operation: run_cancelled on already cancelled run is allowed
         if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
           // Get full run for return value
-          const [fullRun] = await drizzle
-            .select()
-            .from(schema.runs)
-            .where(eq(schema.runs.runId, effectiveRunId))
-            .limit(1);
+          const fullRun = await fetchRun(drizzle, effectiveRunId);
 
           // Create the event (still record it)
-          await drizzle.insert(schema.events).values({
+          const eventRow = await insertEvent(drizzle, {
             runId: effectiveRunId,
-            eventId,
+            eventId: getEventId(),
             correlationId: data.correlationId,
             eventType: data.eventType,
             eventData: 'eventData' in data ? data.eventData : undefined,
+            occurredAt: params?.occurredAt,
+            specVersion: effectiveSpecVersion,
           });
-
-          // MySQL doesn't support RETURNING, so fetch the event we just created
-          const [createdEvent] = await drizzle
-            .select({ createdAt: schema.events.createdAt })
-            .from(schema.events)
-            .where(eq(schema.events.eventId, eventId))
-            .limit(1);
 
           const result = {
             ...data,
-            ...createdEvent,
+            ...compact(eventRow),
             runId: effectiveRunId,
-            eventId,
+            eventId: getEventId(),
           };
           const parsed = EventSchema.parse(result);
-          const resolveData = params?.resolveData ?? 'all';
           return {
             event: filterEventData(parsed, resolveData),
-            run: fullRun
-              ? (() => {
-                  applyCborFallback(fullRun);
-                  fullRun.error = parseErrorJson(fullRun.error);
-                  return deserializeRunError(compact(fullRun));
-                })()
-              : undefined,
+            run: fullRun,
           };
         }
 
@@ -351,13 +431,18 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
       }
 
       // Step-related event validation
-      let validatedStep: { status: string; startedAt: Date | null } | null = null;
+      let validatedStep: {
+        status: string;
+        startedAt: Date | null;
+        retryAfter: Date | null;
+      } | null = null;
       const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
       if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
         const [existingStep] = await drizzle
           .select({
             status: schema.steps.status,
             startedAt: schema.steps.startedAt,
+            retryAfter: schema.steps.retryAfter,
           })
           .from(schema.steps)
           .where(
@@ -374,19 +459,17 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
 
-        if (isStepTerminal(validatedStep.status)) {
-          throw new WorkflowWorldError(
+        if (isTerminal(validatedStep.status)) {
+          throw new EntityConflictError(
             `Cannot modify step in terminal state "${validatedStep.status}"`,
-            { status: 410 },
           );
         }
 
         // On terminal runs: only allow completing/failing in-progress steps
-        if (currentRun && isRunTerminal(currentRun.status)) {
+        if (currentRun && isTerminal(currentRun.status)) {
           if (validatedStep.status !== 'running') {
-            throw new WorkflowWorldError(
+            throw new RunExpiredError(
               `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-              { status: 410 },
             );
           }
         }
@@ -402,537 +485,612 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           .limit(1);
 
         if (!existingHook) {
-          throw new WorkflowWorldError(`Hook "${data.correlationId}" not found`, { status: 404 });
+          throw new HookNotFoundError(data.correlationId);
         }
       }
 
       // ============================================================
-      // Entity creation/updates based on event type
+      // Entity creation/updates based on event type. Each entity write
+      // commits atomically with its event log entry — a crash cannot
+      // leave a mutated entity without the corresponding event.
       // ============================================================
+      const outcome = await drizzle.transaction(async (tx): Promise<MutationOutcome> => {
+        let run: WorkflowRun | undefined;
+        let step: Step | undefined;
+        let hook: Hook | undefined;
 
-      // Handle run_created event: create the run entity atomically
-      if (data.eventType === 'run_created') {
-        const eventData = (data as any).eventData as {
-          deploymentId: string;
-          workflowName: string;
-          input: any[];
-          executionContext?: Record<string, any>;
-        };
-        await drizzle
-          .insert(schema.runs)
-          .values({
-            runId: effectiveRunId,
-            deploymentId: eventData.deploymentId,
-            workflowName: eventData.workflowName,
-            input: eventData.input as SerializedContent,
-            executionContext: eventData.executionContext as SerializedContent | undefined,
-            status: 'pending',
-          })
-          .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
-
-        const [runValue] = await drizzle
-          .select()
-          .from(schema.runs)
-          .where(eq(schema.runs.runId, effectiveRunId))
-          .limit(1);
-        if (runValue) {
-          applyCborFallback(runValue);
-          runValue.error = parseErrorJson(runValue.error);
-          run = deserializeRunError(compact(runValue));
-        }
-      }
-
-      // Handle run_started event: update run status
-      if (data.eventType === 'run_started') {
-        // Idempotency: if run is already past pending, this is a replay.
-        // Return existing run state without creating a duplicate event.
-        if (currentRun?.status === 'running') {
-          const [existingRun] = await drizzle
-            .select()
-            .from(schema.runs)
-            .where(eq(schema.runs.runId, effectiveRunId))
-            .limit(1);
-          if (existingRun) {
-            applyCborFallback(existingRun);
-            existingRun.error = parseErrorJson(existingRun.error);
-            run = deserializeRunError(compact(existingRun));
-          }
-          const resolveData = params?.resolveData ?? 'all';
-          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
-        }
-
-        await drizzle
-          .update(schema.runs)
-          .set({
-            status: 'running',
-            startedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(schema.runs.runId, effectiveRunId));
-
-        const [runValue] = await drizzle
-          .select()
-          .from(schema.runs)
-          .where(eq(schema.runs.runId, effectiveRunId))
-          .limit(1);
-        if (runValue) {
-          applyCborFallback(runValue);
-          runValue.error = parseErrorJson(runValue.error);
-          run = deserializeRunError(compact(runValue));
-        }
-      }
-
-      // Handle run_completed event: update run status and cleanup hooks
-      if (data.eventType === 'run_completed') {
-        const eventData = (data as any).eventData as { output?: any };
-        await drizzle
-          .update(schema.runs)
-          .set({
-            status: 'completed',
-            output: eventData?.output as SerializedContent | undefined,
-            completedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(schema.runs.runId, effectiveRunId));
-
-        const [runValue] = await drizzle
-          .select()
-          .from(schema.runs)
-          .where(eq(schema.runs.runId, effectiveRunId))
-          .limit(1);
-        if (runValue) {
-          applyCborFallback(runValue);
-          runValue.error = parseErrorJson(runValue.error);
-          run = deserializeRunError(compact(runValue));
-        }
-        // Delete all hooks for this run to allow token reuse
-        await drizzle.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
-      }
-
-      // Handle run_failed event: update run status and cleanup hooks
-      if (data.eventType === 'run_failed') {
-        const eventData = (data as any).eventData as {
-          error: any;
-          errorCode?: string;
-        };
-        const errorMessage =
-          typeof eventData.error === 'string'
-            ? eventData.error
-            : (eventData.error?.message ?? 'Unknown error');
-        const errorObj: StructuredError = {
-          message: errorMessage,
-          stack: eventData.error?.stack,
-          code: eventData.errorCode,
-        };
-        await drizzle
-          .update(schema.runs)
-          .set({
-            status: 'failed',
-            error: JSON.stringify(errorObj),
-            completedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(schema.runs.runId, effectiveRunId));
-
-        const [runValue] = await drizzle
-          .select()
-          .from(schema.runs)
-          .where(eq(schema.runs.runId, effectiveRunId))
-          .limit(1);
-        if (runValue) {
-          applyCborFallback(runValue);
-          runValue.error = parseErrorJson(runValue.error);
-          run = deserializeRunError(compact(runValue));
-        }
-        // Delete all hooks for this run to allow token reuse
-        await drizzle.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
-      }
-
-      // Handle run_cancelled event: update run status and cleanup hooks
-      if (data.eventType === 'run_cancelled') {
-        await drizzle
-          .update(schema.runs)
-          .set({
-            status: 'cancelled',
-            completedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(schema.runs.runId, effectiveRunId));
-
-        const [runValue] = await drizzle
-          .select()
-          .from(schema.runs)
-          .where(eq(schema.runs.runId, effectiveRunId))
-          .limit(1);
-        if (runValue) {
-          applyCborFallback(runValue);
-          runValue.error = parseErrorJson(runValue.error);
-          run = deserializeRunError(compact(runValue));
-        }
-        // Delete all hooks for this run to allow token reuse
-        await drizzle.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
-      }
-
-      // Handle step_created event: create step entity
-      if (data.eventType === 'step_created') {
-        const eventData = (data as any).eventData as {
-          stepName: string;
-          input: any;
-        };
-        await drizzle
-          .insert(schema.steps)
-          .values({
-            runId: effectiveRunId,
-            stepId: data.correlationId!,
-            stepName: eventData.stepName,
-            input: eventData.input as SerializedContent,
-            status: 'pending',
-            attempt: 0,
-          })
-          .onDuplicateKeyUpdate({ set: { stepId: data.correlationId! } });
-
-        const [stepValue] = await drizzle
-          .select()
-          .from(schema.steps)
-          .where(eq(schema.steps.stepId, data.correlationId!))
-          .limit(1);
-        if (stepValue) {
-          applyCborFallbackStep(stepValue);
-          stepValue.error = parseErrorJson(stepValue.error);
-          step = deserializeStepError(compact(stepValue));
-        }
-      }
-
-      // Handle step_started event: increment attempt, set status to 'running'
-      if (data.eventType === 'step_started') {
-        const isFirstStart = !validatedStep?.startedAt;
-
-        await drizzle
-          .update(schema.steps)
-          .set({
-            status: 'running',
-            attempt: sql`${schema.steps.attempt} + 1`,
-            ...(isFirstStart ? { startedAt: now } : {}),
-          })
-          .where(
-            and(
-              eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!),
-            ),
-          );
-
-        const [stepValue] = await drizzle
-          .select()
-          .from(schema.steps)
-          .where(
-            and(
-              eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!),
-            ),
-          )
-          .limit(1);
-        if (stepValue) {
-          applyCborFallbackStep(stepValue);
-          stepValue.error = parseErrorJson(stepValue.error);
-          step = deserializeStepError(compact(stepValue));
-        }
-      }
-
-      // Handle step_completed event: update step status
-      if (data.eventType === 'step_completed') {
-        const eventData = (data as any).eventData as { result?: any };
-        const result = await drizzle
-          .update(schema.steps)
-          .set({
-            status: 'completed',
-            output: eventData?.result as SerializedContent | undefined,
-            completedAt: now,
-          })
-          .where(
-            and(
-              eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!),
-              notInArray(schema.steps.status, ['completed', 'failed', 'cancelled']),
-            ),
-          );
-
-        if (result[0].affectedRows > 0) {
-          const [stepValue] = await drizzle
-            .select()
-            .from(schema.steps)
-            .where(
-              and(
-                eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!),
-              ),
-            )
-            .limit(1);
-          if (stepValue) {
-            applyCborFallbackStep(stepValue);
-            stepValue.error = parseErrorJson(stepValue.error);
-            step = deserializeStepError(compact(stepValue));
-          }
-        } else {
-          const [existing] = await drizzle
-            .select({
-              status: schema.steps.status,
-              startedAt: schema.steps.startedAt,
+        // Handle run_created event: create the run entity
+        if (data.eventType === 'run_created') {
+          const eventData = (data as any).eventData as {
+            deploymentId: string;
+            workflowName: string;
+            input: any[];
+            executionContext?: Record<string, any>;
+          };
+          await tx
+            .insert(schema.runs)
+            .values({
+              runId: effectiveRunId,
+              deploymentId: eventData.deploymentId,
+              workflowName: eventData.workflowName,
+              input: eventData.input as SerializedContent,
+              executionContext: eventData.executionContext as SerializedContent | undefined,
+              status: 'pending',
+              specVersion: effectiveSpecVersion,
             })
-            .from(schema.steps)
+            .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
+          run = await fetchRun(tx, effectiveRunId);
+        }
+
+        // Handle run_started event: update run status
+        if (data.eventType === 'run_started') {
+          // Idempotency: if run is already past pending, this is a replay.
+          // Return existing run state without creating a duplicate event.
+          if (currentRun?.status === 'running') {
+            run = await fetchRun(tx, effectiveRunId);
+            return { kind: 'run-started-replay', run };
+          }
+
+          const [updated] = await tx
+            .update(schema.runs)
+            .set({
+              status: 'running',
+              startedAt: now,
+              updatedAt: now,
+            })
             .where(
               and(
-                eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!),
+                eq(schema.runs.runId, effectiveRunId),
+                notInArray(schema.runs.status, ['completed', 'failed', 'cancelled']),
               ),
-            )
-            .limit(1);
-          if (!existing) {
-            throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.runs.status })
+              .from(schema.runs)
+              .where(eq(schema.runs.runId, effectiveRunId))
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowRunNotFoundError(effectiveRunId);
+            }
+            if (isTerminal(existing.status)) {
+              throw new RunExpiredError(
+                `Workflow run "${effectiveRunId}" is already in terminal state "${existing.status}"`,
+              );
+            }
           }
-          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
-            throw new WorkflowWorldError(
-              `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 },
+          run = await fetchRun(tx, effectiveRunId);
+        }
+
+        // Handle run_completed event: update run status and cleanup hooks.
+        // Uses conditional UPDATE to prevent completing an already-terminal run.
+        if (data.eventType === 'run_completed') {
+          const eventData = (data as any).eventData as { output?: any };
+          const [updated] = await tx
+            .update(schema.runs)
+            .set({
+              status: 'completed',
+              output: eventData?.output as SerializedContent | undefined,
+              completedAt: now,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, effectiveRunId),
+                notInArray(schema.runs.status, ['completed', 'failed', 'cancelled']),
+              ),
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.runs.status })
+              .from(schema.runs)
+              .where(eq(schema.runs.runId, effectiveRunId))
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowRunNotFoundError(effectiveRunId);
+            }
+            if (isTerminal(existing.status)) {
+              throw new EntityConflictError(
+                `Cannot transition run from terminal state "${existing.status}"`,
+              );
+            }
+          }
+          run = await fetchRun(tx, effectiveRunId);
+          // Delete all hooks for this run to allow token reuse
+          await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
+        }
+
+        // Handle run_failed event: update run status and cleanup hooks.
+        // Uses conditional UPDATE to prevent failing an already-terminal run.
+        if (data.eventType === 'run_failed') {
+          const eventData = (data as any).eventData as {
+            error: any;
+            errorCode?: string;
+          };
+          const errorMessage =
+            typeof eventData.error === 'string'
+              ? eventData.error
+              : (eventData.error?.message ?? 'Unknown error');
+          const errorObj: StructuredError = {
+            message: errorMessage,
+            stack: eventData.error?.stack,
+            code: eventData.errorCode,
+          };
+          const [updated] = await tx
+            .update(schema.runs)
+            .set({
+              status: 'failed',
+              error: JSON.stringify(errorObj),
+              completedAt: now,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, effectiveRunId),
+                notInArray(schema.runs.status, ['completed', 'failed', 'cancelled']),
+              ),
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.runs.status })
+              .from(schema.runs)
+              .where(eq(schema.runs.runId, effectiveRunId))
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowRunNotFoundError(effectiveRunId);
+            }
+            if (isTerminal(existing.status)) {
+              throw new EntityConflictError(
+                `Cannot transition run from terminal state "${existing.status}"`,
+              );
+            }
+          }
+          run = await fetchRun(tx, effectiveRunId);
+          // Delete all hooks for this run to allow token reuse
+          await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
+        }
+
+        // Handle run_cancelled event: update run status and cleanup hooks.
+        // Uses conditional UPDATE to prevent cancelling an already-terminal run.
+        // Note: idempotent run_cancelled on already-cancelled runs is handled
+        // earlier in the pre-validation block (creates event and returns early).
+        if (data.eventType === 'run_cancelled') {
+          const [updated] = await tx
+            .update(schema.runs)
+            .set({
+              status: 'cancelled',
+              completedAt: now,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, effectiveRunId),
+                notInArray(schema.runs.status, ['completed', 'failed', 'cancelled']),
+              ),
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.runs.status })
+              .from(schema.runs)
+              .where(eq(schema.runs.runId, effectiveRunId))
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowRunNotFoundError(effectiveRunId);
+            }
+            if (isTerminal(existing.status)) {
+              throw new EntityConflictError(
+                `Cannot transition run from terminal state "${existing.status}"`,
+              );
+            }
+          }
+          run = await fetchRun(tx, effectiveRunId);
+          // Delete all hooks for this run to allow token reuse
+          await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
+        }
+
+        // Handle step_created event: create step entity
+        if (data.eventType === 'step_created') {
+          const eventData = (data as any).eventData as {
+            stepName: string;
+            input: any;
+          };
+          await tx
+            .insert(schema.steps)
+            .values({
+              runId: effectiveRunId,
+              stepId: data.correlationId!,
+              stepName: eventData.stepName,
+              input: eventData.input as SerializedContent,
+              status: 'pending',
+              attempt: 0,
+              specVersion: effectiveSpecVersion,
+            })
+            .onDuplicateKeyUpdate({ set: { stepId: data.correlationId! } });
+          step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+        }
+
+        // Handle step_started event: increment attempt, set status to 'running'.
+        // The terminal-state guard is part of the UPDATE, not just the earlier
+        // validation read — that closes the race where another writer
+        // completes/fails the step between validation and start.
+        if (data.eventType === 'step_started') {
+          // Retried steps may be scheduled for later. Enforce the backoff
+          // recorded by step_retrying — the runtime converts TooEarlyError
+          // into a delayed re-enqueue.
+          if (validatedStep?.retryAfter && validatedStep.retryAfter.getTime() > Date.now()) {
+            throw new TooEarlyError(
+              `Cannot start step "${data.correlationId}": retryAfter timestamp has not been reached yet`,
+              {
+                retryAfter: Math.ceil((validatedStep.retryAfter.getTime() - Date.now()) / 1000),
+              },
             );
           }
-        }
-      }
 
-      // Handle step_failed event: terminal state with error
-      if (data.eventType === 'step_failed') {
-        const eventData = (data as any).eventData as {
-          error?: any;
-          stack?: string;
-        };
-        const errorMessage =
-          typeof eventData?.error === 'string'
-            ? eventData.error
-            : (eventData?.error?.message ?? 'Unknown error');
-
-        const result = await drizzle
-          .update(schema.steps)
-          .set({
-            status: 'failed',
-            error: JSON.stringify({
-              message: errorMessage,
-              stack: eventData?.stack,
-            }),
-            completedAt: now,
-          })
-          .where(
-            and(
-              eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!),
-              notInArray(schema.steps.status, ['completed', 'failed', 'cancelled']),
-            ),
-          );
-
-        if (result[0].affectedRows > 0) {
-          const [stepValue] = await drizzle
-            .select()
-            .from(schema.steps)
-            .where(
-              and(
-                eq(schema.steps.runId, effectiveRunId),
-                eq(schema.steps.stepId, data.correlationId!),
-              ),
-            )
-            .limit(1);
-          if (stepValue) {
-            applyCborFallbackStep(stepValue);
-            stepValue.error = parseErrorJson(stepValue.error);
-            step = deserializeStepError(compact(stepValue));
-          }
-        } else {
-          const [existing] = await drizzle
-            .select({
-              status: schema.steps.status,
-              startedAt: schema.steps.startedAt,
+          const [updated] = await tx
+            .update(schema.steps)
+            .set({
+              status: 'running',
+              attempt: sql`${schema.steps.attempt} + 1`,
+              // Only set startedAt on first start — COALESCE so concurrent
+              // step_started calls can't clobber the original timestamp.
+              startedAt: sql`COALESCE(${schema.steps.startedAt}, ${now})`,
+              // Always clear retryAfter now that the step has started
+              retryAfter: null,
             })
-            .from(schema.steps)
             .where(
               and(
                 eq(schema.steps.runId, effectiveRunId),
                 eq(schema.steps.stepId, data.correlationId!),
+                notInArray(schema.steps.status, ['completed', 'failed', 'cancelled']),
               ),
-            )
-            .limit(1);
-          if (!existing) {
-            throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
-          }
-          if (['completed', 'failed', 'cancelled'].includes(existing.status)) {
-            throw new WorkflowWorldError(
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.steps.status })
+              .from(schema.steps)
+              .where(
+                and(
+                  eq(schema.steps.runId, effectiveRunId),
+                  eq(schema.steps.stepId, data.correlationId!),
+                ),
+              )
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, {
+                status: 404,
+              });
+            }
+            throw new EntityConflictError(
               `Cannot modify step in terminal state "${existing.status}"`,
-              { status: 410 },
             );
           }
+          step = await fetchStep(tx, effectiveRunId, data.correlationId!);
         }
-      }
 
-      // Handle step_retrying event: sets status back to 'pending', records error
-      if (data.eventType === 'step_retrying') {
-        const eventData = (data as any).eventData as {
-          error?: any;
-          stack?: string;
-          retryAfter?: Date;
-        };
-        const errorMessage =
-          typeof eventData?.error === 'string'
-            ? eventData.error
-            : (eventData?.error?.message ?? 'Unknown error');
-
-        await drizzle
-          .update(schema.steps)
-          .set({
-            status: 'pending',
-            error: JSON.stringify({
-              message: errorMessage,
-              stack: eventData?.stack,
-            }),
-            retryAfter: eventData?.retryAfter,
-          })
-          .where(
-            and(
-              eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!),
-            ),
-          );
-
-        const [stepValue] = await drizzle
-          .select()
-          .from(schema.steps)
-          .where(
-            and(
-              eq(schema.steps.runId, effectiveRunId),
-              eq(schema.steps.stepId, data.correlationId!),
-            ),
-          )
-          .limit(1);
-        if (stepValue) {
-          applyCborFallbackStep(stepValue);
-          stepValue.error = parseErrorJson(stepValue.error);
-          step = deserializeStepError(compact(stepValue));
+        // Handle step_completed event: update step status.
+        // Uses conditional UPDATE to prevent completing an already-terminal step.
+        if (data.eventType === 'step_completed') {
+          const eventData = (data as any).eventData as { result?: any };
+          const [updated] = await tx
+            .update(schema.steps)
+            .set({
+              status: 'completed',
+              output: eventData?.result as SerializedContent | undefined,
+              completedAt: now,
+            })
+            .where(
+              and(
+                eq(schema.steps.runId, effectiveRunId),
+                eq(schema.steps.stepId, data.correlationId!),
+                notInArray(schema.steps.status, ['completed', 'failed', 'cancelled']),
+              ),
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.steps.status })
+              .from(schema.steps)
+              .where(
+                and(
+                  eq(schema.steps.runId, effectiveRunId),
+                  eq(schema.steps.stepId, data.correlationId!),
+                ),
+              )
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, {
+                status: 404,
+              });
+            }
+            if (isTerminal(existing.status)) {
+              throw new EntityConflictError(
+                `Cannot modify step in terminal state "${existing.status}"`,
+              );
+            }
+          } else {
+            step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+          }
         }
-      }
 
-      // Handle hook_created event: create hook entity
-      if (data.eventType === 'hook_created') {
-        const eventData = (data as any).eventData as {
-          token: string;
-          metadata?: any;
-        };
+        // Handle step_failed event: terminal state with error.
+        // Uses conditional UPDATE to prevent failing an already-terminal step.
+        if (data.eventType === 'step_failed') {
+          const eventData = (data as any).eventData as {
+            error?: any;
+            stack?: string;
+          };
+          const errorMessage =
+            typeof eventData?.error === 'string'
+              ? eventData.error
+              : (eventData?.error?.message ?? 'Unknown error');
 
-        // Check for duplicate token
-        const [existingHook] = await drizzle
-          .select({ hookId: schema.hooks.hookId })
-          .from(schema.hooks)
-          .where(eq(schema.hooks.token, eventData.token))
-          .limit(1);
+          const [updated] = await tx
+            .update(schema.steps)
+            .set({
+              status: 'failed',
+              error: JSON.stringify({
+                message: errorMessage,
+                stack: eventData?.stack,
+              }),
+              completedAt: now,
+            })
+            .where(
+              and(
+                eq(schema.steps.runId, effectiveRunId),
+                eq(schema.steps.stepId, data.correlationId!),
+                notInArray(schema.steps.status, ['completed', 'failed', 'cancelled']),
+              ),
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.steps.status })
+              .from(schema.steps)
+              .where(
+                and(
+                  eq(schema.steps.runId, effectiveRunId),
+                  eq(schema.steps.stepId, data.correlationId!),
+                ),
+              )
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, {
+                status: 404,
+              });
+            }
+            if (isTerminal(existing.status)) {
+              throw new EntityConflictError(
+                `Cannot modify step in terminal state "${existing.status}"`,
+              );
+            }
+          } else {
+            step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+          }
+        }
 
-        if (existingHook) {
-          // Create hook_conflict event instead of throwing 409
-          const conflictEventData = { token: eventData.token };
+        // Handle step_retrying event: sets status back to 'pending', records error.
+        // Uses conditional UPDATE to prevent retrying an already-terminal step.
+        if (data.eventType === 'step_retrying') {
+          const eventData = (data as any).eventData as {
+            error?: any;
+            stack?: string;
+            retryAfter?: Date;
+          };
+          const errorMessage =
+            typeof eventData?.error === 'string'
+              ? eventData.error
+              : (eventData?.error?.message ?? 'Unknown error');
 
-          await drizzle.insert(events).values({
-            runId: effectiveRunId,
-            eventId,
-            correlationId: data.correlationId,
-            eventType: 'hook_conflict',
-            eventData: conflictEventData,
-          });
+          const [updated] = await tx
+            .update(schema.steps)
+            .set({
+              status: 'pending',
+              error: JSON.stringify({
+                message: errorMessage,
+                stack: eventData?.stack,
+              }),
+              retryAfter: eventData?.retryAfter,
+            })
+            .where(
+              and(
+                eq(schema.steps.runId, effectiveRunId),
+                eq(schema.steps.stepId, data.correlationId!),
+                notInArray(schema.steps.status, ['completed', 'failed', 'cancelled']),
+              ),
+            );
+          if (updated.affectedRows === 0) {
+            const [existing] = await tx
+              .select({ status: schema.steps.status })
+              .from(schema.steps)
+              .where(
+                and(
+                  eq(schema.steps.runId, effectiveRunId),
+                  eq(schema.steps.stepId, data.correlationId!),
+                ),
+              )
+              .limit(1);
+            if (!existing) {
+              throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, {
+                status: 404,
+              });
+            }
+            if (isTerminal(existing.status)) {
+              throw new EntityConflictError(
+                `Cannot modify step in terminal state "${existing.status}"`,
+              );
+            }
+          } else {
+            step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+          }
+        }
 
-          const [conflictValue] = await drizzle
-            .select({ createdAt: events.createdAt })
-            .from(events)
-            .where(eq(events.eventId, eventId))
+        // Handle hook_created event: create hook entity
+        if (data.eventType === 'hook_created') {
+          const eventData = (data as any).eventData as {
+            token: string;
+            metadata?: any;
+            isWebhook?: boolean;
+          };
+
+          // Check whether any hook already holds this token
+          const [existingHook] = await tx
+            .select({ hookId: schema.hooks.hookId, runId: schema.hooks.runId })
+            .from(schema.hooks)
+            .where(eq(schema.hooks.token, eventData.token))
             .limit(1);
 
-          if (!conflictValue) {
-            throw new WorkflowWorldError(`Event ${eventId} could not be created`, { status: 409 });
+          if (existingHook) {
+            if (
+              existingHook.runId === effectiveRunId &&
+              existingHook.hookId === data.correlationId
+            ) {
+              // Same (runId, hookId): either a replayed/duplicate hook_created
+              // or an orphaned hook row from a crash between the hook INSERT
+              // and the event INSERT. Distinguish by whether the hook_created
+              // event exists in the log (see vercel/workflow#2283).
+              const [existingEvent] = await tx
+                .select({ eventId: events.eventId })
+                .from(events)
+                .where(
+                  and(
+                    eq(events.runId, effectiveRunId),
+                    eq(events.correlationId, data.correlationId!),
+                    eq(events.eventType, 'hook_created'),
+                  ),
+                )
+                .limit(1);
+              if (existingEvent) {
+                // Real duplicate: the runtime's dedup catch path swallows this.
+                throw new EntityConflictError(`Hook "${data.correlationId}" already created`);
+              }
+              // Orphaned hook row: complete the partial write by falling
+              // through to the event INSERT below, returning the persisted
+              // entity rather than undefined.
+              const [recovered] = await tx
+                .select()
+                .from(schema.hooks)
+                .where(eq(schema.hooks.hookId, data.correlationId!))
+                .limit(1);
+              if (recovered) {
+                recovered.metadata ||= recovered.metadataJson;
+                hook = HookSchema.parse(compact(recovered));
+              }
+            } else {
+              // A different (runId, hookId) holds this token. Create a
+              // hook_conflict event instead of throwing 409 — this lets the
+              // workflow continue and fail gracefully when the hook is awaited.
+              const conflictEventData = {
+                token: eventData.token,
+                conflictingRunId: existingHook.runId,
+              };
+              const eventRow = await insertEvent(tx, {
+                runId: effectiveRunId,
+                eventId: getEventId(),
+                correlationId: data.correlationId,
+                eventType: 'hook_conflict',
+                eventData: conflictEventData,
+                occurredAt: params?.occurredAt,
+                specVersion: effectiveSpecVersion,
+              });
+              return { kind: 'hook-conflict', eventRow, conflictEventData };
+            }
+          } else {
+            await tx
+              .insert(schema.hooks)
+              .values({
+                runId: effectiveRunId,
+                hookId: data.correlationId!,
+                token: eventData.token,
+                metadata: eventData.metadata as SerializedContent,
+                // Multi-tenancy fields - not yet implemented, using empty strings as placeholders
+                ownerId: '',
+                projectId: '',
+                environment: '',
+                specVersion: effectiveSpecVersion,
+                isWebhook: eventData.isWebhook,
+              })
+              .onDuplicateKeyUpdate({ set: { hookId: data.correlationId! } });
+
+            const [hookValue] = await tx
+              .select()
+              .from(schema.hooks)
+              .where(eq(schema.hooks.hookId, data.correlationId!))
+              .limit(1);
+            if (hookValue) {
+              hookValue.metadata ||= hookValue.metadataJson;
+              hook = HookSchema.parse(compact(hookValue));
+            }
           }
-
-          const conflictResult = {
-            eventType: 'hook_conflict' as const,
-            correlationId: data.correlationId,
-            eventData: conflictEventData,
-            ...conflictValue,
-            runId: effectiveRunId,
-            eventId,
-          };
-          const parsedConflict = EventSchema.parse(conflictResult);
-          const resolveData = params?.resolveData ?? 'all';
-          return {
-            event: filterEventData(parsedConflict, resolveData),
-            run,
-            step,
-            hook: undefined,
-          };
         }
 
-        await drizzle
-          .insert(schema.hooks)
-          .values({
-            runId: effectiveRunId,
-            hookId: data.correlationId!,
-            token: eventData.token,
-            metadata: eventData.metadata as SerializedContent,
-            // Multi-tenancy fields - not yet implemented, using empty strings as placeholders
-            ownerId: '',
-            projectId: '',
-            environment: '',
-          })
-          .onDuplicateKeyUpdate({ set: { hookId: data.correlationId! } });
-
-        const [hookValue] = await drizzle
-          .select()
-          .from(schema.hooks)
-          .where(eq(schema.hooks.hookId, data.correlationId!))
-          .limit(1);
-        if (hookValue) {
-          hookValue.metadata ||= hookValue.metadataJson;
-          hook = HookSchema.parse(compact(hookValue));
+        // Handle hook_disposed event: delete hook entity atomically. If no
+        // row was deleted, a concurrent caller already disposed the hook.
+        if (data.eventType === 'hook_disposed' && data.correlationId) {
+          const [deleted] = await tx
+            .delete(schema.hooks)
+            .where(eq(schema.hooks.hookId, data.correlationId));
+          if (deleted.affectedRows === 0) {
+            throw new EntityConflictError(`Hook "${data.correlationId}" already disposed`);
+          }
         }
-      }
 
-      // Handle hook_disposed event: delete hook entity
-      if (data.eventType === 'hook_disposed' && data.correlationId) {
-        await drizzle.delete(schema.hooks).where(eq(schema.hooks.hookId, data.correlationId));
-      }
+        // Strip eventData from run_started — it belongs on run_created only.
+        const storedEventData =
+          data.eventType === 'run_started'
+            ? undefined
+            : 'eventData' in data
+              ? data.eventData
+              : undefined;
 
-      const storedEventData =
-        data.eventType === 'run_started'
-          ? undefined
-          : 'eventData' in data
-            ? data.eventData
-            : undefined;
-      await drizzle.insert(events).values({
-        runId: effectiveRunId,
-        eventId,
-        correlationId: data.correlationId,
-        eventType: data.eventType,
-        eventData: storedEventData,
+        const eventRow = await insertEvent(tx, {
+          runId: effectiveRunId,
+          eventId: getEventId(),
+          correlationId: data.correlationId,
+          eventType: data.eventType,
+          eventData: storedEventData,
+          occurredAt: params?.occurredAt,
+          specVersion: effectiveSpecVersion,
+        });
+
+        return { kind: 'event-created', eventRow, run, step, hook };
       });
 
-      const [value] = await drizzle
-        .select({ createdAt: events.createdAt })
-        .from(events)
-        .where(eq(events.eventId, eventId))
-        .limit(1);
-      if (!value) {
-        throw new WorkflowWorldError(`Event ${eventId} could not be created`, {
-          status: 409,
-        });
+      if (outcome.kind === 'run-started-replay') {
+        return {
+          run: outcome.run ? (filterRunData(outcome.run, resolveData) as WorkflowRun) : undefined,
+        };
       }
-      const result = { ...data, ...value, runId: effectiveRunId, eventId };
+
+      if (outcome.kind === 'hook-conflict') {
+        const conflictResult = {
+          eventType: 'hook_conflict' as const,
+          correlationId: data.correlationId,
+          eventData: outcome.conflictEventData,
+          ...compact(outcome.eventRow),
+          runId: effectiveRunId,
+          eventId: getEventId(),
+        };
+        const parsedConflict = EventSchema.parse(conflictResult);
+        return {
+          event: filterEventData(parsedConflict, resolveData),
+          run: undefined,
+          step: undefined,
+          hook: undefined,
+        };
+      }
+
+      const result = {
+        ...data,
+        ...compact(outcome.eventRow),
+        runId: effectiveRunId,
+        eventId: getEventId(),
+      };
       if (data.eventType === 'run_started') {
         delete (result as any).eventData;
       }
       const parsed = EventSchema.parse(result);
-      const resolveData = params?.resolveData ?? 'all';
 
       // Preload all events for run_started to reduce TTFB
       let allEvents: Event[] | undefined;
-      if (data.eventType === 'run_started' && run) {
+      if (data.eventType === 'run_started' && outcome.run) {
         const eventRows = await drizzle
           .select()
           .from(events)
@@ -945,7 +1103,13 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         });
       }
 
-      return { event: filterEventData(parsed, resolveData), run, step, hook, events: allEvents };
+      return {
+        event: filterEventData(parsed, resolveData),
+        run: outcome.run,
+        step: outcome.step,
+        hook: outcome.hook,
+        events: allEvents,
+      };
     },
     async get(runId, eventId, params) {
       const [value] = await drizzle
@@ -1037,9 +1201,7 @@ export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
     async get(hookId, params) {
       const [value] = await drizzle.select().from(hooks).where(eq(hooks.hookId, hookId)).limit(1);
       if (!value) {
-        throw new WorkflowWorldError(`Hook not found: ${hookId}`, {
-          status: 404,
-        });
+        throw new HookNotFoundError(hookId);
       }
       value.metadata ||= value.metadataJson;
       const parsed = HookSchema.parse(compact(value));
@@ -1049,9 +1211,7 @@ export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
     async getByToken(token, params) {
       const [value] = await drizzle.select().from(hooks).where(eq(hooks.token, token)).limit(1);
       if (!value) {
-        throw new WorkflowWorldError(`Hook not found for token: ${token}`, {
-          status: 404,
-        });
+        throw new HookNotFoundError(token);
       }
       value.metadata ||= value.metadataJson;
       const parsed = HookSchema.parse(compact(value));

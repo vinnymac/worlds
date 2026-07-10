@@ -1,10 +1,11 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
+  parseQueueName,
   type Queue,
+  type QueueKind,
   type QueueOptions,
   type QueuePayload,
-  type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
 import { decode, encode } from 'cbor-x';
@@ -18,9 +19,9 @@ import { debug } from './util.js';
 type Drizzle = MySql2Database<typeof schema>;
 
 const QUEUE_PATHNAMES = {
-  __wkf_workflow_: 'flow',
-  __wkf_step_: 'step',
-} as const satisfies Record<QueuePrefix, string>;
+  workflow: 'flow',
+  step: 'step',
+} as const satisfies Record<QueueKind, string>;
 
 export interface MysqlQueueConfig {
   /** Poll interval in milliseconds (default: 100) */
@@ -35,6 +36,12 @@ export interface MysqlQueueConfig {
   idempotencyTtlMs?: number;
   /** How often to run idempotency cleanup in milliseconds (default: 60 seconds) */
   cleanupIntervalMs?: number;
+  /**
+   * How long a job may stay in 'processing' before it is considered orphaned
+   * (worker crashed mid-dispatch) and reclaimed. Must exceed the HTTP dispatch
+   * timeout. Default: httpTimeoutMs + 60_000
+   */
+  visibilityTimeoutMs?: number;
   /**
    * Base URL the worker uses to dispatch jobs back to the user's HTTP server.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
@@ -54,6 +61,7 @@ interface RawJobRow {
   id: number;
   job_id: string;
   queue_name: string;
+  idempotency_key: string | null;
   payload: Buffer;
   status: string;
   attempt: number;
@@ -73,21 +81,125 @@ function resolveBaseUrl(config: MysqlQueueConfig): string {
   return `http://localhost:${port}`;
 }
 
-async function cleanupExpiredIdempotencyKeys(db: Drizzle, ttlMs: number): Promise<number> {
-  const cutoff = new Date(Date.now() - ttlMs);
+/**
+ * JSON transport that preserves Uint8Array values via a tagged envelope
+ * ({ __type: 'Uint8Array', data: '<base64>' }). Required for the resilient
+ * start path where runInput.input (binary serialized data) is sent through
+ * the queue — plain JSON.stringify would mangle it into index-keyed objects.
+ */
+function encodeTaggedJson(value: unknown): string {
+  // Pre-walk instead of a JSON.stringify replacer: Buffer.prototype.toJSON
+  // runs before the replacer sees the value, so a replacer alone would miss
+  // Buffers (which CBOR decoding produces for binary data).
+  const tag = (v: unknown): unknown => {
+    if (v instanceof Uint8Array) {
+      return { __type: 'Uint8Array', data: Buffer.from(v).toString('base64') };
+    }
+    if (Array.isArray(v)) {
+      return v.map(tag);
+    }
+    if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
+      const out: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(v)) {
+        out[key] = tag(val);
+      }
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(tag(value));
+}
+
+function decodeTaggedJson(text: string): unknown {
+  return JSON.parse(text, (_key, v: unknown) => {
+    if (
+      v !== null &&
+      typeof v === 'object' &&
+      (v as { __type?: unknown }).__type === 'Uint8Array' &&
+      typeof (v as { data?: unknown }).data === 'string'
+    ) {
+      return new Uint8Array(Buffer.from((v as { data: string }).data, 'base64'));
+    }
+    return v;
+  });
+}
+
+/**
+ * Delete expired idempotency keys, but only when the deduped job is gone
+ * (completed jobs are deleted; their keys are released in completeJob).
+ * Keys whose job is still pending/processing — e.g. scheduled far in the
+ * future by a 503 timeoutSeconds or a long retryAfter — must survive the
+ * TTL, otherwise a replay re-enqueue would insert a duplicate job.
+ */
+export async function cleanupExpiredIdempotencyKeys(db: Drizzle, ttlMs: number): Promise<number> {
+  // Compute the cutoff server-side: binding a JS Date through raw SQL uses
+  // the driver's local timezone while drizzle-written timestamps are UTC.
+  const ttlSeconds = Math.ceil(ttlMs / 1000);
 
   const result = await db.execute(sql`
-    DELETE FROM \`workflow\`.\`workflow_job_idempotency\`
-    WHERE \`created_at\` < ${cutoff}
+    DELETE i FROM \`workflow\`.\`workflow_job_idempotency\` i
+    WHERE i.\`created_at\` < DATE_SUB(NOW(3), INTERVAL ${ttlSeconds} SECOND)
+      AND NOT EXISTS (
+        SELECT 1 FROM \`workflow\`.\`workflow_jobs\` j
+        WHERE j.\`job_id\` = i.\`message_id\`
+          AND j.\`status\` IN ('pending', 'processing')
+      )
   `);
 
   const affectedRows =
     (result as unknown as [{ affectedRows: number }, unknown])[0]?.affectedRows ?? 0;
   debug('Cleaned up expired idempotency keys', {
     affectedRows,
-    cutoffDate: cutoff.toISOString(),
+    ttlSeconds,
   });
   return affectedRows;
+}
+
+/**
+ * Reclaim jobs orphaned in 'processing' by a crashed/restarted worker:
+ * reset them to 'pending' so another worker picks them up, or mark them
+ * 'failed' when their attempts are exhausted. Without this, any process
+ * death between fetchJob's commit and completeJob strands the run forever.
+ */
+export async function reclaimStaleJobs(db: Drizzle, visibilityTimeoutMs: number): Promise<number> {
+  // Compute the cutoff server-side: binding a JS Date through raw SQL uses
+  // the driver's local timezone while drizzle-written timestamps are UTC.
+  const timeoutSeconds = Math.ceil(visibilityTimeoutMs / 1000);
+
+  const reset = await db.execute(sql`
+    UPDATE \`workflow\`.\`workflow_jobs\`
+    SET \`status\` = 'pending',
+        \`locked_at\` = NULL,
+        \`locked_by\` = NULL,
+        \`updated_at\` = NOW(3)
+    WHERE \`status\` = 'processing'
+      AND \`locked_at\` < DATE_SUB(NOW(3), INTERVAL ${timeoutSeconds} SECOND)
+      AND \`attempt\` < \`max_attempts\`
+  `);
+  const resetRows = (reset as unknown as [{ affectedRows: number }, unknown])[0]?.affectedRows ?? 0;
+
+  const failed = await db.execute(sql`
+    UPDATE \`workflow\`.\`workflow_jobs\`
+    SET \`status\` = 'failed',
+        \`error\` = 'Job lock expired: worker crashed or timed out',
+        \`locked_at\` = NULL,
+        \`locked_by\` = NULL,
+        \`updated_at\` = NOW(3)
+    WHERE \`status\` = 'processing'
+      AND \`locked_at\` < DATE_SUB(NOW(3), INTERVAL ${timeoutSeconds} SECOND)
+      AND \`attempt\` >= \`max_attempts\`
+  `);
+  const failedRows =
+    (failed as unknown as [{ affectedRows: number }, unknown])[0]?.affectedRows ?? 0;
+
+  if (resetRows > 0 || failedRows > 0) {
+    debug('Reclaimed stale processing jobs', {
+      resetRows,
+      failedRows,
+      timeoutSeconds,
+    });
+  }
+  return resetRows + failedRows;
 }
 
 async function fetchJob(
@@ -166,6 +278,8 @@ async function enqueueJob(
       await tx.insert(schema.jobs).values({
         jobId: messageId,
         queueName,
+        // Persist the effective key so job completion can release it
+        idempotencyKey,
         payload: Buffer.from(encode(envelope)),
         status: 'pending',
         maxAttempts: opts?.maxAttempts ?? 3,
@@ -197,14 +311,10 @@ async function enqueueJob(
   }
 }
 
-async function handleJobFailure(
-  db: Drizzle,
-  jobId: number,
-  error: unknown,
-  attempt: number,
-  maxAttempts: number,
-): Promise<void> {
+async function handleJobFailure(db: Drizzle, job: RawJobRow, error: unknown): Promise<void> {
   const errorMessage = error instanceof Error ? error.message : String(error);
+  const attempt = job.attempt ?? 1;
+  const maxAttempts = job.max_attempts ?? 3;
 
   if (attempt >= maxAttempts) {
     await db
@@ -215,7 +325,14 @@ async function handleJobFailure(
         lockedAt: null,
         lockedBy: null,
       })
-      .where(eq(schema.jobs.id, jobId));
+      .where(eq(schema.jobs.id, job.id));
+    // Permanent failure: release the idempotency key so the failed job does
+    // not block a future re-enqueue of the same logical message.
+    if (job.idempotency_key) {
+      await db
+        .delete(schema.idempotency)
+        .where(eq(schema.idempotency.idempotencyKey, job.idempotency_key));
+    }
   } else {
     const backoffMs = Math.min(1000 * 2 ** (attempt - 1), 30000);
     const scheduledFor = new Date(Date.now() + backoffMs);
@@ -229,17 +346,17 @@ async function handleJobFailure(
         lockedBy: null,
         scheduledFor,
       })
-      .where(eq(schema.jobs.id, jobId));
+      .where(eq(schema.jobs.id, job.id));
   }
 }
 
-async function completeJob(db: Drizzle, jobId: number, idempotencyKey?: string): Promise<void> {
-  await db.delete(schema.jobs).where(eq(schema.jobs.id, jobId));
-  if (idempotencyKey) {
-    await db
-      .delete(schema.idempotency)
-      .where(eq(schema.idempotency.idempotencyKey, idempotencyKey));
-  }
+async function completeJob(db: Drizzle, job: RawJobRow): Promise<void> {
+  await db.delete(schema.jobs).where(eq(schema.jobs.id, job.id));
+  // Release the idempotency key recorded at enqueue time. Rows written
+  // before the idempotency_key column existed fall back to the messageId,
+  // which was the default key.
+  const idempotencyKey = job.idempotency_key ?? job.job_id;
+  await db.delete(schema.idempotency).where(eq(schema.idempotency.idempotencyKey, idempotencyKey));
 }
 
 /**
@@ -262,15 +379,16 @@ export function createQueue(
     idempotencyTtlMs = 5 * 60 * 1000,
     cleanupIntervalMs = 60 * 1000,
     httpTimeoutMs = 300_000,
+    visibilityTimeoutMs = httpTimeoutMs + 60_000,
   } = config;
 
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   const prefix = 'workflow_';
   const Queues = {
-    __wkf_workflow_: `${prefix}flows`,
-    __wkf_step_: `${prefix}steps`,
-  } as const satisfies Record<QueuePrefix, string>;
+    workflow: `${prefix}flows`,
+    step: `${prefix}steps`,
+  } as const satisfies Record<QueueKind, string>;
 
   let running = false;
 
@@ -281,8 +399,8 @@ export function createQueue(
     message: QueuePayload,
     opts?: QueueOptions,
   ) => {
-    const qPrefix = parseQueuePrefix(queueName);
-    const listKey = Queues[qPrefix];
+    const { kind } = parseQueueName(queueName);
+    const listKey = Queues[kind];
 
     const envelope: JobEnvelope = { queueName, message };
 
@@ -308,7 +426,9 @@ export function createQueue(
 
       const attempt = Number.parseInt(attemptStr, 10);
       try {
-        const body = await req.json();
+        // Tagged-JSON transport: restores Uint8Array values that dispatch()
+        // encoded, keeping binary payloads (e.g. runInput.input) intact.
+        const body = decodeTaggedJson(await req.text());
         const result = await handler(body, {
           attempt,
           queueName: reqQueueName,
@@ -340,16 +460,12 @@ export function createQueue(
         'x-vqs-message-id': messageId,
         'x-vqs-message-attempt': String(attempt),
       },
-      body: JSON.stringify(envelope.message),
+      body: encodeTaggedJson(envelope.message),
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
   }
 
-  async function processJob(
-    job: RawJobRow,
-    listKey: string,
-    queuePrefix: QueuePrefix,
-  ): Promise<void> {
+  async function processJob(job: RawJobRow, listKey: string, kind: QueueKind): Promise<void> {
     const startTime = Date.now();
     try {
       const envelope = decode(job.payload) as JobEnvelope;
@@ -357,11 +473,11 @@ export function createQueue(
         envelope,
         job.job_id,
         job.attempt ?? 1,
-        QUEUE_PATHNAMES[queuePrefix],
+        QUEUE_PATHNAMES[kind],
       );
 
       if (response.ok) {
-        await completeJob(db, job.id, job.job_id);
+        await completeJob(db, job);
         metrics.recordProcessed(listKey, Date.now() - startTime);
         return;
       }
@@ -404,18 +520,18 @@ export function createQueue(
         `[world-mysql processJob] Error processing job ${job.job_id} (attempt ${job.attempt}/${job.max_attempts}):`,
         error instanceof Error ? error.message : error,
       );
-      await handleJobFailure(db, job.id, error, job.attempt ?? 1, job.max_attempts ?? maxAttempts);
+      await handleJobFailure(db, job, error);
     }
   }
 
-  async function worker(queuePrefix: QueuePrefix, listKey: string, workerIdx: number) {
-    const wId = `${workerId}_${queuePrefix}_${workerIdx}`;
+  async function worker(kind: QueueKind, listKey: string, workerIdx: number) {
+    const wId = `${workerId}_${kind}_${workerIdx}`;
 
     while (running) {
       try {
         const job = await fetchJob(db, listKey, wId);
         if (job) {
-          await processJob(job, listKey, queuePrefix);
+          await processJob(job, listKey, kind);
         } else {
           await delay(pollIntervalMs);
         }
@@ -427,10 +543,10 @@ export function createQueue(
   }
 
   function startWorkers() {
-    const entries = Object.entries(Queues) as [QueuePrefix, string][];
-    for (const [queuePrefix, listKey] of entries) {
+    const entries = Object.entries(Queues) as [QueueKind, string][];
+    for (const [kind, listKey] of entries) {
       for (let i = 0; i < concurrency; i++) {
-        worker(queuePrefix, listKey, i).catch((error) => {
+        worker(kind, listKey, i).catch((error) => {
           console.error(`[world-mysql] Worker for ${listKey} crashed:`, error);
         });
       }
@@ -443,6 +559,15 @@ export function createQueue(
     queue,
     async start() {
       running = true;
+
+      // Recover jobs orphaned by a previous crashed process before workers
+      // start pulling new work.
+      try {
+        await reclaimStaleJobs(db, visibilityTimeoutMs);
+      } catch (error) {
+        debug('Error reclaiming stale jobs on start', { error });
+      }
+
       startWorkers();
 
       cleanupTimer = setInterval(async () => {
@@ -451,6 +576,11 @@ export function createQueue(
         } catch (error) {
           debug('Error in idempotency cleanup', { error });
         }
+        try {
+          await reclaimStaleJobs(db, visibilityTimeoutMs);
+        } catch (error) {
+          debug('Error reclaiming stale jobs', { error });
+        }
       }, cleanupIntervalMs);
 
       debug('Started queue workers and cleanup timer', {
@@ -458,6 +588,7 @@ export function createQueue(
         pollIntervalMs,
         idempotencyTtlMs,
         cleanupIntervalMs,
+        visibilityTimeoutMs,
       });
     },
     stop() {
@@ -473,11 +604,3 @@ export function createQueue(
     },
   };
 }
-
-const parseQueuePrefix = (name: ValidQueueName): QueuePrefix => {
-  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
-  for (const p of prefixes) {
-    if (name.startsWith(p)) return p;
-  }
-  throw new Error(`Invalid queue name: ${name}`);
-};

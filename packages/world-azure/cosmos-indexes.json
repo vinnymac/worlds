@@ -22,7 +22,7 @@
         "order": "ascending"
       },
       {
-        "path": "/createdAt",
+        "path": "/runId",
         "order": "descending"
       }
     ],
@@ -36,7 +36,7 @@
         "order": "ascending"
       },
       {
-        "path": "/createdAt",
+        "path": "/runId",
         "order": "descending"
       }
     ],
@@ -46,7 +46,7 @@
         "order": "ascending"
       },
       {
-        "path": "/createdAt",
+        "path": "/runId",
         "order": "descending"
       }
     ],
@@ -60,7 +60,17 @@
         "order": "ascending"
       },
       {
-        "path": "/createdAt",
+        "path": "/eventId",
+        "order": "ascending"
+      }
+    ],
+    [
+      {
+        "path": "/type",
+        "order": "ascending"
+      },
+      {
+        "path": "/eventId",
         "order": "ascending"
       }
     ]

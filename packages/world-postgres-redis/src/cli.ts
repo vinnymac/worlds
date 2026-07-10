@@ -19,6 +19,8 @@ const MIGRATION_FILES = [
   '0000_cheerful_kylun.sql',
   '0001_sudden_wilson_fisk.sql',
   '0002_outbox_and_notify.sql',
+  '0003_events_occurred_at.sql',
+  '0004_hooks_token_unique_stream_run_id.sql',
 ];
 
 async function setupDatabase() {
@@ -40,10 +42,29 @@ async function setupDatabase() {
     console.log('\n[1/3] Running migrations...');
     const migrationsDir = join(__dirname, '..', 'src', 'drizzle', 'migrations');
 
+    // Track applied migrations so each file runs exactly once. Databases
+    // provisioned before tracking existed have an empty table; that is safe
+    // because every shipped migration is idempotent.
+    await sql.unsafe('CREATE SCHEMA IF NOT EXISTS "workflow"');
+    await sql.unsafe(
+      'CREATE TABLE IF NOT EXISTS "workflow"."__migrations" ("tag" text PRIMARY KEY, "applied_at" timestamp DEFAULT now() NOT NULL)',
+    );
+    const appliedRows = await sql`SELECT tag FROM "workflow"."__migrations"`;
+    const applied = new Set(appliedRows.map((row) => String(row.tag)));
+
     for (const file of MIGRATION_FILES) {
+      const tag = file.replace(/\.sql$/, '');
+      if (applied.has(tag)) {
+        console.log(`  Skipped (already applied): ${file}`);
+        continue;
+      }
       const migrationPath = join(migrationsDir, file);
       const migrationSQL = await readFile(migrationPath, 'utf-8');
-      await sql.unsafe(migrationSQL);
+      // Apply the migration and record it atomically.
+      await sql.begin(async (tx) => {
+        await tx.unsafe(migrationSQL);
+        await tx`INSERT INTO "workflow"."__migrations" ("tag") VALUES (${tag})`;
+      });
       console.log(`  Applied: ${file}`);
     }
 

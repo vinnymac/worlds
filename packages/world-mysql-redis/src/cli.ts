@@ -21,8 +21,17 @@ async function setupDatabase() {
     // Read all migration SQL files
     const migrationsDir = join(__dirname, '..', 'migrations');
 
-    // Read migration files in order
-    const migrationFiles = ['0000_initial.sql', '0001_outbox.sql'];
+    // Read migration files in order. Migration history is append-only: 0001
+    // shipped in published releases, so it stays even though 0003 drops the
+    // (always-empty) outbox table it created.
+    const migrationFiles = [
+      '0000_initial.sql',
+      '0001_outbox.sql',
+      '0002_events_occurred_at.sql',
+      '0003_drop_outbox.sql',
+      '0004_steps_status_cancelled.sql',
+      '0005_stream_chunks_run_id.sql',
+    ];
 
     for (const file of migrationFiles) {
       const migrationPath = join(migrationsDir, file);
@@ -46,7 +55,6 @@ async function setupDatabase() {
     console.log('  - workflow.workflow_steps');
     console.log('  - workflow.workflow_hooks');
     console.log('  - workflow.workflow_stream_chunks');
-    console.log('  - workflow.workflow_outbox');
 
     await connection.end();
     process.exit(0);

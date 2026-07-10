@@ -1,16 +1,19 @@
 import { MySqlContainer } from '@testcontainers/mysql';
 import { encode, decode } from 'cbor-x';
 import { drizzle } from 'drizzle-orm/mysql2';
-import { sql } from 'drizzle-orm';
+import type { MySql2Database } from 'drizzle-orm/mysql2';
+import { eq, sql } from 'drizzle-orm';
 import mysql from 'mysql2/promise';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { cleanupExpiredIdempotencyKeys, reclaimStaleJobs } from '../src/queue.js';
 import * as schema from '../src/schema.js';
+import { applyMigrations } from './migrate.js';
 
 const shouldSkipTests = process.platform === 'win32';
 
 describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
   let mysqlContainer: Awaited<ReturnType<InstanceType<typeof MySqlContainer>['start']>>;
-  let db: ReturnType<typeof drizzle>;
+  let db: MySql2Database<typeof schema>;
   let pool: mysql.Pool;
 
   beforeAll(async () => {
@@ -25,33 +28,9 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
     pool = mysql.createPool(dbUrl);
     db = drizzle(pool, { schema, mode: 'default' });
 
-    // Create tables
+    // Create tables from the real migrations
     const connection = await mysql.createConnection(dbUrl);
-    await connection.execute('CREATE SCHEMA IF NOT EXISTS `workflow`');
-    await connection.execute(`CREATE TABLE \`workflow\`.\`workflow_jobs\` (
-      \`id\` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      \`job_id\` VARCHAR(255) NOT NULL UNIQUE,
-      \`queue_name\` VARCHAR(255) NOT NULL,
-      \`payload\` BLOB NOT NULL,
-      \`status\` ENUM('pending','processing','failed') NOT NULL DEFAULT 'pending',
-      \`attempt\` INT NOT NULL DEFAULT 0,
-      \`max_attempts\` INT NOT NULL DEFAULT 3,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      \`locked_at\` TIMESTAMP NULL,
-      \`locked_by\` VARCHAR(255),
-      \`error\` TEXT,
-      \`scheduled_for\` TIMESTAMP NULL,
-      INDEX \`idx_jobs_queue_status\` (\`queue_name\`, \`status\`, \`id\`),
-      INDEX \`idx_jobs_scheduled\` (\`scheduled_for\`)
-    )`);
-    await connection.execute(`CREATE TABLE \`workflow\`.\`workflow_job_idempotency\` (
-      \`idempotency_key\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`message_id\` VARCHAR(255) NOT NULL,
-      \`queue_name\` VARCHAR(255) NOT NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      INDEX \`idx_idempotency_created\` (\`created_at\`)
-    )`);
+    await applyMigrations(connection);
     await connection.end();
   }, 60_000);
 
@@ -157,5 +136,101 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
     console.log('transaction result:', result ? Object.keys(result) : 'null');
     expect(result).not.toBeNull();
     expect(result.queue_name).toBe('workflow_flows');
+  });
+
+  it('reclaims stale processing jobs and fails exhausted ones', async () => {
+    const payload = Buffer.from(encode({ runId: 'test_run_reclaim' }));
+    const staleLockedAt = new Date(Date.now() - 10 * 60 * 1000);
+
+    // Orphaned job with attempts remaining → back to pending
+    await db.insert(schema.jobs).values({
+      jobId: 'msg_reclaim_pending',
+      queueName: 'workflow_flows',
+      payload,
+      status: 'processing',
+      attempt: 1,
+      maxAttempts: 3,
+      lockedAt: staleLockedAt,
+      lockedBy: 'dead_worker',
+    });
+    // Orphaned job with attempts exhausted → failed
+    await db.insert(schema.jobs).values({
+      jobId: 'msg_reclaim_failed',
+      queueName: 'workflow_flows',
+      payload,
+      status: 'processing',
+      attempt: 3,
+      maxAttempts: 3,
+      lockedAt: staleLockedAt,
+      lockedBy: 'dead_worker',
+    });
+    // Actively processing job (fresh lock) → untouched
+    await db.insert(schema.jobs).values({
+      jobId: 'msg_reclaim_active',
+      queueName: 'workflow_flows',
+      payload,
+      status: 'processing',
+      attempt: 1,
+      maxAttempts: 3,
+      lockedAt: new Date(),
+      lockedBy: 'live_worker',
+    });
+
+    const reclaimed = await reclaimStaleJobs(db, 5 * 60 * 1000);
+    expect(reclaimed).toBe(2);
+
+    const [reset] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.jobId, 'msg_reclaim_pending'));
+    expect(reset.status).toBe('pending');
+    expect(reset.lockedBy).toBeNull();
+
+    const [failed] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.jobId, 'msg_reclaim_failed'));
+    expect(failed.status).toBe('failed');
+
+    const [active] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.jobId, 'msg_reclaim_active'));
+    expect(active.status).toBe('processing');
+  });
+
+  it('idempotency TTL cleanup keeps keys for still-queued jobs', async () => {
+    const payload = Buffer.from(encode({ runId: 'test_run_idem' }));
+    const expiredCreatedAt = new Date(Date.now() - 10 * 60 * 1000);
+
+    // Expired key whose job is still scheduled → must survive cleanup
+    await db.insert(schema.jobs).values({
+      jobId: 'msg_idem_live',
+      queueName: 'workflow_steps',
+      idempotencyKey: 'step_live',
+      payload,
+      status: 'pending',
+      scheduledFor: new Date(Date.now() + 30 * 60 * 1000),
+    });
+    await db.insert(schema.idempotency).values({
+      idempotencyKey: 'step_live',
+      messageId: 'msg_idem_live',
+      queueName: 'workflow_steps',
+      createdAt: expiredCreatedAt,
+    });
+
+    // Expired key whose job is gone (completed) → released
+    await db.insert(schema.idempotency).values({
+      idempotencyKey: 'step_done',
+      messageId: 'msg_idem_done',
+      queueName: 'workflow_steps',
+      createdAt: expiredCreatedAt,
+    });
+
+    const released = await cleanupExpiredIdempotencyKeys(db, 5 * 60 * 1000);
+    expect(released).toBe(1);
+
+    const remaining = await db.select().from(schema.idempotency);
+    expect(remaining.map((r) => r.idempotencyKey)).toEqual(['step_live']);
   });
 });

@@ -30,7 +30,15 @@
       "queryScope": "COLLECTION_GROUP",
       "fields": [
         { "fieldPath": "correlationId", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "ASCENDING" }
+        { "fieldPath": "eventId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "events",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "correlationId", "order": "ASCENDING" },
+        { "fieldPath": "eventId", "order": "DESCENDING" }
       ]
     },
     {

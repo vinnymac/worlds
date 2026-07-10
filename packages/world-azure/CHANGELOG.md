@@ -92,7 +92,6 @@
 - e2d3f2e: Reliability and observability enhancements across all world packages, plus event-idempotency bug fixes and a new shared utilities package.
 
   ## New Package
-
   - `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
   ## Critical Bug Fixes — Event Idempotency
@@ -110,19 +109,16 @@
   ## Reliability & Observability
 
   ### `world-azure`
-
   - Cosmos DB transactional batches for multi-document writes
   - RU/s throttling retry with backoff
   - Service Bus session support
 
   ### `world-cloudflare`
-
   - Durable Object storage transactions
   - Permanent vs. transient error handling in queue consumers
   - Schema migration framework for DO storage
 
   ### `world-firestore-tasks`
-
   - Batched writes for atomic multi-document mutations
   - Cloud Tasks idempotency keys
   - Idempotent consumer pattern
@@ -130,25 +126,21 @@
   - Polling-mode streamer
 
   ### `world-mysql`
-
   - TTL-based cleanup of idempotency rows
   - Queue processing metrics (`src/metrics.ts`)
 
   ### `world-mysql-redis`
-
   - Outbox pattern (`src/outbox.ts`, `migrations/0001_outbox.sql`)
   - Deadlock retry logic
   - Cross-backend health check
 
   ### `world-nats-jetstream`
-
   - Secondary indexes for query patterns
   - Configurable JetStream dedup window
   - Worker health checks + exponential backoff
   - Bucket TTL/compaction configuration
 
   ### `world-postgres-redis`
-
   - Outbox pattern (`src/outbox.ts`)
   - LISTEN/NOTIFY pub/sub (`src/notify.ts`, migration `0002_outbox_and_notify.sql`)
   - Cross-backend health check (`src/health.ts`)
@@ -156,20 +148,17 @@
   - Unified idempotency handling
 
   ### `world-redis`
-
   - Atomic Lua scripts for multi-key writes
   - Queue/stream metrics
   - Streams-based event log
 
   ### `world-redis-bullmq`
-
   - Stalled-job recovery
   - Configurable retry/backoff
   - Queue metrics
   - Delayed-job support
 
   ### `world-upstash`
-
   - QStash signature verification
   - Request deduplication
   - Request-budget monitoring

@@ -1,4 +1,4 @@
-import { asc, eq, lt, sql } from 'drizzle-orm';
+import { and, asc, eq, lt, sql } from 'drizzle-orm';
 import type { Drizzle } from './drizzle/index.js';
 import { Schema } from './drizzle/index.js';
 import { debug } from './util.js';
@@ -6,6 +6,12 @@ import { debug } from './util.js';
 const MAX_ATTEMPTS = 5;
 const RELAY_INTERVAL_MS = 1_000;
 const BATCH_SIZE = 100;
+/**
+ * Rows younger than this are left to the enqueuer's optimistic push. Without
+ * the grace period the relay can push a row in the window between the
+ * caller's INSERT and its own push/DELETE, double-delivering the message.
+ */
+const RELAY_GRACE_MS = 5_000;
 
 export interface OutboxEntry {
   id: string;
@@ -45,7 +51,12 @@ export function createOutboxRelay(
     const rows = await drizzle
       .select()
       .from(outbox)
-      .where(lt(outbox.attempts, MAX_ATTEMPTS))
+      .where(
+        and(
+          lt(outbox.attempts, MAX_ATTEMPTS),
+          lt(outbox.createdAt, new Date(Date.now() - RELAY_GRACE_MS)),
+        ),
+      )
       .orderBy(asc(outbox.createdAt))
       .limit(BATCH_SIZE);
 
@@ -82,11 +93,11 @@ export function createOutboxRelay(
     return relayed;
   }
 
+  // Counts intentionally include rows past MAX_ATTEMPTS: abandoned rows are
+  // undelivered messages and must stay visible to the health check rather
+  // than silently disappearing.
   async function getPendingCount(): Promise<number> {
-    const [result] = await drizzle
-      .select({ count: sql<number>`count(*)::int` })
-      .from(outbox)
-      .where(lt(outbox.attempts, MAX_ATTEMPTS));
+    const [result] = await drizzle.select({ count: sql<number>`count(*)::int` }).from(outbox);
     return result?.count ?? 0;
   }
 
@@ -94,7 +105,6 @@ export function createOutboxRelay(
     const [result] = await drizzle
       .select({ createdAt: outbox.createdAt })
       .from(outbox)
-      .where(lt(outbox.attempts, MAX_ATTEMPTS))
       .orderBy(asc(outbox.createdAt))
       .limit(1);
     if (!result) return null;

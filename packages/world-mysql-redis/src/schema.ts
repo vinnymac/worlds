@@ -91,6 +91,7 @@ export const events = schema.table(
     eventType: varchar('type', { length: 255 }).$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id', { length: 255 }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
+    occurredAt: timestamp('occurred_at'),
     runId: varchar('run_id', { length: 255 }).notNull(),
     /** @deprecated */
     eventDataJson: json('payload'),
@@ -158,19 +159,6 @@ export const hooks = schema.table(
   ],
 );
 
-export const outbox = schema.table(
-  'workflow_outbox',
-  {
-    id: bigint('id', { mode: 'number' }).autoincrement().primaryKey(),
-    messageId: varchar('message_id', { length: 36 }).notNull().unique(),
-    payload: json('payload').notNull(),
-    createdAt: timestamp('created_at', { fsp: 6 }).defaultNow().notNull(),
-    attempts: int('attempts').default(0).notNull(),
-    lastError: text('last_error'),
-  },
-  (tb) => [index('idx_outbox_created_at').on(tb.createdAt)],
-);
-
 const blob = customType<{ data: Buffer; notNull: false; default: false }>({
   dataType() {
     return 'blob';
@@ -182,6 +170,8 @@ export const streams = schema.table(
   {
     chunkId: varchar('id', { length: 255 }).$type<`chnk_${string}`>().notNull(),
     streamId: varchar('stream_id', { length: 255 }).notNull(),
+    /** Nullable: rows written before the run_id column existed have no owner */
+    runId: varchar('run_id', { length: 255 }),
     chunkData: blob('data').notNull(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     eof: boolean('eof').notNull(),
@@ -190,5 +180,6 @@ export const streams = schema.table(
   (tb) => [
     primaryKey({ columns: [tb.streamId, tb.chunkId] }),
     index('idx_stream_chunks_sequence').on(tb.streamId, tb.sequence),
+    index('idx_stream_chunks_run_id').on(tb.runId),
   ],
 );

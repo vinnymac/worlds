@@ -1,31 +1,82 @@
 import type {
   GetChunksOptions,
+  StreamChunk,
   StreamChunksResponse,
   StreamInfoResponse,
   Streamer,
 } from '@workflow/world';
-import { and, eq, gt } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { monotonicFactory } from 'ulid';
 import * as schema from './schema.js';
 
 const { streams } = schema;
 
+/** Opaque pagination cursor for getStreamChunks: last chunkId + running index. */
+interface ChunkCursor {
+  c: string;
+  i: number;
+}
+
+function decodeChunkCursor(cursor: string | undefined): ChunkCursor | null {
+  if (!cursor) return null;
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+    if (
+      decoded !== null &&
+      typeof decoded === 'object' &&
+      typeof (decoded as ChunkCursor).c === 'string' &&
+      typeof (decoded as ChunkCursor).i === 'number'
+    ) {
+      return decoded as ChunkCursor;
+    }
+    return null;
+  } catch {
+    // Invalid cursor, start from beginning
+    return null;
+  }
+}
+
 /**
  * MySQL streamer using polling-based approach.
  *
  * Unlike PostgreSQL which uses NOTIFY/LISTEN for real-time push notifications,
- * MySQL lacks native pub/sub. We use a sequence-based polling pattern instead:
- * - Each chunk gets an auto-incrementing sequence number
- * - Readers poll for chunks where sequence > lastSequence
- * - Poll interval of 100ms provides acceptable latency for most use cases
+ * MySQL lacks native pub/sub. Readers poll for new chunks instead.
+ *
+ * Ordering is by the monotonic ULID chunkId — never by timestamp. Chunks
+ * written within the same millisecond (the norm for token streaming) would
+ * collide on a timestamp sequence and be silently dropped or reordered.
  */
 export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer {
   const ulid = monotonicFactory();
 
   const genChunkId = () => `chnk_${ulid()}` as const;
-  // Use timestamp-based sequence to avoid conflicts across restarts
-  const nextSequence = () => Date.now();
+
+  const toBuffer = (chunk: string | Uint8Array): Buffer =>
+    typeof chunk === 'string'
+      ? Buffer.from(chunk)
+      : Buffer.isBuffer(chunk)
+        ? chunk
+        : Buffer.from(chunk);
+
+  /** Count of data (non-EOF) chunks in a stream. */
+  async function countDataChunks(name: string): Promise<number> {
+    const [countResult] = await drizzle
+      .select({ count: sql<number>`count(*)` })
+      .from(streams)
+      .where(and(eq(streams.streamId, name), eq(streams.eof, false)));
+    return Number(countResult?.count ?? 0);
+  }
+
+  /** Whether the stream has an EOF marker (i.e. is closed). */
+  async function isStreamDone(name: string): Promise<boolean> {
+    const [eofRow] = await drizzle
+      .select({ eof: streams.eof })
+      .from(streams)
+      .where(and(eq(streams.streamId, name), eq(streams.eof, true)))
+      .limit(1);
+    return Boolean(eofRow);
+  }
 
   return {
     async writeToStream(
@@ -34,45 +85,49 @@ export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer
       chunk: string | Uint8Array,
     ) {
       // Await runId if it's a promise to ensure proper flushing
-      await _runId;
-
-      const chunkId = genChunkId();
-      const buffer =
-        typeof chunk === 'string'
-          ? Buffer.from(chunk)
-          : Buffer.isBuffer(chunk)
-            ? chunk
-            : Buffer.from(chunk);
+      const runId = await _runId;
 
       await drizzle.insert(streams).values({
-        chunkId,
+        chunkId: genChunkId(),
         streamId: name,
-        chunkData: buffer,
+        runId,
+        chunkData: toBuffer(chunk),
         eof: false,
-        sequence: nextSequence(),
+        sequence: Date.now(),
       });
     },
 
     async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
       // Await runId if it's a promise to ensure proper flushing
-      await _runId;
+      const runId = await _runId;
 
-      const chunkId = genChunkId();
       await drizzle.insert(streams).values({
-        chunkId,
+        chunkId: genChunkId(),
         streamId: name,
+        runId,
         chunkData: Buffer.from([]),
         eof: true,
-        sequence: nextSequence(),
+        sequence: Date.now(),
       });
     },
 
     async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
       let closed = false;
-      let lastSequence = startIndex ?? -1;
+
+      // startIndex is a chunk index: positive skips that many data chunks
+      // from the start, negative starts that many chunks before the end.
+      let remainingSkip = startIndex ?? 0;
+      if (remainingSkip < 0) {
+        const dataCount = await countDataChunks(name);
+        remainingSkip = Math.max(0, dataCount + remainingSkip);
+      }
 
       return new ReadableStream<Uint8Array>({
         async start(controller) {
+          // Cursor over the monotonic ULID chunkId. The empty string sorts
+          // before every ULID, so '' starts at the beginning.
+          let lastChunkId = '';
+
           // Use a polling loop in start() rather than pull() because
           // Node.js ReadableStream doesn't reliably re-invoke pull()
           // when it resolves without enqueuing data.
@@ -80,14 +135,14 @@ export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer
             while (!closed) {
               const chunks = await drizzle
                 .select({
-                  sequence: streams.sequence,
+                  chunkId: streams.chunkId,
                   eof: streams.eof,
                   data: streams.chunkData,
                 })
                 .from(streams)
-                .where(and(eq(streams.streamId, name), gt(streams.sequence, lastSequence)))
-                .orderBy(streams.sequence)
-                .limit(10);
+                .where(and(eq(streams.streamId, name), sql`${streams.chunkId} > ${lastChunkId}`))
+                .orderBy(asc(streams.chunkId))
+                .limit(50);
 
               if (!chunks.length) {
                 await new Promise((resolve) => setTimeout(resolve, 100));
@@ -95,12 +150,17 @@ export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer
               }
 
               for (const chunk of chunks) {
-                lastSequence = chunk.sequence;
+                lastChunkId = chunk.chunkId;
 
                 if (chunk.eof) {
                   closed = true;
                   controller.close();
                   return;
+                }
+
+                if (remainingSkip > 0) {
+                  remainingSkip--;
+                  continue;
                 }
 
                 if (chunk.data.byteLength) {
@@ -129,23 +189,73 @@ export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer
       });
     },
 
-    async listStreamsByRunId(_runId: string): Promise<string[]> {
-      // Not implemented for MySQL-Upstash
-      return [];
+    async listStreamsByRunId(runId: string): Promise<string[]> {
+      const results = await drizzle
+        .selectDistinct({ streamId: streams.streamId })
+        .from(streams)
+        .where(eq(streams.runId, runId));
+      return results.map((r) => r.streamId);
     },
 
     async getStreamChunks(
-      _name: string,
+      name: string,
       _runId: string,
-      _options?: GetChunksOptions,
+      options?: GetChunksOptions,
     ): Promise<StreamChunksResponse> {
-      // Not implemented for MySQL-Upstash
-      return { data: [], hasMore: false, cursor: null, done: true };
+      const limit = options?.limit ?? 100;
+      const cursor = decodeChunkCursor(options?.cursor);
+
+      // Fetch only data rows (exclude EOF) with limit + 1 to detect hasMore.
+      const rows = await drizzle
+        .select({
+          chunkId: streams.chunkId,
+          data: streams.chunkData,
+        })
+        .from(streams)
+        .where(
+          and(
+            eq(streams.streamId, name),
+            eq(streams.eof, false),
+            cursor ? sql`${streams.chunkId} > ${cursor.c}` : undefined,
+          ),
+        )
+        .orderBy(asc(streams.chunkId))
+        .limit(limit + 1);
+
+      const hasMore = rows.length > limit;
+      const pageRows = rows.slice(0, limit);
+      const baseIndex = cursor?.i ?? 0;
+
+      const chunks: StreamChunk[] = pageRows.map((row, i) => ({
+        index: baseIndex + i,
+        data: new Uint8Array(row.data),
+      }));
+
+      const lastRow = pageRows.at(-1);
+      const nextCursor =
+        hasMore && lastRow
+          ? Buffer.from(
+              JSON.stringify({
+                c: lastRow.chunkId,
+                i: baseIndex + pageRows.length,
+              } satisfies ChunkCursor),
+            ).toString('base64')
+          : null;
+
+      return {
+        data: chunks,
+        cursor: nextCursor,
+        hasMore,
+        done: await isStreamDone(name),
+      };
     },
 
-    async getStreamInfo(_name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Not implemented for MySQL-Upstash
-      return { tailIndex: -1, done: false };
+    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
+      const dataCount = await countDataChunks(name);
+      return {
+        tailIndex: dataCount - 1,
+        done: await isStreamDone(name),
+      };
     },
   };
 }

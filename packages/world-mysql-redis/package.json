@@ -52,7 +52,6 @@
     "db:push": "node dist/cli.js"
   },
   "dependencies": {
-    "@fantasticfour/shared": "workspace:*",
     "@workflow/errors": "catalog:",
     "@workflow/world": "catalog:",
     "cbor-x": "catalog:",
@@ -62,6 +61,7 @@
     "ulid": "catalog:"
   },
   "devDependencies": {
+    "@fantasticfour/shared": "workspace:*",
     "@testcontainers/mysql": "catalog:",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
@@ -75,5 +75,5 @@
   "volta": {
     "extends": "../../package.json"
   },
-  "packageManager": "pnpm@11.0.5"
+  "packageManager": "pnpm@11.11.0"
 }
