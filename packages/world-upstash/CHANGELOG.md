@@ -1,5 +1,45 @@
 # @fantasticfour/world-upstash
 
+## 1.4.0
+
+### Minor Changes
+
+- dbb9744: Pass a retry budget to QStash that matches core's delivery expectation.
+
+  QStash's default hard-failure retry count is small (3 on the free plan), well
+  below core's `MAX_QUEUE_DELIVERIES` (48). Publishes (including the
+  `{ timeoutSeconds }` self-republish) now request 47 retries — 48 total
+  deliveries — so transient handler failures are redelivered right up to the
+  point where core would give up, instead of QStash dropping the message first.
+  The count is configurable via the new `qstashRetries` world option (QStash
+  still clamps it to your plan's maximum).
+
+- ee02f27: Align world-upstash with the @workflow/world 4.2.1 contract and fix several
+  reliability bugs.
+
+  `specVersion` is now declared and the body is transmitted as binary-safe
+  base64, so the handshake succeeds on any QStash plan without content-encoding
+  surprises. The typed error taxonomy from `@workflow/core` is adopted throughout,
+  meaning `WorkflowNotFoundError`, `RunNotFoundError`, and friends are thrown by
+  name rather than as generic errors, which lets `@workflow/core` route them
+  correctly. Creation events and hook tokens are now claimed via `SETNX`, fixing
+  a replay self-conflict where a run could fight itself on redelivery and a
+  last-writer-wins race when two deliveries arrived in close succession.
+
+  `opts.idempotencyKey` is forwarded as `deduplicationId` on every publish. The
+  previous code generated a fresh ULID per call, so QStash deduplication was
+  effectively disabled and callers who relied on it received duplicate processing.
+  `isWebhook` is now persisted so the flag survives a redelivery cycle. The
+  stream-closed flag comparison is also corrected: Upstash auto-deserializes the
+  stored `"1"` to the number `1`, so the `=== '1'` guard always missed and streams
+  never reported closed. Stream chunks are consistently base64 encoded, preventing
+  string-chunk corruption that corrupted payloads like `'hello world'` on
+  round-trip.
+
+  `retryAfter` is now enforced on rate-limit responses, and `hook_created` conflict
+  semantics match the 4.2.1 spec so a repeated webhook delivery is idempotent
+  rather than raising an error.
+
 ## 1.3.0
 
 ### Minor Changes
@@ -92,6 +132,7 @@
 - e2d3f2e: Reliability and observability enhancements across all world packages, plus event-idempotency bug fixes and a new shared utilities package.
 
   ## New Package
+
   - `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
   ## Critical Bug Fixes — Event Idempotency
@@ -109,16 +150,19 @@
   ## Reliability & Observability
 
   ### `world-azure`
+
   - Cosmos DB transactional batches for multi-document writes
   - RU/s throttling retry with backoff
   - Service Bus session support
 
   ### `world-cloudflare`
+
   - Durable Object storage transactions
   - Permanent vs. transient error handling in queue consumers
   - Schema migration framework for DO storage
 
   ### `world-firestore-tasks`
+
   - Batched writes for atomic multi-document mutations
   - Cloud Tasks idempotency keys
   - Idempotent consumer pattern
@@ -126,21 +170,25 @@
   - Polling-mode streamer
 
   ### `world-mysql`
+
   - TTL-based cleanup of idempotency rows
   - Queue processing metrics (`src/metrics.ts`)
 
   ### `world-mysql-redis`
+
   - Outbox pattern (`src/outbox.ts`, `migrations/0001_outbox.sql`)
   - Deadlock retry logic
   - Cross-backend health check
 
   ### `world-nats-jetstream`
+
   - Secondary indexes for query patterns
   - Configurable JetStream dedup window
   - Worker health checks + exponential backoff
   - Bucket TTL/compaction configuration
 
   ### `world-postgres-redis`
+
   - Outbox pattern (`src/outbox.ts`)
   - LISTEN/NOTIFY pub/sub (`src/notify.ts`, migration `0002_outbox_and_notify.sql`)
   - Cross-backend health check (`src/health.ts`)
@@ -148,17 +196,20 @@
   - Unified idempotency handling
 
   ### `world-redis`
+
   - Atomic Lua scripts for multi-key writes
   - Queue/stream metrics
   - Streams-based event log
 
   ### `world-redis-bullmq`
+
   - Stalled-job recovery
   - Configurable retry/backoff
   - Queue metrics
   - Delayed-job support
 
   ### `world-upstash`
+
   - QStash signature verification
   - Request deduplication
   - Request-budget monitoring

@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-mysql-redis",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Hybrid World implementation using MySQL for durable storage with Redis Lists for queue management",
   "keywords": [
     "durable-functions",

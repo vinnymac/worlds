@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-firestore-tasks",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "GCP Firestore + Cloud Tasks World implementation with real-time streaming and excellent developer experience",
   "keywords": [
     "cloud-tasks",
