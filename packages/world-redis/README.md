@@ -86,6 +86,14 @@ await world.start();
 - `workflow:queue:flows`
 - `workflow:queue:steps`
 
+**Streams** - Ordered stream chunks (base64-encoded, with an `eof` marker):
+
+- `workflow:stream:{name}`
+
+**Sets** - Stream membership index (powers `listStreamsByRunId`):
+
+- `workflow:streams:by_run:{runId}`
+
 ## Local Development
 
 ```bash

@@ -11,7 +11,7 @@ If you want to use a different Redis client or customize the data structures, yo
 The Redis world consists of four main components:
 
 1. **Storage Layer** - Redis hashes and sorted sets for workflow data
-2. **Queue System** - Redis Lists (LPUSH/BRPOP) for job processing
+2. **Queue System** - Redis Lists (LPUSH/BLMOVE) with a durable delayed set for job processing
 3. **Streaming** - Redis Streams for real-time data
 4. **Embedded World** - Reuses local world for execution
 
@@ -57,7 +57,7 @@ All IDs use ULID (Universally Unique Lexicographically Sortable Identifier):
 ```mermaid
 graph LR
     Client --> RL[Redis Lists]
-    RL --> Worker[BRPOP Worker]
+    RL --> Worker[BLMOVE Worker]
     Worker --> EW[Embedded World]
     EW --> HTTP[HTTP fetch]
     HTTP --> API[Workflow API]
@@ -68,23 +68,22 @@ graph LR
 
 ### Queue Implementation
 
-- **Redis Lists**: Two lists (`{prefix}flows`, `{prefix}steps`)
+- **Redis Lists**: Two ready lists (`{prefix}flows`, `{prefix}steps`)
+- **Delayed Set**: `{list}:delayed` sorted set scored by deliver-at time — `delaySeconds`, 503 soft retries, and failure backoff all park messages here durably (never in-process timers), so restarts cannot lose deferred deliveries
+- **Processing Lists**: Workers BLMOVE into per-worker `{list}:processing:{consumer}` lists; a reclaimer returns entries to the ready list when a worker's heartbeat expires (crash between dequeue and dispatch cannot lose the message)
 - **Workers**: Configurable concurrency (default: 10)
-- **Job Processing**: Workers use BRPOP to retrieve messages, deserialize, and re-queue to embedded world
-- **Idempotency**: Manual tracking using Redis Sets with 24-hour TTL
-- **Blocking**: BRPOP blocks until jobs are available (no polling)
+- **Idempotency**: Per-key reservations (`{list}:idempotent:{key}`, SET NX with 24-hour TTL), reserved atomically with the enqueue and released on completion or final drop
+- **Blocking**: BLMOVE blocks until jobs are available; a lightweight poller promotes due delayed messages
 
 ### Message Flow
 
 1. Client calls `world.queue(queueName, message, opts)`
-2. Message serialized with JsonTransport
-3. Idempotency key checked/added to Redis Set (SADD)
-4. Job added to Redis List via LPUSH
-5. Worker blocks on BRPOP until job available
-6. Worker deserializes message
-7. Worker re-queues to embedded world
-8. Embedded world makes HTTP fetch to execute workflow/step
-9. After success, idempotency key removed from Set
+2. Message serialized with a binary-safe JSON transport (Uint8Array round-trips)
+3. One atomic Lua call reserves the idempotency key and LPUSHes the envelope (or ZADDs it into the delayed set when `delaySeconds` is set)
+4. Worker blocks on BLMOVE, atomically moving the job into its processing list
+5. Worker deserializes message
+6. Worker makes HTTP fetch to execute workflow/step
+7. On success, one atomic Lua call removes the job from the processing list and releases the idempotency key; on 503/failure the job is atomically parked in the delayed set for redelivery
 
 ## Streaming
 
@@ -124,7 +123,7 @@ graph LR
 
 ## Setup
 
-Call `world.start()` to initialize queue workers. When `.start()` is called, workers begin blocking on BRPOP for the Redis Lists. When a job arrives, workers make HTTP fetch calls to the embedded world endpoints (`.well-known/workflow/v1/flow` or `.well-known/workflow/v1/step`) to execute the actual workflow logic.
+Call `world.start()` to initialize queue workers. When `.start()` is called, workers begin blocking on BLMOVE for the Redis Lists (moving jobs into per-worker processing lists), a poller promotes due delayed messages, and a reclaimer recovers jobs stranded by crashed workers. When a job arrives, workers make HTTP fetch calls to the embedded world endpoints (`.well-known/workflow/v1/flow` or `.well-known/workflow/v1/step`) to execute the actual workflow logic.
 
 In **Next.js**, the `world.start()` function needs to be added to `instrumentation.ts|js` to ensure workers start before request handling:
 
@@ -146,7 +145,7 @@ if (process.env.NEXT_RUNTIME !== 'edge') {
 - **Fast Reads**: Redis hashes provide O(1) lookups
 - **Efficient Pagination**: Sorted sets enable O(log N) range queries
 - **Real-time Streaming**: Redis Streams + Pub/Sub for low latency
-- **Simple Queuing**: Redis Lists with BRPOP provide reliable FIFO processing
+- **Simple Queuing**: Redis Lists with BLMOVE + processing-list reclaim provide reliable at-least-once processing
 - **Memory Efficient**: Compact binary serialization
 
 ### Considerations
@@ -194,7 +193,7 @@ closeStream (eof=true)
 
 The Redis world uses the **embedded world pattern**:
 
-1. BRPOP workers don't execute workflows directly
+1. BLMOVE workers don't execute workflows directly
 2. Instead, they re-queue to an embedded local world
 3. Embedded world makes HTTP requests to workflow endpoints
 4. This enables:
@@ -204,10 +203,10 @@ The Redis world uses the **embedded world pattern**:
 
 ## Error Handling
 
-- **WorkflowAPIError**: Thrown for not found (404) and conflict (409)
-- **Validation**: Entity existence checks before operations
-- **Idempotency**: Manual deduplication via Redis Sets with SADD
-- **Worker Errors**: Logged but don't crash worker process (workers retry BRPOP after 1s delay on error)
+- **Error taxonomy**: The specific `@workflow/errors` classes core discriminates by name — `EntityConflictError` (duplicate creations, terminal-state conflicts), `RunExpiredError` (operations on terminal runs), `TooEarlyError` (step retry backoff not reached), `WorkflowRunNotFoundError`, and `HookNotFoundError`
+- **Validation**: Entity existence and terminal-state checks before operations; entity transitions use compare-and-swap Lua scripts so concurrent events cannot overwrite each other
+- **Idempotency**: Creation events write entity + event in one atomic Lua script; duplicates reject with `EntityConflictError` so the event log holds exactly one creation event
+- **Worker Errors**: Logged but don't crash worker process (workers retry BLMOVE after 1s delay on error); in-flight messages survive crashes via processing-list reclaim
 
 ## Monitoring
 
@@ -239,7 +238,7 @@ Use RedisInsight (included in docker-compose) to:
 - **Key Count**: `DBSIZE`
 - **Stream Length**: `XLEN workflow:stream:{name}`
 - **Queue Depth**: `LLEN workflow_flows` / `LLEN workflow_steps`
-- **Worker Status**: Monitor logs for BRPOP worker activity
+- **Worker Status**: Monitor logs for BLMOVE worker activity
 
 ## Migration from world-postgres
 

@@ -1,4 +1,5 @@
 import type { Storage, World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { Redis } from 'ioredis';
 import type { RedisWorldConfig } from './config.js';
 import { createQueue, type QueueStats } from './queue.js';
@@ -23,6 +24,8 @@ function createStorage(redis: Redis, keyPrefix: string): Storage {
 export interface RedisWorld extends World {
   /** Start background queue workers */
   start(): Promise<void>;
+  /** Stop background workers and release all Redis connections */
+  close(): Promise<void>;
   /** Get queue depth and health metrics for observability */
   getQueueStats(): Promise<QueueStats>;
   /** Get stream health metrics for a specific stream */
@@ -52,8 +55,23 @@ export function createWorld(
     ...storage,
     ...streamer,
     ...queue,
+    // Declaring the current spec version enables resilient start: core
+    // includes runInput on the first queue delivery, and run_started
+    // bootstraps the run when it wins the race against run_created. The
+    // queue transport is binary-safe (Uint8Array round-trips), which this
+    // spec version requires.
+    specVersion: SPEC_VERSION_CURRENT,
     async start() {
       await queue.start();
+    },
+    async close() {
+      await queue.stop();
+      await streamer.closeStreamer();
+      try {
+        await redis.quit();
+      } catch {
+        redis.disconnect();
+      }
     },
   };
 }
