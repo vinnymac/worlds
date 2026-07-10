@@ -1,11 +1,12 @@
-import type { World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
 import { type CloudflareQueueConfig, createQueue } from './queue.js';
 import { type CloudflareStorageConfig, createStorage } from './storage.js';
 import { type CloudflareStreamerConfig, createStreamer } from './streamer.js';
 
 export interface CloudflareWorldConfig {
   env?: {
-    WORKFLOW_DB: CloudflareStorageConfig['env']['WORKFLOW_DB'];
+    WORKFLOW_DB: CloudflareStorageConfig['env']['WORKFLOW_DB'] &
+      CloudflareQueueConfig['env']['WORKFLOW_DB'];
     WORKFLOW_INDEX: CloudflareStorageConfig['env']['WORKFLOW_INDEX'];
     WORKFLOW_QUEUE: CloudflareQueueConfig['env']['WORKFLOW_QUEUE'];
     WORKFLOW_STREAMS: CloudflareStreamerConfig['env']['WORKFLOW_STREAMS'];
@@ -16,8 +17,12 @@ export interface CloudflareWorldConfig {
 export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
   // Check for global test environment first (for @workflow/world-testing)
   let env = config?.env;
-  if (!env && (globalThis as any).CLOUDFLARE_ENV) {
-    env = (globalThis as any).CLOUDFLARE_ENV;
+  if (!env) {
+    const globalEnv = (globalThis as { CLOUDFLARE_ENV?: CloudflareWorldConfig['env'] })
+      .CLOUDFLARE_ENV;
+    if (globalEnv) {
+      env = globalEnv;
+    }
   }
 
   if (!env) {
@@ -41,6 +46,7 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
   const queue = createQueue({
     env: {
       WORKFLOW_QUEUE: env.WORKFLOW_QUEUE,
+      WORKFLOW_DB: env.WORKFLOW_DB,
     },
     deploymentId,
   });
@@ -55,6 +61,10 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
     ...storage,
     ...queue,
     ...streamer,
+    // Enables resilient start: runs are created at the current spec version,
+    // so the queue message carries runInput and run_started can bootstrap the
+    // run when run_created has not landed yet.
+    specVersion: SPEC_VERSION_CURRENT,
   };
 }
 

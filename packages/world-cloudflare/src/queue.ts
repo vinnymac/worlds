@@ -2,11 +2,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
 import {
   MessageId,
+  parseQueueName,
   type Queue,
+  type QueueKind,
   type QueuePayload,
-  type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
+import { parse, stringify } from '@fantasticfour/shared';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
 
@@ -33,9 +35,22 @@ function computeBackoff(attempt: number): number {
   return Math.min(60, 2 ** attempt);
 }
 
+/**
+ * How long a consumer-side dedup claim blocks other messages carrying the
+ * same idempotencyKey. Stale claims (holder crashed or the message went to
+ * the DLQ without releasing) are stolen after this window so replay
+ * re-enqueues cannot be stranded forever.
+ */
+const DEDUP_CLAIM_STALE_MS = 15 * 60 * 1000;
+
 export interface CloudflareQueueConfig {
   env: {
     WORKFLOW_QUEUE: CloudflareQueue;
+    /**
+     * Durable Object namespace used for consumer-side idempotency claims
+     * (one claim DO per `claim:<queueName>:<idempotencyKey>`).
+     */
+    WORKFLOW_DB: InflightClaimNamespace;
   };
   deploymentId: string;
   /**
@@ -54,8 +69,35 @@ export interface CloudflareQueueConfig {
 }
 
 interface CloudflareQueue {
-  send(message: unknown, options?: { contentType?: string }): Promise<void>;
-  sendBatch(messages: Array<{ body: unknown }>): Promise<void>;
+  send(
+    body: string,
+    options?: { contentType?: 'text' | 'json'; delaySeconds?: number },
+  ): Promise<void>;
+}
+
+/** Subset of the WorkflowRunDO RPC surface used for queue dedup claims. */
+export interface InflightClaimStub {
+  claimInflight(params: { messageId: string; staleMs: number }): Promise<{ claimed: boolean }>;
+  releaseInflight(): Promise<void>;
+}
+
+export interface InflightClaimNamespace {
+  idFromName(name: string): { toString(): string };
+  get(id: { toString(): string }): InflightClaimStub;
+}
+
+/**
+ * Wire format for messages on the Cloudflare Queue (and the HTTP push from a
+ * queue consumer Worker to the workflow endpoint). Serialized with the shared
+ * tagged-JSON codec so binary payloads (`runInput.input` at spec >= 3 is a
+ * Uint8Array) survive the round-trip — plain JSON.stringify would mangle them.
+ */
+interface QueueEnvelope {
+  messageId: string;
+  queueName: ValidQueueName;
+  message: QueuePayload;
+  idempotencyKey?: string;
+  timestamp: number;
 }
 
 interface PumpEnvelope {
@@ -63,14 +105,15 @@ interface PumpEnvelope {
   queueName: ValidQueueName;
   attempt: number;
   message: QueuePayload;
+  idempotencyKey?: string;
 }
 
 type Pathname = 'flow' | 'step';
 
 const QUEUE_PATHNAMES = {
-  __wkf_workflow_: 'flow',
-  __wkf_step_: 'step',
-} as const satisfies Record<QueuePrefix, Pathname>;
+  workflow: 'flow',
+  step: 'step',
+} as const satisfies Record<QueueKind, Pathname>;
 
 function resolveBaseUrl(config: CloudflareQueueConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -83,6 +126,10 @@ function resolveBaseUrl(config: CloudflareQueueConfig): string {
  * In-process test pump. Replaces the previous `@workflow/world-local` fallback.
  * Holds two in-memory FIFOs and HTTP-dispatches envelopes to the user's server
  * at `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ *
+ * Mirrors world-local's idempotency semantics: messages are deduplicated on
+ * `idempotencyKey` while a message with the same key is in flight, and the
+ * key is released only when the message is fully handled (success or drop).
  */
 function createTestPump(config: CloudflareQueueConfig) {
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
@@ -91,7 +138,15 @@ function createTestPump(config: CloudflareQueueConfig) {
 
   const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
   const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  /** Inflight messageIds by idempotencyKey (world-local queue.js semantics). */
+  const inflightMessages = new Map<string, MessageId>();
   let running = false;
+
+  function release(envelope: PumpEnvelope) {
+    if (envelope.idempotencyKey) {
+      inflightMessages.delete(envelope.idempotencyKey);
+    }
+  }
 
   function enqueue(pathname: Pathname, envelope: PumpEnvelope) {
     queues[pathname].push(envelope);
@@ -116,11 +171,14 @@ function createTestPump(config: CloudflareQueueConfig) {
         'x-vqs-message-id': envelope.messageId,
         'x-vqs-message-attempt': String(envelope.attempt),
       },
-      body: JSON.stringify(envelope.message),
+      body: stringify(envelope.message),
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
 
-    if (response.ok) return;
+    if (response.ok) {
+      release(envelope);
+      return;
+    }
 
     const text = await response.text();
 
@@ -133,6 +191,7 @@ function createTestPump(config: CloudflareQueueConfig) {
       }
       const timeoutSeconds = (parsed as { timeoutSeconds?: number } | null)?.timeoutSeconds;
       if (typeof timeoutSeconds === 'number') {
+        // Same message re-delivered later: the idempotency key stays claimed.
         void delay(timeoutSeconds * 1000).then(() => enqueue(pathname, envelope));
         return;
       }
@@ -143,6 +202,7 @@ function createTestPump(config: CloudflareQueueConfig) {
       const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
       void delay(backoff).then(() => enqueue(pathname, next));
     } else {
+      release(envelope);
       console.error(
         `[world-cloudflare test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
       );
@@ -156,14 +216,26 @@ function createTestPump(config: CloudflareQueueConfig) {
       try {
         await dispatch(envelope, pathname);
       } catch (err) {
+        release(envelope);
         console.error(`[world-cloudflare test pump] dispatch error on ${pathname}:`, err);
       }
     }
   }
 
   return {
-    push(pathname: Pathname, envelope: PumpEnvelope) {
-      enqueue(pathname, envelope);
+    /** Returns the inflight messageId when the key is already claimed. */
+    inflight(idempotencyKey: string | undefined): MessageId | undefined {
+      return idempotencyKey ? inflightMessages.get(idempotencyKey) : undefined;
+    },
+    push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number) {
+      if (envelope.idempotencyKey) {
+        inflightMessages.set(envelope.idempotencyKey, MessageId.parse(envelope.messageId));
+      }
+      if (delaySeconds && delaySeconds > 0) {
+        void delay(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
+      } else {
+        enqueue(pathname, envelope);
+      }
     },
     async start() {
       if (running) return;
@@ -178,14 +250,6 @@ function createTestPump(config: CloudflareQueueConfig) {
   };
 }
 
-function parseQueuePrefix(name: ValidQueueName): QueuePrefix {
-  const prefixes: QueuePrefix[] = ['__wkf_step_', '__wkf_workflow_'];
-  for (const p of prefixes) {
-    if (name.startsWith(p)) return p;
-  }
-  throw new Error(`Invalid queue name: ${name}`);
-}
-
 export function createQueue(config: CloudflareQueueConfig): Queue & { start(): Promise<void> } {
   const { env, deploymentId } = config;
 
@@ -196,31 +260,54 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
     return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
   }
 
+  const getClaimStub = (queueName: string, idempotencyKey: string): InflightClaimStub => {
+    const id = env.WORKFLOW_DB.idFromName(`claim:${queueName}:${idempotencyKey}`);
+    return env.WORKFLOW_DB.get(id);
+  };
+
   return {
     async queue(queueName, message, opts) {
       if (isTestMode()) {
-        const queuePrefix = parseQueuePrefix(queueName);
+        // Dedup on idempotencyKey while a message with the same key is in
+        // flight — core re-enqueues every still-pending step on every replay
+        // with idempotencyKey = stepId and relies on queue-level dedup.
+        const existing = testPump.inflight(opts?.idempotencyKey);
+        if (existing) {
+          return { messageId: existing };
+        }
+        const { kind } = parseQueueName(queueName);
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-        testPump.push(QUEUE_PATHNAMES[queuePrefix], {
-          messageId,
-          queueName,
-          attempt: 1,
-          message,
-        });
+        testPump.push(
+          QUEUE_PATHNAMES[kind],
+          {
+            messageId,
+            queueName,
+            attempt: 1,
+            message,
+            idempotencyKey: opts?.idempotencyKey,
+          },
+          opts?.delaySeconds,
+        );
         return { messageId };
       }
 
-      // Production: Cloudflare Queue.
-      const wrappedMessage = {
+      // Production: Cloudflare Queue. Cloudflare Queues does no content
+      // dedup, so the idempotencyKey travels in the envelope and is claimed
+      // consumer-side before the handler runs (see createQueueHandler).
+      const messageId = MessageId.parse(`msg_${generateMessageId()}`);
+      const envelope: QueueEnvelope = {
+        messageId,
         queueName,
         message,
         idempotencyKey: opts?.idempotencyKey,
         timestamp: Date.now(),
       };
 
-      await env.WORKFLOW_QUEUE.send(wrappedMessage);
+      await env.WORKFLOW_QUEUE.send(stringify(envelope), {
+        contentType: 'text',
+        delaySeconds: opts?.delaySeconds,
+      });
 
-      const messageId = MessageId.parse(`msg_${opts?.idempotencyKey || Date.now().toString()}`);
       return { messageId };
     },
 
@@ -241,7 +328,8 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
           }
           const attempt = Number.parseInt(attemptStr, 10);
           try {
-            const body = await req.json();
+            // Tagged-JSON codec: revives Uint8Array payloads (runInput.input).
+            const body = parse<unknown>(await req.text());
             const result = await handler(body, {
               attempt,
               queueName: reqQueueName,
@@ -257,12 +345,18 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
         };
       }
 
-      // Production: Cloudflare Queues delivery wire format.
+      // Production: Cloudflare Queues delivery wire format. The consumer
+      // Worker forwards each queue message body (the tagged-JSON envelope) to
+      // this handler and maps the response onto message.ack() / .retry():
+      // - 2xx  -> ack
+      // - 503 with Retry-After -> retry({ delaySeconds: retryAfter })
+      // - other non-2xx -> retry (with Retry-After backoff when present)
       return async (req: Request) => {
         const retryCount = Number.parseInt(req.headers.get('CF-Queue-Retry-Count') || '0', 10);
 
+        let claimStub: InflightClaimStub | undefined;
         try {
-          const body = (await req.json()) as unknown;
+          const body = parse<unknown>(await req.text());
 
           if (
             typeof body !== 'object' ||
@@ -273,13 +367,11 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
             return new Response('Invalid message format', { status: 400 });
           }
 
-          interface QueueMessage {
+          const envelope = body as Partial<QueueEnvelope> & {
             queueName: string;
             message: unknown;
-            idempotencyKey?: string;
-          }
-
-          const { queueName, message, idempotencyKey } = body as QueueMessage;
+          };
+          const { queueName, message, idempotencyKey } = envelope;
 
           if (!queueName?.startsWith(queueNamePrefix)) {
             return new Response('Invalid queue', { status: 400 });
@@ -288,28 +380,74 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
           const attempt = retryCount + 1;
 
           const messageIdStr =
-            req.headers.get('CF-Queue-Message-Id') || `msg_${idempotencyKey || Date.now()}`;
+            req.headers.get('CF-Queue-Message-Id') ||
+            envelope.messageId ||
+            `msg_${idempotencyKey || Date.now()}`;
 
-          await handler(message, {
+          // Consumer-side dedup: claim the idempotencyKey before invoking the
+          // handler. A redelivery of the SAME message re-enters its own
+          // claim; a DIFFERENT message with the same key (replay re-enqueue
+          // racing an inflight step) is acked without executing.
+          if (idempotencyKey) {
+            claimStub = getClaimStub(queueName, idempotencyKey);
+            const { claimed } = await claimStub.claimInflight({
+              messageId: messageIdStr,
+              staleMs: DEDUP_CLAIM_STALE_MS,
+            });
+            if (!claimed) {
+              debug('[Cloudflare Queue Handler] Duplicate message, acking without execution:', {
+                queueName,
+                idempotencyKey,
+                messageId: messageIdStr,
+              });
+              return new Response(JSON.stringify({ ok: true, duplicate: true }), { status: 200 });
+            }
+          }
+
+          const result = await handler(message, {
             attempt,
             queueName: queueName as ValidQueueName,
             messageId: MessageId.parse(messageIdStr),
           });
 
+          // { timeoutSeconds } means "do NOT ack; redeliver after N seconds"
+          // (retryable step errors, ThrottleError deferral). The claim stays
+          // held so duplicates are still fenced during the wait.
+          if (result && typeof result.timeoutSeconds === 'number') {
+            debug('[Cloudflare Queue Handler] Handler requested redelivery:', {
+              timeoutSeconds: result.timeoutSeconds,
+            });
+            return new Response(JSON.stringify({ timeoutSeconds: result.timeoutSeconds }), {
+              status: 503,
+              headers: { 'Retry-After': String(result.timeoutSeconds) },
+            });
+          }
+
+          // Release the claim ONLY on successful completion.
+          if (claimStub) {
+            await claimStub.releaseInflight();
+          }
+
           return new Response('OK', { status: 200 });
         } catch (error) {
-          // Permanent vs transient distinction. Permanent errors ack to skip retries.
+          // Permanent vs transient distinction. Permanent errors ack to skip
+          // retries; the message is finished, so its claim is released too.
           if (isPermanentError(error)) {
             const status = (error as WorkflowWorldError).status;
             debug('[Cloudflare Queue Handler] Permanent error, acking message:', {
               status,
               error: String(error),
             });
+            if (claimStub) {
+              await claimStub.releaseInflight();
+            }
             return new Response(JSON.stringify({ error: String(error), permanent: true }), {
               status: 200,
             });
           }
 
+          // Transient: keep the claim (the same message redelivers and
+          // re-enters it) and signal a retry.
           const backoffSeconds = computeBackoff(retryCount);
           debug('[Cloudflare Queue Handler] Transient error, will retry:', {
             error: String(error),

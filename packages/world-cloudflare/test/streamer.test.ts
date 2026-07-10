@@ -1,96 +1,59 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createStreamer } from '../src/streamer.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createStreamer, type StreamDOStub } from '../src/streamer.js';
+import { createMockEnv } from '../src/test-mocks.js';
 
-describe('Streamer (StreamDO integration)', () => {
-  let mockStreamDO: any;
-  let mockEnv: any;
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const result = await reader.read();
+    if (result.done) break;
+    chunks.push(result.value);
+  }
+  return chunks;
+}
+
+function text(chunks: Uint8Array[]): string {
+  return chunks.map((c) => new TextDecoder().decode(c)).join('');
+}
+
+describe('Streamer (StreamDO RPC integration)', () => {
+  let mockEnv: ReturnType<typeof createMockEnv>;
   let streamer: ReturnType<typeof createStreamer>;
-  let storedChunks: any[];
 
   beforeEach(() => {
-    storedChunks = [];
-
-    // Mock Durable Object Stub with fetch API
-    mockStreamDO = {
-      fetch: vi.fn(async (request: Request) => {
-        const url = new URL(request.url);
-
-        if (request.method === 'POST') {
-          // Store chunk
-          const body = await request.json();
-          storedChunks.push(body);
-          return new Response('OK', { status: 200 });
-        }
-
-        if (request.method === 'GET') {
-          // Read chunks
-          const lastSeq = Number(url.searchParams.get('lastSequence') || '-1');
-          const limit = Number(url.searchParams.get('limit') || '10');
-
-          const newChunks = storedChunks.filter((c) => c.sequence > lastSeq).slice(0, limit);
-
-          return new Response(JSON.stringify(newChunks), { status: 200 });
-        }
-
-        return new Response('Not found', { status: 404 });
-      }),
-    };
-
-    mockEnv = {
-      WORKFLOW_STREAMS: {
-        idFromName: vi.fn((name: string) => ({ toString: () => name })),
-        get: vi.fn(() => mockStreamDO),
-      },
-    };
-
+    mockEnv = createMockEnv();
     streamer = createStreamer({ env: mockEnv });
   });
 
-  afterEach(() => {
-    vi.clearAllMocks();
-    storedChunks = [];
-  });
-
   describe('writeToStream()', () => {
-    it('should write string chunk to stream', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-      const chunk = 'Hello, world!';
+    it('should write string chunks with monotonic indexes', async () => {
+      await streamer.writeToStream('test-stream', 'wrun_123', 'Hello');
+      await streamer.writeToStream('test-stream', 'wrun_123', ' world');
 
-      await streamer.writeToStream(streamName, runId, chunk);
-
-      expect(mockStreamDO.fetch).toHaveBeenCalledOnce();
-      expect(storedChunks).toHaveLength(1);
-
-      const storedChunk = storedChunks[0];
-      expect(storedChunk.streamId).toBe(streamName);
-      expect(storedChunk.chunkId).toMatch(/^chnk_/);
-      expect(storedChunk.sequence).toBeTypeOf('number');
-      expect(storedChunk.eof).toBe(false);
-
-      // Verify base64 encoding
-      const decoded = Buffer.from(storedChunk.chunkData, 'base64').toString();
-      expect(decoded).toBe(chunk);
+      const stub = mockEnv.WORKFLOW_STREAMS.get(
+        mockEnv.WORKFLOW_STREAMS.idFromName('stream:test-stream'),
+      );
+      const { chunks, tailIndex } = await stub.getChunks({ startIndex: 0, limit: 10 });
+      expect(chunks).toHaveLength(2);
+      expect(tailIndex).toBe(1);
+      expect(new TextDecoder().decode(chunks[0])).toBe('Hello');
+      expect(new TextDecoder().decode(chunks[1])).toBe(' world');
     });
 
-    it('should write binary chunk to stream', async () => {
-      const streamName = 'binary-stream';
-      const runId = 'wrun_456';
-      const chunk = new Uint8Array([1, 2, 3, 4, 5]);
+    it('should write binary chunks untouched', async () => {
+      const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
+      await streamer.writeToStream('binary-stream', 'wrun_456', bytes);
 
-      await streamer.writeToStream(streamName, runId, chunk);
-
-      expect(storedChunks).toHaveLength(1);
-
-      const storedChunk = storedChunks[0];
-      const decoded = Buffer.from(storedChunk.chunkData, 'base64');
-      expect(decoded).toEqual(Buffer.from(chunk));
+      const stub = mockEnv.WORKFLOW_STREAMS.get(
+        mockEnv.WORKFLOW_STREAMS.idFromName('stream:binary-stream'),
+      );
+      const { chunks } = await stub.getChunks({ startIndex: 0, limit: 10 });
+      expect(Array.from(chunks[0])).toEqual([0, 1, 2, 253, 254, 255]);
     });
 
     it('should await runId promise before writing', async () => {
-      const streamName = 'test-stream';
       let resolved = false;
-
       const runIdPromise = new Promise<string>((resolve) => {
         setTimeout(() => {
           resolved = true;
@@ -98,438 +61,239 @@ describe('Streamer (StreamDO integration)', () => {
         }, 50);
       });
 
-      await streamer.writeToStream(streamName, runIdPromise, 'data');
+      await streamer.writeToStream('test-stream', runIdPromise, 'data');
 
       expect(resolved).toBe(true);
-      expect(storedChunks).toHaveLength(1);
-    });
-
-    it('should generate sequential chunk IDs', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-
-      await streamer.writeToStream(streamName, runId, 'chunk1');
-      await streamer.writeToStream(streamName, runId, 'chunk2');
-      await streamer.writeToStream(streamName, runId, 'chunk3');
-
-      expect(storedChunks).toHaveLength(3);
-
-      const chunkIds = storedChunks.map((c) => c.chunkId);
-      expect(chunkIds[0]).toMatch(/^chnk_/);
-      expect(chunkIds[1]).toMatch(/^chnk_/);
-      expect(chunkIds[2]).toMatch(/^chnk_/);
-
-      // Chunk IDs should be unique
-      expect(new Set(chunkIds).size).toBe(3);
-    });
-
-    it('should generate sequence numbers', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-
-      await streamer.writeToStream(streamName, runId, 'chunk1');
-      await streamer.writeToStream(streamName, runId, 'chunk2');
-      await streamer.writeToStream(streamName, runId, 'chunk3');
-
-      const sequences = storedChunks.map((c) => c.sequence);
-
-      // Sequences should be numbers and generally increasing over time
-      expect(sequences[0]).toBeTypeOf('number');
-      expect(sequences[1]).toBeTypeOf('number');
-      expect(sequences[2]).toBeTypeOf('number');
-
-      // Sequences should be non-negative
-      expect(sequences[0]).toBeGreaterThanOrEqual(0);
-      expect(sequences[1]).toBeGreaterThanOrEqual(0);
-      expect(sequences[2]).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should include timestamp in chunk', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-
-      await streamer.writeToStream(streamName, runId, 'data');
-
-      const storedChunk = storedChunks[0];
-      expect(storedChunk.createdAt).toBeDefined();
-      expect(new Date(storedChunk.createdAt).getTime()).toBeGreaterThan(Date.now() - 1000);
-    });
-
-    it('should get correct StreamDO by name', async () => {
-      const streamName = 'named-stream';
-      const runId = 'wrun_123';
-
-      await streamer.writeToStream(streamName, runId, 'data');
-
-      expect(mockEnv.WORKFLOW_STREAMS.idFromName).toHaveBeenCalledWith(streamName);
-      expect(mockEnv.WORKFLOW_STREAMS.get).toHaveBeenCalled();
+      const info = await streamer.getStreamInfo('test-stream', 'wrun_789');
+      expect(info.tailIndex).toBe(0);
     });
 
     it('should handle empty string chunks', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
+      await streamer.writeToStream('test-stream', 'wrun_123', '');
 
-      await streamer.writeToStream(streamName, runId, '');
-
-      expect(storedChunks).toHaveLength(1);
-
-      const decoded = Buffer.from(storedChunks[0].chunkData, 'base64').toString();
-      expect(decoded).toBe('');
+      const info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      expect(info.tailIndex).toBe(0);
     });
 
-    it('should handle large binary chunks', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-      const largeChunk = new Uint8Array(10000).fill(255);
+    it('should reject writes after the stream is closed', async () => {
+      await streamer.writeToStream('test-stream', 'wrun_123', 'data');
+      await streamer.closeStream('test-stream', 'wrun_123');
 
-      await streamer.writeToStream(streamName, runId, largeChunk);
-
-      expect(storedChunks).toHaveLength(1);
-
-      const decoded = Buffer.from(storedChunks[0].chunkData, 'base64');
-      expect(decoded.length).toBe(10000);
-      expect(decoded[0]).toBe(255);
+      await expect(streamer.writeToStream('test-stream', 'wrun_123', 'more')).rejects.toThrow(
+        /closed/,
+      );
     });
   });
 
   describe('closeStream()', () => {
-    it('should write EOF marker to stream', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
+    it('should mark the stream done', async () => {
+      await streamer.writeToStream('test-stream', 'wrun_123', 'data');
 
-      await streamer.closeStream(streamName, runId);
+      let info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      expect(info.done).toBe(false);
 
-      expect(storedChunks).toHaveLength(1);
+      await streamer.closeStream('test-stream', 'wrun_123');
 
-      const eofChunk = storedChunks[0];
-      expect(eofChunk.eof).toBe(true);
-      expect(eofChunk.chunkData).toBe('');
-      expect(eofChunk.streamId).toBe(streamName);
-      expect(eofChunk.chunkId).toMatch(/^chnk_/);
+      info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      expect(info.done).toBe(true);
+      expect(info.tailIndex).toBe(0);
     });
 
-    it('should await runId promise before closing', async () => {
-      const streamName = 'test-stream';
-      let resolved = false;
+    it('should be idempotent', async () => {
+      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.closeStream('test-stream', 'wrun_123');
 
-      const runIdPromise = new Promise<string>((resolve) => {
-        setTimeout(() => {
-          resolved = true;
-          resolve('wrun_789');
-        }, 50);
-      });
-
-      await streamer.closeStream(streamName, runIdPromise);
-
-      expect(resolved).toBe(true);
-      expect(storedChunks).toHaveLength(1);
-      expect(storedChunks[0].eof).toBe(true);
-    });
-
-    it('should generate unique chunk ID for EOF marker', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-
-      await streamer.writeToStream(streamName, runId, 'data1');
-      await streamer.writeToStream(streamName, runId, 'data2');
-      await streamer.closeStream(streamName, runId);
-
-      expect(storedChunks).toHaveLength(3);
-
-      const chunkIds = storedChunks.map((c) => c.chunkId);
-      expect(new Set(chunkIds).size).toBe(3);
-    });
-
-    it('should generate sequence number for EOF', async () => {
-      const streamName = 'test-stream';
-      const runId = 'wrun_123';
-
-      await streamer.writeToStream(streamName, runId, 'data1');
-      await streamer.writeToStream(streamName, runId, 'data2');
-      await streamer.closeStream(streamName, runId);
-
-      const sequences = storedChunks.map((c) => c.sequence);
-
-      // EOF should have a valid sequence number
-      expect(sequences[2]).toBeTypeOf('number');
-      expect(sequences[2]).toBeGreaterThanOrEqual(0);
+      const info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      expect(info.done).toBe(true);
+      expect(info.tailIndex).toBe(-1);
     });
   });
 
   describe('readFromStream()', () => {
-    it('should return ReadableStream', async () => {
-      const streamName = 'test-stream';
+    it('should read all chunks and close on EOF', async () => {
+      await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 1\n');
+      await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 2\n');
+      await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 3\n');
+      await streamer.closeStream('test-stream', 'wrun_123');
 
-      const stream = await streamer.readFromStream(streamName);
+      const stream = await streamer.readFromStream('test-stream');
+      const chunks = await readAll(stream);
 
-      expect(stream).toBeInstanceOf(ReadableStream);
+      expect(chunks).toHaveLength(3);
+      expect(text(chunks)).toBe('Chunk 1\nChunk 2\nChunk 3\n');
     });
 
-    it('should read chunks from stream', async () => {
-      const streamName = 'test-stream';
+    it('should handle binary data end-to-end', async () => {
+      await streamer.writeToStream('binary-stream', 'wrun_123', new Uint8Array([0, 1, 2, 3, 4]));
+      await streamer.writeToStream('binary-stream', 'wrun_123', new Uint8Array([5, 6, 7, 8, 9]));
+      await streamer.closeStream('binary-stream', 'wrun_123');
 
-      // Pre-populate chunks with EOF
-      storedChunks.push({
-        chunkId: 'chnk_1',
-        streamId: streamName,
-        sequence: 1,
-        chunkData: Buffer.from('Hello').toString('base64'),
-        eof: false,
-      });
-      storedChunks.push({
-        chunkId: 'chnk_2',
-        streamId: streamName,
-        sequence: 2,
-        chunkData: Buffer.from(' world!').toString('base64'),
-        eof: false,
-      });
-      storedChunks.push({
-        chunkId: 'chnk_eof',
-        streamId: streamName,
-        sequence: 3,
-        chunkData: '',
-        eof: true,
-      });
-
-      const stream = await streamer.readFromStream(streamName);
-      const reader = stream.getReader();
-
-      const chunks: Uint8Array[] = [];
-      let iterations = 0;
-      const maxIterations = 10; // Prevent infinite loop
-
-      while (iterations < maxIterations) {
-        const result = await reader.read();
-        iterations++;
-
-        if (result.done) {
-          break;
-        }
-
-        if (result.value) {
-          chunks.push(result.value);
-        }
-      }
-
-      expect(chunks.length).toBeGreaterThan(0);
-
-      const text1 = Buffer.from(chunks[0]).toString();
-      expect(text1).toBe('Hello');
-
-      if (chunks.length > 1) {
-        const text2 = Buffer.from(chunks[1]).toString();
-        expect(text2).toBe(' world!');
-      }
-    });
-
-    it('should close stream on EOF marker', async () => {
-      const streamName = 'test-stream';
-
-      storedChunks.push({
-        chunkId: 'chnk_1',
-        streamId: streamName,
-        sequence: 1,
-        chunkData: Buffer.from('data').toString('base64'),
-        eof: false,
-      });
-      storedChunks.push({
-        chunkId: 'chnk_eof',
-        streamId: streamName,
-        sequence: 2,
-        chunkData: '',
-        eof: true,
-      });
-
-      const stream = await streamer.readFromStream(streamName);
-      const reader = stream.getReader();
-
-      const chunks: Uint8Array[] = [];
-      let done = false;
-
-      while (!done) {
-        const result = await reader.read();
-        done = result.done;
-        if (result.value) {
-          chunks.push(result.value);
-        }
-      }
-
-      // Should have read 1 chunk (EOF marker doesn't produce data)
-      expect(chunks).toHaveLength(1);
-      expect(done).toBe(true);
-    });
-
-    it('should respect sequence ordering', async () => {
-      const streamName = 'test-stream';
-
-      // Add chunks out of order, reader should filter correctly
-      storedChunks.push({
-        chunkId: 'chnk_1',
-        streamId: streamName,
-        sequence: 1,
-        chunkData: Buffer.from('first').toString('base64'),
-        eof: false,
-      });
-      storedChunks.push({
-        chunkId: 'chnk_2',
-        streamId: streamName,
-        sequence: 2,
-        chunkData: Buffer.from('second').toString('base64'),
-        eof: false,
-      });
-      storedChunks.push({
-        chunkId: 'chnk_eof',
-        streamId: streamName,
-        sequence: 3,
-        chunkData: '',
-        eof: true,
-      });
-
-      const stream = await streamer.readFromStream(streamName);
-      const reader = stream.getReader();
-
-      const chunks: Uint8Array[] = [];
-      let done = false;
-
-      while (!done) {
-        const result = await reader.read();
-        done = result.done;
-        if (result.value) {
-          chunks.push(result.value);
-        }
-      }
+      const stream = await streamer.readFromStream('binary-stream');
+      const chunks = await readAll(stream);
 
       expect(chunks).toHaveLength(2);
-      expect(Buffer.from(chunks[0]).toString()).toBe('first');
-      expect(Buffer.from(chunks[1]).toString()).toBe('second');
+      expect(Array.from(chunks[0])).toEqual([0, 1, 2, 3, 4]);
+      expect(Array.from(chunks[1])).toEqual([5, 6, 7, 8, 9]);
+    });
+
+    it('should read a live stream that closes later', async () => {
+      await streamer.writeToStream('live-stream', 'wrun_123', 'early');
+
+      const stream = await streamer.readFromStream('live-stream');
+      const reader = stream.getReader();
+
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toBe('early');
+
+      // Write + close while the reader is polling for more.
+      setTimeout(() => {
+        void streamer
+          .writeToStream('live-stream', 'wrun_123', 'late')
+          .then(() => streamer.closeStream('live-stream', 'wrun_123'));
+      }, 50);
+
+      const second = await reader.read();
+      expect(new TextDecoder().decode(second.value)).toBe('late');
+
+      const end = await reader.read();
+      expect(end.done).toBe(true);
+    });
+
+    it('should honor a positive startIndex', async () => {
+      await streamer.writeToStream('test-stream', 'wrun_123', 'zero');
+      await streamer.writeToStream('test-stream', 'wrun_123', 'one');
+      await streamer.writeToStream('test-stream', 'wrun_123', 'two');
+      await streamer.closeStream('test-stream', 'wrun_123');
+
+      const stream = await streamer.readFromStream('test-stream', 1);
+      const chunks = await readAll(stream);
+
+      expect(text(chunks)).toBe('onetwo');
+    });
+
+    it('should resolve a negative startIndex from the end', async () => {
+      await streamer.writeToStream('test-stream', 'wrun_123', 'zero');
+      await streamer.writeToStream('test-stream', 'wrun_123', 'one');
+      await streamer.writeToStream('test-stream', 'wrun_123', 'two');
+      await streamer.closeStream('test-stream', 'wrun_123');
+
+      const stream = await streamer.readFromStream('test-stream', -2);
+      const chunks = await readAll(stream);
+
+      expect(text(chunks)).toBe('onetwo');
     });
 
     it('should handle stream cancellation', async () => {
-      const streamName = 'test-stream';
+      await streamer.writeToStream('test-stream', 'wrun_123', 'data');
 
-      const stream = await streamer.readFromStream(streamName);
+      const stream = await streamer.readFromStream('test-stream');
       const reader = stream.getReader();
 
+      await reader.read();
       await reader.cancel();
 
       const result = await reader.read();
       expect(result.done).toBe(true);
     });
 
-    it('should handle DO fetch errors gracefully', async () => {
-      const streamName = 'error-stream';
+    it('should propagate DO errors instead of silently closing', async () => {
+      const fail = async (): Promise<never> => {
+        throw new Error('DO unavailable');
+      };
+      const failingStub: StreamDOStub = {
+        writeChunk: vi.fn(fail),
+        closeStream: vi.fn(fail),
+        getChunks: vi.fn(fail),
+        getInfo: vi.fn(fail),
+        registerStream: vi.fn(fail),
+        listStreams: vi.fn(fail),
+      };
+      const failingEnv = {
+        WORKFLOW_STREAMS: {
+          idFromName: (name: string) => ({ toString: () => name }),
+          get: () => failingStub,
+        },
+      };
 
-      // Mock fetch to return error
-      mockStreamDO.fetch = vi.fn(async () => {
-        return new Response('Error', { status: 500 });
-      });
-
-      const stream = await streamer.readFromStream(streamName);
+      const failingStreamer = createStreamer({ env: failingEnv });
+      const stream = await failingStreamer.readFromStream('error-stream');
       const reader = stream.getReader();
 
-      const result = await reader.read();
-      expect(result.done).toBe(true);
-    });
-
-    it('should decode base64 chunks correctly', async () => {
-      const streamName = 'test-stream';
-      const originalData = 'Test data with special chars: !@#$%^&*()';
-
-      storedChunks.push({
-        chunkId: 'chnk_1',
-        streamId: streamName,
-        sequence: 1,
-        chunkData: Buffer.from(originalData).toString('base64'),
-        eof: false,
-      });
-      storedChunks.push({
-        chunkId: 'chnk_eof',
-        streamId: streamName,
-        sequence: 2,
-        chunkData: '',
-        eof: true,
-      });
-
-      const stream = await streamer.readFromStream(streamName);
-      const reader = stream.getReader();
-
-      const chunks: Uint8Array[] = [];
-      let iterations = 0;
-
-      while (iterations < 5) {
-        const result = await reader.read();
-        iterations++;
-
-        if (result.done) break;
-        if (result.value) chunks.push(result.value);
-      }
-
-      expect(chunks.length).toBeGreaterThan(0);
-      const decoded = Buffer.from(chunks[0]).toString();
-      expect(decoded).toBe(originalData);
+      await expect(reader.read()).rejects.toThrow('DO unavailable');
     });
   });
 
-  describe('Integration: Write and Read', () => {
-    it('should write and read stream end-to-end', async () => {
-      const streamName = 'integration-stream';
-      const runId = 'wrun_integration';
-
-      // Write chunks
-      await streamer.writeToStream(streamName, runId, 'Chunk 1\n');
-      await streamer.writeToStream(streamName, runId, 'Chunk 2\n');
-      await streamer.writeToStream(streamName, runId, 'Chunk 3\n');
-      await streamer.closeStream(streamName, runId);
-
-      // Read stream
-      const stream = await streamer.readFromStream(streamName);
-      const reader = stream.getReader();
-
-      const chunks: Uint8Array[] = [];
-      let done = false;
-
-      while (!done) {
-        const result = await reader.read();
-        done = result.done;
-        if (result.value) {
-          chunks.push(result.value);
-        }
+  describe('getStreamChunks()', () => {
+    it('should paginate chunks with a numeric cursor', async () => {
+      for (let i = 0; i < 5; i++) {
+        await streamer.writeToStream('paged-stream', 'wrun_123', `chunk-${i}`);
       }
+      await streamer.closeStream('paged-stream', 'wrun_123');
 
-      expect(chunks).toHaveLength(3);
+      const page1 = await streamer.getStreamChunks('paged-stream', 'wrun_123', { limit: 2 });
+      expect(page1.data).toHaveLength(2);
+      expect(page1.data[0].index).toBe(0);
+      expect(page1.data[1].index).toBe(1);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.cursor).toBe('2');
+      expect(page1.done).toBe(true);
 
-      const fullText = chunks.map((c) => Buffer.from(c).toString()).join('');
-      expect(fullText).toBe('Chunk 1\nChunk 2\nChunk 3\n');
+      const page2 = await streamer.getStreamChunks('paged-stream', 'wrun_123', {
+        limit: 2,
+        cursor: page1.cursor ?? undefined,
+      });
+      expect(page2.data.map((c) => c.index)).toEqual([2, 3]);
+      expect(page2.hasMore).toBe(true);
+
+      const page3 = await streamer.getStreamChunks('paged-stream', 'wrun_123', {
+        limit: 2,
+        cursor: page2.cursor ?? undefined,
+      });
+      expect(page3.data.map((c) => c.index)).toEqual([4]);
+      expect(page3.hasMore).toBe(false);
+      expect(page3.cursor).toBeNull();
+      expect(new TextDecoder().decode(page3.data[0].data)).toBe('chunk-4');
     });
 
-    it('should handle binary data end-to-end', async () => {
-      const streamName = 'binary-stream';
-      const runId = 'wrun_binary';
+    it('should report done=false for open streams', async () => {
+      await streamer.writeToStream('open-stream', 'wrun_123', 'data');
 
-      const binaryData1 = new Uint8Array([0, 1, 2, 3, 4]);
-      const binaryData2 = new Uint8Array([5, 6, 7, 8, 9]);
+      const result = await streamer.getStreamChunks('open-stream', 'wrun_123');
+      expect(result.done).toBe(false);
+      expect(result.hasMore).toBe(false);
+      expect(result.data).toHaveLength(1);
+    });
 
-      await streamer.writeToStream(streamName, runId, binaryData1);
-      await streamer.writeToStream(streamName, runId, binaryData2);
-      await streamer.closeStream(streamName, runId);
+    it('should reject invalid cursors', async () => {
+      await expect(
+        streamer.getStreamChunks('any-stream', 'wrun_123', { cursor: 'bogus' }),
+      ).rejects.toThrow(/Invalid stream cursor/);
+    });
+  });
 
-      const stream = await streamer.readFromStream(streamName);
-      const reader = stream.getReader();
+  describe('getStreamInfo()', () => {
+    it('should return -1 tailIndex for empty streams', async () => {
+      const info = await streamer.getStreamInfo('empty-stream', 'wrun_123');
+      expect(info).toEqual({ tailIndex: -1, done: false });
+    });
+  });
 
-      const chunks: Uint8Array[] = [];
-      let done = false;
+  describe('listStreamsByRunId()', () => {
+    it('should list streams written for a run', async () => {
+      await streamer.writeToStream('stream-a', 'wrun_list', 'a');
+      await streamer.writeToStream('stream-b', 'wrun_list', 'b');
+      await streamer.writeToStream('stream-c', 'wrun_other', 'c');
 
-      while (!done) {
-        const result = await reader.read();
-        done = result.done;
-        if (result.value) {
-          chunks.push(result.value);
-        }
-      }
+      const streams = await streamer.listStreamsByRunId('wrun_list');
+      expect(streams.sort()).toEqual(['stream-a', 'stream-b']);
 
-      expect(chunks).toHaveLength(2);
-      expect(Array.from(chunks[0])).toEqual([0, 1, 2, 3, 4]);
-      expect(Array.from(chunks[1])).toEqual([5, 6, 7, 8, 9]);
+      const other = await streamer.listStreamsByRunId('wrun_other');
+      expect(other).toEqual(['stream-c']);
+    });
+
+    it('should return an empty list for unknown runs', async () => {
+      const streams = await streamer.listStreamsByRunId('wrun_unknown');
+      expect(streams).toEqual([]);
     });
   });
 });
