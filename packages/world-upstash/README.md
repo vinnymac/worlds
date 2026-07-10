@@ -40,6 +40,23 @@ QSTASH_TARGET_URL=https://your-app.com/api/workflow
 WORKFLOW_REDIS_KEY_PREFIX=workflow:
 ```
 
+### Retry budget
+
+When a delivery's handler responds with a non-2xx status, QStash redelivers the
+message. QStash's own default retry count is small (3 on the free plan), which
+is well below the workflow runtime's expectation of up to 48 total deliveries
+before a run is marked failed. This world therefore defaults to **47 retries
+(48 total deliveries)** so transient failures are not dropped prematurely.
+
+Override it with `qstashRetries` (QStash clamps the value to your plan's
+maximum):
+
+```typescript
+const world = createWorld({
+  qstashRetries: 20,
+});
+```
+
 ## Usage
 
 ### Basic Setup
@@ -119,14 +136,14 @@ export async function POST(request: Request) {
 
 ## Comparison with Other Worlds
 
-| Feature | world-upstash | world-redis-bullmq | world-firestore-tasks |
-|---------|--------------|-------------------|----------------------|
-| Infrastructure | None (serverless) | Redis + BullMQ | GCP Firestore + Cloud Tasks |
-| Real-time streaming | ❌ (use polling) | ✅ | ✅ |
-| Edge runtime | ✅ | ❌ | ❌ |
-| Global replication | ✅ | ❌ | ✅ |
-| Cost model | Pay-per-use | Fixed server costs | Pay-per-use |
-| Local development | Limited | ✅ | ✅ (emulators) |
+| Feature             | world-upstash     | world-redis-bullmq | world-firestore-tasks       |
+| ------------------- | ----------------- | ------------------ | --------------------------- |
+| Infrastructure      | None (serverless) | Redis + BullMQ     | GCP Firestore + Cloud Tasks |
+| Real-time streaming | ❌ (use polling)  | ✅                 | ✅                          |
+| Edge runtime        | ✅                | ❌                 | ❌                          |
+| Global replication  | ✅                | ❌                 | ✅                          |
+| Cost model          | Pay-per-use       | Fixed server costs | Pay-per-use                 |
+| Local development   | Limited           | ✅                 | ✅ (emulators)              |
 
 ## Local Development
 

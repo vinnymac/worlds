@@ -1,4 +1,5 @@
 import type { Storage, World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { Redis } from '@upstash/redis';
 import type { UpstashWorldConfig } from './config.js';
 import { createQueue } from './queue.js';
@@ -48,12 +49,18 @@ export function createWorld(config: UpstashWorldConfig = {}): World {
     currentSigningKey: config.qstashCurrentSigningKey,
     nextSigningKey: config.qstashNextSigningKey,
     enableDeduplication: config.enableDeduplication,
+    retries: config.qstashRetries,
   });
 
   const storage = createStorage(storageRedis, keyPrefix);
   const streamer = createStreamer({ redis: streamerRedis, keyPrefix });
 
   return {
+    // Declare the supported spec version so core creates runs at the
+    // current spec (enabling resilient start: runInput rides the queue
+    // message and run_started can bootstrap the run). The queue transport
+    // uses the tagged-JSON codec, so Uint8Array payloads survive.
+    specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,
     ...queue,
