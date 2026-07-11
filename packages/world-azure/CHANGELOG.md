@@ -1,5 +1,11 @@
 # @fantasticfour/world-azure
 
+## 1.4.1
+
+### Patch Changes
+
+- 617b1c7: Add `files` field to restrict npm publish to `dist/` only. Saving 141–215 KB per package.
+
 ## 1.4.0
 
 ### Minor Changes
