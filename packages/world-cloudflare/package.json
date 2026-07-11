@@ -17,6 +17,9 @@
     "url": "https://github.com/vinnymac/worlds.git",
     "directory": "packages/world-cloudflare"
   },
+  "files": [
+    "dist"
+  ],
   "type": "module",
   "exports": {
     ".": {

@@ -18,6 +18,9 @@
     "url": "https://github.com/vinnymac/worlds.git",
     "directory": "packages/world-firestore-tasks"
   },
+  "files": [
+    "dist"
+  ],
   "type": "module",
   "exports": {
     ".": {
