@@ -25,6 +25,7 @@ import type {
   PaginatedResponse,
   ResolveData,
   RunCreatedEventRequest,
+  SerializedData,
   Step,
   StepWithoutData,
   Storage,
@@ -57,7 +58,7 @@ interface SerializedError {
 }
 
 type SerializedStepUpdate = Omit<UpdateStepRequest, 'error'> & {
-  error?: SerializedError;
+  error?: SerializedData | SerializedError;
 };
 
 function isValidRunData(data: unknown): data is Record<string, unknown> & { error?: unknown } {
@@ -93,17 +94,20 @@ function _serializeStepError(data: UpdateStepRequest): SerializedStepUpdate {
     ...data,
   };
 
-  if (!baseData.error) {
+  const { error, ...rest } = baseData;
+  if (error === undefined) {
     return baseData;
   }
-
-  const { error, ...rest } = baseData;
+  if (typeof error !== 'object' || error === null || ArrayBuffer.isView(error)) {
+    return baseData;
+  }
+  const err = error as { message?: string; stack?: string; code?: string };
   return {
     ...rest,
     error: {
-      message: error.message,
-      stack: error.stack,
-      code: error.code,
+      message: err.message ?? '',
+      stack: err.stack,
+      code: err.code,
     },
   };
 }
@@ -613,6 +617,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 workflowName: runData.workflowName,
                 specVersion: effectiveSpecVersion,
                 status: 'pending',
+                attributes: {},
                 input: runData.input,
                 executionContext: runData.executionContext,
                 deploymentId: runData.deploymentId,
@@ -697,6 +702,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                       workflowName: runInput.workflowName,
                       specVersion: effectiveSpecVersion,
                       status: 'running',
+                      attributes: {},
                       input: runInput.input,
                       executionContext: runInput.executionContext,
                       deploymentId: runInput.deploymentId,

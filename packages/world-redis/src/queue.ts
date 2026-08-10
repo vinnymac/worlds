@@ -1,13 +1,6 @@
 import { hostname } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-  MessageId,
-  parseQueueName,
-  type Queue,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type Queue, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import type { RedisWorldConfig } from './config.js';
@@ -39,10 +32,7 @@ interface MessageEnvelope {
   message: QueuePayload;
 }
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+const QUEUE_PATHNAME = 'flow';
 
 /** TTL for idempotency reservations. A safety net only: reservations are
  * explicitly released on completion or final drop; the TTL guards against
@@ -228,10 +218,7 @@ export function createQueue(
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const QueueName = `${prefix}flows`;
 
   const delayedKey = (listKey: string) => `${listKey}:delayed`;
   const idempotencyKeyFor = (listKey: string, key: string) => `${listKey}:idempotent:${key}`;
@@ -255,8 +242,7 @@ export function createQueue(
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'redis';
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
+    const listKey = QueueName;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
 
     const envelope: MessageEnvelope = {
@@ -361,8 +347,8 @@ export function createQueue(
     );
   }
 
-  async function worker(kind: QueueKind, listKey: string) {
-    const pathname = QUEUE_PATHNAMES[kind];
+  async function worker(listKey: string) {
+    const pathname = QUEUE_PATHNAME;
     const consumerId = `${hostname()}-${process.pid}-${generateMessageId()}`;
     const processingKey = `${listKey}:processing:${consumerId}`;
     const ownerKey = `${processingKey}:owner`;
@@ -511,7 +497,7 @@ export function createQueue(
   /** Promote due delayed messages to the ready lists. */
   async function promoterLoop() {
     while (!stopped) {
-      for (const listKey of Object.values(Queues)) {
+      for (const listKey of [QueueName]) {
         try {
           let promoted: unknown;
           do {
@@ -565,7 +551,7 @@ export function createQueue(
 
   async function reclaimerLoop() {
     while (!stopped) {
-      for (const listKey of Object.values(Queues)) {
+      for (const listKey of [QueueName]) {
         try {
           await reclaimOnce(listKey);
         } catch (error) {
@@ -589,33 +575,22 @@ export function createQueue(
   }
 
   async function getQueueStats(): Promise<QueueStats> {
-    const flowsKey = Queues.workflow;
-    const stepsKey = Queues.step;
+    const flowsKey = QueueName;
 
-    const [
-      workflowsPending,
-      stepsPending,
-      workflowsDelayed,
-      stepsDelayed,
-      workflowsIdempotencyKeys,
-      stepsIdempotencyKeys,
-    ] = await Promise.all([
+    const [workflowsPending, workflowsDelayed, workflowsIdempotencyKeys] = await Promise.all([
       redis.llen(flowsKey),
-      redis.llen(stepsKey),
       redis.zcard(delayedKey(flowsKey)),
-      redis.zcard(delayedKey(stepsKey)),
       countKeys(`${flowsKey}:idempotent:*`),
-      countKeys(`${stepsKey}:idempotent:*`),
     ]);
 
     const stats: QueueStats = {
       workflowsPending,
-      stepsPending,
+      stepsPending: 0,
       workflowsDelayed,
-      stepsDelayed,
+      stepsDelayed: 0,
       workflowsIdempotencyKeys,
-      stepsIdempotencyKeys,
-      totalPending: workflowsPending + stepsPending + workflowsDelayed + stepsDelayed,
+      stepsIdempotencyKeys: 0,
+      totalPending: workflowsPending + workflowsDelayed,
     };
 
     debug('queue stats', stats);
@@ -631,11 +606,8 @@ export function createQueue(
       if (started) return;
       started = true;
       const concurrency = config.queueConcurrency || 10;
-      const entries = Object.entries(Queues) as [QueueKind, string][];
       loopPromises.push(
-        ...entries.flatMap(([kind, listKey]) =>
-          Array.from({ length: concurrency }, () => worker(kind, listKey)),
-        ),
+        ...Array.from({ length: concurrency }, () => worker(QueueName)),
         promoterLoop(),
         reclaimerLoop(),
       );

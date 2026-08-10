@@ -28,8 +28,8 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
   describe('writeToStream()', () => {
     it('should write string chunks with monotonic indexes', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'Hello');
-      await streamer.writeToStream('test-stream', 'wrun_123', ' world');
+      await streamer.streams.write('wrun_123', 'test-stream', 'Hello');
+      await streamer.streams.write('wrun_123', 'test-stream', ' world');
 
       const stub = mockEnv.WORKFLOW_STREAMS.get(
         mockEnv.WORKFLOW_STREAMS.idFromName('stream:test-stream'),
@@ -43,7 +43,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
     it('should write binary chunks untouched', async () => {
       const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
-      await streamer.writeToStream('binary-stream', 'wrun_456', bytes);
+      await streamer.streams.write('wrun_456', 'binary-stream', bytes);
 
       const stub = mockEnv.WORKFLOW_STREAMS.get(
         mockEnv.WORKFLOW_STREAMS.idFromName('stream:binary-stream'),
@@ -52,34 +52,25 @@ describe('Streamer (StreamDO RPC integration)', () => {
       expect(Array.from(chunks[0])).toEqual([0, 1, 2, 253, 254, 255]);
     });
 
-    it('should await runId promise before writing', async () => {
-      let resolved = false;
-      const runIdPromise = new Promise<string>((resolve) => {
-        setTimeout(() => {
-          resolved = true;
-          resolve('wrun_789');
-        }, 50);
-      });
+    it('should write with a string runId', async () => {
+      await streamer.streams.write('wrun_789', 'test-stream', 'data');
 
-      await streamer.writeToStream('test-stream', runIdPromise, 'data');
-
-      expect(resolved).toBe(true);
-      const info = await streamer.getStreamInfo('test-stream', 'wrun_789');
+      const info = await streamer.streams.getInfo('wrun_789', 'test-stream');
       expect(info.tailIndex).toBe(0);
     });
 
     it('should handle empty string chunks', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', '');
+      await streamer.streams.write('wrun_123', 'test-stream', '');
 
-      const info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      const info = await streamer.streams.getInfo('wrun_123', 'test-stream');
       expect(info.tailIndex).toBe(0);
     });
 
     it('should reject writes after the stream is closed', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'data');
-      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.streams.write('wrun_123', 'test-stream', 'data');
+      await streamer.streams.close('wrun_123', 'test-stream');
 
-      await expect(streamer.writeToStream('test-stream', 'wrun_123', 'more')).rejects.toThrow(
+      await expect(streamer.streams.write('wrun_123', 'test-stream', 'more')).rejects.toThrow(
         /closed/,
       );
     });
@@ -87,23 +78,23 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
   describe('closeStream()', () => {
     it('should mark the stream done', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'data');
+      await streamer.streams.write('wrun_123', 'test-stream', 'data');
 
-      let info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      let info = await streamer.streams.getInfo('wrun_123', 'test-stream');
       expect(info.done).toBe(false);
 
-      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.streams.close('wrun_123', 'test-stream');
 
-      info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      info = await streamer.streams.getInfo('wrun_123', 'test-stream');
       expect(info.done).toBe(true);
       expect(info.tailIndex).toBe(0);
     });
 
     it('should be idempotent', async () => {
-      await streamer.closeStream('test-stream', 'wrun_123');
-      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.streams.close('wrun_123', 'test-stream');
+      await streamer.streams.close('wrun_123', 'test-stream');
 
-      const info = await streamer.getStreamInfo('test-stream', 'wrun_123');
+      const info = await streamer.streams.getInfo('wrun_123', 'test-stream');
       expect(info.done).toBe(true);
       expect(info.tailIndex).toBe(-1);
     });
@@ -111,12 +102,12 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
   describe('readFromStream()', () => {
     it('should read all chunks and close on EOF', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 1\n');
-      await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 2\n');
-      await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 3\n');
-      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.streams.write('wrun_123', 'test-stream', 'Chunk 1\n');
+      await streamer.streams.write('wrun_123', 'test-stream', 'Chunk 2\n');
+      await streamer.streams.write('wrun_123', 'test-stream', 'Chunk 3\n');
+      await streamer.streams.close('wrun_123', 'test-stream');
 
-      const stream = await streamer.readFromStream('test-stream');
+      const stream = await streamer.streams.get('wrun_123', 'test-stream');
       const chunks = await readAll(stream);
 
       expect(chunks).toHaveLength(3);
@@ -124,11 +115,11 @@ describe('Streamer (StreamDO RPC integration)', () => {
     });
 
     it('should handle binary data end-to-end', async () => {
-      await streamer.writeToStream('binary-stream', 'wrun_123', new Uint8Array([0, 1, 2, 3, 4]));
-      await streamer.writeToStream('binary-stream', 'wrun_123', new Uint8Array([5, 6, 7, 8, 9]));
-      await streamer.closeStream('binary-stream', 'wrun_123');
+      await streamer.streams.write('wrun_123', 'binary-stream', new Uint8Array([0, 1, 2, 3, 4]));
+      await streamer.streams.write('wrun_123', 'binary-stream', new Uint8Array([5, 6, 7, 8, 9]));
+      await streamer.streams.close('wrun_123', 'binary-stream');
 
-      const stream = await streamer.readFromStream('binary-stream');
+      const stream = await streamer.streams.get('wrun_123', 'binary-stream');
       const chunks = await readAll(stream);
 
       expect(chunks).toHaveLength(2);
@@ -137,9 +128,9 @@ describe('Streamer (StreamDO RPC integration)', () => {
     });
 
     it('should read a live stream that closes later', async () => {
-      await streamer.writeToStream('live-stream', 'wrun_123', 'early');
+      await streamer.streams.write('wrun_123', 'live-stream', 'early');
 
-      const stream = await streamer.readFromStream('live-stream');
+      const stream = await streamer.streams.get('wrun_123', 'live-stream');
       const reader = stream.getReader();
 
       const first = await reader.read();
@@ -147,9 +138,9 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
       // Write + close while the reader is polling for more.
       setTimeout(() => {
-        void streamer
-          .writeToStream('live-stream', 'wrun_123', 'late')
-          .then(() => streamer.closeStream('live-stream', 'wrun_123'));
+        void streamer.streams
+          .write('wrun_123', 'live-stream', 'late')
+          .then(() => streamer.streams.close('wrun_123', 'live-stream'));
       }, 50);
 
       const second = await reader.read();
@@ -160,33 +151,33 @@ describe('Streamer (StreamDO RPC integration)', () => {
     });
 
     it('should honor a positive startIndex', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'zero');
-      await streamer.writeToStream('test-stream', 'wrun_123', 'one');
-      await streamer.writeToStream('test-stream', 'wrun_123', 'two');
-      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.streams.write('wrun_123', 'test-stream', 'zero');
+      await streamer.streams.write('wrun_123', 'test-stream', 'one');
+      await streamer.streams.write('wrun_123', 'test-stream', 'two');
+      await streamer.streams.close('wrun_123', 'test-stream');
 
-      const stream = await streamer.readFromStream('test-stream', 1);
+      const stream = await streamer.streams.get('wrun_123', 'test-stream', 1);
       const chunks = await readAll(stream);
 
       expect(text(chunks)).toBe('onetwo');
     });
 
     it('should resolve a negative startIndex from the end', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'zero');
-      await streamer.writeToStream('test-stream', 'wrun_123', 'one');
-      await streamer.writeToStream('test-stream', 'wrun_123', 'two');
-      await streamer.closeStream('test-stream', 'wrun_123');
+      await streamer.streams.write('wrun_123', 'test-stream', 'zero');
+      await streamer.streams.write('wrun_123', 'test-stream', 'one');
+      await streamer.streams.write('wrun_123', 'test-stream', 'two');
+      await streamer.streams.close('wrun_123', 'test-stream');
 
-      const stream = await streamer.readFromStream('test-stream', -2);
+      const stream = await streamer.streams.get('wrun_123', 'test-stream', -2);
       const chunks = await readAll(stream);
 
       expect(text(chunks)).toBe('onetwo');
     });
 
     it('should handle stream cancellation', async () => {
-      await streamer.writeToStream('test-stream', 'wrun_123', 'data');
+      await streamer.streams.write('wrun_123', 'test-stream', 'data');
 
-      const stream = await streamer.readFromStream('test-stream');
+      const stream = await streamer.streams.get('wrun_123', 'test-stream');
       const reader = stream.getReader();
 
       await reader.read();
@@ -216,7 +207,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
       };
 
       const failingStreamer = createStreamer({ env: failingEnv });
-      const stream = await failingStreamer.readFromStream('error-stream');
+      const stream = await failingStreamer.streams.get('wrun_123', 'error-stream');
       const reader = stream.getReader();
 
       await expect(reader.read()).rejects.toThrow('DO unavailable');
@@ -226,11 +217,11 @@ describe('Streamer (StreamDO RPC integration)', () => {
   describe('getStreamChunks()', () => {
     it('should paginate chunks with a numeric cursor', async () => {
       for (let i = 0; i < 5; i++) {
-        await streamer.writeToStream('paged-stream', 'wrun_123', `chunk-${i}`);
+        await streamer.streams.write('wrun_123', 'paged-stream', `chunk-${i}`);
       }
-      await streamer.closeStream('paged-stream', 'wrun_123');
+      await streamer.streams.close('wrun_123', 'paged-stream');
 
-      const page1 = await streamer.getStreamChunks('paged-stream', 'wrun_123', { limit: 2 });
+      const page1 = await streamer.streams.getChunks('wrun_123', 'paged-stream', { limit: 2 });
       expect(page1.data).toHaveLength(2);
       expect(page1.data[0].index).toBe(0);
       expect(page1.data[1].index).toBe(1);
@@ -238,14 +229,14 @@ describe('Streamer (StreamDO RPC integration)', () => {
       expect(page1.cursor).toBe('2');
       expect(page1.done).toBe(true);
 
-      const page2 = await streamer.getStreamChunks('paged-stream', 'wrun_123', {
+      const page2 = await streamer.streams.getChunks('wrun_123', 'paged-stream', {
         limit: 2,
         cursor: page1.cursor ?? undefined,
       });
       expect(page2.data.map((c) => c.index)).toEqual([2, 3]);
       expect(page2.hasMore).toBe(true);
 
-      const page3 = await streamer.getStreamChunks('paged-stream', 'wrun_123', {
+      const page3 = await streamer.streams.getChunks('wrun_123', 'paged-stream', {
         limit: 2,
         cursor: page2.cursor ?? undefined,
       });
@@ -256,9 +247,9 @@ describe('Streamer (StreamDO RPC integration)', () => {
     });
 
     it('should report done=false for open streams', async () => {
-      await streamer.writeToStream('open-stream', 'wrun_123', 'data');
+      await streamer.streams.write('wrun_123', 'open-stream', 'data');
 
-      const result = await streamer.getStreamChunks('open-stream', 'wrun_123');
+      const result = await streamer.streams.getChunks('wrun_123', 'open-stream');
       expect(result.done).toBe(false);
       expect(result.hasMore).toBe(false);
       expect(result.data).toHaveLength(1);
@@ -266,33 +257,33 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
     it('should reject invalid cursors', async () => {
       await expect(
-        streamer.getStreamChunks('any-stream', 'wrun_123', { cursor: 'bogus' }),
+        streamer.streams.getChunks('wrun_123', 'any-stream', { cursor: 'bogus' }),
       ).rejects.toThrow(/Invalid stream cursor/);
     });
   });
 
   describe('getStreamInfo()', () => {
     it('should return -1 tailIndex for empty streams', async () => {
-      const info = await streamer.getStreamInfo('empty-stream', 'wrun_123');
+      const info = await streamer.streams.getInfo('wrun_123', 'empty-stream');
       expect(info).toEqual({ tailIndex: -1, done: false });
     });
   });
 
   describe('listStreamsByRunId()', () => {
     it('should list streams written for a run', async () => {
-      await streamer.writeToStream('stream-a', 'wrun_list', 'a');
-      await streamer.writeToStream('stream-b', 'wrun_list', 'b');
-      await streamer.writeToStream('stream-c', 'wrun_other', 'c');
+      await streamer.streams.write('wrun_list', 'stream-a', 'a');
+      await streamer.streams.write('wrun_list', 'stream-b', 'b');
+      await streamer.streams.write('wrun_other', 'stream-c', 'c');
 
-      const streams = await streamer.listStreamsByRunId('wrun_list');
+      const streams = await streamer.streams.list('wrun_list');
       expect(streams.sort()).toEqual(['stream-a', 'stream-b']);
 
-      const other = await streamer.listStreamsByRunId('wrun_other');
+      const other = await streamer.streams.list('wrun_other');
       expect(other).toEqual(['stream-c']);
     });
 
     it('should return an empty list for unknown runs', async () => {
-      const streams = await streamer.listStreamsByRunId('wrun_unknown');
+      const streams = await streamer.streams.list('wrun_unknown');
       expect(streams).toEqual([]);
     });
   });

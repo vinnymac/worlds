@@ -286,135 +286,133 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
   }
 
   return {
-    async writeToStream(
-      name: string,
-      _runId: string | Promise<string>,
-      chunk: string | Uint8Array,
-    ) {
-      // Generate the chunkId synchronously BEFORE any await so ULID order
-      // matches call order even when runId is a promise multiple writes
-      // are waiting on.
-      const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const runId = await _runId;
-      await registerStreamForRun(runId, name);
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array) {
+        // Generate the chunkId synchronously BEFORE any await so ULID order
+        // matches call order even when runId is a promise multiple writes
+        // are waiting on.
+        const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
+        await registerStreamForRun(runId, name);
 
-      const buffer =
-        typeof chunk === 'string'
-          ? Buffer.from(chunk)
-          : Buffer.isBuffer(chunk)
-            ? chunk
-            : Buffer.from(chunk);
+        const buffer =
+          typeof chunk === 'string'
+            ? Buffer.from(chunk)
+            : Buffer.isBuffer(chunk)
+              ? chunk
+              : Buffer.from(chunk);
 
-      await chunksCol(name)
-        .doc(chunkId)
-        .set({
+        await chunksCol(name)
+          .doc(chunkId)
+          .set({
+            chunkId,
+            streamId: name,
+            chunkData: buffer.toString('base64'),
+            eof: false,
+            createdAt: new Date(),
+          });
+      },
+
+      async close(runId: string, name: string) {
+        const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
+        await registerStreamForRun(runId, name);
+
+        await chunksCol(name).doc(chunkId).set({
           chunkId,
           streamId: name,
-          chunkData: buffer.toString('base64'),
-          eof: false,
+          chunkData: '',
+          eof: true,
           createdAt: new Date(),
         });
-    },
+      },
 
-    async closeStream(name: string, _runId: string | Promise<string>) {
-      const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const runId = await _runId;
-      await registerStreamForRun(runId, name);
+      async get(_runId: string, streamName: string, startIndex = 0) {
+        if (mode === 'polling') {
+          return readFromStreamPolling(streamName, startIndex);
+        }
+        return readFromStreamListener(streamName, startIndex);
+      },
 
-      await chunksCol(name).doc(chunkId).set({
-        chunkId,
-        streamId: name,
-        chunkData: '',
-        eof: true,
-        createdAt: new Date(),
-      });
-    },
+      async list(runId: string): Promise<string[]> {
+        const snapshot = await firestore
+          .collection('workflow_streams')
+          .where('runId', '==', runId)
+          .get();
+        return snapshot.docs.map((doc) => {
+          const streamId = doc.data().streamId;
+          return typeof streamId === 'string' ? streamId : doc.id;
+        });
+      },
 
-    async readFromStream(streamName: string, startIndex = 0) {
-      if (mode === 'polling') {
-        return readFromStreamPolling(streamName, startIndex);
-      }
-      return readFromStreamListener(streamName, startIndex);
-    },
+      async getChunks(
+        _runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        const limit = Math.min(Math.max(options?.limit ?? 100, 1), 1000);
 
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      const snapshot = await firestore
-        .collection('workflow_streams')
-        .where('runId', '==', runId)
-        .get();
-      return snapshot.docs.map((doc) => {
-        const streamId = doc.data().streamId;
-        return typeof streamId === 'string' ? streamId : doc.id;
-      });
-    },
-
-    async getStreamChunks(
-      name: string,
-      _runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      const limit = Math.min(Math.max(options?.limit ?? 100, 1), 1000);
-
-      let cursor: ChunkCursor = { i: 0, c: '' };
-      if (options?.cursor) {
-        try {
-          const decoded = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf-8'));
-          if (typeof decoded?.i !== 'number' || typeof decoded?.c !== 'string') {
-            throw new Error('malformed cursor payload');
+        let cursor: ChunkCursor = { i: 0, c: '' };
+        if (options?.cursor) {
+          try {
+            const decoded = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf-8'));
+            if (typeof decoded?.i !== 'number' || typeof decoded?.c !== 'string') {
+              throw new Error('malformed cursor payload');
+            }
+            cursor = decoded as ChunkCursor;
+          } catch (error) {
+            throw new WorkflowWorldError(`Invalid stream cursor: ${String(error)}`, {
+              status: 400,
+            });
           }
-          cursor = decoded as ChunkCursor;
-        } catch (error) {
-          throw new WorkflowWorldError(`Invalid stream cursor: ${String(error)}`, { status: 400 });
         }
-      }
 
-      let query = chunksCol(name).orderBy('chunkId', 'asc');
-      if (cursor.c) {
-        query = query.where('chunkId', '>', cursor.c);
-      }
-      // limit + 1 to detect whether more data (or the EOF marker) follows.
-      const snapshot = await query.limit(limit + 1).get();
-
-      const data: StreamChunk[] = [];
-      let done = false;
-      let hasMore = false;
-      let lastChunkId = cursor.c;
-      for (const doc of snapshot.docs) {
-        const chunk = doc.data() as StoredChunk;
-        if (chunk.eof) {
-          done = true;
-          break;
+        let query = chunksCol(name).orderBy('chunkId', 'asc');
+        if (cursor.c) {
+          query = query.where('chunkId', '>', cursor.c);
         }
-        if (data.length >= limit) {
-          hasMore = true;
-          break;
+        // limit + 1 to detect whether more data (or the EOF marker) follows.
+        const snapshot = await query.limit(limit + 1).get();
+
+        const data: StreamChunk[] = [];
+        let done = false;
+        let hasMore = false;
+        let lastChunkId = cursor.c;
+        for (const doc of snapshot.docs) {
+          const chunk = doc.data() as StoredChunk;
+          if (chunk.eof) {
+            done = true;
+            break;
+          }
+          if (data.length >= limit) {
+            hasMore = true;
+            break;
+          }
+          data.push({ index: cursor.i + data.length, data: decodeChunkData(chunk) });
+          lastChunkId = chunk.chunkId;
         }
-        data.push({ index: cursor.i + data.length, data: decodeChunkData(chunk) });
-        lastChunkId = chunk.chunkId;
-      }
 
-      const nextCursor = hasMore
-        ? Buffer.from(
-            JSON.stringify({ i: cursor.i + data.length, c: lastChunkId } satisfies ChunkCursor),
-          ).toString('base64')
-        : null;
+        const nextCursor = hasMore
+          ? Buffer.from(
+              JSON.stringify({ i: cursor.i + data.length, c: lastChunkId } satisfies ChunkCursor),
+            ).toString('base64')
+          : null;
 
-      return { data, cursor: nextCursor, hasMore, done };
-    },
+        return { data, cursor: nextCursor, hasMore, done };
+      },
 
-    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Project only the eof flag — metadata never needs chunk payloads.
-      const snapshot = await chunksCol(name).select('eof').get();
-      let dataCount = 0;
-      let done = false;
-      for (const doc of snapshot.docs) {
-        if (doc.get('eof') === true) {
-          done = true;
-        } else {
-          dataCount++;
+      async getInfo(_runId: string, name: string): Promise<StreamInfoResponse> {
+        // Project only the eof flag — metadata never needs chunk payloads.
+        const snapshot = await chunksCol(name).select('eof').get();
+        let dataCount = 0;
+        let done = false;
+        for (const doc of snapshot.docs) {
+          if (doc.get('eof') === true) {
+            done = true;
+          } else {
+            dataCount++;
+          }
         }
-      }
-      return { tailIndex: dataCount - 1, done };
+        return { tailIndex: dataCount - 1, done };
+      },
     },
   };
 }

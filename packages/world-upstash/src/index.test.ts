@@ -33,8 +33,8 @@ describe('createWorld', () => {
     expect(world.queue).toBeDefined();
     expect(world.getDeploymentId).toBeDefined();
     expect(world.createQueueHandler).toBeDefined();
-    expect(world.writeToStream).toBeDefined();
-    expect(world.closeStream).toBeDefined();
-    expect(world.readFromStream).toBeDefined();
+    expect(world.streams.write).toBeDefined();
+    expect(world.streams.close).toBeDefined();
+    expect(world.streams.get).toBeDefined();
   });
 });

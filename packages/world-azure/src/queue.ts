@@ -2,13 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { ServiceBusClient, ServiceBusSender } from '@azure/service-bus';
 import { ServiceBusAdministrationClient } from '@azure/service-bus';
 import type { Queue, QueueOptions } from '@workflow/world';
-import {
-  MessageId,
-  parseQueueName,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, parseQueueName, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 
@@ -45,12 +39,9 @@ interface PumpEnvelope {
   message: QueuePayload;
 }
 
-type Pathname = 'flow' | 'step';
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, Pathname>;
+/** v5 has a single queue kind; flow is the only pathname. */
+type Pathname = 'flow';
+const QUEUE_PATHNAME = 'flow';
 
 /** Dedup window for Service Bus duplicate detection (ISO 8601 duration). */
 const DUPLICATE_DETECTION_WINDOW = 'PT15M';
@@ -89,8 +80,8 @@ function createTestPump(config: ServiceBusConfig) {
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [] };
+  const wakers: Record<Pathname, Array<() => void>> = { flow: [] };
   /**
    * In-flight messages by idempotency key: enqueueing the same key while a
    * prior message is still being processed returns the original messageId
@@ -200,7 +191,6 @@ function createTestPump(config: ServiceBusConfig) {
       if (running) return;
       running = true;
       void loop('flow');
-      void loop('step');
     },
     stop() {
       running = false;
@@ -341,10 +331,10 @@ export function createQueue(config: ServiceBusConfig): Queue & {
   return {
     async queue(name, message, opts) {
       if (isTest) {
-        const { kind } = parseQueueName(name);
+        void parseQueueName(name);
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         const effectiveId = testPump.push(
-          QUEUE_PATHNAMES[kind],
+          QUEUE_PATHNAME,
           {
             messageId,
             idempotencyKey: opts?.idempotencyKey,

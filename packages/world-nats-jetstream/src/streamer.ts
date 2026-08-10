@@ -175,201 +175,197 @@ export function createStreamer(config: StreamerConfig): Streamer {
   }
 
   return {
-    async writeToStream(
-      name: string,
-      _runId: string | Promise<string>,
-      chunk: string | Uint8Array,
-    ): Promise<void> {
-      // Await runId if it's a promise
-      const runId = await _runId;
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array): Promise<void> {
+        await ensureStream(name);
+        await registerStreamForRun(runId, name);
 
-      await ensureStream(name);
-      await registerStreamForRun(runId, name);
+        const streamName = streamNameFor(name);
+        const subject = `${streamName}.data`;
 
-      const streamName = streamNameFor(name);
-      const subject = `${streamName}.data`;
+        const data = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk);
 
-      const data = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk);
+        // Publish chunk to JetStream with headers
+        const h = createHeaders();
+        h.set('X-Content-Type', 'application/octet-stream');
+        h.set('X-EOF', 'false');
+        const jetstream = await getJetStream();
+        await jetstream.publish(subject, data, { headers: h });
+      },
 
-      // Publish chunk to JetStream with headers
-      const h = createHeaders();
-      h.set('X-Content-Type', 'application/octet-stream');
-      h.set('X-EOF', 'false');
-      const jetstream = await getJetStream();
-      await jetstream.publish(subject, data, { headers: h });
-    },
+      async close(runId: string, name: string): Promise<void> {
+        await ensureStream(name);
+        await registerStreamForRun(runId, name);
 
-    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
-      // Await runId if it's a promise
-      const runId = await _runId;
+        const streamName = streamNameFor(name);
+        const subject = `${streamName}.data`;
 
-      await ensureStream(name);
-      await registerStreamForRun(runId, name);
+        // Publish EOF marker
+        const h = createHeaders();
+        h.set('X-Content-Type', 'application/octet-stream');
+        h.set('X-EOF', 'true');
+        const jetstream = await getJetStream();
+        await jetstream.publish(subject, new Uint8Array(0), { headers: h });
+      },
 
-      const streamName = streamNameFor(name);
-      const subject = `${streamName}.data`;
-
-      // Publish EOF marker
-      const h = createHeaders();
-      h.set('X-Content-Type', 'application/octet-stream');
-      h.set('X-EOF', 'true');
-      const jetstream = await getJetStream();
-      await jetstream.publish(subject, new Uint8Array(0), { headers: h });
-    },
-
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      const bucket = await getStreamsByRunBucket();
-      // Drain the key listing before issuing gets: the keys() iterator drops
-      // buffered keys when the consumer awaits unrelated work between reads.
-      const keys: string[] = [];
-      const iter = await bucket.keys(`${runId}.>`);
-      for await (const key of iter) {
-        keys.push(key);
-      }
-      const names: string[] = [];
-      for (const key of keys) {
-        const entry = await bucket.get(key);
-        if (!entry || entry.operation !== 'PUT') continue;
-        names.push(
-          typeof entry.value === 'string' ? entry.value : new TextDecoder().decode(entry.value),
-        );
-      }
-      return names;
-    },
-
-    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      await ensureStream(name);
-      const { dataCount, done } = await getTailState(name);
-      return { tailIndex: dataCount - 1, done };
-    },
-
-    async getStreamChunks(
-      name: string,
-      _runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      await ensureStream(name);
-
-      const limit = Math.min(options?.limit ?? DEFAULT_CHUNK_LIMIT, MAX_CHUNK_LIMIT);
-      const startIndex = decodeCursor(options?.cursor);
-
-      const jsm = await getManager();
-      const streamName = streamNameFor(name);
-
-      const chunks: StreamChunk[] = [];
-      let done = false;
-      let hasMore = false;
-
-      // Chunk index i lives at stream sequence i + 1. Walk from the cursor,
-      // collecting up to `limit` data chunks, then peek one further message
-      // to distinguish "more chunks" from "EOF" from "end of written data".
-      for (let index = startIndex; ; index++) {
-        let msg: StoredMsg;
-        try {
-          msg = await jsm.streams.getMessage(streamName, { seq: index + 1 });
-        } catch (err) {
-          if (isNoMessageFound(err)) break;
-          throw err;
+      async list(runId: string): Promise<string[]> {
+        const bucket = await getStreamsByRunBucket();
+        // Drain the key listing before issuing gets: the keys() iterator drops
+        // buffered keys when the consumer awaits unrelated work between reads.
+        const keys: string[] = [];
+        const iter = await bucket.keys(`${runId}.>`);
+        for await (const key of iter) {
+          keys.push(key);
         }
-
-        if (isEofMessage(msg)) {
-          done = true;
-          break;
+        const names: string[] = [];
+        for (const key of keys) {
+          const entry = await bucket.get(key);
+          if (!entry || entry.operation !== 'PUT') continue;
+          names.push(
+            typeof entry.value === 'string' ? entry.value : new TextDecoder().decode(entry.value),
+          );
         }
+        return names;
+      },
 
-        if (chunks.length >= limit) {
-          hasMore = true;
-          break;
-        }
+      async getInfo(_runId: string, name: string): Promise<StreamInfoResponse> {
+        await ensureStream(name);
+        const { dataCount, done } = await getTailState(name);
+        return { tailIndex: dataCount - 1, done };
+      },
 
-        chunks.push({ index, data: new Uint8Array(msg.data) });
-      }
+      async getChunks(
+        _runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        await ensureStream(name);
 
-      const nextCursor = hasMore ? encodeCursor(startIndex + chunks.length) : null;
+        const limit = Math.min(options?.limit ?? DEFAULT_CHUNK_LIMIT, MAX_CHUNK_LIMIT);
+        const startIndex = decodeCursor(options?.cursor);
 
-      return {
-        data: chunks,
-        cursor: nextCursor,
-        hasMore,
-        done,
-      };
-    },
+        const jsm = await getManager();
+        const streamName = streamNameFor(name);
 
-    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
-      await ensureStream(name);
+        const chunks: StreamChunk[] = [];
+        let done = false;
+        let hasMore = false;
 
-      const streamName = streamNameFor(name);
-      const consumerName = `${streamName}_reader_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-      // Resolve negative startIndex ("start that many chunks before the
-      // current end") against the tail before creating the consumer.
-      let resolvedStartIndex = startIndex ?? 0;
-      if (resolvedStartIndex < 0) {
-        const { dataCount } = await getTailState(name);
-        resolvedStartIndex = Math.max(0, dataCount + resolvedStartIndex);
-      }
-
-      let messages: ConsumerMessages | null = null;
-
-      return new ReadableStream<Uint8Array>({
-        async start(controller) {
+        // Chunk index i lives at stream sequence i + 1. Walk from the cursor,
+        // collecting up to `limit` data chunks, then peek one further message
+        // to distinguish "more chunks" from "EOF" from "end of written data".
+        for (let index = startIndex; ; index++) {
+          let msg: StoredMsg;
           try {
-            const jetstream = await getJetStream();
-            const jsm = await jetstream.jetstreamManager();
-
-            // Create ephemeral consumer for this reader. Chunk index i is
-            // stream sequence i + 1, so starting at resolvedStartIndex means
-            // opt_start_seq = resolvedStartIndex + 1 — this is the single
-            // skip mechanism (no additional client-side skipping).
-            const consumerInfo = await jsm.consumers.add(streamName, {
-              name: consumerName,
-              ack_policy: AckPolicy.Explicit,
-              deliver_policy:
-                resolvedStartIndex > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
-              opt_start_seq: resolvedStartIndex > 0 ? resolvedStartIndex + 1 : undefined,
-              filter_subject: `${streamName}.data`,
-              inactive_threshold: 30 * 1_000_000_000, // 30 seconds
-            });
-
-            // Get the consumer via JetStreamClient.consumers API
-            const consumer = await jetstream.consumers.get(streamName, consumerInfo.name);
-            const iter = await consumer.consume();
-            messages = iter;
-
-            for await (const msg of iter) {
-              // Check for EOF marker
-              const isEof = msg.headers?.get('X-EOF') === 'true';
-
-              if (isEof) {
-                msg.ack();
-                controller.close();
-                iter.close();
-                break;
-              }
-
-              // Enqueue the chunk
-              if (msg.data.byteLength > 0) {
-                controller.enqueue(new Uint8Array(msg.data));
-              }
-
-              msg.ack();
-            }
-
-            // Clean up consumer
-            try {
-              await jsm.consumers.delete(streamName, consumerName);
-            } catch {
-              // Ignore cleanup errors
-            }
-          } catch (error) {
-            controller.error(error);
+            msg = await jsm.streams.getMessage(streamName, { seq: index + 1 });
+          } catch (err) {
+            if (isNoMessageFound(err)) break;
+            throw err;
           }
-        },
-        async cancel() {
-          // Stop the consume loop; the start() epilogue deletes the consumer.
-          messages?.close();
-        },
-      });
+
+          if (isEofMessage(msg)) {
+            done = true;
+            break;
+          }
+
+          if (chunks.length >= limit) {
+            hasMore = true;
+            break;
+          }
+
+          chunks.push({ index, data: new Uint8Array(msg.data) });
+        }
+
+        const nextCursor = hasMore ? encodeCursor(startIndex + chunks.length) : null;
+
+        return {
+          data: chunks,
+          cursor: nextCursor,
+          hasMore,
+          done,
+        };
+      },
+
+      async get(
+        _runId: string,
+        name: string,
+        startIndex?: number,
+      ): Promise<ReadableStream<Uint8Array>> {
+        await ensureStream(name);
+
+        const streamName = streamNameFor(name);
+        const consumerName = `${streamName}_reader_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+        // Resolve negative startIndex ("start that many chunks before the
+        // current end") against the tail before creating the consumer.
+        let resolvedStartIndex = startIndex ?? 0;
+        if (resolvedStartIndex < 0) {
+          const { dataCount } = await getTailState(name);
+          resolvedStartIndex = Math.max(0, dataCount + resolvedStartIndex);
+        }
+
+        let messages: ConsumerMessages | null = null;
+
+        return new ReadableStream<Uint8Array>({
+          async start(controller) {
+            try {
+              const jetstream = await getJetStream();
+              const jsm = await jetstream.jetstreamManager();
+
+              // Create ephemeral consumer for this reader. Chunk index i is
+              // stream sequence i + 1, so starting at resolvedStartIndex means
+              // opt_start_seq = resolvedStartIndex + 1 — this is the single
+              // skip mechanism (no additional client-side skipping).
+              const consumerInfo = await jsm.consumers.add(streamName, {
+                name: consumerName,
+                ack_policy: AckPolicy.Explicit,
+                deliver_policy:
+                  resolvedStartIndex > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
+                opt_start_seq: resolvedStartIndex > 0 ? resolvedStartIndex + 1 : undefined,
+                filter_subject: `${streamName}.data`,
+                inactive_threshold: 30 * 1_000_000_000, // 30 seconds
+              });
+
+              // Get the consumer via JetStreamClient.consumers API
+              const consumer = await jetstream.consumers.get(streamName, consumerInfo.name);
+              const iter = await consumer.consume();
+              messages = iter;
+
+              for await (const msg of iter) {
+                // Check for EOF marker
+                const isEof = msg.headers?.get('X-EOF') === 'true';
+
+                if (isEof) {
+                  msg.ack();
+                  controller.close();
+                  iter.close();
+                  break;
+                }
+
+                // Enqueue the chunk
+                if (msg.data.byteLength > 0) {
+                  controller.enqueue(new Uint8Array(msg.data));
+                }
+
+                msg.ack();
+              }
+
+              // Clean up consumer
+              try {
+                await jsm.consumers.delete(streamName, consumerName);
+              } catch {
+                // Ignore cleanup errors
+              }
+            } catch (error) {
+              controller.error(error);
+            }
+          },
+          async cancel() {
+            // Stop the consume loop; the start() epilogue deletes the consumer.
+            messages?.close();
+          },
+        });
+      },
     },
   };
 }

@@ -53,17 +53,7 @@ async function readClosedFlag(redis: Redis, closedKey: string): Promise<boolean>
   return value != null && String(value) === '1';
 }
 
-/**
- * The Streamer contract, plus the Upstash-specific `runId` parameter on
- * `readFromStream` (chunk lists are keyed by run, so polling requires it).
- */
-export interface UpstashStreamer extends Omit<Streamer, 'readFromStream'> {
-  readFromStream(
-    name: string,
-    startIndex?: number,
-    runId?: string,
-  ): Promise<ReadableStream<Uint8Array>>;
-}
+export type UpstashStreamer = Streamer;
 
 /**
  * Create a streamer for Upstash world using Redis as storage.
@@ -85,143 +75,144 @@ export function createStreamer(config: UpstashStreamerConfig): UpstashStreamer {
 
   return {
     streamFlushIntervalMs: 10,
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array): Promise<void> {
+        const key = streamChunksKey(name, runId);
+        await redis.rpush(key, encodeChunk(chunk));
 
-    async writeToStream(name: string, runId: string, chunk: string | Uint8Array): Promise<void> {
-      const key = streamChunksKey(name, runId);
-      await redis.rpush(key, encodeChunk(chunk));
+        // Track stream name for this run
+        await redis.sadd(streamsByRunKey(runId), name);
+      },
 
-      // Track stream name for this run
-      await redis.sadd(streamsByRunKey(runId), name);
-    },
+      async close(runId: string, name: string): Promise<void> {
+        const key = streamClosedKey(name, runId);
+        await redis.set(key, '1');
+      },
 
-    async closeStream(name: string, runId: string): Promise<void> {
-      const key = streamClosedKey(name, runId);
-      await redis.set(key, '1');
-    },
+      async get(
+        runId: string,
+        name: string,
+        startIndex?: number,
+      ): Promise<ReadableStream<Uint8Array>> {
+        // Enhancement 7: Polling-based ReadableStream implementation.
+        // Upstash Redis HTTP API does not support SUBSCRIBE or BLPOP, so we poll
+        // at a configurable interval until the stream is closed.
+        //
+        // If no runId is provided, fall back to an empty stream (cannot poll without it).
+        if (!runId) {
+          debug('streams.get called without runId; returning empty stream');
+          return new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.close();
+            },
+          });
+        }
 
-    async readFromStream(
-      name: string,
-      startIndex?: number,
-      runId?: string,
-    ): Promise<ReadableStream<Uint8Array>> {
-      // Enhancement 7: Polling-based ReadableStream implementation.
-      // Upstash Redis HTTP API does not support SUBSCRIBE or BLPOP, so we poll
-      // at a configurable interval until the stream is closed.
-      //
-      // If no runId is provided, fall back to an empty stream (cannot poll without it).
-      if (!runId) {
-        debug('readFromStream called without runId; returning empty stream');
+        const chunksKey = streamChunksKey(name, runId);
+        const closedKey = streamClosedKey(name, runId);
+        const pollInterval = defaultPollIntervalMs;
+
+        // Resolve a negative startIndex relative to the current end of the
+        // stream (interface contract: -3 on a 10-chunk stream starts at 7,
+        // clamped to 0). LRANGE would otherwise interpret negative indices
+        // end-relative per chunk fetch, duplicating/skipping chunks as the
+        // index is incremented.
+        let currentIndex: number;
+        if (startIndex !== undefined && startIndex < 0) {
+          const length = await redis.llen(chunksKey);
+          currentIndex = Math.max(0, length + startIndex);
+        } else {
+          currentIndex = startIndex ?? 0;
+        }
+
         return new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.close();
+          async pull(controller) {
+            // Poll until we get new data or the stream is closed
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+              try {
+                const rawChunks = await redis.lrange<string>(
+                  chunksKey,
+                  currentIndex,
+                  currentIndex + 99,
+                );
+
+                if (rawChunks.length > 0) {
+                  for (const chunk of rawChunks) {
+                    controller.enqueue(decodeChunk(chunk));
+                    currentIndex++;
+                  }
+                  // Yield control after enqueuing a batch
+                  return;
+                }
+
+                // No new data -- check if stream is closed
+                if (await readClosedFlag(redis, closedKey)) {
+                  controller.close();
+                  return;
+                }
+
+                // Wait before next poll
+                await sleep(pollInterval);
+              } catch (err) {
+                debug('readFromStream poll error:', err);
+                controller.error(err);
+                return;
+              }
+            }
           },
         });
-      }
+      },
 
-      const chunksKey = streamChunksKey(name, runId);
-      const closedKey = streamClosedKey(name, runId);
-      const pollInterval = defaultPollIntervalMs;
+      async list(runId: string): Promise<string[]> {
+        const streams = await redis.smembers<string[]>(streamsByRunKey(runId));
+        return streams || [];
+      },
 
-      // Resolve a negative startIndex relative to the current end of the
-      // stream (interface contract: -3 on a 10-chunk stream starts at 7,
-      // clamped to 0). LRANGE would otherwise interpret negative indices
-      // end-relative per chunk fetch, duplicating/skipping chunks as the
-      // index is incremented.
-      let currentIndex: number;
-      if (startIndex !== undefined && startIndex < 0) {
+      async getChunks(
+        runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        const limit = Math.min(options?.limit ?? 100, 1000);
+        const fromIndex = options?.cursor ? Number.parseInt(options.cursor, 10) : 0;
+
+        const chunksKey = streamChunksKey(name, runId);
+        const closedKey = streamClosedKey(name, runId);
+
+        const rawChunks = await redis.lrange<string>(chunksKey, fromIndex, fromIndex + limit - 1);
+        const isClosed = await readClosedFlag(redis, closedKey);
+        const totalLength = await redis.llen(chunksKey);
+
+        // Decode base64 back to Uint8Array and create StreamChunk objects
+        const data = (rawChunks || []).map((chunk: string, offset: number) => ({
+          index: fromIndex + offset,
+          data: decodeChunk(chunk),
+        }));
+
+        const hasMore = fromIndex + rawChunks.length < totalLength;
+        const nextCursor = hasMore ? String(fromIndex + rawChunks.length) : null;
+
+        return {
+          data,
+          cursor: nextCursor,
+          hasMore,
+          done: isClosed && !hasMore,
+        };
+      },
+
+      async getInfo(runId: string, name: string): Promise<StreamInfoResponse> {
+        const chunksKey = streamChunksKey(name, runId);
+        const closedKey = streamClosedKey(name, runId);
+
         const length = await redis.llen(chunksKey);
-        currentIndex = Math.max(0, length + startIndex);
-      } else {
-        currentIndex = startIndex ?? 0;
-      }
+        const isClosed = await readClosedFlag(redis, closedKey);
 
-      return new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          // Poll until we get new data or the stream is closed
-          // eslint-disable-next-line no-constant-condition
-          while (true) {
-            try {
-              const rawChunks = await redis.lrange<string>(
-                chunksKey,
-                currentIndex,
-                currentIndex + 99,
-              );
-
-              if (rawChunks.length > 0) {
-                for (const chunk of rawChunks) {
-                  controller.enqueue(decodeChunk(chunk));
-                  currentIndex++;
-                }
-                // Yield control after enqueuing a batch
-                return;
-              }
-
-              // No new data -- check if stream is closed
-              if (await readClosedFlag(redis, closedKey)) {
-                controller.close();
-                return;
-              }
-
-              // Wait before next poll
-              await sleep(pollInterval);
-            } catch (err) {
-              debug('readFromStream poll error:', err);
-              controller.error(err);
-              return;
-            }
-          }
-        },
-      });
-    },
-
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      const streams = await redis.smembers<string[]>(streamsByRunKey(runId));
-      return streams || [];
-    },
-
-    async getStreamChunks(
-      name: string,
-      runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      const limit = Math.min(options?.limit ?? 100, 1000);
-      const fromIndex = options?.cursor ? Number.parseInt(options.cursor, 10) : 0;
-
-      const chunksKey = streamChunksKey(name, runId);
-      const closedKey = streamClosedKey(name, runId);
-
-      const rawChunks = await redis.lrange<string>(chunksKey, fromIndex, fromIndex + limit - 1);
-      const isClosed = await readClosedFlag(redis, closedKey);
-      const totalLength = await redis.llen(chunksKey);
-
-      // Decode base64 back to Uint8Array and create StreamChunk objects
-      const data = (rawChunks || []).map((chunk: string, offset: number) => ({
-        index: fromIndex + offset,
-        data: decodeChunk(chunk),
-      }));
-
-      const hasMore = fromIndex + rawChunks.length < totalLength;
-      const nextCursor = hasMore ? String(fromIndex + rawChunks.length) : null;
-
-      return {
-        data,
-        cursor: nextCursor,
-        hasMore,
-        done: isClosed && !hasMore,
-      };
-    },
-
-    async getStreamInfo(name: string, runId: string): Promise<StreamInfoResponse> {
-      const chunksKey = streamChunksKey(name, runId);
-      const closedKey = streamClosedKey(name, runId);
-
-      const length = await redis.llen(chunksKey);
-      const isClosed = await readClosedFlag(redis, closedKey);
-
-      return {
-        tailIndex: Math.max(0, length - 1),
-        done: isClosed,
-      };
+        return {
+          tailIndex: Math.max(0, length - 1),
+          done: isClosed,
+        };
+      },
     },
   };
 }

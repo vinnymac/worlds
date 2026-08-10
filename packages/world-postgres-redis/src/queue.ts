@@ -1,7 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
-  parseQueueName,
   type Queue,
   type QueueKind,
   QueuePayloadSchema,
@@ -24,10 +23,8 @@ interface MessageEnvelope {
   message: unknown;
 }
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+/** v5 has a single queue kind; flow is the only pathname. */
+const QUEUE_PATHNAME = 'flow';
 
 /** How long an enqueue-dedup key survives if never explicitly released. */
 const DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -121,11 +118,8 @@ export function createQueue(
   const visibilityMs = httpTimeoutMs + VISIBILITY_BUFFER_MS;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
-  const queueEntries = Object.entries(Queues) as [QueueKind, string][];
+  const QueueName = `${prefix}flows`;
+  const queueEntries = [['workflow', QueueName]] as [QueueKind, string][];
 
   // Used to fail the run loudly when a message exhausts its delivery attempts.
   const events = createEventsStorage(drizzle);
@@ -171,8 +165,7 @@ export function createQueue(
   });
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
+    const listKey = QueueName;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const idempotencyKey = opts?.idempotencyKey;
     const dedupKey = idempotencyKey ? dedupKeyFor(listKey, idempotencyKey) : null;
@@ -318,7 +311,7 @@ export function createQueue(
         : 'workflowRunId' in message
           ? message.workflowRunId
           : null;
-    if (!runId) return;
+    if (typeof runId !== 'string') return;
     try {
       await events.create(runId, {
         eventType: 'run_failed',
@@ -339,7 +332,6 @@ export function createQueue(
     listKey: string,
     item: string,
     envelope: MessageEnvelope,
-    kind: QueueKind,
   ): Promise<void> {
     const inflightKey = `${listKey}:inflight`;
     const delayedKey = `${listKey}:delayed`;
@@ -364,7 +356,7 @@ export function createQueue(
     };
 
     try {
-      const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
+      const response = await dispatch(envelope, QUEUE_PATHNAME);
 
       if (response.ok) {
         if (envelope.idempotencyKey) {
@@ -421,7 +413,6 @@ export function createQueue(
     listKey: string,
     processingListKey: string,
     item: string,
-    kind: QueueKind,
   ): Promise<void> {
     // Claim the item: record a visibility deadline in the in-flight sorted
     // set, then drop it from the processing landing zone. If this worker
@@ -443,7 +434,7 @@ export function createQueue(
 
     const idempotencyKey = envelope.idempotencyKey;
     if (!idempotencyKey) {
-      await executeItem(workerRedis, listKey, item, envelope, kind);
+      await executeItem(workerRedis, listKey, item, envelope);
       return;
     }
     if (completedMessages.has(idempotencyKey)) {
@@ -462,14 +453,14 @@ export function createQueue(
       }
       return;
     }
-    const execution = executeItem(workerRedis, listKey, item, envelope, kind).finally(() => {
+    const execution = executeItem(workerRedis, listKey, item, envelope).finally(() => {
       inflightMessages.delete(idempotencyKey);
     });
     inflightMessages.set(idempotencyKey, { item, execution });
     await execution;
   }
 
-  async function worker(kind: QueueKind, listKey: string) {
+  async function worker(listKey: string) {
     const workerRedis = redis.duplicate();
     const processingListKey = `${listKey}:processing`;
 
@@ -486,7 +477,7 @@ export function createQueue(
           continue;
         }
         if (!item) continue;
-        await processItem(workerRedis, listKey, processingListKey, item, kind);
+        await processItem(workerRedis, listKey, processingListKey, item);
       }
     } finally {
       await workerRedis.quit().catch(() => {
@@ -524,10 +515,10 @@ export function createQueue(
 
   function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
-    for (const [kind, listKey] of queueEntries) {
+    for (const listKey of queueEntries.map(([, l]) => l)) {
       for (let i = 0; i < concurrency; i++) {
         workerLoops.push(
-          worker(kind, listKey).catch((error) => {
+          worker(listKey).catch((error) => {
             console.error(`[world-postgres-redis] Worker for ${listKey} crashed:`, error);
           }),
         );

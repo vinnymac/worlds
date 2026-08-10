@@ -1521,17 +1521,17 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       // Handle run_failed event: CAS transition + cleanup hooks/waits
       if (data.eventType === 'run_failed') {
         const eventData = data.eventData;
+        const err = eventData.error;
         const errorMessage =
-          typeof eventData.error === 'string'
-            ? eventData.error
-            : (eventData.error?.message ?? 'Unknown error');
+          typeof err === 'string'
+            ? err
+            : ((err as { message?: string })?.message ?? 'Unknown error');
 
         run = await applyTerminalRunTransition(effectiveRunId, 'run_failed', 'failed', now, () => ({
           output: undefined,
           error: {
             message: errorMessage,
-            stack: typeof eventData.error === 'string' ? undefined : eventData.error?.stack,
-            code: eventData.errorCode,
+            stack: typeof err === 'string' ? undefined : (err as { stack?: string })?.stack,
           },
         }));
       }
@@ -1585,16 +1585,17 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       // Handle step_failed event: terminal state with error
       if (data.eventType === 'step_failed' && data.correlationId) {
         const eventData = data.eventData;
+        const err = eventData.error;
         const errorMessage =
-          typeof eventData.error === 'string'
-            ? eventData.error
-            : (eventData.error?.message ?? 'Unknown error');
+          typeof err === 'string'
+            ? err
+            : ((err as { message?: string })?.message ?? 'Unknown error');
 
         step = await applyStepUpdate(effectiveRunId, data.correlationId, now, () => ({
           status: 'failed' as const,
           error: {
             message: errorMessage,
-            stack: eventData.stack,
+            stack: typeof err === 'string' ? undefined : (err as { stack?: string })?.stack,
           },
           completedAt: now,
         }));
@@ -1603,16 +1604,17 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       // Handle step_retrying event: sets status back to 'pending', records error
       if (data.eventType === 'step_retrying' && data.correlationId) {
         const eventData = data.eventData;
+        const err = eventData.error;
         const errorMessage =
-          typeof eventData.error === 'string'
-            ? eventData.error
-            : (eventData.error?.message ?? 'Unknown error');
+          typeof err === 'string'
+            ? err
+            : ((err as { message?: string })?.message ?? 'Unknown error');
 
         step = await applyStepUpdate(effectiveRunId, data.correlationId, now, () => ({
           status: 'pending' as const,
           error: {
             message: errorMessage,
-            stack: eventData.stack,
+            stack: typeof err === 'string' ? undefined : (err as { stack?: string })?.stack,
           },
           retryAfter: eventData.retryAfter,
         }));

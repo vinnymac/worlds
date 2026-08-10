@@ -1,9 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
-  parseQueueName,
   type Queue,
-  type QueueKind,
   type QueueOptions,
   type QueuePayload,
   type ValidQueueName,
@@ -18,10 +16,8 @@ import { debug } from './util.js';
 
 type Drizzle = MySql2Database<typeof schema>;
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+/** v5 has a single queue kind; flow is the only pathname. */
+const QUEUE_PATHNAME = 'flow';
 
 export interface MysqlQueueConfig {
   /** Poll interval in milliseconds (default: 100) */
@@ -385,10 +381,7 @@ export function createQueue(
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   const prefix = 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const QueueName = `${prefix}flows`;
 
   let running = false;
 
@@ -399,8 +392,7 @@ export function createQueue(
     message: QueuePayload,
     opts?: QueueOptions,
   ) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
+    const listKey = QueueName;
 
     const envelope: JobEnvelope = { queueName, message };
 
@@ -465,16 +457,11 @@ export function createQueue(
     });
   }
 
-  async function processJob(job: RawJobRow, listKey: string, kind: QueueKind): Promise<void> {
+  async function processJob(job: RawJobRow, listKey: string): Promise<void> {
     const startTime = Date.now();
     try {
       const envelope = decode(job.payload) as JobEnvelope;
-      const response = await dispatch(
-        envelope,
-        job.job_id,
-        job.attempt ?? 1,
-        QUEUE_PATHNAMES[kind],
-      );
+      const response = await dispatch(envelope, job.job_id, job.attempt ?? 1, QUEUE_PATHNAME);
 
       if (response.ok) {
         await completeJob(db, job);
@@ -524,14 +511,14 @@ export function createQueue(
     }
   }
 
-  async function worker(kind: QueueKind, listKey: string, workerIdx: number) {
-    const wId = `${workerId}_${kind}_${workerIdx}`;
+  async function worker(listKey: string, workerIdx: number) {
+    const wId = `${workerId}_${workerIdx}`;
 
     while (running) {
       try {
         const job = await fetchJob(db, listKey, wId);
         if (job) {
-          await processJob(job, listKey, kind);
+          await processJob(job, listKey);
         } else {
           await delay(pollIntervalMs);
         }
@@ -543,13 +530,10 @@ export function createQueue(
   }
 
   function startWorkers() {
-    const entries = Object.entries(Queues) as [QueueKind, string][];
-    for (const [kind, listKey] of entries) {
-      for (let i = 0; i < concurrency; i++) {
-        worker(kind, listKey, i).catch((error) => {
-          console.error(`[world-mysql] Worker for ${listKey} crashed:`, error);
-        });
-      }
+    for (let i = 0; i < concurrency; i++) {
+      worker(QueueName, i).catch((error) => {
+        console.error(`[world-mysql] Worker for ${QueueName} crashed:`, error);
+      });
     }
   }
 

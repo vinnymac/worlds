@@ -561,15 +561,15 @@ describe('Real Cloudflare Durable Objects', () => {
     });
 
     it('should write and read a stream end-to-end', async () => {
-      await streamer.writeToStream(streamName, streamRunId, 'Hello, ');
-      await streamer.writeToStream(
-        streamName,
+      await streamer.streams.write(streamRunId, streamName, 'Hello, ');
+      await streamer.streams.write(
         streamRunId,
+        streamName,
         new Uint8Array([119, 111, 114, 108, 100]),
       );
-      await streamer.closeStream(streamName, streamRunId);
+      await streamer.streams.close(streamRunId, streamName);
 
-      const stream = await streamer.readFromStream(streamName);
+      const stream = await streamer.streams.get(streamRunId, streamName);
       const reader = stream.getReader();
       const chunks: Uint8Array[] = [];
       for (;;) {
@@ -584,30 +584,30 @@ describe('Real Cloudflare Durable Objects', () => {
     });
 
     it('should expose stream info and reject writes after close', async () => {
-      let info = await streamer.getStreamInfo(streamName, streamRunId);
+      let info = await streamer.streams.getInfo(streamRunId, streamName);
       expect(info).toEqual({ tailIndex: -1, done: false });
 
-      await streamer.writeToStream(streamName, streamRunId, 'data');
-      await streamer.closeStream(streamName, streamRunId);
+      await streamer.streams.write(streamRunId, streamName, 'data');
+      await streamer.streams.close(streamRunId, streamName);
 
-      info = await streamer.getStreamInfo(streamName, streamRunId);
+      info = await streamer.streams.getInfo(streamRunId, streamName);
       expect(info).toEqual({ tailIndex: 0, done: true });
 
-      await expect(streamer.writeToStream(streamName, streamRunId, 'late')).rejects.toThrow();
+      await expect(streamer.streams.write(streamRunId, streamName, 'late')).rejects.toThrow();
     });
 
     it('should paginate stored chunks via getStreamChunks', async () => {
       for (let i = 0; i < 5; i++) {
-        await streamer.writeToStream(streamName, streamRunId, `chunk-${i}`);
+        await streamer.streams.write(streamRunId, streamName, `chunk-${i}`);
       }
-      await streamer.closeStream(streamName, streamRunId);
+      await streamer.streams.close(streamRunId, streamName);
 
-      const page1 = await streamer.getStreamChunks(streamName, streamRunId, { limit: 3 });
+      const page1 = await streamer.streams.getChunks(streamRunId, streamName, { limit: 3 });
       expect(page1.data.map((c) => c.index)).toEqual([0, 1, 2]);
       expect(page1.hasMore).toBe(true);
       expect(page1.done).toBe(true);
 
-      const page2 = await streamer.getStreamChunks(streamName, streamRunId, {
+      const page2 = await streamer.streams.getChunks(streamRunId, streamName, {
         limit: 3,
         cursor: page1.cursor ?? undefined,
       });
@@ -617,13 +617,13 @@ describe('Real Cloudflare Durable Objects', () => {
     });
 
     it('should list streams by run id', async () => {
-      await streamer.writeToStream(`${streamName}-a`, streamRunId, 'a');
-      await streamer.writeToStream(`${streamName}-b`, streamRunId, 'b');
+      await streamer.streams.write(streamRunId, `${streamName}-a`, 'a');
+      await streamer.streams.write(streamRunId, `${streamName}-b`, 'b');
 
-      const streams = await streamer.listStreamsByRunId(streamRunId);
+      const streams = await streamer.streams.list(streamRunId);
       expect(streams.sort()).toEqual([`${streamName}-a`, `${streamName}-b`]);
 
-      const empty = await streamer.listStreamsByRunId(`wrun_${crypto.randomUUID()}`);
+      const empty = await streamer.streams.list(`wrun_${crypto.randomUUID()}`);
       expect(empty).toEqual([]);
     });
   });

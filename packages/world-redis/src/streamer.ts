@@ -204,224 +204,224 @@ export function createStreamer(config: StreamerConfig): Streamer & {
   return {
     getStreamStats,
     closeStreamer,
-    async writeToStream(
-      name: string,
-      _runId: string | Promise<string>,
-      chunk: string | Uint8Array,
-    ): Promise<void> {
-      // Await runId if it's a promise to ensure proper flushing
-      const runId = await _runId;
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array): Promise<void> {
+        const data = !Buffer.isBuffer(chunk) ? Buffer.from(chunk) : chunk;
 
-      const data = !Buffer.isBuffer(chunk) ? Buffer.from(chunk) : chunk;
+        // Add chunk to Redis Stream with auto-generated ID
+        const entryId = (await redis.xadd(
+          streamKey(name),
+          '*',
+          'data',
+          data.toString('base64'),
+          'eof',
+          'false',
+        ))!;
 
-      // Add chunk to Redis Stream with auto-generated ID
-      const entryId = (await redis.xadd(
-        streamKey(name),
-        '*',
-        'data',
-        data.toString('base64'),
-        'eof',
-        'false',
-      ))!;
+        // Register this stream under its run so listStreamsByRunId can find it.
+        // SADD is idempotent, so repeating it per chunk is safe.
+        await redis.sadd(streamsByRunKey(runId), name);
 
-      // Register this stream under its run so listStreamsByRunId can find it.
-      // SADD is idempotent, so repeating it per chunk is safe.
-      await redis.sadd(streamsByRunKey(runId), name);
+        // CRITICAL: Wait for subscription to be ready before publishing
+        // Otherwise the message might be published before anyone is subscribed
+        await subscriptionReady;
 
-      // CRITICAL: Wait for subscription to be ready before publishing
-      // Otherwise the message might be published before anyone is subscribed
-      await subscriptionReady;
+        // Notify subscribers with the auto-generated entry ID
+        await redis.publish(
+          STREAM_CHANNEL,
+          JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
+        );
+      },
 
-      // Notify subscribers with the auto-generated entry ID
-      await redis.publish(
-        STREAM_CHANNEL,
-        JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
-      );
-    },
+      async close(runId: string, name: string): Promise<void> {
+        // Add final chunk with eof=true, using auto-generated ID
+        const entryId = (await redis.xadd(streamKey(name), '*', 'data', '', 'eof', 'true'))!;
 
-    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
-      // Await runId if it's a promise to ensure proper flushing
-      const runId = await _runId;
+        // Ensure the stream is indexed even if it closes without any data write.
+        await redis.sadd(streamsByRunKey(runId), name);
 
-      // Add final chunk with eof=true, using auto-generated ID
-      const entryId = (await redis.xadd(streamKey(name), '*', 'data', '', 'eof', 'true'))!;
+        // CRITICAL: Wait for subscription to be ready before publishing
+        // Otherwise the message might be published before anyone is subscribed
+        await subscriptionReady;
 
-      // Ensure the stream is indexed even if it closes without any data write.
-      await redis.sadd(streamsByRunKey(runId), name);
+        // Notify subscribers with the auto-generated entry ID
+        await redis.publish(
+          STREAM_CHANNEL,
+          JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
+        );
+      },
 
-      // CRITICAL: Wait for subscription to be ready before publishing
-      // Otherwise the message might be published before anyone is subscribed
-      await subscriptionReady;
+      async get(
+        _runId: string,
+        name: string,
+        startIndex?: number,
+      ): Promise<ReadableStream<Uint8Array>> {
+        const cleanups: (() => void)[] = [];
 
-      // Notify subscribers with the auto-generated entry ID
-      await redis.publish(
-        STREAM_CHANNEL,
-        JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
-      );
-    },
+        return new ReadableStream<Uint8Array>({
+          async start(controller) {
+            // Track last entry ID for ordering
+            let lastEntryId = '';
+            let offset = startIndex ?? 0;
+            let buffer = [] as StreamChunkEvent[] | null;
 
-    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
-      const cleanups: (() => void)[] = [];
+            const shouldSkipChunk = (entryId: string): boolean => {
+              if (lastEntryId === '') return false;
+              return compareStreamIds(lastEntryId, entryId) >= 0;
+            };
 
-      return new ReadableStream<Uint8Array>({
-        async start(controller) {
-          // Track last entry ID for ordering
-          let lastEntryId = '';
-          let offset = startIndex ?? 0;
-          let buffer = [] as StreamChunkEvent[] | null;
+            const shouldApplyOffset = (): boolean => {
+              if (offset > 0) {
+                offset--;
+                return true;
+              }
+              return false;
+            };
 
-          const shouldSkipChunk = (entryId: string): boolean => {
-            if (lastEntryId === '') return false;
-            return compareStreamIds(lastEntryId, entryId) >= 0;
-          };
+            const enqueueChunkData = (msg: {
+              id: string;
+              data: Uint8Array;
+              eof: boolean;
+            }): void => {
+              if (msg.data.byteLength) {
+                controller.enqueue(new Uint8Array(msg.data));
+              }
+              if (msg.eof) {
+                controller.close();
+              }
+              lastEntryId = msg.id;
+            };
 
-          const shouldApplyOffset = (): boolean => {
-            if (offset > 0) {
-              offset--;
-              return true;
+            function enqueue(msg: { id: string; data: Uint8Array; eof: boolean }) {
+              if (shouldSkipChunk(msg.id)) return;
+              if (shouldApplyOffset()) return;
+              enqueueChunkData(msg);
             }
-            return false;
-          };
 
-          const enqueueChunkData = (msg: { id: string; data: Uint8Array; eof: boolean }): void => {
-            if (msg.data.byteLength) {
-              controller.enqueue(new Uint8Array(msg.data));
+            function onData(data: StreamChunkEvent) {
+              if (buffer) {
+                buffer.push(data);
+                return;
+              }
+              enqueue(data);
             }
-            if (msg.eof) {
-              controller.close();
-            }
-            lastEntryId = msg.id;
-          };
 
-          function enqueue(msg: { id: string; data: Uint8Array; eof: boolean }) {
-            if (shouldSkipChunk(msg.id)) return;
-            if (shouldApplyOffset()) return;
-            enqueueChunkData(msg);
-          }
-
-          function onData(data: StreamChunkEvent) {
-            if (buffer) {
-              buffer.push(data);
-              return;
-            }
-            enqueue(data);
-          }
-
-          events.on(`strm:${name}`, onData);
-          cleanups.push(() => {
-            events.off(`strm:${name}`, onData);
-          });
-
-          // Read all historical chunks from Redis Stream
-          // XRANGE reads entries from start to end
-          const chunks = await redis.xrange(streamKey(name), '-', '+');
-
-          const parsedChunks: StreamChunkEvent[] = [];
-          for (const [id, fields] of chunks) {
-            const data = Buffer.from(fields[1] as string, 'base64');
-            const eof = fields[3] === 'true';
-            parsedChunks.push({
-              id,
-              data,
-              eof,
+            events.on(`strm:${name}`, onData);
+            cleanups.push(() => {
+              events.off(`strm:${name}`, onData);
             });
-          }
 
-          // Process historical chunks and buffered real-time chunks
-          for (const chunk of [...parsedChunks, ...(buffer ?? [])]) {
-            enqueue(chunk);
-          }
+            // Read all historical chunks from Redis Stream
+            // XRANGE reads entries from start to end
+            const chunks = await redis.xrange(streamKey(name), '-', '+');
 
-          // From now on, process chunks in real-time
-          buffer = null;
-        },
-        cancel() {
-          cleanups.forEach((fn) => void fn());
-        },
-      });
-    },
+            const parsedChunks: StreamChunkEvent[] = [];
+            for (const [id, fields] of chunks) {
+              const data = Buffer.from(fields[1] as string, 'base64');
+              const eof = fields[3] === 'true';
+              parsedChunks.push({
+                id,
+                data,
+                eof,
+              });
+            }
 
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      return (await redis.smembers(streamsByRunKey(runId))) ?? [];
-    },
+            // Process historical chunks and buffered real-time chunks
+            for (const chunk of [...parsedChunks, ...(buffer ?? [])]) {
+              enqueue(chunk);
+            }
 
-    async getStreamChunks(
-      name: string,
-      _runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      const limit = Math.min(options?.limit ?? 100, 1000);
-
-      // Cursor carries the running 0-based data-chunk index plus the last
-      // returned entry ID, letting us resume with a bounded XRANGE instead of
-      // rescanning the whole stream on every page.
-      let dataIndex = 0;
-      let start = '-';
-      if (options?.cursor) {
-        try {
-          const decoded = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf-8')) as {
-            i?: number;
-            id?: string;
-          };
-          if (typeof decoded.i === 'number') dataIndex = decoded.i;
-          // '(' makes the range start exclusive of the last returned entry.
-          if (typeof decoded.id === 'string') start = `(${decoded.id}`;
-        } catch {
-          // Malformed cursor -> restart from the beginning of the stream.
-          dataIndex = 0;
-          start = '-';
-        }
-      }
-
-      // Fetch one extra entry to detect whether more data pages follow.
-      const entries = await redis.xrange(streamKey(name), start, '+', 'COUNT', limit + 1);
-
-      const data: StreamChunk[] = [];
-      let done = false;
-      let hasMore = false;
-      let lastId: string | null = null;
-
-      for (const [id, fields] of entries) {
-        if (fields[3] === 'true') {
-          // The eof marker is always the terminal entry, so reaching it means
-          // the stream is complete and no further data pages exist.
-          done = true;
-          break;
-        }
-        if (data.length >= limit) {
-          // A data entry beyond the requested page: more pages remain.
-          hasMore = true;
-          break;
-        }
-        data.push({
-          index: dataIndex,
-          data: new Uint8Array(Buffer.from(fields[1] as string, 'base64')),
+            // From now on, process chunks in real-time
+            buffer = null;
+          },
+          cancel() {
+            cleanups.forEach((fn) => void fn());
+          },
         });
-        dataIndex++;
-        lastId = id;
-      }
+      },
 
-      const cursor =
-        hasMore && lastId
-          ? Buffer.from(JSON.stringify({ i: dataIndex, id: lastId })).toString('base64')
-          : null;
+      async list(runId: string): Promise<string[]> {
+        return (await redis.smembers(streamsByRunKey(runId))) ?? [];
+      },
 
-      return { data, cursor, hasMore, done };
-    },
+      async getChunks(
+        _runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        const limit = Math.min(options?.limit ?? 100, 1000);
 
-    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      const key = streamKey(name);
-      const [length, tail] = await Promise.all([
-        redis.xlen(key),
-        redis.xrevrange(key, '+', '-', 'COUNT', 1),
-      ]);
-      // The eof marker is always the final entry (closeStream is the terminal
-      // XADD, and auto-generated IDs are monotonic), so the last entry alone
-      // tells us whether the stream is done. Data chunks are the non-eof
-      // entries; an empty stream yields tailIndex -1.
-      const done = tail.length > 0 && tail[0][1][3] === 'true';
-      const dataCount = length - (done ? 1 : 0);
-      return { tailIndex: dataCount - 1, done };
+        // Cursor carries the running 0-based data-chunk index plus the last
+        // returned entry ID, letting us resume with a bounded XRANGE instead of
+        // rescanning the whole stream on every page.
+        let dataIndex = 0;
+        let start = '-';
+        if (options?.cursor) {
+          try {
+            const decoded = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf-8')) as {
+              i?: number;
+              id?: string;
+            };
+            if (typeof decoded.i === 'number') dataIndex = decoded.i;
+            // '(' makes the range start exclusive of the last returned entry.
+            if (typeof decoded.id === 'string') start = `(${decoded.id}`;
+          } catch {
+            // Malformed cursor -> restart from the beginning of the stream.
+            dataIndex = 0;
+            start = '-';
+          }
+        }
+
+        // Fetch one extra entry to detect whether more data pages follow.
+        const entries = await redis.xrange(streamKey(name), start, '+', 'COUNT', limit + 1);
+
+        const data: StreamChunk[] = [];
+        let done = false;
+        let hasMore = false;
+        let lastId: string | null = null;
+
+        for (const [id, fields] of entries) {
+          if (fields[3] === 'true') {
+            // The eof marker is always the terminal entry, so reaching it means
+            // the stream is complete and no further data pages exist.
+            done = true;
+            break;
+          }
+          if (data.length >= limit) {
+            // A data entry beyond the requested page: more pages remain.
+            hasMore = true;
+            break;
+          }
+          data.push({
+            index: dataIndex,
+            data: new Uint8Array(Buffer.from(fields[1] as string, 'base64')),
+          });
+          dataIndex++;
+          lastId = id;
+        }
+
+        const cursor =
+          hasMore && lastId
+            ? Buffer.from(JSON.stringify({ i: dataIndex, id: lastId })).toString('base64')
+            : null;
+
+        return { data, cursor, hasMore, done };
+      },
+
+      async getInfo(_runId: string, name: string): Promise<StreamInfoResponse> {
+        const key = streamKey(name);
+        const [length, tail] = await Promise.all([
+          redis.xlen(key),
+          redis.xrevrange(key, '+', '-', 'COUNT', 1),
+        ]);
+        // The eof marker is always the final entry (closeStream is the terminal
+        // XADD, and auto-generated IDs are monotonic), so the last entry alone
+        // tells us whether the stream is done. Data chunks are the non-eof
+        // entries; an empty stream yields tailIndex -1.
+        const done = tail.length > 0 && tail[0][1][3] === 'true';
+        const dataCount = length - (done ? 1 : 0);
+        return { tailIndex: dataCount - 1, done };
+      },
     },
   };
 }

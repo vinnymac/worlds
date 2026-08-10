@@ -7,10 +7,10 @@ catalog:
   '@testcontainers/postgresql': ^11.8.1
   '@testcontainers/redis': ^11.8.1
   '@types/node': ^22.19.0
-  '@workflow/core': 4.6.0
-  '@workflow/errors': 4.1.4
-  '@workflow/world': 4.2.1
-  '@workflow/world-testing': 4.1.11
+  '@workflow/core': 5.0.0-beta.40
+  '@workflow/errors': 5.0.0-beta.16
+  '@workflow/world': 5.0.0-beta.25
+  '@workflow/world-testing': 5.0.0-beta.40
   cbor-x: ^1.6.0
   dotenv: ^17.2.3
   drizzle-kit: ^0.31.7

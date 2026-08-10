@@ -3,7 +3,6 @@ import {
   MessageId,
   parseQueueName,
   type Queue,
-  type QueueKind,
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
@@ -62,10 +61,8 @@ const MAX_DELIVER = 64;
 /** Redelivery delay for failed dispatches (matches world-local's 5s linear backoff). */
 const NAK_DELAY_MS = 5_000;
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+/** v5 has a single queue kind; flow is the only pathname. */
+const QUEUE_PATHNAME = 'flow';
 
 function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -94,10 +91,7 @@ export function createQueue(
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Streams = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const StreamName = `${prefix}flows`;
 
   const dedupWindowMs = config.dedupWindowMs ?? DEFAULT_DEDUP_WINDOW_MS;
   // JetStream takes nanoseconds for its time fields.
@@ -119,7 +113,8 @@ export function createQueue(
     const jetstream = await getJetStream();
     const jsm = await jetstream.jetstreamManager();
 
-    for (const streamName of Object.values(Streams)) {
+    {
+      const streamName = StreamName;
       try {
         await jsm.streams.add({
           name: streamName,
@@ -144,9 +139,8 @@ export function createQueue(
   const queue: Queue['queue'] = async (queueName, message, opts) => {
     await initStreams();
 
-    const { kind, id } = parseQueueName(queueName);
-    const streamName = Streams[kind];
-    const subject = `${streamName}.${id}`;
+    const { id } = parseQueueName(queueName);
+    const subject = `${StreamName}.${id}`;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
 
@@ -217,7 +211,7 @@ export function createQueue(
     });
   }
 
-  async function worker(kind: QueueKind, streamName: string) {
+  async function worker(streamName: string) {
     try {
       const jetstream = await getJetStream();
       const jsm = await jetstream.jetstreamManager();
@@ -249,7 +243,7 @@ export function createQueue(
       const messages = await consumer.consume();
 
       health.consecutiveFailures = 0;
-      const pathname = QUEUE_PATHNAMES[kind];
+      const pathname = QUEUE_PATHNAME;
 
       for await (const msg of messages) {
         let envelope: MessageEnvelope;
@@ -335,7 +329,7 @@ export function createQueue(
       console.error(`[world-nats-jetstream worker] Error in worker for ${streamName}:`, error);
 
       await delay(backoff);
-      void worker(kind, streamName);
+      void worker(streamName);
     }
   }
 
@@ -343,12 +337,8 @@ export function createQueue(
     await initStreams();
 
     const concurrency = config.queueConcurrency || 10;
-    const entries = Object.entries(Streams) as [QueueKind, string][];
-
-    for (const [kind, streamName] of entries) {
-      for (let i = 0; i < concurrency; i++) {
-        void worker(kind, streamName);
-      }
+    for (let i = 0; i < concurrency; i++) {
+      void worker(StreamName);
     }
   }
 
