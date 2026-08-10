@@ -3,7 +3,6 @@ import {
   MessageId,
   parseQueueName,
   type Queue as QueueInterface,
-  type QueueKind,
   type ValidQueueName,
 } from '@workflow/world';
 import { DelayedError, type Job, Queue, Worker } from 'bullmq';
@@ -28,10 +27,8 @@ export interface QueueStats {
   delayed: number;
 }
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+/** v5 has a single queue kind; flow is the only pathname. */
+const QUEUE_PATHNAME = 'flow';
 
 interface QueueJobData {
   /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_…`) */
@@ -96,10 +93,7 @@ export function createQueue(
   const generateMessageId = monotonicFactory();
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const QueueName = `${prefix}flows`;
 
   const maxAttempts = config.maxAttempts ?? 5;
   const backoffType = config.backoffType ?? 'exponential';
@@ -120,17 +114,11 @@ export function createQueue(
     maxRetriesPerRequest: null,
   };
 
-  const bullQueues = new Map<QueueKind, Queue<QueueJobData>>();
-  const workers = new Map<QueueKind, Worker<QueueJobData>>();
-
-  for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
-    bullQueues.set(kind, new Queue<QueueJobData>(jobName, { connection: connectionOptions }));
-  }
+  const bullQueue = new Queue<QueueJobData>(QueueName, { connection: connectionOptions });
+  const workers: Worker<QueueJobData>[] = [];
 
   const queue: QueueInterface['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const bullQueue = bullQueues.get(kind);
-    if (!bullQueue) throw new Error(`No BullMQ queue registered for queue kind ${kind}`);
+    void parseQueueName(queueName);
 
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
@@ -167,8 +155,8 @@ export function createQueue(
     return { messageId };
   };
 
-  function createProcessor(kind: QueueKind) {
-    const pathname = QUEUE_PATHNAMES[kind];
+  function createProcessor() {
+    const pathname = QUEUE_PATHNAME;
     return async (job: Job<QueueJobData>, token?: string) => {
       const baseUrl = resolveBaseUrl(config);
       const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
@@ -250,27 +238,25 @@ export function createQueue(
   async function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
 
-    for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
-      const worker = new Worker<QueueJobData>(jobName, createProcessor(kind), {
-        connection: connectionOptions,
-        concurrency,
-        stalledInterval,
-        maxStalledCount,
-        // Low drainDelay reduces idle pickup latency.
-        drainDelay: 300,
-      });
+    const worker = new Worker<QueueJobData>(QueueName, createProcessor(), {
+      connection: connectionOptions,
+      concurrency,
+      stalledInterval,
+      maxStalledCount,
+      // Low drainDelay reduces idle pickup latency.
+      drainDelay: 300,
+    });
 
-      worker.on('failed', (job, err) => {
-        console.error(`Job ${job?.id} failed:`, err);
-      });
-      worker.on('error', (err) => {
-        console.error('Worker error:', err);
-      });
+    worker.on('failed', (job, err) => {
+      console.error(`Job ${job?.id} failed:`, err);
+    });
+    worker.on('error', (err) => {
+      console.error('Worker error:', err);
+    });
 
-      workers.set(kind, worker);
-    }
+    workers.push(worker);
 
-    await Promise.all(Array.from(workers.values()).map((worker) => worker.waitUntilReady()));
+    await Promise.all(workers.map((w) => w.waitUntilReady()));
   }
 
   async function getQueueStats(): Promise<QueueStats> {
@@ -282,20 +268,18 @@ export function createQueue(
       delayed: 0,
     };
 
-    for (const bullQueue of bullQueues.values()) {
-      const counts = await bullQueue.getJobCounts(
-        'waiting',
-        'active',
-        'completed',
-        'failed',
-        'delayed',
-      );
-      totals.waiting += counts.waiting;
-      totals.active += counts.active;
-      totals.completed += counts.completed;
-      totals.failed += counts.failed;
-      totals.delayed += counts.delayed;
-    }
+    const counts = await bullQueue.getJobCounts(
+      'waiting',
+      'active',
+      'completed',
+      'failed',
+      'delayed',
+    );
+    totals.waiting += counts.waiting;
+    totals.active += counts.active;
+    totals.completed += counts.completed;
+    totals.failed += counts.failed;
+    totals.delayed += counts.delayed;
 
     return totals;
   }
@@ -309,10 +293,9 @@ export function createQueue(
       await startWorkers();
     },
     async close() {
-      await Promise.all(Array.from(workers.values()).map((worker) => worker.close()));
-      workers.clear();
-      await Promise.all(Array.from(bullQueues.values()).map((bullQueue) => bullQueue.close()));
-      bullQueues.clear();
+      await Promise.all(workers.map((worker) => worker.close()));
+      workers.length = 0;
+      await bullQueue.close();
     },
   };
 }

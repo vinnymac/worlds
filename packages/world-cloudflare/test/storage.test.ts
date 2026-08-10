@@ -876,7 +876,9 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       const result = await storage.events.create(run.runId, {
         eventType: 'step_failed',
         correlationId: 'step-1',
-        eventData: { error: 'string step failure', stack: 'at somewhere' },
+        eventData: {
+          error: { message: 'string step failure', stack: 'at somewhere' },
+        },
       });
 
       expect(result.step?.error?.message).toBe('string step failure');

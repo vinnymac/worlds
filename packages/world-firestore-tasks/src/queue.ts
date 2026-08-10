@@ -3,13 +3,7 @@ import { parse, stringify } from '@fantasticfour/shared';
 import type { Firestore } from '@google-cloud/firestore';
 import type { CloudTasksClient } from '@google-cloud/tasks';
 import type { Queue } from '@workflow/world';
-import {
-  MessageId,
-  parseQueueName,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, parseQueueName, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
 
@@ -45,12 +39,9 @@ interface PumpEnvelope {
   idempotencyKey?: string;
 }
 
-type Pathname = 'flow' | 'step';
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, Pathname>;
+/** v5 has a single queue kind; flow is the only pathname. */
+type Pathname = 'flow';
+const QUEUE_PATHNAME = 'flow';
 
 /**
  * How long processed-task dedup markers stay relevant. Cloud Tasks only
@@ -97,8 +88,8 @@ function createTestPump(config: CloudTasksConfig) {
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [] };
+  const wakers: Record<Pathname, Array<() => void>> = { flow: [] };
   let running = false;
 
   /**
@@ -227,7 +218,6 @@ function createTestPump(config: CloudTasksConfig) {
       if (running) return;
       running = true;
       void loop('flow');
-      void loop('step');
     },
     stop() {
       running = false;
@@ -369,7 +359,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
   return {
     async queue(name, message, opts) {
       if (isTestMode()) {
-        const { kind } = parseQueueName(name);
+        void parseQueueName(name);
         if (opts?.idempotencyKey) {
           const existing = testPump.getInflight(opts.idempotencyKey);
           if (existing) {
@@ -378,7 +368,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
         }
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         testPump.push(
-          QUEUE_PATHNAMES[kind],
+          QUEUE_PATHNAME,
           {
             messageId,
             queueName: name,

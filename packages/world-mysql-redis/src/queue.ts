@@ -1,12 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-  MessageId,
-  parseQueueName,
-  type Queue,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type Queue, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
@@ -20,10 +13,8 @@ interface MessageEnvelope {
   message: QueuePayload;
 }
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+/** v5 has a single queue kind; flow is the only pathname. */
+const QUEUE_PATHNAME = 'flow';
 
 /** How long an idempotency reservation is held (seconds). */
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
@@ -168,10 +159,7 @@ export function createQueue(
   const leaseMs = httpTimeoutMs + LEASE_GRACE_MS;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const QueueName = `${prefix}flows`;
 
   let stopped = false;
 
@@ -189,8 +177,7 @@ export function createQueue(
     config.deploymentId ?? 'mysql-redis';
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const keys = keysFor(Queues[kind]);
+    const keys = keysFor(QueueName);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
 
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
@@ -322,12 +309,7 @@ export function createQueue(
     await multi.exec();
   }
 
-  async function processItem(
-    workerRedis: Redis,
-    listKey: string,
-    item: string,
-    kind: QueueKind,
-  ): Promise<void> {
+  async function processItem(workerRedis: Redis, listKey: string, item: string): Promise<void> {
     let envelope: MessageEnvelope;
     try {
       envelope = parse<MessageEnvelope>(item);
@@ -351,7 +333,7 @@ export function createQueue(
     };
 
     try {
-      const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
+      const response = await dispatch(envelope, QUEUE_PATHNAME);
 
       if (response.ok) {
         await ack(workerRedis, listKey, item, envelope.idempotencyKey);
@@ -387,7 +369,7 @@ export function createQueue(
     }
   }
 
-  async function worker(kind: QueueKind, listKey: string) {
+  async function worker(listKey: string) {
     const workerRedis = redis.duplicate();
     const keys = keysFor(listKey);
 
@@ -406,7 +388,7 @@ export function createQueue(
         // Lease the item so the reclaimer can requeue it if this process
         // dies mid-dispatch.
         await workerRedis.zadd(keys.leases, Date.now() + leaseMs, item);
-        await processItem(workerRedis, listKey, item, kind);
+        await processItem(workerRedis, listKey, item);
       }
     } finally {
       await workerRedis.quit();
@@ -463,17 +445,15 @@ export function createQueue(
 
   function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
-    const entries = Object.entries(Queues) as [QueueKind, string][];
-    entries.forEach(([kind, listKey]) => {
-      maintenance(listKey).catch((error) => {
-        console.error(`[world-mysql-redis] Maintenance loop for ${listKey} crashed:`, error);
-      });
-      for (let i = 0; i < concurrency; i++) {
-        worker(kind, listKey).catch((error) => {
-          console.error(`[world-mysql-redis] Worker for ${listKey} crashed:`, error);
-        });
-      }
+    const listKey = QueueName;
+    maintenance(listKey).catch((error) => {
+      console.error(`[world-mysql-redis] Maintenance loop for ${listKey} crashed:`, error);
     });
+    for (let i = 0; i < concurrency; i++) {
+      worker(listKey).catch((error) => {
+        console.error(`[world-mysql-redis] Worker for ${listKey} crashed:`, error);
+      });
+    }
   }
 
   return {

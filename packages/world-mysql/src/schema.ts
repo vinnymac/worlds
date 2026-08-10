@@ -63,6 +63,9 @@ export const runs = schema.table(
     inputJson: json('input').$type<SerializedContent>(),
     input: Cbor<SerializedContent>()('input_cbor'),
     error: text('error'),
+    attributes: json('attributes').$type<Record<string, string>>().notNull().default({}),
+    errorCode: varchar('error_code', { length: 255 }),
+    encryptionPublicKey: text('encryption_public_key'),
     createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { fsp: 3 })
       .defaultNow()
@@ -97,6 +100,7 @@ export const events = schema.table(
     eventDataJson: json('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
     specVersion: int('spec_version'),
+    resumeId: varchar('resume_id', { length: 255 }),
   } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
   (tb) => [
     index('idx_workflow_events_run_id').on(tb.runId),
@@ -152,7 +156,15 @@ export const hooks = schema.table(
     metadata: Cbor<SerializedContent>()('metadata_cbor'),
     specVersion: int('spec_version'),
     isWebhook: boolean('is_webhook'),
-  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
+    isSystem: boolean('is_system'),
+    tokenRetentionUntil: timestamp('token_retention_until', { fsp: 3 }),
+    /** @deprecated */
+    resumeContextJson: json('resume_context'),
+    resumeContext: Cbor<unknown>()('resume_context_cbor'),
+    /** @deprecated */
+    resumeCapabilitiesJson: json('resume_capabilities'),
+    resumeCapabilities: Cbor<unknown>()('resume_capabilities_cbor'),
+  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata' | 'resumeContext' | 'resumeCapabilities'>>,
   (tb) => [
     index('idx_workflow_hooks_run_id').on(tb.runId),
     index('idx_workflow_hooks_token').on(tb.token),

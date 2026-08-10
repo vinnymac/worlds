@@ -206,46 +206,11 @@ export function createAzureWorld(
     createQueueHandler: queue.createQueueHandler,
     getDeploymentId: queue.getDeploymentId,
 
-    get writeToStream() {
+    get streams() {
       if (!streamerInstance) {
         throw new Error('Azure world not started. Call start() first.');
       }
-      return streamerInstance.writeToStream;
-    },
-
-    get closeStream() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.closeStream;
-    },
-
-    get readFromStream() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.readFromStream;
-    },
-
-    get listStreamsByRunId() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.listStreamsByRunId;
-    },
-
-    get getStreamChunks() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.getStreamChunks;
-    },
-
-    get getStreamInfo() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.getStreamInfo;
+      return streamerInstance.streams;
     },
 
     async start() {

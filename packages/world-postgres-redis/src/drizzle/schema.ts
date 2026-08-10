@@ -67,6 +67,9 @@ export const runs = schema.table(
     inputJson: jsonb('input').$type<SerializedContent>(),
     input: Cbor<SerializedContent>()('input_cbor'),
     error: text('error'),
+    attributes: jsonb('attributes').$type<Record<string, string>>().notNull().default({}),
+    errorCode: varchar('error_code', { length: 255 }),
+    encryptionPublicKey: text('encryption_public_key'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
       .defaultNow()
@@ -98,6 +101,7 @@ export const events = schema.table(
     eventDataJson: jsonb('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
     specVersion: integer('spec_version'),
+    resumeId: varchar('resume_id', { length: 255 }),
   } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
   (tb) => [index().on(tb.runId), index().on(tb.correlationId)],
 );
@@ -145,7 +149,15 @@ export const hooks = schema.table(
     metadata: Cbor<unknown>()('metadata_cbor'),
     specVersion: integer('spec_version'),
     isWebhook: boolean('is_webhook'),
-  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
+    isSystem: boolean('is_system'),
+    tokenRetentionUntil: timestamp('token_retention_until'),
+    /** @deprecated */
+    resumeContextJson: jsonb('resume_context'),
+    resumeContext: Cbor<unknown>()('resume_context_cbor'),
+    /** @deprecated */
+    resumeCapabilitiesJson: jsonb('resume_capabilities'),
+    resumeCapabilities: Cbor<unknown>()('resume_capabilities_cbor'),
+  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata' | 'resumeContext' | 'resumeCapabilities'>>,
   // token is UNIQUE so concurrent hook_created calls for the same token
   // cannot both insert (the hook_created handler routes the loser to the
   // duplicate / hook_conflict paths).

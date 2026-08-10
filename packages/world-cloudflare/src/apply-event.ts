@@ -637,7 +637,7 @@ export async function applyEvent(
         compact({
           ...step,
           status: 'failed',
-          error: toStructuredError(data.eventData.error, { stack: data.eventData.stack }),
+          error: toStructuredError(data.eventData.error),
           completedAt: now,
           updatedAt: now,
         }),
@@ -657,7 +657,7 @@ export async function applyEvent(
         compact({
           ...step,
           status: 'pending',
-          error: toStructuredError(data.eventData.error, { stack: data.eventData.stack }),
+          error: toStructuredError(data.eventData.error),
           retryAfter: data.eventData.retryAfter ? new Date(data.eventData.retryAfter) : undefined,
           updatedAt: now,
         }),
