@@ -31,6 +31,7 @@ async function setupDatabase() {
       '0003_drop_outbox.sql',
       '0004_steps_status_cancelled.sql',
       '0005_stream_chunks_run_id.sql',
+      '0006_runs_state_updated_at.sql',
     ];
 
     for (const file of migrationFiles) {

@@ -26,12 +26,12 @@
     "ci:publish": "pnpm build && changeset publish"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.31.0",
+    "@changesets/cli": "^3.0.0",
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.8",
-    "oxfmt": "0.58.0",
-    "oxlint": "1.73.0",
-    "turbo": "^2.10.4",
+    "lint-staged": "^17.3.0",
+    "oxfmt": "0.64.0",
+    "oxlint": "1.79.0",
+    "turbo": "^2.10.11",
     "typescript": "7.0.2"
   },
   "lint-staged": {
@@ -39,12 +39,12 @@
     "**/*.{js,jsx,ts,tsx,mjs,mts}": "npx oxlint --deny-warnings"
   },
   "engines": {
-    "node": "^22.0.0 || ^24.0.0",
+    "node": "^22.22.1 || ^24.11.0",
     "pnpm": ">=11.0.0"
   },
   "volta": {
     "node": "24.18.0",
-    "pnpm": "11.11.0"
+    "pnpm": "11.22.0"
   },
-  "packageManager": "pnpm@11.11.0"
+  "packageManager": "pnpm@11.22.0"
 }

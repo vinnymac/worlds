@@ -27,6 +27,7 @@ async function setupDatabase() {
       '0000_initial.sql',
       '0001_events_occurred_at.sql',
       '0002_spec_current_queue_streams.sql',
+      '0003_runs_state_updated_at.sql',
     ];
 
     for (const file of migrationFiles) {

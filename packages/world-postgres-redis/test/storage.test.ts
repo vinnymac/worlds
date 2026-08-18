@@ -4,6 +4,7 @@ import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { EntityConflictError, TooEarlyError, WorkflowRunNotFoundError } from '@workflow/errors';
 import type { Hook, Step, WorkflowRun } from '@workflow/world';
 import postgres from 'postgres';
+import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createClient } from '../src/drizzle/index.js';
 import {
@@ -1368,6 +1369,121 @@ describe('Storage (Postgres integration)', () => {
       });
       const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
+    });
+  });
+
+  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt` — the conformance
+  // suite has no coverage for this, so pin the semantics here.
+  describe('stateUpdatedAt optimistic-concurrency guard', () => {
+    const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+
+    async function startRun(workflowName: string): Promise<WorkflowRun> {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-state-guard',
+        workflowName,
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_started');
+      return run;
+    }
+
+    async function completeStep(runId: string, stepId: string): Promise<number> {
+      await createStep(events, runId, { stepId, stepName: 'guarded-step', input: [] });
+      await updateStep(events, runId, stepId, 'step_started');
+      const completed = await events.create(runId, {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: { result: [] },
+      });
+      return ulidTime(completed.event!.eventId);
+    }
+
+    function stepCreated(stepId: string) {
+      return {
+        eventType: 'step_created' as const,
+        correlationId: stepId,
+        eventData: { stepName: 'guarded-step', input: [] },
+      };
+    }
+
+    it('rejects a snapshot strictly older than the marker with PreconditionFailedError', async () => {
+      const run = await startRun('state-guard-stale');
+      const marker = await completeStep(run.runId, 'step-guard-source');
+
+      await expect(
+        events.create(run.runId, stepCreated('step-guard-stale'), {
+          stateUpdatedAt: marker - 1,
+        }),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+
+      // The unlocked fail-fast check runs before any entity write.
+      const stepList = await steps.list({ runId: run.runId });
+      expect(stepList.data.some((s) => s.stepId === 'step-guard-stale')).toBe(false);
+    });
+
+    it('accepts an equal snapshot and an absent snapshot, and never advances on replay creates', async () => {
+      const run = await startRun('state-guard-equal');
+      const marker = await completeStep(run.runId, 'step-guard-source');
+
+      // Equal must pass — `<=` here would livelock an up-to-date client.
+      const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
+        stateUpdatedAt: marker,
+      });
+      expect(equal.step?.stepId).toBe('step-guard-equal');
+
+      // Replay-origin creates carry a stateUpdatedAt and must not advance the
+      // marker, so the same snapshot still passes afterwards.
+      const again = await events.create(run.runId, stepCreated('step-guard-equal-2'), {
+        stateUpdatedAt: marker,
+      });
+      expect(again.step?.stepId).toBe('step-guard-equal-2');
+
+      // Absent stateUpdatedAt fails open.
+      const unguarded = await events.create(run.runId, stepCreated('step-guard-absent'));
+      expect(unguarded.step?.stepId).toBe('step-guard-absent');
+    });
+
+    it('advances the marker on hook_received but not on run lifecycle events', async () => {
+      const run = await startRun('state-guard-hook');
+
+      // run_created / run_started omit stateUpdatedAt but are not externally
+      // originated: advancing on them would reject every replay.
+      const beforeHook = await events.create(run.runId, stepCreated('step-guard-pre-hook'), {
+        stateUpdatedAt: 1,
+      });
+      expect(beforeHook.step?.stepId).toBe('step-guard-pre-hook');
+
+      await createHook(events, run.runId, { hookId: 'hook-guard', token: 'token-guard' });
+      const received = await events.create(run.runId, {
+        eventType: 'hook_received',
+        correlationId: 'hook-guard',
+        eventData: {},
+      });
+      const marker = ulidTime(received.event!.eventId);
+
+      await expect(
+        events.create(run.runId, stepCreated('step-guard-post-hook'), {
+          stateUpdatedAt: marker - 1,
+        }),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+    });
+  });
+
+  describe('maxEvents', () => {
+    it('reports the per-run event ceiling on both run_started paths', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-max-events',
+        workflowName: 'max-events',
+        input: [],
+      });
+
+      const started = await events.create(run.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(25_000);
+
+      // The idempotent replay path is the easy miss: core reads maxEvents only
+      // off the run_started response, so it must be carried here too.
+      const replayed = await events.create(run.runId, { eventType: 'run_started' });
+      expect(replayed.maxEvents).toBe(25_000);
     });
   });
 

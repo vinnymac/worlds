@@ -37,7 +37,7 @@ export function createWorld(
   const db = drizzle(pool, { schema, mode: 'default' });
 
   const queue = createQueue(redis, config);
-  const storage = createStorage(db);
+  const storage = createStorage(db, { maxEventsPerRun: config.maxEventsPerRun });
   const streamer = createStreamer(db);
 
   return {

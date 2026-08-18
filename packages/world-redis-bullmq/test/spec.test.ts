@@ -1,5 +1,9 @@
 import { RedisContainer } from '@testcontainers/redis';
 import { createTestSuite } from '@workflow/world-testing';
+// Opt-in suite: `createTestSuite` does not include it in 4.1.18, so it has to
+// be deep-imported. It asserts the world honours WORKFLOW_MAX_EVENTS via
+// EventResult.maxEvents.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on a docker container
@@ -23,4 +27,5 @@ if (process.platform === 'win32') {
 
   test('smoke', () => {});
   createTestSuite('@fantasticfour/world-redis-bullmq');
+  eventLimit('@fantasticfour/world-redis-bullmq');
 }

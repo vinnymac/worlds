@@ -2,10 +2,12 @@ import { setTimeout } from 'node:timers/promises';
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
 } from '@workflow/errors';
+import { ulidToDate } from '@workflow/world';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createStorage } from '../src/storage.js';
 import { clearMockData, createMockEnv } from '../src/test-mocks.js';
@@ -1184,6 +1186,215 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
       expect(seen).toHaveLength(7);
       expect(new Set(seen).size).toBe(7);
+    });
+  });
+
+  describe('Optimistic concurrency guard (stateUpdatedAt, world 4.3.1)', () => {
+    /** ULID time (epoch ms) of an event id, i.e. the state-marker unit. */
+    function eventTime(eventId: string): number {
+      const time = ulidToDate(eventId.slice(eventId.lastIndexOf('_') + 1))?.getTime();
+      if (time === undefined) throw new Error(`not a decodable event id: ${eventId}`);
+      return time;
+    }
+
+    /**
+     * Drive a run to the point where an externally-originated step_completed
+     * has advanced the state marker, and report the marker value.
+     */
+    async function runWithMarker(): Promise<{ runId: string; marker: number }> {
+      const run = await createRun({
+        deploymentId: 'test-deployment',
+        workflowName: 'guard-workflow',
+        input: [],
+      });
+      await storage.events.create(run.runId, { eventType: 'run_started' });
+      await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'step-guard',
+        eventData: { stepName: 'guarded', input: [] },
+      });
+      await storage.events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: 'step-guard',
+        eventData: {},
+      });
+      // No stateUpdatedAt -> externally originated -> advances the marker.
+      const completed = await storage.events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: 'step-guard',
+        eventData: { result: 'ok' },
+      });
+      return { runId: run.runId, marker: eventTime(completed.event!.eventId) };
+    }
+
+    it('rejects a strictly older snapshot with PreconditionFailedError', async () => {
+      const { runId, marker } = await runWithMarker();
+
+      await expect(
+        storage.events.create(
+          runId,
+          {
+            eventType: 'wait_created',
+            correlationId: 'wait-stale',
+            eventData: { resumeAt: new Date(Date.now() + 60_000) },
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
+
+      // The rejected create must not have appended anything.
+      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
+      expect(events.data.some((e) => e.eventType === 'wait_created')).toBe(false);
+    });
+
+    it('accepts an equal snapshot and does not advance the marker', async () => {
+      const { runId, marker } = await runWithMarker();
+
+      // Equal passes (anti-livelock for an up-to-date client)...
+      await storage.events.create(
+        runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-a',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { stateUpdatedAt: marker },
+      );
+      // ...and a replay-origin create must not move the marker forward, so the
+      // same snapshot still passes afterwards.
+      await storage.events.create(
+        runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-b',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { stateUpdatedAt: marker },
+      );
+
+      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
+      expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(2);
+    });
+
+    it('fails open when no snapshot is supplied', async () => {
+      const { runId } = await runWithMarker();
+
+      const result = await storage.events.create(runId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-unguarded',
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      });
+      expect(result.event).toBeDefined();
+    });
+
+    it('advances the marker on an externally-originated hook_received', async () => {
+      const run = await createRun({
+        deploymentId: 'test-deployment',
+        workflowName: 'guard-hook-workflow',
+        input: [],
+      });
+      await storage.events.create(run.runId, { eventType: 'run_started' });
+      await storage.events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-guard',
+        eventData: { token: 'token-guard' },
+      });
+      const received = await storage.events.create(run.runId, {
+        eventType: 'hook_received',
+        correlationId: 'hook-guard',
+        eventData: { payload: {} },
+      });
+      const marker = eventTime(received.event!.eventId);
+
+      await expect(
+        storage.events.create(
+          run.runId,
+          {
+            eventType: 'hook_disposed',
+            correlationId: 'hook-guard',
+            eventData: {},
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
+    });
+
+    it('does not arm the guard from run lifecycle events', async () => {
+      // run_created / run_started are created without a snapshot but are NOT
+      // externally originated; treating them as such would 412 every replay.
+      const run = await createRun({
+        deploymentId: 'test-deployment',
+        workflowName: 'guard-lifecycle-workflow',
+        input: [],
+      });
+      const started = await storage.events.create(run.runId, { eventType: 'run_started' });
+      const startedAt = eventTime(started.event!.eventId);
+
+      const result = await storage.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-x',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { stateUpdatedAt: startedAt - 1000 },
+      );
+      expect(result.event).toBeDefined();
+    });
+  });
+
+  describe('Event ceiling (EventResult.maxEvents, world 4.3.1)', () => {
+    it('reports the default ceiling on run_started and on its idempotent replay', async () => {
+      const run = await createRun({
+        deploymentId: 'test-deployment',
+        workflowName: 'max-events-workflow',
+        input: [],
+      });
+
+      const started = await storage.events.create(run.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(25_000);
+
+      // The runtime reads maxEvents only from run_started, so the replay path
+      // (already-running, no new event) must report it too.
+      const replay = await storage.events.create(run.runId, { eventType: 'run_started' });
+      expect(replay.event).toBeUndefined();
+      expect(replay.maxEvents).toBe(25_000);
+    });
+
+    it('does not report a ceiling on non-run_started responses', async () => {
+      const run = await createRun({
+        deploymentId: 'test-deployment',
+        workflowName: 'max-events-scope-workflow',
+        input: [],
+      });
+      const created = await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'step-max',
+        eventData: { stepName: 'x', input: [] },
+      });
+      expect(created.maxEvents).toBeUndefined();
+    });
+
+    it('honors an explicitly configured ceiling', async () => {
+      const configured = createStorage({
+        env: mockEnv,
+        deploymentId: 'test-deployment',
+        maxEventsPerRun: 10,
+      });
+      const created = await configured.events.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId: 'test-deployment', workflowName: 'capped', input: [] },
+      });
+      const started = await configured.events.create(created.run!.runId, {
+        eventType: 'run_started',
+      });
+      expect(started.maxEvents).toBe(10);
+    });
+
+    it('rejects a non-positive configured ceiling', () => {
+      expect(() =>
+        createStorage({ env: mockEnv, deploymentId: 'test-deployment', maxEventsPerRun: 0 }),
+      ).toThrow(/positive integer/);
     });
   });
 });

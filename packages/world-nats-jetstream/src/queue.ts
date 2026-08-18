@@ -6,8 +6,9 @@ import {
   type QueueKind,
   type QueuePayload,
   type ValidQueueName,
+  WorkflowInvokePayloadSchema,
 } from '@workflow/world';
-import type { JetStreamClient } from 'nats';
+import type { JetStreamClient, JsMsg } from 'nats';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
@@ -111,6 +112,62 @@ export function createQueue(
   };
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'nats-jetstream';
+
+  /**
+   * In-flight workflow replays, keyed by run. See `runSerialized`.
+   */
+  const inflightWorkflowRuns = new Map<string, Promise<void>>();
+
+  /**
+   * Serialization key for a delivery, or `undefined` when it may run freely.
+   *
+   * Only workflow invocations are keyed: step deliveries must stay parallel so
+   * fan-out is preserved. A payload that is not a workflow invocation (a step
+   * or health-check message on the workflow stream) falls through unserialized.
+   */
+  function workflowRunSerializationKey(kind: QueueKind, message: QueuePayload): string | undefined {
+    if (kind !== 'workflow') return undefined;
+    const invoke = WorkflowInvokePayloadSchema.safeParse(message);
+    if (!invoke.success) return undefined;
+    return `workflow:${invoke.data.runId}`;
+  }
+
+  /**
+   * Run `task`, serialized against every other delivery sharing `key`.
+   *
+   * All worker coroutines for a stream share one durable consumer, so two
+   * deliveries for the same run are routinely handed to two workers at once.
+   * Replaying a run twice concurrently corrupts its event log: each replay
+   * allocates its own `step_created` correlationId, and neither replay can
+   * consume the other's event, which surfaces as `ReplayDivergenceError` and
+   * ultimately `CorruptedEventLogError`. Chaining deliveries per run removes
+   * that race.
+   *
+   * A failed task must not poison the chain, hence the `catch` on the
+   * predecessor; the identity check before deleting keeps a newer link from
+   * being evicted by an older one's cleanup.
+   *
+   * This mirrors the reference world-postgres implementation and shares its
+   * limitation: it serializes within a process, not across them. The storage
+   * layer's `stateUpdatedAt` guard is what covers the cross-process case.
+   */
+  async function runSerialized(key: string | undefined, task: () => Promise<void>): Promise<void> {
+    if (!key) {
+      await task();
+      return;
+    }
+    const previous = inflightWorkflowRuns.get(key);
+    const execution = (previous ?? Promise.resolve())
+      .catch(() => {})
+      .then(task)
+      .finally(() => {
+        if (inflightWorkflowRuns.get(key) === execution) {
+          inflightWorkflowRuns.delete(key);
+        }
+      });
+    inflightWorkflowRuns.set(key, execution);
+    await execution;
+  }
 
   let initialized = false;
   const initStreams = async () => {
@@ -217,6 +274,62 @@ export function createQueue(
     });
   }
 
+  /**
+   * Dispatch one delivery and settle it (ack / nak). Never throws: every
+   * failure mode is translated into a nak so JetStream owns the redelivery.
+   */
+  async function deliver(
+    msg: JsMsg,
+    envelope: MessageEnvelope,
+    pathname: string,
+    streamName: string,
+  ): Promise<void> {
+    try {
+      // Derive the attempt from JetStream's delivery count (1-based) so
+      // redeliveries surface as attempt 2, 3, ... and core's poison-pill
+      // escalation (attempt > MAX_QUEUE_DELIVERIES) can trigger.
+      const response = await dispatch(envelope, msg.info.deliveryCount, pathname);
+
+      if (response.ok) {
+        msg.ack();
+        health.lastSuccessfulFetch = Date.now();
+        health.totalProcessed++;
+        return;
+      }
+
+      const text = await response.text();
+
+      if (response.status === 503) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = null;
+        }
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
+        ) {
+          // JetStream supports a custom nak delay (in ms).
+          const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
+          msg.nak(timeoutMs);
+          return;
+        }
+      }
+
+      msg.nak(NAK_DELAY_MS);
+      health.totalFailed++;
+      console.error(
+        `[world-nats-jetstream worker] HTTP ${response.status} on ${streamName}: ${text}`,
+      );
+    } catch (error) {
+      console.error(`[world-nats-jetstream worker] dispatch error from ${streamName}:`, error);
+      msg.nak(NAK_DELAY_MS);
+      health.totalFailed++;
+    }
+  }
+
   async function worker(kind: QueueKind, streamName: string) {
     try {
       const jetstream = await getJetStream();
@@ -266,57 +379,20 @@ export function createQueue(
           continue;
         }
 
-        // Extend the ack deadline while the dispatch is in flight. HTTP
-        // handlers may legitimately run up to httpTimeoutMs (default 300s),
-        // far beyond ack_wait (30s) — without heartbeats JetStream would
-        // redeliver the message mid-execution and run it concurrently.
+        // Extend the ack deadline for as long as this delivery is ours. That
+        // covers both the in-flight dispatch (HTTP handlers may run up to
+        // httpTimeoutMs, default 300s, far beyond ack_wait's 30s) and any
+        // time spent queued behind another replay of the same run — a
+        // waiting message that stopped heartbeating would be redelivered to
+        // another worker and reintroduce the concurrency we are removing.
         const progressTimer = setInterval(() => {
           msg.working();
         }, ACK_PROGRESS_INTERVAL_MS);
 
         try {
-          // Derive the attempt from JetStream's delivery count (1-based) so
-          // redeliveries surface as attempt 2, 3, ... and core's poison-pill
-          // escalation (attempt > MAX_QUEUE_DELIVERIES) can trigger.
-          const response = await dispatch(envelope, msg.info.deliveryCount, pathname);
-
-          if (response.ok) {
-            msg.ack();
-            health.lastSuccessfulFetch = Date.now();
-            health.totalProcessed++;
-            continue;
-          }
-
-          const text = await response.text();
-
-          if (response.status === 503) {
-            let parsed: unknown;
-            try {
-              parsed = JSON.parse(text);
-            } catch {
-              parsed = null;
-            }
-            if (
-              parsed &&
-              typeof parsed === 'object' &&
-              typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
-            ) {
-              // JetStream supports a custom nak delay (in ms).
-              const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-              msg.nak(timeoutMs);
-              continue;
-            }
-          }
-
-          msg.nak(NAK_DELAY_MS);
-          health.totalFailed++;
-          console.error(
-            `[world-nats-jetstream worker] HTTP ${response.status} on ${streamName}: ${text}`,
+          await runSerialized(workflowRunSerializationKey(kind, envelope.message), () =>
+            deliver(msg, envelope, pathname, streamName),
           );
-        } catch (error) {
-          console.error(`[world-nats-jetstream worker] dispatch error from ${streamName}:`, error);
-          msg.nak(NAK_DELAY_MS);
-          health.totalFailed++;
         } finally {
           clearInterval(progressTimer);
         }

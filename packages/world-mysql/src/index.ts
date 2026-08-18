@@ -30,6 +30,14 @@ export interface MysqlWorldConfig {
    * Recommendation: 2x workers + 5 buffer
    */
   connectionLimit?: number;
+
+  /**
+   * Per-run event ceiling reported to the runtime on `run_started`
+   * (`EventResult.maxEvents`). The runtime fails a runaway run with
+   * `MAX_EVENTS_EXCEEDED` once its replay log reaches this many events.
+   * Defaults to `WORKFLOW_MAX_EVENTS`, else 25000.
+   */
+  maxEventsPerRun?: number;
 }
 
 export function createMysqlWorld(
@@ -37,7 +45,7 @@ export function createMysqlWorld(
     databaseUrl: process.env.DATABASE_URL || 'mysql://root:root@localhost:3306/mysql_test',
   },
 ): World & { start(): Promise<void>; stop(): void; close(): Promise<void> } {
-  const { databaseUrl, queue: queueConfig = {}, connectionLimit = 25 } = config;
+  const { databaseUrl, queue: queueConfig = {}, connectionLimit = 25, maxEventsPerRun } = config;
 
   // Create MySQL connection pool
   const pool = mysql.createPool({
@@ -48,7 +56,7 @@ export function createMysqlWorld(
   const db = drizzle(pool, { schema, mode: 'default' });
 
   // Create world components
-  const storage = createStorage(db);
+  const storage = createStorage(db, { maxEventsPerRun });
   const queue = createQueue(db, queueConfig);
   const streamer = createStreamer(db);
 

@@ -1,6 +1,9 @@
 import { MySqlContainer } from '@testcontainers/mysql';
 import { RedisContainer } from '@testcontainers/redis';
 import { createTestSuite } from '@workflow/world-testing';
+// Not re-exported from the package entry point and not wired into
+// createTestSuite (world-testing 4.1.18) — opt in via the deep import.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 import mysql from 'mysql2/promise';
 
@@ -54,6 +57,7 @@ if (shouldSkipTests) {
         \`started_at\` TIMESTAMP NULL,
         \`spec_version\` INT,
         \`expired_at\` TIMESTAMP NULL,
+        \`state_updated_at\` BIGINT NULL,
         INDEX \`idx_workflow_runs_name\` (\`name\`),
         INDEX \`idx_workflow_runs_status\` (\`status\`)
       )`,
@@ -149,4 +153,5 @@ if (shouldSkipTests) {
 
   test('smoke', () => {});
   createTestSuite('@fantasticfour/world-mysql-redis');
+  eventLimit('@fantasticfour/world-mysql-redis');
 }

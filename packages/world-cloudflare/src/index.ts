@@ -12,6 +12,12 @@ export interface CloudflareWorldConfig {
     WORKFLOW_STREAMS: CloudflareStreamerConfig['env']['WORKFLOW_STREAMS'];
   };
   deploymentId?: string;
+  /**
+   * Per-run event ceiling reported to the runtime on `run_started`
+   * (`EventResult.maxEvents`). Defaults to the `WORKFLOW_MAX_EVENTS`
+   * environment variable, then to 25,000.
+   */
+  maxEventsPerRun?: CloudflareStorageConfig['maxEventsPerRun'];
 }
 
 export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
@@ -41,6 +47,7 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
       WORKFLOW_INDEX: env.WORKFLOW_INDEX,
     },
     deploymentId,
+    maxEventsPerRun: config?.maxEventsPerRun,
   });
 
   const queue = createQueue({

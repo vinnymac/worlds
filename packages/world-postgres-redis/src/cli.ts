@@ -21,6 +21,7 @@ const MIGRATION_FILES = [
   '0002_outbox_and_notify.sql',
   '0003_events_occurred_at.sql',
   '0004_hooks_token_unique_stream_run_id.sql',
+  '0005_runs_state_updated_at.sql',
 ];
 
 async function setupDatabase() {

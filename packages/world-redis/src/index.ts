@@ -11,8 +11,8 @@ import {
 } from './storage.js';
 import { createStreamer, type StreamStats } from './streamer.js';
 
-function createStorage(redis: Redis, keyPrefix: string): Storage {
-  const config = { redis, keyPrefix };
+function createStorage(redis: Redis, keyPrefix: string, maxEventsPerRun?: number): Storage {
+  const config = { redis, keyPrefix, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -46,7 +46,7 @@ export function createWorld(
 
   const keyPrefix = config.keyPrefix || 'workflow:';
 
-  const storage = createStorage(redis, keyPrefix);
+  const storage = createStorage(redis, keyPrefix, config.maxEventsPerRun);
   const streamer = createStreamer({ redis, keyPrefix });
 
   const queue = createQueue(redis, config);

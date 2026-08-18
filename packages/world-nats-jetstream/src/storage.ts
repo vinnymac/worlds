@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -42,7 +43,7 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { JetStreamClient, KV, KvEntry } from 'nats';
-import { monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 import { compact, debug } from './util.js';
 
@@ -50,10 +51,48 @@ interface NatsStorageConfig {
   getJetStream: () => Promise<JetStreamClient>;
   keyPrefix: string;
   terminalRunTTLMs?: number;
+  maxEventsPerRun?: number;
 }
 
 /** Default TTL for terminal runs: 30 days. */
 const DEFAULT_TERMINAL_RUN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Default per-run event ceiling; mirrors the Vercel World. */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/**
+ * Resolve the per-run event ceiling reported to the runtime on `run_started`.
+ *
+ * Explicit config wins; otherwise `WORKFLOW_MAX_EVENTS` (the variable the
+ * conformance suite sets on the server it spawns); otherwise the default.
+ * A present-but-nonsensical value is a misconfiguration, so it throws rather
+ * than silently reverting to the default and leaving runs unbounded.
+ */
+function resolveMaxEventsPerRun(configured?: number): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new Error(`maxEventsPerRun must be a positive integer, received ${configured}`);
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  if (raw === undefined || raw === '') return DEFAULT_MAX_EVENTS_PER_RUN;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`WORKFLOW_MAX_EVENTS must be a positive integer, received "${raw}"`);
+  }
+  return parsed;
+}
+
+/**
+ * Decode the ULID time embedded in a prefixed id (e.g. `wevt_01J...`).
+ *
+ * Matches how the runtime derives `stateUpdatedAt` from the last event it
+ * loaded: strip through the *last* underscore, then decode.
+ */
+function idTime(id: string): number {
+  return decodeTime(id.slice(id.lastIndexOf('_') + 1));
+}
 
 /**
  * Convert KV entry value to string (handles both string and Uint8Array)
@@ -353,7 +392,7 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
  * Create storage for workflow events using JetStream KV Store
  */
 export function createEventsStorage(config: NatsStorageConfig): Storage['events'] {
-  const { getJetStream, keyPrefix } = config;
+  const { getJetStream, keyPrefix, maxEventsPerRun } = config;
   const ulid = monotonicFactory();
 
   let eventsBucket: KV;
@@ -367,6 +406,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   let stepsByRunBucket: KV;
   let hooksByRunBucket: KV;
   let eventsByRunBucket: KV;
+  let runStateMarkersBucket: KV;
 
   const initBuckets = async () => {
     if (!eventsBucket) {
@@ -400,6 +440,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         history: 1,
       });
       eventsByRunBucket = await jetstream.views.kv(`${keyPrefix}events_by_run`, {
+        history: 1,
+      });
+      // Optimistic-concurrency markers (one per run); only the latest matters.
+      runStateMarkersBucket = await jetstream.views.kv(`${keyPrefix}run_state_markers`, {
         history: 1,
       });
     }
@@ -447,6 +491,65 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     } catch {
       // May not exist
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Optimistic-concurrency marker (CreateEventParams.stateUpdatedAt)
+  // ------------------------------------------------------------------
+
+  /**
+   * Read a run's state marker: the ULID time of the most recent
+   * *externally-originated* event recorded for it.
+   *
+   * `null` means no such event has been recorded yet, which passes the guard.
+   */
+  async function readStateMarker(runId: string): Promise<number | null> {
+    const entry = await getLiveEntry(runStateMarkersBucket, runId);
+    if (!entry) return null;
+    const marker = Number(kvValueToString(entry.value));
+    if (!Number.isInteger(marker)) {
+      throw new WorkflowWorldError(`Corrupt state marker for run "${runId}"`, { status: 500 });
+    }
+    return marker;
+  }
+
+  /**
+   * Advance a run's state marker to `markerTime`, never backwards.
+   *
+   * Revision-checked (CAS) like every other read-modify-write in this module:
+   * a lost update would regress the marker and silently disable the guard for
+   * every later create.
+   */
+  async function advanceStateMarker(runId: string, markerTime: number): Promise<void> {
+    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+      const entry = await getLiveEntry(runStateMarkersBucket, runId);
+      if (!entry) {
+        // `create` only succeeds while the key is absent, so a concurrent
+        // writer cannot be clobbered — it just sends us round again.
+        const created = await runStateMarkersBucket
+          .create(runId, `${markerTime}`)
+          .then(() => true)
+          .catch(() => false);
+        if (created) return;
+        continue;
+      }
+      const current = Number(kvValueToString(entry.value));
+      if (!Number.isInteger(current)) {
+        throw new WorkflowWorldError(`Corrupt state marker for run "${runId}"`, { status: 500 });
+      }
+      if (current >= markerTime) return;
+      try {
+        await runStateMarkersBucket.update(runId, `${markerTime}`, entry.revision);
+        return;
+      } catch (err) {
+        if (!isWrongLastSequence(err)) throw err;
+        // Lost the race — re-read and re-compare.
+      }
+    }
+    throw new WorkflowWorldError(
+      `Concurrent state-marker update for run "${runId}" did not settle after ${MAX_CAS_ATTEMPTS} attempts`,
+      { status: 409 },
+    );
   }
 
   /** Persist an event and index it under its run for efficient per-run reads. */
@@ -831,6 +934,34 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         }
       }
 
+      // Optimistic-concurrency guard (@workflow/world 4.3.1). A replay-origin
+      // create carries the ULID time of the newest event the runtime had
+      // loaded. Reject it when an externally-originated event was recorded
+      // after that snapshot, so the runtime reloads instead of writing from a
+      // stale view of the log. An equal timestamp must pass (an up-to-date
+      // client is never rejected — that would livelock it), and an absent
+      // `stateUpdatedAt` disables the guard for this create.
+      //
+      // Checked here, immediately before the first entity mutation, rather
+      // than at the top of `create`: this is as close to the write as a
+      // multi-bucket KV store allows. The marker only ever moves forward, so
+      // a marker advance landing between this read and the write can only
+      // make the guard fail *open* — exactly how a backend that ignores the
+      // field behaves — and can never reject a client that is up to date.
+      //
+      // Legacy (specVersion < 2) runs return above and are never guarded;
+      // they predate the replay model the guard protects.
+      if (params?.stateUpdatedAt !== undefined) {
+        const marker = await readStateMarker(effectiveRunId);
+        if (marker !== null && params.stateUpdatedAt < marker) {
+          throw new PreconditionFailedError(
+            `Event log for run "${effectiveRunId}" changed since ` +
+              `${new Date(params.stateUpdatedAt).toISOString()}: a newer externally-originated ` +
+              `event was recorded at ${new Date(marker).toISOString()}`,
+          );
+        }
+      }
+
       // Entity creation/updates
       if (data.eventType === 'run_created') {
         const eventData = data.eventData as {
@@ -891,7 +1022,13 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
           }
           const resolveData = params?.resolveData ?? 'all';
-          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
+          // The ceiling must ride every `run_started` response, not just the
+          // first: the runtime re-reads it on each replay and drops the limit
+          // entirely when it is absent.
+          return {
+            run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined,
+            ...(run ? { maxEvents: resolveMaxEventsPerRun(maxEventsPerRun) } : {}),
+          };
         }
 
         let oldStatus: string | undefined;
@@ -922,7 +1059,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           // semantics as the pre-check above: no duplicate event.
           const parsedRun = WorkflowRunSchema.parse(compact(result.value));
           const resolveData = params?.resolveData ?? 'all';
-          return { run: filterRunData(parsedRun, resolveData) as WorkflowRun };
+          return {
+            run: filterRunData(parsedRun, resolveData) as WorkflowRun,
+            maxEvents: resolveMaxEventsPerRun(maxEventsPerRun),
+          };
         }
         if (result.type === 'updated') {
           await reindexRunStatus(effectiveRunId, oldStatus, 'running');
@@ -1389,6 +1529,21 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       await putEvent(effectiveRunId, eventId, event);
 
+      // Only *externally-originated* events advance the state marker: a
+      // `hook_received` or `step_completed` recorded without a
+      // `stateUpdatedAt`. Replay-origin creates carry one, and the runtime
+      // also creates `run_created`/`run_started`/`run_failed` without one —
+      // advancing on those would reject every subsequent replay of the run.
+      //
+      // Advanced only after the event is durable: a marker ahead of the log
+      // is unreachable by any client and would livelock the run.
+      if (
+        params?.stateUpdatedAt === undefined &&
+        (data.eventType === 'hook_received' || data.eventType === 'step_completed')
+      ) {
+        await advanceStateMarker(effectiveRunId, idTime(eventId));
+      }
+
       const parsed = EventSchema.parse(event);
       const resolveData = params?.resolveData ?? 'all';
 
@@ -1413,6 +1568,11 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         // Preloaded events are complete; expose a cursor with the same
         // semantics as events.list so the runtime can reload incrementally.
         ...(allEvents ? { cursor: allEvents.at(-1)?.eventId ?? null, hasMore: false } : {}),
+        // The runtime reads the per-run event ceiling from the `run_started`
+        // response and nowhere else.
+        ...(data.eventType === 'run_started' && run
+          ? { maxEvents: resolveMaxEventsPerRun(maxEventsPerRun) }
+          : {}),
       };
     },
 
@@ -1810,6 +1970,9 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
   const eventsBucket = await jetstream.views.kv(`${keyPrefix}events`, { history: 10 });
   const eventsByRunBucket = await jetstream.views.kv(`${keyPrefix}events_by_run`, { history: 1 });
   const waitsBucket = await jetstream.views.kv(`${keyPrefix}waits`, { history: 1 });
+  const runStateMarkersBucket = await jetstream.views.kv(`${keyPrefix}run_state_markers`, {
+    history: 1,
+  });
 
   let compactedCount = 0;
 
@@ -1913,6 +2076,13 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
               }
             }
           }
+        }
+
+        // Delete the run's optimistic-concurrency marker
+        try {
+          await runStateMarkersBucket.delete(runId);
+        } catch {
+          /* noop */
         }
 
         // Delete the run itself and its index entry

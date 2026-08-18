@@ -1,8 +1,9 @@
 import type { Container, JSONObject, OperationInput, SqlQuerySpec } from '@azure/cosmos';
-import { BulkOperationType } from '@azure/cosmos';
+import { BulkOperationType, PatchOperationType } from '@azure/cosmos';
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -38,11 +39,13 @@ import {
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
+  ulidToDate,
   WaitSchema,
 } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { encodeCbor, decodeCbor } from './cbor.js';
 import {
+  assertBatchCommitted,
   compact,
   isConflictError,
   isNotFoundError,
@@ -56,7 +59,7 @@ import {
  * All documents in `workflow_runs` container share a partition key of /runId
  * and are distinguished by their `type` field.
  */
-type DocType = 'run' | 'event' | 'step' | 'hook' | 'wait';
+type DocType = 'run' | 'event' | 'step' | 'hook' | 'wait' | 'marker';
 
 type CosmosDoc = Record<string, unknown>;
 
@@ -65,12 +68,93 @@ type CosmosDoc = Record<string, unknown>;
  */
 const MAX_TRANSITION_ATTEMPTS = 5;
 
+/**
+ * Id of the per-run optimistic-concurrency marker document. It lives in the
+ * run's own partition so it can participate in the same transactional batch as
+ * the event it guards.
+ */
+function stateMarkerId(runId: string): string {
+  return `marker:${runId}`;
+}
+
+/**
+ * Event types that advance the state marker when created outside a replay
+ * (i.e. without a `stateUpdatedAt` snapshot). Deliberately narrow: core also
+ * omits `stateUpdatedAt` on `run_created` / `run_started` / `run_failed`, and
+ * advancing on those would reject every subsequent replay-origin create.
+ */
+const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
+
+/**
+ * Default per-run event ceiling. Mirrors `@workflow/world-local`, which in
+ * turn mirrors the Vercel World.
+ */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
 interface CosmosStorageConfig {
   /** Main container for runs, events, steps, hooks (partition key: /runId) */
   container: Container;
   /** Secondary container for O(1) hook lookup by token (partition key: /token) */
   hooksByTokenContainer: Container;
   deploymentId: string;
+  /**
+   * Per-run event ceiling reported to the runtime as `EventResult.maxEvents`.
+   * Defaults to `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}.
+   */
+  maxEventsPerRun?: number;
+}
+
+/**
+ * Extra transactional-batch operations that enforce (or advance) the per-run
+ * state marker, plus the snapshot they were built from. Threaded into every
+ * batch so the guard commits or rolls back together with the event.
+ */
+interface StateGuard {
+  operations: OperationInput[];
+  /** `CreateEventParams.stateUpdatedAt`, when the caller sent one. */
+  stateUpdatedAt?: number;
+}
+
+/**
+ * Resolve the per-run event ceiling: explicit config wins, then the
+ * `WORKFLOW_MAX_EVENTS` environment variable, then the default. An explicitly
+ * configured value must be a positive integer — a bad value is a
+ * misconfiguration, not something to silently paper over.
+ */
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new WorkflowWorldError(
+        `maxEventsPerRun must be a positive integer, received ${configured}`,
+        { status: 500 },
+      );
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
+}
+
+/**
+ * ULID time (epoch ms) embedded in a prefixed event id, or undefined when the
+ * id is not a decodable ULID. Mirrors core's `latestEventStateUpdatedAt`,
+ * which likewise fails open rather than livelocking on an undecodable id.
+ */
+function eventIdTime(eventId: string): number | undefined {
+  const underscore = eventId.lastIndexOf('_');
+  const rawUlid = underscore === -1 ? eventId : eventId.slice(underscore + 1);
+  return ulidToDate(rawUlid)?.getTime();
+}
+
+/** A freshly seeded state marker: no externally-originated event yet. */
+function newStateMarkerDoc(runId: string): CosmosDoc {
+  return {
+    id: stateMarkerId(runId),
+    type: 'marker' as DocType,
+    runId,
+    stateUpdatedAt: 0,
+  };
 }
 
 interface SerializedError {
@@ -339,14 +423,78 @@ function deserializeWait(doc: Record<string, unknown>): Wait {
 export function createStorage(config: CosmosStorageConfig): Storage {
   const { container, hooksByTokenContainer } = config;
   const ulid = monotonicFactory();
+  const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
+
+  /**
+   * Read the per-run state marker, or undefined when the run predates the
+   * marker (legacy runs) or has recorded no externally-originated event yet.
+   */
+  async function readStateMarker(runId: string): Promise<number | undefined> {
+    const doc = await readRunPartitionDoc(runId, stateMarkerId(runId));
+    const value = doc?.stateUpdatedAt;
+    return typeof value === 'number' ? value : undefined;
+  }
+
+  /**
+   * Re-read the marker after a rejected batch and translate the rejection into
+   * the contract error when the guard was the cause. Batch failures arrive
+   * without a usable status (see util.ts), so the cause is established by
+   * re-reading rather than by inspecting the error.
+   */
+  async function throwIfStale(runId: string, stateUpdatedAt: number): Promise<void> {
+    const marker = await readStateMarker(runId);
+    if (marker !== undefined && stateUpdatedAt < marker) {
+      throw new PreconditionFailedError(
+        `Event creation for run "${runId}" is based on a stale snapshot ` +
+          `(stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
+      );
+    }
+  }
 
   /**
    * Execute a same-partition transactional batch with 429 retry.
    * All event + entity mutations go through here so the event log and the
    * materialized entities can never diverge on partial failure.
+   *
+   * `guard` appends the optimistic-concurrency operations, making the marker
+   * check (or advance) atomic with the event write: a batch is all-or-nothing,
+   * so a failed guard condition rolls the event back too.
    */
-  function commitBatch(operations: OperationInput[], partitionKey: string) {
-    return withCosmosRetry(() => container.items.batch(operations, partitionKey));
+  async function commitBatch(
+    operations: OperationInput[],
+    partitionKey: string,
+    guard?: StateGuard,
+  ) {
+    const allOperations = guard ? [...operations, ...guard.operations] : operations;
+    try {
+      return await withCosmosRetry(async () => {
+        // batch() resolves even when the transaction was rejected, so the
+        // per-operation statuses have to be inspected explicitly.
+        const response = await container.items.batch(allOperations, partitionKey);
+        assertBatchCommitted(response);
+        return response;
+      });
+    } catch (error: unknown) {
+      if (
+        guard?.stateUpdatedAt !== undefined &&
+        (isWrappedBatchError(error) || isPreconditionFailedError(error))
+      ) {
+        await throwIfStale(partitionKey, guard.stateUpdatedAt);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Commit an event document that has no same-partition entity mutation.
+   * Still a batch, so the state guard commits atomically with the event.
+   */
+  function commitEventDoc(eventDoc: CosmosDoc, runId: string, guard: StateGuard) {
+    return commitBatch(
+      [{ operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) }],
+      runId,
+      guard,
+    );
   }
 
   /**
@@ -455,6 +603,12 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         [
           { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
           { operationType: BulkOperationType.Create, resourceBody: toResourceBody(run) },
+          // Seed the state marker with the run so later guarded creates can
+          // patch it conditionally (Patch requires the document to exist).
+          {
+            operationType: BulkOperationType.Create,
+            resourceBody: toResourceBody(newStateMarkerDoc(runId)),
+          },
         ],
         runId,
       );
@@ -490,6 +644,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     eventType: string,
     eventData: Record<string, unknown> | undefined,
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<WorkflowRun> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
@@ -571,6 +726,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             },
           ],
           runId,
+          guard,
         );
       } catch (error: unknown) {
         // Etag mismatch (412 inside the batch) or another wrapped failure:
@@ -609,6 +765,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     stepId: string,
     data: { stepName: string; input: unknown },
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<{ step: Step }> {
     const now = new Date();
     const step: CosmosDoc = {
@@ -631,6 +788,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           { operationType: BulkOperationType.Create, resourceBody: toResourceBody(step) },
         ],
         runId,
+        guard,
       );
     } catch (error: unknown) {
       // See createRunFromEvent: batch errors are opaque, so re-read to
@@ -661,6 +819,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     eventType: string,
     eventData: Record<string, unknown> | undefined,
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<Step> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
@@ -746,6 +905,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             },
           ],
           runId,
+          guard,
         );
       } catch (error: unknown) {
         if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
@@ -772,6 +932,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     eventData: Record<string, unknown> | undefined,
     specVersion: number,
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<Wait> {
     const now = new Date();
     const waitDoc: CosmosDoc = {
@@ -794,6 +955,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           { operationType: BulkOperationType.Create, resourceBody: toResourceBody(waitDoc) },
         ],
         runId,
+        guard,
       );
     } catch (error: unknown) {
       if (isConflictError(error) || isWrappedBatchError(error)) {
@@ -816,6 +978,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     runId: string,
     correlationId: string,
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<Wait> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
@@ -844,6 +1007,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
             },
           ],
           runId,
+          guard,
         );
       } catch (error: unknown) {
         if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
@@ -871,6 +1035,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     hookId: string,
     hookDoc: CosmosDoc,
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<void> {
     try {
       await commitBatch(
@@ -879,6 +1044,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           { operationType: BulkOperationType.Delete, id: hookDoc.id as string },
         ],
         runId,
+        guard,
       );
     } catch (error: unknown) {
       if (isWrappedBatchError(error) || isNotFoundError(error)) {
@@ -964,6 +1130,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     data: { token: string; metadata?: unknown; isWebhook?: boolean },
     specVersion: number,
     eventDoc: CosmosDoc,
+    guard: StateGuard,
   ): Promise<{ hook?: Hook; conflictEvent?: Event }> {
     const now = new Date();
 
@@ -1016,7 +1183,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         } catch (error: unknown) {
           if (!isConflictError(error)) throw error;
         }
-        await withCosmosRetry(() => container.items.create(eventDoc));
+        await commitEventDoc(eventDoc, runId, guard);
         return { hook: deserializeHook(claim) };
       }
 
@@ -1037,7 +1204,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         specVersion,
         createdAt: now.toISOString(),
       };
-      await withCosmosRetry(() => container.items.create(conflictDoc));
+      await commitEventDoc(conflictDoc, runId, guard);
       const conflictEvent = EventSchema.parse({
         runId,
         eventId: eventDoc.eventId,
@@ -1080,7 +1247,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
     // Commit the hook_created event last so a crash above leaves orphaned hook
     // docs that the recovery path can complete instead of an event without entity.
-    await withCosmosRetry(() => container.items.create(eventDoc));
+    await commitEventDoc(eventDoc, runId, guard);
 
     const parsed = HookSchema.parse(
       compact({
@@ -1200,7 +1367,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams,
+        params?: CreateEventParams,
       ): Promise<EventResult> {
         const now = new Date();
 
@@ -1268,6 +1435,12 @@ export function createStorage(config: CosmosStorageConfig): Storage {
                     resourceBody: toResourceBody(syntheticEventDoc),
                   },
                   { operationType: BulkOperationType.Create, resourceBody: toResourceBody(runDoc) },
+                  // Seed the state marker with the bootstrapped run, matching
+                  // createRunFromEvent.
+                  {
+                    operationType: BulkOperationType.Create,
+                    resourceBody: toResourceBody(newStateMarkerDoc(effectiveRunId)),
+                  },
                 ],
                 effectiveRunId,
               );
@@ -1321,6 +1494,66 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const result: EventResult = { event: parsed };
 
         // ============================================================
+        // GUARD: optimistic concurrency (CreateEventParams.stateUpdatedAt).
+        //
+        // Cosmos has no serializable read, so the check is expressed as a
+        // conditional Patch on the marker document inside the SAME
+        // transactional batch as the event write. A concurrent
+        // externally-originated event moves the marker past the snapshot, the
+        // condition fails, and the batch (event included) rolls back — which
+        // commitBatch then re-reads and reports as PreconditionFailedError.
+        //
+        // Strictly-older snapshots are rejected; an equal snapshot passes (an
+        // up-to-date client must never livelock) and an absent snapshot fails
+        // open, disabling the guard for that create.
+        // ============================================================
+        const stateUpdatedAt = params?.stateUpdatedAt;
+        const guard: StateGuard = { operations: [], stateUpdatedAt };
+        if (stateUpdatedAt !== undefined) {
+          const marker = await readStateMarker(effectiveRunId);
+          if (marker !== undefined) {
+            if (stateUpdatedAt < marker) {
+              throw new PreconditionFailedError(
+                `Event creation for run "${effectiveRunId}" is based on a stale snapshot ` +
+                  `(stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
+              );
+            }
+            guard.operations.push({
+              operationType: BulkOperationType.Patch,
+              id: stateMarkerId(effectiveRunId),
+              resourceBody: {
+                // Numeric literal built from a number we validated above, so
+                // there is nothing to interpolate unsafely.
+                condition: `from c where c.stateUpdatedAt <= ${stateUpdatedAt}`,
+                operations: [
+                  { op: PatchOperationType.set, path: '/guardCheckedAt', value: now.getTime() },
+                ],
+              },
+            });
+          }
+          // No marker document => run predates the guard (or has recorded no
+          // externally-originated event): nothing to be stale against.
+        } else if (EXTERNAL_EVENT_TYPES.has(data.eventType)) {
+          // Externally originated: this event becomes the new marker.
+          //
+          // Written as an unconditional Upsert so a parallel step fan-out never
+          // contends on an etag. Two advances racing can leave the marker a few
+          // ms behind the newest event, which only ever weakens the guard
+          // (fail-open) — it can never produce a spurious rejection.
+          const time = eventIdTime(eventId);
+          const marker = await readStateMarker(effectiveRunId);
+          if (time !== undefined && (marker === undefined || time > marker)) {
+            guard.operations.push({
+              operationType: BulkOperationType.Upsert,
+              resourceBody: toResourceBody({
+                ...newStateMarkerDoc(effectiveRunId),
+                stateUpdatedAt: time,
+              }),
+            });
+          }
+        }
+
+        // ============================================================
         // VALIDATION: terminal-state and event-ordering guards.
         // These run BEFORE the event document is written so rejected
         // duplicates can never corrupt the replay log. The runtime
@@ -1359,7 +1592,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               // Idempotent operation: run_cancelled on an already cancelled run
               // records the event without re-transitioning the run.
               if (currentRun.status === 'cancelled') {
-                await withCosmosRetry(() => container.items.create(eventDoc));
+                await commitEventDoc(eventDoc, effectiveRunId, guard);
                 result.run = currentRun;
                 return result;
               }
@@ -1455,6 +1688,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               correlationId as string,
               eventData as { stepName: string; input: unknown },
               eventDoc,
+              guard,
             );
             result.step = step;
             break;
@@ -1479,6 +1713,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               hookEventData,
               effectiveSpecVersion,
               eventDoc,
+              guard,
             );
             if (conflictEvent) {
               result.event = conflictEvent;
@@ -1493,6 +1728,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               correlationId as string,
               existingHookDoc as CosmosDoc,
               eventDoc,
+              guard,
             );
             break;
           }
@@ -1503,6 +1739,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               eventData,
               effectiveSpecVersion,
               eventDoc,
+              guard,
             );
             break;
           }
@@ -1511,6 +1748,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               effectiveRunId,
               correlationId as string,
               eventDoc,
+              guard,
             );
             break;
           }
@@ -1529,6 +1767,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               data.eventType,
               eventData,
               eventDoc,
+              guard,
             );
             break;
           }
@@ -1542,13 +1781,16 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               data.eventType,
               eventData,
               eventDoc,
+              guard,
             );
             break;
           }
           default: {
             // hook_received (and any future event-only types): store the
-            // event; no entity mutation needed at the storage level.
-            await withCosmosRetry(() => container.items.create(eventDoc));
+            // event; no entity mutation needed at the storage level. Still a
+            // guarded batch so hook_received can advance the state marker
+            // atomically with its own event.
+            await commitEventDoc(eventDoc, effectiveRunId, guard);
             break;
           }
         }
@@ -1569,6 +1811,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           result.events = eventDocs.map((doc: Record<string, unknown>) => deserializeEvent(doc));
           result.cursor = result.events.at(-1)?.eventId ?? null;
           result.hasMore = false;
+        }
+
+        // The runtime reads the per-run event ceiling from the run_started
+        // response only, so it must also be present on the idempotent
+        // already-running replay path above.
+        if (data.eventType === 'run_started' && result.run) {
+          result.maxEvents = maxEventsPerRun;
         }
 
         return result;

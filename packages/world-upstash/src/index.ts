@@ -12,8 +12,8 @@ import {
 import { createStreamer } from './streamer.js';
 import { instrumentRedis } from './util.js';
 
-function createStorage(redis: Redis, keyPrefix: string): Storage {
-  const config = { redis, keyPrefix };
+function createStorage(redis: Redis, keyPrefix: string, maxEventsPerRun?: number): Storage {
+  const config = { redis, keyPrefix, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -52,7 +52,7 @@ export function createWorld(config: UpstashWorldConfig = {}): World {
     retries: config.qstashRetries,
   });
 
-  const storage = createStorage(storageRedis, keyPrefix);
+  const storage = createStorage(storageRedis, keyPrefix, config.maxEventsPerRun);
   const streamer = createStreamer({ redis: streamerRedis, keyPrefix });
 
   return {

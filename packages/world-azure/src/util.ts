@@ -1,3 +1,4 @@
+import type { OperationResponse } from '@azure/cosmos';
 import { createDebugLogger } from '@fantasticfour/shared';
 
 export { compact } from '@fantasticfour/shared';
@@ -18,6 +19,47 @@ const BATCH_ERROR_PREFIX = 'Batch request error:';
 
 export function isWrappedBatchError(err: unknown): err is Error {
   return err instanceof Error && err.message.startsWith(BATCH_ERROR_PREFIX);
+}
+
+/**
+ * Per-operation status meaning "rolled back because a sibling operation in the
+ * same transactional batch failed" — never the root cause.
+ */
+const HTTP_FAILED_DEPENDENCY = 424;
+
+/**
+ * A transactional-batch operation that the server rejected.
+ *
+ * Shaped so both classifiers keep working: the `Batch request error:` prefix
+ * satisfies {@link isWrappedBatchError}, and `code` carries the real status
+ * that `Items.batch()` would otherwise discard.
+ */
+export class BatchOperationError extends Error {
+  readonly code: number;
+
+  constructor(index: number, code: number) {
+    super(`${BATCH_ERROR_PREFIX} operation ${index} failed with status ${code}`);
+    this.name = 'BatchOperationError';
+    this.code = code;
+  }
+}
+
+/**
+ * Surface a rejected transactional batch as an error.
+ *
+ * `Items.batch()` only wraps *transport* failures — a rejected operation comes
+ * back as a resolved response (HTTP 207) carrying the failing status on
+ * `result[i].statusCode`, with siblings marked 424. Nothing is committed in
+ * that case, so a caller that ignores the response silently drops the write.
+ */
+export function assertBatchCommitted(response: { result?: OperationResponse[] }): void {
+  const results = response.result;
+  if (!results) return;
+  for (const [index, result] of results.entries()) {
+    const status = result.statusCode;
+    if (status < 400 || status === HTTP_FAILED_DEPENDENCY) continue;
+    throw new BatchOperationError(index, status);
+  }
 }
 
 function hasStatus(err: unknown, status: number): boolean {

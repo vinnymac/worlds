@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -30,7 +31,7 @@ import {
 } from '@workflow/world';
 import { and, desc, eq, gt, lt, notInArray, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory } from 'ulid';
 import type { SerializedContent } from './schema.js';
 import * as schema from './schema.js';
 import { compact } from './util.js';
@@ -40,6 +41,114 @@ type Drizzle = MySql2Database<typeof schema>;
 // A drizzle client or an open transaction on one — lets helpers run inside
 // the events.create() transaction as well as standalone.
 type DrizzleOrTx = Drizzle | Parameters<Parameters<Drizzle['transaction']>[0]>[0];
+
+/**
+ * Per-run event ceiling reported to the runtime on `run_started`. Mirrors the
+ * Vercel World's default; the runtime fails the run with
+ * `MAX_EVENTS_EXCEEDED` once the replay log reaches it.
+ */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+export interface EventsStorageOptions {
+  /**
+   * Per-run event ceiling returned as `EventResult.maxEvents` on `run_started`.
+   * Defaults to `WORKFLOW_MAX_EVENTS` when it parses to a positive integer,
+   * otherwise {@link DEFAULT_MAX_EVENTS_PER_RUN}.
+   */
+  maxEventsPerRun?: number;
+}
+
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new TypeError(
+        `maxEventsPerRun must be a positive integer, received ${String(configured)}`,
+      );
+    }
+    return configured;
+  }
+  // Env is an operator escape hatch, so it fails open to the default rather
+  // than crashing a deployment over a malformed value.
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
+}
+
+/**
+ * Event types that advance the per-run `state_updated_at` marker when created
+ * *without* a `stateUpdatedAt` — i.e. the externally-originated events that
+ * invalidate a replay snapshot. The naive "any create without stateUpdatedAt"
+ * rule is wrong: the runtime also omits it on `run_created` / `run_started` /
+ * `run_failed`, and advancing on those would reject every replay.
+ */
+const EXTERNAL_STATE_EVENT_TYPES: readonly string[] = ['hook_received', 'step_completed'];
+
+/** Epoch ms encoded in a `wevt_<ulid>` id. The client strips at the last `_`. */
+function eventIdTime(eventId: string): number {
+  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+}
+
+/**
+ * Optimistic-concurrency preamble for an event insert
+ * (`CreateEventParams.stateUpdatedAt`, @workflow/world 4.3.1).
+ *
+ * Takes the run row `FOR UPDATE` when this create either carries a
+ * `stateUpdatedAt` (so the marker check and the insert are one serializable
+ * unit) or is externally originated (so its marker advance is serialized
+ * against concurrent guarded creates).
+ *
+ * The lock is acquired *before* the event ULID is allocated, and that ordering
+ * is load-bearing: a writer that allocated an id and only then blocked on the
+ * run row would commit a smaller id after a larger one. Event order is eventId
+ * order, so a reader that already consumed the larger id would later see the
+ * log grow backwards and fail replay with a divergence.
+ *
+ * Rejects only when `stateUpdatedAt` is *strictly* older than the marker — an
+ * equal timestamp must pass or an up-to-date client livelocks. An absent
+ * marker or an absent `stateUpdatedAt` fails open, as the contract specifies.
+ *
+ * @returns whether the caller must call {@link advanceStateMarker} after the insert.
+ */
+async function lockRunState(
+  tx: DrizzleOrTx,
+  runId: string,
+  eventType: string,
+  stateUpdatedAt: number | undefined,
+): Promise<boolean> {
+  const guarded = stateUpdatedAt !== undefined;
+  const advances = !guarded && EXTERNAL_STATE_EVENT_TYPES.includes(eventType);
+  if (!guarded && !advances) return false;
+
+  const [row] = await tx
+    .select({ stateUpdatedAt: schema.runs.stateUpdatedAt })
+    .from(schema.runs)
+    .where(eq(schema.runs.runId, runId))
+    .limit(1)
+    .for('update');
+
+  if (guarded) {
+    const marker = row?.stateUpdatedAt;
+    if (marker != null && stateUpdatedAt < marker) {
+      throw new PreconditionFailedError(
+        `Workflow run "${runId}" advanced past the caller's snapshot (stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
+      );
+    }
+  }
+  return advances;
+}
+
+/**
+ * Advance the run's state marker to the ULID time of the event just written.
+ * `GREATEST` keeps the marker monotonic without a read-modify-write, so
+ * out-of-order commits cannot walk it backwards.
+ */
+async function advanceStateMarker(tx: DrizzleOrTx, runId: string, eventId: string): Promise<void> {
+  const marker = eventIdTime(eventId);
+  await tx
+    .update(schema.runs)
+    .set({ stateUpdatedAt: sql`GREATEST(COALESCE(${schema.runs.stateUpdatedAt}, 0), ${marker})` })
+    .where(eq(schema.runs.runId, runId));
+}
 
 /**
  * Parse error JSON string into a StructuredError object.
@@ -68,7 +177,9 @@ function parseErrorJson(errorJson: string | null): any {
  * Deserialize run data, handling legacy error fields.
  */
 function deserializeRunError(run: any): WorkflowRun {
-  const { errorStack, errorCode, ...rest } = run;
+  // stateUpdatedAt is our internal optimistic-concurrency marker column, not a
+  // WorkflowRun field — drop it here so it never leaks onto a returned entity.
+  const { errorStack, errorCode, stateUpdatedAt: _stateUpdatedAt, ...rest } = run;
 
   // If no legacy fields, return as-is
   if (!errorStack && !errorCode) {
@@ -209,9 +320,13 @@ type MutationOutcome =
       conflictEventData: { token: string; conflictingRunId: string };
     };
 
-export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
+export function createEventsStorage(
+  drizzle: Drizzle,
+  options: EventsStorageOptions = {},
+): Storage['events'] {
   const ulid = monotonicFactory();
   const events = schema.events;
+  const maxEvents = resolveMaxEventsPerRun(options.maxEventsPerRun);
 
   // Terminal statuses, used both for JS checks and as atomic guards in
   // UPDATE ... WHERE clauses (prevents TOCTOU races between validation
@@ -404,6 +519,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           return {
             event: filterEventData(parsed, resolveData),
             run: fullRun,
+            ...(fullRun ? { maxEvents } : {}),
           };
         }
 
@@ -498,6 +614,17 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         let run: WorkflowRun | undefined;
         let step: Step | undefined;
         let hook: Hook | undefined;
+
+        // Optimistic-concurrency preamble. Taking the run row lock here —
+        // before any entity write and before the event ULID is allocated —
+        // makes the marker check and this event's insert one serializable
+        // unit, and a rejection rolls the whole create back.
+        const advancesStateMarker = await lockRunState(
+          tx,
+          effectiveRunId,
+          data.eventType,
+          params?.stateUpdatedAt,
+        );
 
         // Handle run_created event: create the run entity
         if (data.eventType === 'run_created') {
@@ -1050,12 +1177,20 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           specVersion: effectiveSpecVersion,
         });
 
+        if (advancesStateMarker) {
+          await advanceStateMarker(tx, effectiveRunId, getEventId());
+        }
+
         return { kind: 'event-created', eventRow, run, step, hook };
       });
 
       if (outcome.kind === 'run-started-replay') {
+        // Core reads maxEvents only off the run_started response, so the
+        // idempotent replay path must carry it too or the ceiling silently
+        // disappears on every replay after the first.
         return {
           run: outcome.run ? (filterRunData(outcome.run, resolveData) as WorkflowRun) : undefined,
+          ...(outcome.run ? { maxEvents } : {}),
         };
       }
 
@@ -1109,6 +1244,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         step: outcome.step,
         hook: outcome.hook,
         events: allEvents,
+        ...(outcome.run ? { maxEvents } : {}),
       };
     },
     async get(runId, eventId, params) {
@@ -1307,10 +1443,10 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
   };
 }
 
-export function createStorage(drizzle: Drizzle): Storage {
+export function createStorage(drizzle: Drizzle, options: EventsStorageOptions = {}): Storage {
   return {
     runs: createRunsStorage(drizzle),
-    events: createEventsStorage(drizzle),
+    events: createEventsStorage(drizzle, options),
     hooks: createHooksStorage(drizzle),
     steps: createStepsStorage(drizzle),
   };

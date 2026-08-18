@@ -1,7 +1,13 @@
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import type { WorkflowRun, Step } from '@workflow/world';
+import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, describe, expect, it, test } from 'vitest';
 import { createWorld } from '../src/index.js';
+
+/** ULID time of a prefixed id, matching how the runtime derives stateUpdatedAt. */
+function eventTime(eventId: string): number {
+  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+}
 
 describe('Storage (NATS JetStream integration)', () => {
   if (process.platform === 'win32') {
@@ -11,6 +17,7 @@ describe('Storage (NATS JetStream integration)', () => {
 
   let container: StartedTestContainer;
   let world: ReturnType<typeof createWorld>;
+  let natsUrl: string;
 
   async function createRun(workflowName = 'test-workflow'): Promise<WorkflowRun> {
     const result = await world.events.create(null, {
@@ -43,7 +50,8 @@ describe('Storage (NATS JetStream integration)', () => {
 
     const host = container.getHost();
     const port = container.getMappedPort(4222);
-    world = createWorld({ nats: `${host}:${port}`, keyPrefix: 'test_' });
+    natsUrl = `${host}:${port}`;
+    world = createWorld({ nats: natsUrl, keyPrefix: 'test_' });
     await world.start();
   }, 120_000);
 
@@ -412,6 +420,198 @@ describe('Storage (NATS JetStream integration)', () => {
       const fetched = await world.steps.get(run.runId, stepId);
       // Without CAS both writers read attempt 0 and store 1 (lost update).
       expect(fetched.attempt).toBe(2);
+    });
+  });
+
+  describe('Event ceiling (maxEvents)', () => {
+    it('reports the default ceiling on every run_started response', async () => {
+      const run = await createRun();
+
+      const started = await world.events.create(run.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(25_000);
+
+      // The replay path must repeat it: the runtime re-reads the ceiling from
+      // every run_started response and drops the limit when it is absent.
+      const replay = await world.events.create(run.runId, { eventType: 'run_started' });
+      expect(replay.run?.status).toBe('running');
+      expect(replay.maxEvents).toBe(25_000);
+    });
+
+    it('honours a configured ceiling', async () => {
+      const configured = createWorld({
+        nats: natsUrl,
+        keyPrefix: 'test_maxevents_',
+        maxEventsPerRun: 7,
+      });
+      try {
+        const created = await configured.events.create(null, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'test-workflow-max-events',
+            input: [],
+          },
+        });
+        const started = await configured.events.create(created.run!.runId, {
+          eventType: 'run_started',
+        });
+        expect(started.maxEvents).toBe(7);
+      } finally {
+        await configured.close();
+      }
+    });
+
+    it('only reports the ceiling on run_started responses', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+
+      const completed = await world.events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: 'done' },
+      });
+      expect(completed.maxEvents).toBeUndefined();
+    });
+  });
+
+  describe('Optimistic concurrency (stateUpdatedAt)', () => {
+    const resumeAt = () => new Date(Date.now() + 60_000);
+
+    it('rejects a create whose snapshot predates an externally-originated event', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+
+      const hookId = `hook-guard-${Date.now()}`;
+      await world.events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId,
+        eventData: { token: `guard-token-${Date.now()}` },
+      });
+
+      // No stateUpdatedAt: externally originated, so it advances the marker.
+      const received = await world.events.create(run.runId, {
+        eventType: 'hook_received',
+        correlationId: hookId,
+        eventData: { payload: 'value' },
+      });
+      const marker = eventTime(received.event!.eventId);
+
+      // Strictly older snapshot → 412.
+      await expect(
+        world.events.create(
+          run.runId,
+          {
+            eventType: 'wait_created',
+            correlationId: 'wait-stale',
+            eventData: { resumeAt: resumeAt() },
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+
+      // Equal snapshot must pass — rejecting an up-to-date client livelocks it.
+      const equal = await world.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-equal',
+          eventData: { resumeAt: resumeAt() },
+        },
+        { stateUpdatedAt: marker },
+      );
+      expect(equal.wait?.status).toBe('waiting');
+
+      // An absent stateUpdatedAt disables the guard entirely.
+      const unguarded = await world.events.create(run.runId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-unguarded',
+        eventData: { resumeAt: resumeAt() },
+      });
+      expect(unguarded.wait?.status).toBe('waiting');
+    });
+
+    it('advances the marker on an unguarded step_completed', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      const stepId = `step-marker-${Date.now()}`;
+      await createStep(run.runId, stepId);
+      await world.events.create(run.runId, { eventType: 'step_started', correlationId: stepId });
+
+      const completed = await world.events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: { result: 42 },
+      });
+      const marker = eventTime(completed.event!.eventId);
+
+      await expect(
+        world.events.create(
+          run.runId,
+          {
+            eventType: 'wait_created',
+            correlationId: 'wait-after-step',
+            eventData: { resumeAt: resumeAt() },
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError' });
+    });
+
+    it('does not advance the marker for replay-origin creates', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      const stepId = `step-replay-origin-${Date.now()}`;
+      await createStep(run.runId, stepId);
+      await world.events.create(run.runId, { eventType: 'step_started', correlationId: stepId });
+
+      // Carries stateUpdatedAt → replay origin → must not advance the marker.
+      const completed = await world.events.create(
+        run.runId,
+        { eventType: 'step_completed', correlationId: stepId, eventData: { result: 42 } },
+        { stateUpdatedAt: Date.now() },
+      );
+
+      // A far older snapshot still passes, because nothing advanced.
+      const wait = await world.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-no-advance',
+          eventData: { resumeAt: resumeAt() },
+        },
+        { stateUpdatedAt: eventTime(completed.event!.eventId) - 60_000 },
+      );
+      expect(wait.wait?.status).toBe('waiting');
+    });
+
+    it('scopes the marker to its own run', async () => {
+      const runA = await createRun();
+      const runB = await createRun();
+      await world.events.create(runA.runId, { eventType: 'run_started' });
+      await world.events.create(runB.runId, { eventType: 'run_started' });
+
+      const hookId = `hook-scope-${Date.now()}`;
+      await world.events.create(runA.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId,
+        eventData: { token: `scope-token-${Date.now()}` },
+      });
+      const received = await world.events.create(runA.runId, {
+        eventType: 'hook_received',
+        correlationId: hookId,
+        eventData: { payload: 'value' },
+      });
+
+      // runB has no marker of its own, so runA's must not reject it.
+      const wait = await world.events.create(
+        runB.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-other-run',
+          eventData: { resumeAt: resumeAt() },
+        },
+        { stateUpdatedAt: eventTime(received.event!.eventId) - 60_000 },
+      );
+      expect(wait.wait?.status).toBe('waiting');
     });
   });
 

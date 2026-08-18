@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   RunNotSupportedError,
   TooEarlyError,
@@ -81,6 +82,38 @@ export interface CloudflareStorageConfig {
     WORKFLOW_INDEX: KVNamespace;
   };
   deploymentId: string;
+  /**
+   * Per-run event ceiling reported to the runtime as `EventResult.maxEvents`.
+   * Defaults to `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}.
+   */
+  maxEventsPerRun?: number;
+}
+
+/**
+ * Default per-run event ceiling. Mirrors `@workflow/world-local`, which in
+ * turn mirrors the Vercel World.
+ */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/**
+ * Resolve the per-run event ceiling: explicit config wins, then the
+ * `WORKFLOW_MAX_EVENTS` environment variable, then the default. An explicitly
+ * configured value must be a positive integer — a bad value is a
+ * misconfiguration, not something to silently paper over.
+ */
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new WorkflowWorldError(
+        `maxEventsPerRun must be a positive integer, received ${configured}`,
+        { status: 500 },
+      );
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
 }
 
 interface KVNamespace {
@@ -150,6 +183,8 @@ function throwOutcomeError(
       throw new RunExpiredError(outcome.message);
     case 'TOO_EARLY':
       throw new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds });
+    case 'PRECONDITION_FAILED':
+      throw new PreconditionFailedError(outcome.message);
     case 'RUN_NOT_SUPPORTED':
       throw new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT);
     case 'LEGACY_RUN_NOT_SUPPORTED':
@@ -160,6 +195,7 @@ function throwOutcomeError(
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const ulid = monotonicFactory();
+  const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
 
   // Helper to get or create a DO for a run
   const getRunDO = (runId: string): WorkflowRunDOStub => {
@@ -243,7 +279,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams,
+        params?: CreateEventParams,
       ): Promise<EventResult> {
         // For run_created events, generate a runId server-side if absent.
         let effectiveRunId: string;
@@ -277,8 +313,14 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         // Guards, event append, and entity mutation run in ONE DO storage
         // transaction (see apply-event.ts). The event is schema-validated
-        // before anything is persisted.
-        const outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder });
+        // before anything is persisted. `stateUpdatedAt` rides along so the
+        // optimistic-concurrency check is atomic with the append.
+        const outcome = await stub.applyEvent({
+          runId: effectiveRunId,
+          data,
+          tokenHolder,
+          stateUpdatedAt: params?.stateUpdatedAt,
+        });
 
         if (!outcome.ok) {
           throwOutcomeError(outcome, effectiveRunId, data);
@@ -312,6 +354,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           step: outcome.step,
           hook: outcome.hook,
           events: outcome.events,
+          // The runtime reads the ceiling from the run_started response only,
+          // so it must also be present on the idempotent already-running
+          // replay path -- keying off the request type covers both.
+          ...(data.eventType === 'run_started' && outcome.run
+            ? { maxEvents: maxEventsPerRun }
+            : {}),
         };
       },
 

@@ -49,7 +49,7 @@
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",
-    "@testcontainers/azure-cosmosdb-emulator": "11.14.0",
+    "@testcontainers/azure-cosmosdb-emulator": "12.1.0",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "testcontainers": "catalog:",

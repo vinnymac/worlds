@@ -17,6 +17,12 @@ export interface AzureWorldConfig {
   /** Service Bus queue name. Defaults to 'workflow-queue' */
   queueName?: string;
   deploymentId?: string;
+  /**
+   * Per-run event ceiling reported to the runtime on `run_started`
+   * (`EventResult.maxEvents`). Defaults to the `WORKFLOW_MAX_EVENTS`
+   * environment variable, then to 25,000.
+   */
+  maxEventsPerRun?: number;
 }
 
 /**
@@ -255,6 +261,7 @@ export function createAzureWorld(
         container: db.container(CONTAINER_WORKFLOW_RUNS),
         hooksByTokenContainer: db.container(CONTAINER_HOOKS_BY_TOKEN),
         deploymentId,
+        maxEventsPerRun: config.maxEventsPerRun,
       });
 
       streamerInstance = createStreamer({

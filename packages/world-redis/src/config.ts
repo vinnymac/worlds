@@ -65,4 +65,14 @@ export interface RedisWorldConfig {
    * Default: 1000
    */
   backoffDelayMs?: number;
+
+  /**
+   * Maximum number of events a single run may accumulate. Reported to the
+   * runtime on the `run_started` response as `EventResult.maxEvents`; the
+   * runtime fails the run with `MAX_EVENTS_EXCEEDED` once the log reaches it
+   * (and may only clamp the value further down).
+   * Must be a positive integer.
+   * Default: process.env.WORKFLOW_MAX_EVENTS || 25_000
+   */
+  maxEventsPerRun?: number;
 }

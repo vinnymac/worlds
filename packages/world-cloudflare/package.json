@@ -47,16 +47,16 @@
     "ulid": "catalog:"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.18.4",
-    "@cloudflare/workers-types": "^5.20260708.1",
+    "@cloudflare/vitest-pool-workers": "0.19.1",
+    "@cloudflare/workers-types": "^5.20260818.1",
     "@fantasticfour/shared": "workspace:*",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
-    "miniflare": "^4.20260708.1",
+    "miniflare": "4.20260730.0",
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",
-    "wrangler": "^4.110.0"
+    "wrangler": "4.116.0"
   },
   "volta": {
     "extends": "../../package.json"

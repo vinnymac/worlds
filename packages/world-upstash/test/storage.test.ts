@@ -3,6 +3,7 @@ import { Redis } from '@upstash/redis';
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   TooEarlyError,
   WorkflowRunNotFoundError,
 } from '@workflow/errors';
@@ -628,6 +629,146 @@ describe('Storage (Upstash Redis integration)', () => {
         received.push(new TextDecoder().decode(value));
       }
       expect(received).toEqual(['c', 'd']);
+    });
+  });
+
+  describe('maxEvents (EventResult.maxEvents)', () => {
+    it('reports the default per-run event ceiling on run_started', async () => {
+      const run = await createRun();
+      const result = await events.create(run.runId, { eventType: 'run_started' });
+      expect(result.maxEvents).toBe(25_000);
+    });
+
+    it('reports the ceiling again on the idempotent run_started replay', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const replay = await events.create(run.runId, { eventType: 'run_started' });
+      expect(replay.run?.status).toBe('running');
+      expect(replay.maxEvents).toBe(25_000);
+    });
+
+    it('honours an explicit maxEventsPerRun config', async () => {
+      const scoped = createEventsStorage({ redis, keyPrefix, maxEventsPerRun: 10 });
+      const created = await scoped.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId: 'd', workflowName: 'capped', input: [] },
+      });
+      expect(created.maxEvents).toBe(10);
+      const started = await scoped.create(created.run!.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(10);
+    });
+
+    it('rejects a maxEventsPerRun that is not a positive integer', () => {
+      expect(() => createEventsStorage({ redis, keyPrefix, maxEventsPerRun: 0 })).toThrow(
+        TypeError,
+      );
+      expect(() => createEventsStorage({ redis, keyPrefix, maxEventsPerRun: 1.5 })).toThrow(
+        TypeError,
+      );
+    });
+  });
+
+  describe('optimistic concurrency (stateUpdatedAt guard)', () => {
+    const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
+
+    /** Create a run that is running with one completed step, so the per-run
+     * state marker has been advanced by an externally-originated event. */
+    async function runWithMarker() {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, { stepId: 'external-step' });
+      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: step.stepId,
+        eventData: { result: 'ok' },
+      });
+      const raw = await redis.get<string>(runStateKey(run.runId));
+      expect(raw).not.toBeNull();
+      return { run, marker: Number(raw) };
+    }
+
+    it('does not advance the marker on run lifecycle events', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      expect(await redis.get(runStateKey(run.runId))).toBeNull();
+    });
+
+    it('advances the marker on an externally-originated step_completed', async () => {
+      const { marker } = await runWithMarker();
+      expect(marker).toBeGreaterThan(0);
+    });
+
+    it('does not advance the marker for a replay-origin create', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, { stepId: 'replay-step' });
+      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
+      await events.create(
+        run.runId,
+        {
+          eventType: 'step_completed',
+          correlationId: step.stepId,
+          eventData: { result: 'ok' },
+        },
+        { stateUpdatedAt: Date.now() },
+      );
+      expect(await redis.get(runStateKey(run.runId))).toBeNull();
+    });
+
+    it('rejects a strictly older stateUpdatedAt with PreconditionFailedError', async () => {
+      const { run, marker } = await runWithMarker();
+      await expect(
+        events.create(
+          run.runId,
+          {
+            eventType: 'step_created',
+            correlationId: 'stale-step',
+            eventData: { stepName: 'stale', input: [] },
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toThrow(PreconditionFailedError);
+      // The event must not have landed in the log.
+      expect(await redis.zcard(`${keyPrefix}events:by_correlation:stale-step`)).toBe(0);
+    });
+
+    it('accepts an equal stateUpdatedAt (anti-livelock)', async () => {
+      const { run, marker } = await runWithMarker();
+      const result = await events.create(
+        run.runId,
+        {
+          eventType: 'step_created',
+          correlationId: 'equal-step',
+          eventData: { stepName: 'equal', input: [] },
+        },
+        { stateUpdatedAt: marker },
+      );
+      expect(result.step?.stepId).toBe('equal-step');
+    });
+
+    it('falls open when no stateUpdatedAt is supplied', async () => {
+      const { run } = await runWithMarker();
+      const result = await events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'unguarded-step',
+        eventData: { stepName: 'unguarded', input: [] },
+      });
+      expect(result.step?.stepId).toBe('unguarded-step');
+    });
+
+    it('rejects a stale run_completed without marking the run terminal', async () => {
+      const { run, marker } = await runWithMarker();
+      await expect(
+        events.create(
+          run.runId,
+          { eventType: 'run_completed', eventData: { output: [] } },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toThrow(PreconditionFailedError);
+
+      const current = await runs.get(run.runId);
+      expect(current.status).toBe('running');
     });
   });
 });

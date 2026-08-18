@@ -2,27 +2,26 @@ packages:
   - packages/*
 
 catalog:
-  '@biomejs/biome': ^2.3.7
-  '@testcontainers/mysql': ^11.8.1
-  '@testcontainers/postgresql': ^11.8.1
-  '@testcontainers/redis': ^11.8.1
-  '@types/node': ^22.19.0
-  '@workflow/core': 4.6.0
-  '@workflow/errors': 4.1.4
-  '@workflow/world': 4.2.1
-  '@workflow/world-testing': 4.1.11
+  '@testcontainers/mysql': ^12.1.0
+  '@testcontainers/postgresql': ^12.1.0
+  '@testcontainers/redis': ^12.1.0
+  '@types/node': ^24.13.3
+  '@workflow/core': 4.8.3
+  '@workflow/errors': 4.2.1
+  '@workflow/world': 4.3.1
+  '@workflow/world-testing': 4.1.18
   cbor-x: ^1.6.0
-  dotenv: ^17.2.3
-  drizzle-kit: ^0.31.7
+  dotenv: ^17.4.2
+  drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2
   ioredis: ^5.10.1
   mysql2: ^3.14.1
   postgres: ^3.4.9
-  testcontainers: 11.14.0
-  tsdown: ^0.22.0
-  typescript: ^5.9.3
+  testcontainers: 12.1.0
+  tsdown: ^0.22.14
+  typescript: 7.0.2
   ulid: ^3.0.2
-  vitest: ^4.1.10
+  vitest: ^4.1.11
 
 # pnpm v11: Allow build scripts for required native dependencies
 # See: https://pnpm.io/11.x/migration#build-scripts-blocking
@@ -53,6 +52,62 @@ pnpm:
 savePrefix: ''
 
 minimumReleaseAgeExclude:
-  - '@cloudflare/vitest-pool-workers@0.18.4'
-  - miniflare@4.20260708.1
-  - wrangler@4.110.0
+  - '@cloudflare/vitest-pool-workers@0.19.1'
+  - miniflare@4.20260730.0
+  - wrangler@4.116.0
+  - '@cloudflare/workers-types@5.20260818.1'
+  - '@oxfmt/binding-android-arm-eabi@0.64.0'
+  - '@oxfmt/binding-android-arm64@0.64.0'
+  - '@oxfmt/binding-darwin-arm64@0.64.0'
+  - '@oxfmt/binding-darwin-x64@0.64.0'
+  - '@oxfmt/binding-freebsd-x64@0.64.0'
+  - '@oxfmt/binding-linux-arm-gnueabihf@0.64.0'
+  - '@oxfmt/binding-linux-arm-musleabihf@0.64.0'
+  - '@oxfmt/binding-linux-arm64-gnu@0.64.0'
+  - '@oxfmt/binding-linux-arm64-musl@0.64.0'
+  - '@oxfmt/binding-linux-ppc64-gnu@0.64.0'
+  - '@oxfmt/binding-linux-riscv64-gnu@0.64.0'
+  - '@oxfmt/binding-linux-riscv64-musl@0.64.0'
+  - '@oxfmt/binding-linux-s390x-gnu@0.64.0'
+  - '@oxfmt/binding-linux-x64-gnu@0.64.0'
+  - '@oxfmt/binding-linux-x64-musl@0.64.0'
+  - '@oxfmt/binding-openharmony-arm64@0.64.0'
+  - '@oxfmt/binding-win32-arm64-msvc@0.64.0'
+  - '@oxfmt/binding-win32-ia32-msvc@0.64.0'
+  - '@oxfmt/binding-win32-x64-msvc@0.64.0'
+  - '@oxlint/binding-android-arm-eabi@1.79.0'
+  - '@oxlint/binding-android-arm64@1.79.0'
+  - '@oxlint/binding-darwin-arm64@1.79.0'
+  - '@oxlint/binding-darwin-x64@1.79.0'
+  - '@oxlint/binding-freebsd-x64@1.79.0'
+  - '@oxlint/binding-linux-arm-gnueabihf@1.79.0'
+  - '@oxlint/binding-linux-arm-musleabihf@1.79.0'
+  - '@oxlint/binding-linux-arm64-gnu@1.79.0'
+  - '@oxlint/binding-linux-arm64-musl@1.79.0'
+  - '@oxlint/binding-linux-ppc64-gnu@1.79.0'
+  - '@oxlint/binding-linux-riscv64-gnu@1.79.0'
+  - '@oxlint/binding-linux-riscv64-musl@1.79.0'
+  - '@oxlint/binding-linux-s390x-gnu@1.79.0'
+  - '@oxlint/binding-linux-x64-gnu@1.79.0'
+  - '@oxlint/binding-linux-x64-musl@1.79.0'
+  - '@oxlint/binding-openharmony-arm64@1.79.0'
+  - '@oxlint/binding-win32-arm64-msvc@1.79.0'
+  - '@oxlint/binding-win32-ia32-msvc@1.79.0'
+  - '@oxlint/binding-win32-x64-msvc@1.79.0'
+  - '@turbo/darwin-64@2.10.11'
+  - '@turbo/darwin-arm64@2.10.11'
+  - '@turbo/linux-64@2.10.11'
+  - '@turbo/linux-arm64@2.10.11'
+  - '@turbo/windows-64@2.10.11'
+  - '@turbo/windows-arm64@2.10.11'
+  - '@vitest/expect@4.1.11'
+  - '@vitest/mocker@4.1.11'
+  - '@vitest/pretty-format@4.1.11'
+  - '@vitest/runner@4.1.11'
+  - '@vitest/snapshot@4.1.11'
+  - '@vitest/spy@4.1.11'
+  - '@vitest/utils@4.1.11'
+  - oxfmt@0.64.0
+  - oxlint@1.79.0
+  - turbo@2.10.11
+  - vitest@4.1.11

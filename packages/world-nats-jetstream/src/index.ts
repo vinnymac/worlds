@@ -15,8 +15,9 @@ function createStorage(
   getJetStream: () => Promise<JetStreamClient>,
   keyPrefix: string,
   terminalRunTTLMs?: number,
+  maxEventsPerRun?: number,
 ): Storage {
-  const config = { getJetStream, keyPrefix, terminalRunTTLMs };
+  const config = { getJetStream, keyPrefix, terminalRunTTLMs, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -60,7 +61,12 @@ export function createWorld(
 
   const keyPrefix = config.keyPrefix || 'workflow_';
 
-  const storage = createStorage(getJetStream, keyPrefix, config.terminalRunTTLMs);
+  const storage = createStorage(
+    getJetStream,
+    keyPrefix,
+    config.terminalRunTTLMs,
+    config.maxEventsPerRun,
+  );
   const streamer = createStreamer({ getJetStream, keyPrefix });
   const queue = createQueue(getJetStream, config);
 

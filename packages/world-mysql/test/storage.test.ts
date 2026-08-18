@@ -4,6 +4,7 @@ import type { Step, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
+import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import * as schema from '../src/schema.js';
 import {
@@ -181,6 +182,114 @@ describe('Storage (MySQL integration)', () => {
       });
       const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
+    });
+  });
+
+  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt` — the conformance
+  // suite has no coverage for this, so pin the semantics here.
+  describe('stateUpdatedAt optimistic-concurrency guard', () => {
+    const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+
+    async function completeStep(runId: string, stepId: string): Promise<number> {
+      await createStep(runId, stepId);
+      await events.create(runId, { eventType: 'step_started', correlationId: stepId });
+      const completed = await events.create(runId, {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: { result: [] },
+      });
+      return ulidTime(completed.event!.eventId);
+    }
+
+    function stepCreated(stepId: string) {
+      return {
+        eventType: 'step_created' as const,
+        correlationId: stepId,
+        eventData: { stepName: 'guarded-step', input: [] },
+      };
+    }
+
+    it('rejects a snapshot strictly older than the marker with PreconditionFailedError', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const marker = await completeStep(run.runId, 'step-guard-source');
+
+      await expect(
+        events.create(run.runId, stepCreated('step-guard-stale'), {
+          stateUpdatedAt: marker - 1,
+        }),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+
+      // The rejected create must leave nothing behind.
+      const stepList = await steps.list({ runId: run.runId });
+      expect(stepList.data.some((s) => s.stepId === 'step-guard-stale')).toBe(false);
+    });
+
+    it('accepts an equal snapshot and an absent snapshot, and never advances on replay creates', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const marker = await completeStep(run.runId, 'step-guard-source');
+
+      // Equal must pass — `<=` here would livelock an up-to-date client.
+      const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
+        stateUpdatedAt: marker,
+      });
+      expect(equal.step?.stepId).toBe('step-guard-equal');
+
+      // Replay-origin creates carry a stateUpdatedAt and must not advance the
+      // marker, so the same snapshot still passes afterwards.
+      const again = await events.create(run.runId, stepCreated('step-guard-equal-2'), {
+        stateUpdatedAt: marker,
+      });
+      expect(again.step?.stepId).toBe('step-guard-equal-2');
+
+      // Absent stateUpdatedAt fails open.
+      const unguarded = await events.create(run.runId, stepCreated('step-guard-absent'));
+      expect(unguarded.step?.stepId).toBe('step-guard-absent');
+    });
+
+    it('advances the marker on hook_received but not on run lifecycle events', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+
+      // run_created / run_started omit stateUpdatedAt but are not externally
+      // originated: advancing on them would reject every replay.
+      const beforeHook = await events.create(run.runId, stepCreated('step-guard-pre-hook'), {
+        stateUpdatedAt: 1,
+      });
+      expect(beforeHook.step?.stepId).toBe('step-guard-pre-hook');
+
+      await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-guard',
+        eventData: { token: 'token-guard' },
+      });
+      const received = await events.create(run.runId, {
+        eventType: 'hook_received',
+        correlationId: 'hook-guard',
+        eventData: {},
+      });
+      const marker = ulidTime(received.event!.eventId);
+
+      await expect(
+        events.create(run.runId, stepCreated('step-guard-post-hook'), {
+          stateUpdatedAt: marker - 1,
+        }),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+    });
+  });
+
+  describe('maxEvents', () => {
+    it('reports the per-run event ceiling on both run_started paths', async () => {
+      const run = await createRun();
+
+      const started = await events.create(run.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(25_000);
+
+      // The idempotent replay path is the easy miss: core reads maxEvents only
+      // off the run_started response, so it must be carried here too.
+      const replayed = await events.create(run.runId, { eventType: 'run_started' });
+      expect(replayed.maxEvents).toBe(25_000);
     });
   });
 

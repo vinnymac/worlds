@@ -1,6 +1,12 @@
 import type { Container } from '@azure/cosmos';
-import { EntityConflictError, HookNotFoundError, WorkflowRunNotFoundError } from '@workflow/errors';
+import {
+  EntityConflictError,
+  HookNotFoundError,
+  PreconditionFailedError,
+  WorkflowRunNotFoundError,
+} from '@workflow/errors';
 import type { WorkflowRun, Step } from '@workflow/world';
+import { ulidToDate } from '@workflow/world';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage } from '../src/storage.js';
 
@@ -32,6 +38,14 @@ describe('Storage (Azure Cosmos DB integration)', () => {
     });
     if (!result.step) throw new Error('Expected step to be created');
     return result.step;
+  }
+
+  async function createStepResult(runId: string, stepId: string) {
+    return storage.events.create(runId, {
+      eventType: 'step_created',
+      correlationId: stepId,
+      eventData: { stepName: 'test-step', input: ['input1'] },
+    });
   }
 
   beforeAll(() => {
@@ -78,31 +92,75 @@ describe('Storage (Azure Cosmos DB integration)', () => {
           return { resource: doc };
         }),
         // Mirrors @azure/cosmos transactional batch: all-or-nothing within a
-        // partition, and failures are rethrown as a PLAIN Error with the
-        // "Batch request error:" prefix (the real SDK discards the status
-        // code), so the storage layer's unwrap/translate path is exercised.
+        // partition, and — as verified against the Cosmos Linux emulator —
+        // a rejected operation RESOLVES with HTTP 207 and the failing status
+        // on result[i].statusCode (siblings 424) rather than throwing. The
+        // storage layer's assertBatchCommitted path turns that into an error.
         batch: vi.fn(async (operations: any[], _partitionKey: string) => {
-          for (const op of operations) {
-            if (op.operationType === 'Create' && mockData.has(op.resourceBody.id)) {
-              throw new Error(
-                'Batch request error: Entity with the specified id already exists in the system.',
-              );
+          /** Evaluate the `from c where c.<field> <op> <number>` conditions we emit. */
+          const conditionHolds = (condition: string | undefined, doc: any): boolean => {
+            if (!condition) return true;
+            const match = /from c where c\.(\w+) (<=|<|>=|>) (-?\d+)$/.exec(condition.trim());
+            if (!match) throw new Error(`mock cannot evaluate condition: ${condition}`);
+            const [, field, operator, rawValue] = match;
+            const actual = doc?.[field];
+            if (typeof actual !== 'number') return false;
+            const expected = Number(rawValue);
+            switch (operator) {
+              case '<=':
+                return actual <= expected;
+              case '<':
+                return actual < expected;
+              case '>=':
+                return actual >= expected;
+              default:
+                return actual > expected;
             }
+          };
+
+          const statuses = operations.map((op) => {
+            if (op.operationType === 'Create' && mockData.has(op.resourceBody.id)) return 409;
             if (
               (op.operationType === 'Replace' || op.operationType === 'Delete') &&
               !mockData.has(op.id)
             ) {
-              throw new Error('Batch request error: Entity with the specified id does not exist.');
+              return 404;
             }
+            if (op.operationType === 'Patch') {
+              if (!mockData.has(op.id)) return 404;
+              return conditionHolds(op.resourceBody.condition, mockData.get(op.id)) ? 200 : 412;
+            }
+            return op.operationType === 'Create' ? 201 : 200;
+          });
+
+          const failedIndex = statuses.findIndex((status) => status >= 400);
+          if (failedIndex !== -1) {
+            return {
+              code: 207,
+              result: statuses.map((status, index) => ({
+                statusCode: index === failedIndex ? status : 424,
+              })),
+            };
           }
+
           for (const op of operations) {
-            if (op.operationType === 'Create' || op.operationType === 'Replace') {
+            if (
+              op.operationType === 'Create' ||
+              op.operationType === 'Replace' ||
+              op.operationType === 'Upsert'
+            ) {
               mockData.set(op.resourceBody.id ?? op.id, op.resourceBody);
             } else if (op.operationType === 'Delete') {
               mockData.delete(op.id);
+            } else if (op.operationType === 'Patch') {
+              const doc = { ...mockData.get(op.id) };
+              for (const patch of op.resourceBody.operations) {
+                doc[patch.path.replace(/^\//, '')] = patch.value;
+              }
+              mockData.set(op.id, doc);
             }
           }
-          return { code: 200 };
+          return { code: 200, result: statuses.map((statusCode) => ({ statusCode })) };
         }),
       },
       item: vi.fn((id: string, _partitionKey: string) => ({
@@ -466,6 +524,220 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       const events = await storage.events.list({ runId: run.runId });
       expect(events.data.filter((e) => e.eventType === 'run_failed')).toHaveLength(0);
       expect(events.data.filter((e) => e.eventType === 'run_completed')).toHaveLength(1);
+    });
+  });
+
+  describe('Optimistic concurrency guard (stateUpdatedAt, world 4.3.1)', () => {
+    /** ULID time (epoch ms) of an event id, i.e. the state-marker unit. */
+    function eventTime(eventId: string): number {
+      const time = ulidToDate(eventId.slice(eventId.lastIndexOf('_') + 1))?.getTime();
+      if (time === undefined) throw new Error(`not a decodable event id: ${eventId}`);
+      return time;
+    }
+
+    /**
+     * Drive a run to the point where an externally-originated step_completed
+     * has advanced the state marker, and report the marker value.
+     */
+    async function runWithMarker(): Promise<{ runId: string; marker: number }> {
+      const run = await createRun('guard-workflow');
+      await storage.events.create(run.runId, { eventType: 'run_started' });
+      await createStep(run.runId, 'step-guard');
+      await storage.events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: 'step-guard',
+        eventData: {},
+      });
+      // No stateUpdatedAt -> externally originated -> advances the marker.
+      const completed = await storage.events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: 'step-guard',
+        eventData: { result: 'ok' },
+      });
+      return { runId: run.runId, marker: eventTime(completed.event!.eventId) };
+    }
+
+    it('rejects a strictly older snapshot with PreconditionFailedError', async () => {
+      const { runId, marker } = await runWithMarker();
+
+      await expect(
+        storage.events.create(
+          runId,
+          {
+            eventType: 'wait_created',
+            correlationId: 'wait-stale',
+            eventData: { resumeAt: new Date(Date.now() + 60_000) },
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
+
+      // The rejected create must not have appended anything.
+      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
+      expect(events.data.some((e) => e.eventType === 'wait_created')).toBe(false);
+    });
+
+    it('rejects inside the batch when the marker advances after the pre-check', async () => {
+      // The fast-path compare passes, so only the in-batch Patch condition can
+      // catch this -- exactly the race the guard exists for.
+      const { runId, marker } = await runWithMarker();
+      const markerDoc = mockData.get(`marker:${runId}`);
+      expect(markerDoc.stateUpdatedAt).toBe(marker);
+
+      const batch = mockContainer.items.batch as unknown as ReturnType<typeof vi.fn>;
+      const original = batch.getMockImplementation()!;
+      batch.mockImplementationOnce(async (operations: any[], partitionKey: string) => {
+        markerDoc.stateUpdatedAt = marker + 1000;
+        return original(operations, partitionKey);
+      });
+
+      await expect(
+        storage.events.create(
+          runId,
+          {
+            eventType: 'wait_created',
+            correlationId: 'wait-raced',
+            eventData: { resumeAt: new Date(Date.now() + 60_000) },
+          },
+          { stateUpdatedAt: marker },
+        ),
+      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
+
+      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
+      expect(events.data.some((e) => e.eventType === 'wait_created')).toBe(false);
+    });
+
+    it('accepts an equal snapshot and does not advance the marker', async () => {
+      const { runId, marker } = await runWithMarker();
+
+      // Equal passes (anti-livelock for an up-to-date client)...
+      await storage.events.create(
+        runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-a',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { stateUpdatedAt: marker },
+      );
+      // ...and a replay-origin create must not move the marker forward, so the
+      // same snapshot still passes afterwards.
+      await storage.events.create(
+        runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-b',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { stateUpdatedAt: marker },
+      );
+
+      expect(mockData.get(`marker:${runId}`).stateUpdatedAt).toBe(marker);
+      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
+      expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(2);
+    });
+
+    it('fails open when no snapshot is supplied', async () => {
+      const { runId } = await runWithMarker();
+
+      const result = await storage.events.create(runId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-unguarded',
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      });
+      expect(result.event).toBeDefined();
+    });
+
+    it('advances the marker on an externally-originated hook_received', async () => {
+      const run = await createRun('guard-hook-workflow');
+      await storage.events.create(run.runId, { eventType: 'run_started' });
+      await storage.events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-guard',
+        eventData: { token: 'token-guard' },
+      });
+      const received = await storage.events.create(run.runId, {
+        eventType: 'hook_received',
+        correlationId: 'hook-guard',
+        eventData: { payload: {} },
+      });
+      const marker = eventTime(received.event!.eventId);
+      expect(mockData.get(`marker:${run.runId}`).stateUpdatedAt).toBe(marker);
+
+      await expect(
+        storage.events.create(
+          run.runId,
+          { eventType: 'hook_disposed', correlationId: 'hook-guard', eventData: {} },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
+    });
+
+    it('does not arm the guard from run lifecycle events', async () => {
+      // run_created / run_started are created without a snapshot but are NOT
+      // externally originated; treating them as such would 412 every replay.
+      const run = await createRun('guard-lifecycle-workflow');
+      const started = await storage.events.create(run.runId, { eventType: 'run_started' });
+      const startedAt = eventTime(started.event!.eventId);
+
+      const result = await storage.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-x',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { stateUpdatedAt: startedAt - 1000 },
+      );
+      expect(result.event).toBeDefined();
+    });
+  });
+
+  describe('Event ceiling (EventResult.maxEvents, world 4.3.1)', () => {
+    it('reports the default ceiling on run_started and on its idempotent replay', async () => {
+      const run = await createRun('max-events-workflow');
+
+      const started = await storage.events.create(run.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(25_000);
+
+      // The runtime reads maxEvents only from run_started, so the replay path
+      // (already-running) must report it too.
+      const replay = await storage.events.create(run.runId, { eventType: 'run_started' });
+      expect(replay.maxEvents).toBe(25_000);
+    });
+
+    it('does not report a ceiling on non-run_started responses', async () => {
+      const run = await createRun('max-events-scope-workflow');
+      const created = await createStepResult(run.runId, 'step-max');
+      expect(created.maxEvents).toBeUndefined();
+    });
+
+    it('honors an explicitly configured ceiling', async () => {
+      const configured = createStorage({
+        container: mockContainer,
+        hooksByTokenContainer: mockHooksByTokenContainer,
+        deploymentId: 'test-deployment',
+        maxEventsPerRun: 10,
+      });
+      const created = await configured.events.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId: 'test-deployment', workflowName: 'capped', input: [] },
+      });
+      const started = await configured.events.create(created.run!.runId, {
+        eventType: 'run_started',
+      });
+      expect(started.maxEvents).toBe(10);
+    });
+
+    it('rejects a non-positive configured ceiling', () => {
+      expect(() =>
+        createStorage({
+          container: mockContainer,
+          hooksByTokenContainer: mockHooksByTokenContainer,
+          deploymentId: 'test-deployment',
+          maxEventsPerRun: 0,
+        }),
+      ).toThrow(/positive integer/);
     });
   });
 });

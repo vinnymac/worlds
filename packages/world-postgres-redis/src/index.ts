@@ -9,16 +9,17 @@ import { createRunUpdateSubscriber, type RunUpdateListener } from './notify.js';
 import { createQueue } from './queue.js';
 import {
   createEventsStorage,
+  type EventsStorageOptions,
   createHooksStorage,
   createRunsStorage,
   createStepsStorage,
 } from './storage.js';
 import { createStreamer } from './streamer.js';
 
-function createStorage(drizzle: Drizzle): Storage {
+function createStorage(drizzle: Drizzle, options: EventsStorageOptions): Storage {
   return {
     runs: createRunsStorage(drizzle),
-    events: createEventsStorage(drizzle),
+    events: createEventsStorage(drizzle, options),
     hooks: createHooksStorage(drizzle),
     steps: createStepsStorage(drizzle),
   };
@@ -46,7 +47,7 @@ export function createWorld(
   const postgres = createPostgres(config.connectionString);
   const drizzle = createClient(postgres);
   const queue = createQueue(redis, drizzle, config);
-  const storage = createStorage(drizzle);
+  const storage = createStorage(drizzle, { maxEventsPerRun: config.maxEventsPerRun });
   const streamer = createStreamer(postgres, drizzle);
 
   // Health check (Enhancement 3)

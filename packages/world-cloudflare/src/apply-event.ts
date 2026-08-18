@@ -17,6 +17,9 @@
  * - step_started before step.retryAfter -> TooEarlyError
  * - error/output/completedAt are cleared whenever a run re-enters a
  *   non-final status (WorkflowRunSchema is a discriminated union)
+ * - a create carrying a `stateUpdatedAt` snapshot older than the run's
+ *   externally-originated state marker -> PreconditionFailedError (4.3.1
+ *   optimistic-concurrency guard)
  *
  * Errors are returned as structured outcomes (never thrown) because custom
  * error classes do not survive the Durable Object RPC boundary with their
@@ -41,6 +44,7 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  ulidToDate,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { compact } from './util.js';
@@ -58,6 +62,19 @@ export const HOOK_KEY_PREFIX = 'hook:';
  * rejected as a duplicate instead of resurrecting the hook.
  */
 const HOOK_EVENT_MARKER_PREFIX = 'hookevent:';
+/**
+ * Per-run optimistic-concurrency marker: the ULID time (epoch ms) of the most
+ * recent *externally-originated* event. See {@link EXTERNAL_EVENT_TYPES}.
+ */
+const STATE_MARKER_KEY = 'statemarker';
+
+/**
+ * Event types that advance the state marker when created outside a replay
+ * (i.e. without a `stateUpdatedAt` snapshot). Deliberately narrow: core also
+ * omits `stateUpdatedAt` on `run_created` / `run_started` / `run_failed`, and
+ * advancing on those would reject every subsequent replay-origin create.
+ */
+const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
 
 export interface EventStoreListOptions {
   prefix: string;
@@ -91,6 +108,13 @@ export interface ApplyEventRequest {
    * (hook_created only). `null` means the token is unclaimed.
    */
   tokenHolder?: { runId: string; hookId: string } | null;
+  /**
+   * `CreateEventParams.stateUpdatedAt` — epoch ms of the newest event the
+   * caller had loaded when it decided to write this one. Present only on
+   * replay-context creates; absent creates are treated as externally
+   * originated and fail open.
+   */
+  stateUpdatedAt?: number;
 }
 
 export type ApplyEventErrorCode =
@@ -100,6 +124,7 @@ export type ApplyEventErrorCode =
   | 'ENTITY_CONFLICT'
   | 'RUN_EXPIRED'
   | 'TOO_EARLY'
+  | 'PRECONDITION_FAILED'
   | 'RUN_NOT_SUPPORTED'
   | 'LEGACY_RUN_NOT_SUPPORTED';
 
@@ -199,6 +224,36 @@ export async function listByPrefix<T>(
   };
 }
 
+/**
+ * Advance the per-run state marker for an externally-originated event.
+ *
+ * Only creates made *without* a `stateUpdatedAt` snapshot may advance it —
+ * replay-origin creates carry one and must not move the marker forward, or a
+ * run would reject its own subsequent writes.
+ *
+ * A non-decodable event id leaves the marker untouched, which disarms the
+ * guard for this run rather than livelocking it. This mirrors core's
+ * `latestEventStateUpdatedAt`, which sends no snapshot in the same situation.
+ */
+async function advanceStateMarker(
+  store: EventStore,
+  ctx: ApplyEventContext,
+  event: Event,
+): Promise<void> {
+  if (ctx.stateUpdatedAt !== undefined) return;
+  if (!EXTERNAL_EVENT_TYPES.has(event.eventType)) return;
+
+  const underscore = event.eventId.lastIndexOf('_');
+  const rawUlid = underscore === -1 ? event.eventId : event.eventId.slice(underscore + 1);
+  const time = ulidToDate(rawUlid)?.getTime();
+  if (time === undefined) return;
+
+  const current = await store.get<number>(STATE_MARKER_KEY);
+  if (current === undefined || time > current) {
+    await store.put(STATE_MARKER_KEY, time);
+  }
+}
+
 /** Delete all hook entities for the run, returning the released tokens. */
 async function releaseAllHooks(
   store: EventStore,
@@ -237,7 +292,28 @@ export async function applyEvent(
 
   const putEvent = async (event: Event): Promise<void> => {
     await store.put(`${EVENT_KEY_PREFIX}${event.eventId}`, event);
+    await advanceStateMarker(store, ctx, event);
   };
+
+  // ============================================================
+  // GUARD: optimistic concurrency (CreateEventParams.stateUpdatedAt)
+  //
+  // Runs first, and inside the caller's storage transaction, so the marker
+  // read and the event append are atomic: a concurrent externally-originated
+  // event cannot land between them. Strictly-older snapshots are rejected;
+  // an equal snapshot passes (an up-to-date client must never livelock) and
+  // an absent snapshot fails open, disabling the guard for that create.
+  // ============================================================
+  if (ctx.stateUpdatedAt !== undefined) {
+    const marker = await store.get<number>(STATE_MARKER_KEY);
+    if (marker !== undefined && ctx.stateUpdatedAt < marker) {
+      return failure(
+        'PRECONDITION_FAILED',
+        `Event creation for run "${runId}" is based on a stale snapshot ` +
+          `(stateUpdatedAt ${ctx.stateUpdatedAt} < ${marker})`,
+      );
+    }
+  }
 
   // ============================================================
   // VALIDATION: current run state (skipped for run_created and for

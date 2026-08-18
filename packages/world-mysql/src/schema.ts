@@ -72,11 +72,18 @@ export const runs = schema.table(
     startedAt: timestamp('started_at', { fsp: 3 }),
     specVersion: int('spec_version'),
     expiredAt: timestamp('expired_at', { fsp: 3 }),
+    /**
+     * Optimistic-concurrency marker for `CreateEventParams.stateUpdatedAt`
+     * (@workflow/world 4.3.1): epoch ms of the ULID time of the most recent
+     * *externally-originated* event recorded for this run. Not part of the
+     * `WorkflowRun` contract — stripped before the entity is returned.
+     */
+    stateUpdatedAt: bigint('state_updated_at', { mode: 'number' }),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
       'input' | 'output' | 'executionContext'
-    >
+    > & { stateUpdatedAt?: number }
   >,
   (tb) => [
     index('idx_workflow_runs_name').on(tb.workflowName),

@@ -52,6 +52,11 @@ interface NatsJetStreamWorldConfig {
 
   // Optional key prefix for KV buckets and streams (default: 'workflow_')
   keyPrefix?: string;
+
+  // Per-run event ceiling reported to the runtime, which fails runs that
+  // exceed it with MAX_EVENTS_EXCEEDED
+  // (default: process.env.WORKFLOW_MAX_EVENTS, else 25_000)
+  maxEventsPerRun?: number;
 }
 ```
 

@@ -1,5 +1,10 @@
 import { GenericContainer, Wait } from 'testcontainers';
 import { createTestSuite } from '@workflow/world-testing';
+// `eventLimit` ships in world-testing 4.1.18 but is deliberately not part of
+// `createTestSuite`; opting in via the deep import is the only way to gate the
+// `EventResult.maxEvents` contract. The package publishes no `exports` map, so
+// the dist path is the public entry point for it.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on a docker container
@@ -36,4 +41,5 @@ if (process.platform === 'win32') {
 
   test('smoke', () => {});
   createTestSuite('@fantasticfour/world-nats-jetstream');
+  eventLimit('@fantasticfour/world-nats-jetstream');
 }

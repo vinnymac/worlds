@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -44,12 +45,14 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from 'ioredis';
-import { monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory } from 'ulid';
 import { compact, debug, parseWithUint8Array, stringifyWithUint8Array } from './util.js';
 
 interface RedisStorageConfig {
   redis: Redis;
   keyPrefix: string;
+  /** See `RedisWorldConfig.maxEventsPerRun`. */
+  maxEventsPerRun?: number;
 }
 
 /** Max retries for optimistic (compare-and-swap) entity updates. Statuses
@@ -61,6 +64,100 @@ const MAX_CAS_ATTEMPTS = 5;
  * observability mirror cannot grow unbounded. Trimming is approximate (`~`)
  * for efficiency. */
 const EVENT_STREAM_MAXLEN = 1000;
+
+/** Per-run event ceiling reported to core, mirroring the Vercel World. */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/**
+ * Resolve the per-run event ceiling surfaced as `EventResult.maxEvents`.
+ * Explicit config wins; otherwise `WORKFLOW_MAX_EVENTS` when it is a positive
+ * integer; otherwise the default. A configured value that is not a positive
+ * integer is a programming error and throws rather than being silently
+ * ignored.
+ */
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new TypeError(
+        `maxEventsPerRun must be a positive integer, received ${String(configured)}`,
+      );
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
+}
+
+/**
+ * Event types that may advance the per-run state marker used by the
+ * `stateUpdatedAt` optimistic-concurrency guard.
+ *
+ * Only *externally-originated* events count: a `hook_received` or
+ * `step_completed` recorded WITHOUT a `stateUpdatedAt`. Replay-origin creates
+ * always carry one and must never advance the marker, and lifecycle events
+ * core sends unguarded (`run_created`, `run_started`, `run_failed`) must not
+ * either — advancing on those would 412-livelock every run.
+ */
+const EXTERNALLY_ORIGINATED_EVENT_TYPES = new Set(['hook_received', 'step_completed']);
+
+/**
+ * Epoch ms encoded in the trailing ULID of an entity id (`wevt_<ulid>`).
+ * Mirrors core's own decode, which strips through the LAST underscore.
+ */
+function eventIdTime(eventId: string): number {
+  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+}
+
+/** Sentinel returned by the Lua guard prelude when the create is stale. */
+const LUA_PRECONDITION_FAILED = -9;
+
+/**
+ * Lua prelude implementing the `stateUpdatedAt` optimistic-concurrency guard.
+ *
+ * `ARGV[argIdx]` holds the caller's `stateUpdatedAt` (empty string = the
+ * caller sent none, so the guard is disabled and the create falls open).
+ * `KEYS[keyIdx]` holds the per-run state marker. Rejection is *strictly*
+ * older-than: an equal timestamp must pass, otherwise an up-to-date client
+ * livelocks.
+ *
+ * Inlined into each write script so the check and the write land in the same
+ * atomic Redis execution.
+ */
+function luaStateGuard(keyIdx: number, argIdx: number): string {
+  return `
+  if ARGV[${argIdx}] ~= '' then
+    local marker = redis.call('GET', KEYS[${keyIdx}])
+    if marker and tonumber(ARGV[${argIdx}]) < tonumber(marker) then
+      return {${LUA_PRECONDITION_FAILED}, marker}
+    end
+  end
+`;
+}
+
+/**
+ * Lua epilogue that advances the per-run state marker to `ARGV[argIdx]`
+ * (empty string = no advance). Monotonic: events can be written out of order,
+ * so the marker only ever moves forward.
+ */
+function luaAdvanceStateMarker(keyIdx: number, argIdx: number): string {
+  return `
+  if ARGV[${argIdx}] ~= '' then
+    local previous = redis.call('GET', KEYS[${keyIdx}])
+    if not previous or tonumber(ARGV[${argIdx}]) > tonumber(previous) then
+      redis.call('SET', KEYS[${keyIdx}], ARGV[${argIdx}])
+    end
+  end
+`;
+}
+
+/** Throw the typed 412 core matches by error name. */
+function throwPreconditionFailed(runId: string, stateUpdatedAt: number, marker: string): never {
+  throw new PreconditionFailedError(
+    `Event for run "${runId}" is stale: stateUpdatedAt ${stateUpdatedAt} predates the run's ` +
+      `state marker ${marker}`,
+  );
+}
 
 /**
  * Filter hook data based on resolveData parameter
@@ -166,14 +263,16 @@ const LUA_CREATE_RUN_WITH_EVENT = `
  * KEYS[1] = run key
  * KEYS[2] = old status index key
  * KEYS[3] = new status index key
+ * KEYS[4] = run state marker key
  * ARGV[1] = expected current run JSON
  * ARGV[2] = updated run JSON
  * ARGV[3] = run ID
  * ARGV[4] = score (timestamp)
+ * ARGV[5] = stateUpdatedAt guard ('' to disable)
  * Returns: nil if run doesn't exist, [0, currentJson] on CAS mismatch,
- *          [1, updatedJson] on success
+ *          [1, updatedJson] on success, [-9, marker] when the guard rejects
  */
-const LUA_CAS_UPDATE_RUN = `
+const LUA_CAS_UPDATE_RUN = `${luaStateGuard(4, 5)}
   local existing = redis.call('GET', KEYS[1])
   if not existing then
     return nil
@@ -196,14 +295,16 @@ const LUA_CAS_UPDATE_RUN = `
  * KEYS[3] = event key
  * KEYS[4] = events by run index key
  * KEYS[5] = events by correlation index key
+ * KEYS[6] = run state marker key
  * ARGV[1] = step JSON
  * ARGV[2] = step ID (correlationId)
  * ARGV[3] = score (timestamp)
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
- * Returns: [wasCreated (0|1), stepJson]
+ * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * Returns: [wasCreated (0|1), stepJson], or [-9, marker] when the guard rejects
  */
-const LUA_CREATE_STEP_WITH_EVENT = `
+const LUA_CREATE_STEP_WITH_EVENT = `${luaStateGuard(6, 6)}
   local wasCreated = redis.call('SETNX', KEYS[1], ARGV[1])
   if wasCreated == 0 then
     return {0, redis.call('GET', KEYS[1])}
@@ -253,16 +354,19 @@ const LUA_CAS_UPDATE_STEP = `
  * KEYS[4] = event key
  * KEYS[5] = events by run index key
  * KEYS[6] = events by correlation index key
+ * KEYS[7] = run state marker key
  * ARGV[1] = hook JSON
  * ARGV[2] = hook ID (correlationId)
  * ARGV[3] = score (timestamp)
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
+ * ARGV[6] = stateUpdatedAt guard ('' to disable)
  * Returns: [2, owningHookId] on token conflict,
  *          [0, hookJson] when the hook already exists,
- *          [1, hookJson] on success
+ *          [1, hookJson] on success,
+ *          [-9, marker] when the guard rejects
  */
-const LUA_CREATE_HOOK_WITH_EVENT = `
+const LUA_CREATE_HOOK_WITH_EVENT = `${luaStateGuard(7, 6)}
   local claimed = redis.call('SETNX', KEYS[2], ARGV[2])
   if claimed == 0 then
     local owner = redis.call('GET', KEYS[2])
@@ -313,14 +417,16 @@ const LUA_DISPOSE_HOOK = `
  * KEYS[3] = event key
  * KEYS[4] = events by run index key
  * KEYS[5] = events by correlation index key
+ * KEYS[6] = run state marker key
  * ARGV[1] = wait JSON
  * ARGV[2] = wait correlation ID
  * ARGV[3] = score (timestamp)
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
- * Returns: [wasCreated (0|1), waitJson]
+ * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * Returns: [wasCreated (0|1), waitJson], or [-9, marker] when the guard rejects
  */
-const LUA_CREATE_WAIT_WITH_EVENT = `
+const LUA_CREATE_WAIT_WITH_EVENT = `${luaStateGuard(6, 6)}
   local wasCreated = redis.call('SETNX', KEYS[1], ARGV[1])
   if wasCreated == 0 then
     return {0, redis.call('GET', KEYS[1])}
@@ -343,15 +449,18 @@ const LUA_CREATE_WAIT_WITH_EVENT = `
  * KEYS[2] = event key
  * KEYS[3] = events by run index key
  * KEYS[4] = events by correlation index key
+ * KEYS[5] = run state marker key
  * ARGV[1] = expected current wait JSON
  * ARGV[2] = updated wait JSON
  * ARGV[3] = score (timestamp)
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
+ * ARGV[6] = stateUpdatedAt guard ('' to disable)
  * Returns: [-1, ''] if the wait doesn't exist, [0, currentJson] on CAS
- *          mismatch, [1, updatedJson] on success
+ *          mismatch, [1, updatedJson] on success, [-9, marker] when the
+ *          guard rejects
  */
-const LUA_CAS_COMPLETE_WAIT_WITH_EVENT = `
+const LUA_CAS_COMPLETE_WAIT_WITH_EVENT = `${luaStateGuard(5, 6)}
   local existing = redis.call('GET', KEYS[1])
   if not existing then
     return {-1, ''}
@@ -368,17 +477,24 @@ const LUA_CAS_COMPLETE_WAIT_WITH_EVENT = `
 `;
 
 /**
- * Atomically store an event and add it to run + correlation indexes.
+ * Atomically store an event and add it to run + correlation indexes, applying
+ * the `stateUpdatedAt` guard and (for externally-originated events) advancing
+ * the per-run state marker in the same execution.
  *
  * KEYS[1] = event key
  * KEYS[2] = events by run index key
  * KEYS[3] = events by correlation index key (or empty string if no correlationId)
+ * KEYS[4] = run state marker key
  * ARGV[1] = event JSON
  * ARGV[2] = event ID
  * ARGV[3] = score (timestamp)
  * ARGV[4] = has correlation ("1" or "0")
+ * ARGV[5] = stateUpdatedAt guard ('' to disable — paths that already guarded
+ *           atomically alongside their entity write pass '')
+ * ARGV[6] = new state marker value ('' to leave the marker untouched)
+ * Returns: [1, ''] on success, [-9, marker] when the guard rejects
  */
-const LUA_STORE_EVENT = `
+const LUA_STORE_EVENT = `${luaStateGuard(4, 5)}
   local eventKey = KEYS[1]
   local byRunIndex = KEYS[2]
   local byCorrelationIndex = KEYS[3]
@@ -392,7 +508,8 @@ const LUA_STORE_EVENT = `
   if hasCorrelation == "1" then
     redis.call('ZADD', byCorrelationIndex, score, eventId)
   end
-  return 1
+${luaAdvanceStateMarker(4, 6)}
+  return {1, ''}
 `;
 
 /**
@@ -528,11 +645,15 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
 export function createEventsStorage(config: RedisStorageConfig): Storage['events'] {
   const { redis, keyPrefix } = config;
   const ulid = monotonicFactory();
+  const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
 
   const eventKey = (id: string) => `${keyPrefix}event:${id}`;
   const eventsIndexKey = (runId: string) => `${keyPrefix}events:by_run:${runId}`;
   const eventsByCorrelationKey = (correlationId: string) =>
     `${keyPrefix}events:by_correlation:${correlationId}`;
+  // Optimistic-concurrency marker: epoch ms of the ULID time of the most
+  // recent externally-originated event for the run.
+  const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
 
   // Run key helpers (needed for event-sourced entity mutations)
   const runKey = (id: string) => `${keyPrefix}run:${id}`;
@@ -644,20 +765,37 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     );
   }
 
-  /** Store an event (entity writes already done) and mirror it. */
-  async function storeEventGeneric(event: StoredEventShape): Promise<void> {
+  /**
+   * Store an event (entity writes already done) and mirror it.
+   *
+   * `guard` carries the caller's `stateUpdatedAt` and is `''` on paths that
+   * already evaluated the guard atomically alongside their entity write, so
+   * the check runs exactly once per create. `markerAdvance` carries the new
+   * per-run state marker for externally-originated events.
+   */
+  async function storeEventGeneric(
+    event: StoredEventShape,
+    guard = '',
+    markerAdvance = '',
+  ): Promise<void> {
     const score = event.createdAt.getTime();
-    await redis.eval(
+    const result = (await redis.eval(
       LUA_STORE_EVENT,
-      3,
+      4,
       eventKey(event.eventId),
       eventsIndexKey(event.runId),
       event.correlationId ? eventsByCorrelationKey(event.correlationId) : '__unused__',
+      runStateKey(event.runId),
       stringifyWithUint8Array(event),
       event.eventId,
       score.toString(),
       event.correlationId ? '1' : '0',
-    );
+      guard,
+      markerAdvance,
+    )) as [number, string];
+    if (result[0] === LUA_PRECONDITION_FAILED) {
+      throwPreconditionFailed(event.runId, Number(guard), result[1]);
+    }
     await mirrorEventToStream(event);
   }
 
@@ -665,6 +803,10 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
    * Compare-and-swap a run update, moving it between status indexes.
    * Returns true when the swap landed; false when the stored run changed
    * since `expectedJson` was read (caller re-reads and re-validates).
+   *
+   * `guard` carries the caller's `stateUpdatedAt`; the check runs inside the
+   * same Lua execution as the transition, so a stale `run_completed` can
+   * never mark the run terminal.
    */
   async function casRunUpdate(
     runId: string,
@@ -673,18 +815,24 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     oldStatus: string,
     newStatus: string,
     scoreMs: number,
+    guard = '',
   ): Promise<boolean> {
     const result = await redis.eval(
       LUA_CAS_UPDATE_RUN,
-      3,
+      4,
       runKey(runId),
       runsByStatusKey(oldStatus),
       runsByStatusKey(newStatus),
+      runStateKey(runId),
       expectedJson,
       stringifyWithUint8Array(updatedRun),
       runId,
       scoreMs.toString(),
+      guard,
     );
+    if (Array.isArray(result) && result[0] === LUA_PRECONDITION_FAILED) {
+      throwPreconditionFailed(runId, Number(guard), String(result[1]));
+    }
     return Array.isArray(result) && result[0] === 1;
   }
 
@@ -702,6 +850,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     newStatus: 'completed' | 'failed' | 'cancelled',
     now: Date,
     mutate: () => Record<string, unknown>,
+    guard = '',
   ): Promise<WorkflowRun | undefined> {
     for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
       const existingData = await redis.get(runKey(runId));
@@ -734,6 +883,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           existing.status,
           newStatus,
           now.getTime(),
+          guard,
         )
       ) {
         await cleanupHooks(runId);
@@ -848,17 +998,22 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           specVersion: SPEC_VERSION_CURRENT,
         };
 
+        // Legacy runs (specVersion < 2) predate the optimistic-concurrency
+        // guard, so neither the guard nor the state marker applies here.
         const score = createdAt.getTime();
         await redis.eval(
           LUA_STORE_EVENT,
-          3,
+          4,
           eventKey(eventId),
           eventsIndexKey(runId),
           data.correlationId ? eventsByCorrelationKey(data.correlationId) : '__unused__',
+          runStateKey(runId),
           stringifyWithUint8Array(event),
           eventId,
           score.toString(),
           data.correlationId ? '1' : '0',
+          '',
+          '',
         );
 
         const parsed = EventSchema.parse(event);
@@ -883,6 +1038,25 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       const eventId = `wevt_${ulid()}`;
       const now = new Date();
       const resolveData = params?.resolveData ?? 'all';
+
+      // ============================================================
+      // OPTIMISTIC CONCURRENCY (@workflow/world 4.3.1)
+      // ============================================================
+      // `stateUpdatedAt` is the ULID time of the newest event the runtime had
+      // loaded when it built this create. Absent → the guard is disabled and
+      // the create falls open, exactly as before.
+      const stateUpdatedAt = params?.stateUpdatedAt;
+      const guard = stateUpdatedAt === undefined ? '' : String(stateUpdatedAt);
+      // Cleared once a path has evaluated `guard` atomically alongside its own
+      // entity write, so the generic event append below does not re-check it
+      // (a second check could reject after the entity was already mutated).
+      let residualGuard = guard;
+      // Only externally-originated events advance the marker (see
+      // EXTERNALLY_ORIGINATED_EVENT_TYPES).
+      const markerAdvance =
+        stateUpdatedAt === undefined && EXTERNALLY_ORIGINATED_EVENT_TYPES.has(data.eventType)
+          ? String(eventIdTime(eventId))
+          : '';
 
       // For run_created events, generate runId server-side if null or empty
       let effectiveRunId: string;
@@ -1032,7 +1206,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          await storeEventGeneric(event);
+          await storeEventGeneric(event, residualGuard);
 
           const parsed = EventSchema.parse(event);
           return {
@@ -1177,7 +1351,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         run = WorkflowRunSchema.parse(compact(newRun));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), run };
+        return { event: filterEventData(parsed, resolveData), run, maxEvents: maxEventsPerRun };
       }
 
       // Handle step_created event: create step entity + event atomically
@@ -1206,20 +1380,26 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         const score = now.getTime();
         const result = (await redis.eval(
           LUA_CREATE_STEP_WITH_EVENT,
-          5,
+          6,
           stepKey(effectiveRunId, data.correlationId),
           stepsIndexKey(effectiveRunId),
           eventKey(eventId),
           eventsIndexKey(effectiveRunId),
           eventsByCorrelationKey(data.correlationId),
+          runStateKey(effectiveRunId),
           stringifyWithUint8Array(newStep),
           data.correlationId,
           score.toString(),
           stringifyWithUint8Array(event),
           eventId,
+          guard,
         )) as [number, string];
 
         debug('step_created lua result', { wasCreated: result[0], stepId: data.correlationId });
+
+        if (result[0] === LUA_PRECONDITION_FAILED) {
+          throwPreconditionFailed(effectiveRunId, Number(guard), result[1]);
+        }
 
         if (result[0] === 0) {
           throw new EntityConflictError(`Step "${data.correlationId}" already exists`);
@@ -1258,21 +1438,27 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         const score = now.getTime();
         const result = (await redis.eval(
           LUA_CREATE_HOOK_WITH_EVENT,
-          6,
+          7,
           hookKey(data.correlationId),
           hooksByTokenKey(eventData.token),
           hooksIndexKey(effectiveRunId),
           eventKey(eventId),
           eventsIndexKey(effectiveRunId),
           eventsByCorrelationKey(data.correlationId),
+          runStateKey(effectiveRunId),
           stringifyWithUint8Array(newHook),
           data.correlationId,
           score.toString(),
           stringifyWithUint8Array(event),
           eventId,
+          guard,
         )) as [number, string];
 
         debug('hook_created lua result', { result: result[0], hookId: data.correlationId });
+
+        if (result[0] === LUA_PRECONDITION_FAILED) {
+          throwPreconditionFailed(effectiveRunId, Number(guard), result[1]);
+        }
 
         if (result[0] === 2) {
           // Cross-hook conflict: a DIFFERENT hookId owns this token. Record
@@ -1346,20 +1532,26 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         const score = now.getTime();
         const result = (await redis.eval(
           LUA_CREATE_WAIT_WITH_EVENT,
-          5,
+          6,
           waitKey(effectiveRunId, data.correlationId),
           waitsIndexKey(effectiveRunId),
           eventKey(eventId),
           eventsIndexKey(effectiveRunId),
           eventsByCorrelationKey(data.correlationId),
+          runStateKey(effectiveRunId),
           stringifyWithUint8Array(newWait),
           data.correlationId,
           score.toString(),
           stringifyWithUint8Array(event),
           eventId,
+          guard,
         )) as [number, string];
 
         debug('wait_created lua result', { wasCreated: result[0], waitId: data.correlationId });
+
+        if (result[0] === LUA_PRECONDITION_FAILED) {
+          throwPreconditionFailed(effectiveRunId, Number(guard), result[1]);
+        }
 
         if (result[0] === 0) {
           throw new EntityConflictError(`Wait "${data.correlationId}" already exists`);
@@ -1404,17 +1596,23 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const score = now.getTime();
           const result = (await redis.eval(
             LUA_CAS_COMPLETE_WAIT_WITH_EVENT,
-            4,
+            5,
             waitKey(effectiveRunId, data.correlationId),
             eventKey(eventId),
             eventsIndexKey(effectiveRunId),
             eventsByCorrelationKey(data.correlationId),
+            runStateKey(effectiveRunId),
             existingData,
             stringifyWithUint8Array(updatedWait),
             score.toString(),
             stringifyWithUint8Array(event),
             eventId,
+            guard,
           )) as [number, string];
+
+          if (result[0] === LUA_PRECONDITION_FAILED) {
+            throwPreconditionFailed(effectiveRunId, Number(guard), result[1]);
+          }
 
           if (result[0] === 1) {
             wait = WaitSchema.parse(compact(updatedWait));
@@ -1445,13 +1643,20 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       if (data.eventType === 'run_started') {
         // Idempotency: if run is already running, this is a replay.
         // Return existing run state without creating a duplicate event.
+        // `maxEvents` MUST be reported here too: core reads the per-run event
+        // ceiling only from the run_started response, so omitting it on the
+        // idempotent path would silently drop the limit on every replay after
+        // the first.
         if (currentRun?.status === 'running') {
           const existingData = await redis.get(runKey(effectiveRunId));
           if (existingData) {
             const parsed = WorkflowRunSchema.parse(
               compact(parseWithUint8Array<WorkflowRun>(existingData)),
             );
-            return { run: filterRunData(parsed, resolveData) as WorkflowRun };
+            return {
+              run: filterRunData(parsed, resolveData) as WorkflowRun,
+              maxEvents: maxEventsPerRun,
+            };
           }
           return { run: undefined };
         }
@@ -1469,7 +1674,10 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const existing = parseWithUint8Array<WorkflowRun>(existingData);
           if (existing.status === 'running') {
             const parsed = WorkflowRunSchema.parse(compact(existing));
-            return { run: filterRunData(parsed, resolveData) as WorkflowRun };
+            return {
+              run: filterRunData(parsed, resolveData) as WorkflowRun,
+              maxEvents: maxEventsPerRun,
+            };
           }
           if (isTerminalWorkflowRunStatus(existing.status)) {
             throw new RunExpiredError(
@@ -1506,7 +1714,10 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         }
       }
 
-      // Handle run_completed event: CAS transition + cleanup hooks/waits
+      // Handle run_completed event: CAS transition + cleanup hooks/waits.
+      // The guard is evaluated inside the transition script so a stale
+      // completion can never mark the run terminal; core turns the resulting
+      // 412 into an immediate re-invoke with a fresh replay.
       if (data.eventType === 'run_completed') {
         const eventData = data.eventData;
         run = await applyTerminalRunTransition(
@@ -1515,7 +1726,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           'completed',
           now,
           () => ({ output: eventData?.output, error: undefined }),
+          guard,
         );
+        residualGuard = '';
       }
 
       // Handle run_failed event: CAS transition + cleanup hooks/waits
@@ -1526,14 +1739,22 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             ? eventData.error
             : (eventData.error?.message ?? 'Unknown error');
 
-        run = await applyTerminalRunTransition(effectiveRunId, 'run_failed', 'failed', now, () => ({
-          output: undefined,
-          error: {
-            message: errorMessage,
-            stack: typeof eventData.error === 'string' ? undefined : eventData.error?.stack,
-            code: eventData.errorCode,
-          },
-        }));
+        run = await applyTerminalRunTransition(
+          effectiveRunId,
+          'run_failed',
+          'failed',
+          now,
+          () => ({
+            output: undefined,
+            error: {
+              message: errorMessage,
+              stack: typeof eventData.error === 'string' ? undefined : eventData.error?.stack,
+              code: eventData.errorCode,
+            },
+          }),
+          guard,
+        );
+        residualGuard = '';
       }
 
       // Handle run_cancelled event: CAS transition + cleanup hooks/waits
@@ -1544,7 +1765,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           'cancelled',
           now,
           () => ({ output: undefined, error: undefined }),
+          guard,
         );
+        residualGuard = '';
       }
 
       // Handle step_started event: increment attempt, set status to 'running'
@@ -1649,7 +1872,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         delete (event as { eventData?: unknown }).eventData;
       }
 
-      await storeEventGeneric(event);
+      await storeEventGeneric(event, residualGuard, markerAdvance);
 
       const parsed = EventSchema.parse(event);
 
@@ -1679,6 +1902,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         hook,
         wait,
         events: allEvents,
+        // Server-owned per-run event ceiling; the runtime enforces it. Only
+        // meaningful when a run entity is attached (run-lifecycle responses).
+        ...(run ? { maxEvents: maxEventsPerRun } : {}),
       };
     },
 
