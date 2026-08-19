@@ -37,7 +37,7 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@google-cloud/firestore": "^7.10.0",

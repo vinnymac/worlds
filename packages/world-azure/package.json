@@ -36,7 +36,7 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@azure/cosmos": "^4.3.1",

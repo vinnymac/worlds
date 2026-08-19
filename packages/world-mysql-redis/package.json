@@ -48,7 +48,7 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "db:push": "node dist/cli.js"
   },
   "dependencies": {
@@ -63,6 +63,7 @@
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",
+    "@fantasticfour/testing": "workspace:*",
     "@testcontainers/mysql": "catalog:",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",

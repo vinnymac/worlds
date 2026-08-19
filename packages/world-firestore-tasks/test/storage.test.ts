@@ -786,7 +786,7 @@ describe('Storage (Firestore integration)', () => {
         await storage.events.create(testRunId, {
           eventType: 'step_retrying',
           correlationId,
-          eventData: { error: 'retry', retryAfter: new Date().toISOString() },
+          eventData: { error: 'retry', retryAfter: new Date() },
         });
 
         await setTimeout(5);
@@ -1224,7 +1224,7 @@ describe('Storage (Firestore integration)', () => {
       const created = await storage.events.create(testRunId, {
         eventType: 'wait_created',
         correlationId: 'wait-1',
-        eventData: { resumeAt: new Date(Date.now() + 60_000).toISOString() },
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
       });
       expect(created.wait).toMatchObject({
         waitId: `${testRunId}-wait-1`,
@@ -1244,13 +1244,13 @@ describe('Storage (Firestore integration)', () => {
       await storage.events.create(testRunId, {
         eventType: 'wait_created',
         correlationId: 'wait-dup',
-        eventData: { resumeAt: new Date().toISOString() },
+        eventData: { resumeAt: new Date() },
       });
       await expect(
         storage.events.create(testRunId, {
           eventType: 'wait_created',
           correlationId: 'wait-dup',
-          eventData: { resumeAt: new Date().toISOString() },
+          eventData: { resumeAt: new Date() },
         }),
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
     });
@@ -1259,7 +1259,7 @@ describe('Storage (Firestore integration)', () => {
       await storage.events.create(testRunId, {
         eventType: 'wait_created',
         correlationId: 'wait-race',
-        eventData: { resumeAt: new Date().toISOString() },
+        eventData: { resumeAt: new Date() },
       });
       await storage.events.create(testRunId, {
         eventType: 'wait_completed',
@@ -1293,6 +1293,7 @@ describe('Storage (Firestore integration)', () => {
         storage.events.create(testRunId, {
           eventType: 'hook_received',
           correlationId: 'no-such-hook',
+          eventData: { payload: {} },
         }),
       ).rejects.toMatchObject({ name: 'HookNotFoundError' });
     });

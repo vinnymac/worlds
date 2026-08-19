@@ -3,6 +3,7 @@ import type { WorkflowRun, Step } from '@workflow/world';
 import { connect } from 'nats';
 import { decodeTime, ulid } from 'ulid';
 import { afterAll, beforeAll, describe, expect, it, test } from 'vitest';
+import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { createWorld } from '../src/index.js';
 
 /** ULID time of a prefixed id, matching how the runtime derives stateUpdatedAt. */
@@ -317,10 +318,9 @@ describe('Storage (NATS JetStream integration)', () => {
         eventData: { token },
       });
       expect(result.hook).toBeUndefined();
-      expect(result.event?.eventType).toBe('hook_conflict');
-      expect(
-        (result.event?.eventData as { conflictingRunId?: string } | undefined)?.conflictingRunId,
-      ).toBe(runA.runId);
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
+        conflictingRunId: runA.runId,
+      });
 
       // The original holder is untouched.
       const holder = await world.hooks.getByToken(token);
@@ -389,12 +389,8 @@ describe('Storage (NATS JetStream integration)', () => {
         ),
       );
       // The run entity is the arbiter: every redelivery rejects.
-      for (const r of results) {
-        expect(r.status).toBe('rejected');
-        expect((r as PromiseRejectedResult).reason).toMatchObject({
-          name: 'EntityConflictError',
-        });
-      }
+      expect(results.every((r) => r.status === 'rejected')).toBe(true);
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await world.events.list({ runId });
       expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
@@ -416,11 +412,7 @@ describe('Storage (NATS JetStream integration)', () => {
 
       const fulfilled = results.filter((r) => r.status === 'fulfilled');
       expect(fulfilled.length).toBeGreaterThanOrEqual(1);
-      for (const r of results) {
-        if (r.status === 'rejected') {
-          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
-        }
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const steps = await world.steps.list({ runId: run.runId });
       expect(steps.data).toHaveLength(1);
@@ -447,11 +439,7 @@ describe('Storage (NATS JetStream integration)', () => {
       );
 
       expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
-      for (const r of results) {
-        if (r.status === 'rejected') {
-          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
-        }
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await world.events.list({ runId: run.runId });
       const created = eventList.data.filter(
@@ -476,11 +464,7 @@ describe('Storage (NATS JetStream integration)', () => {
       );
 
       expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
-      for (const r of results) {
-        if (r.status === 'rejected') {
-          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
-        }
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await world.events.list({ runId: run.runId });
       expect(

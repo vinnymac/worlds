@@ -10,6 +10,7 @@ import { Redis } from 'ioredis';
 import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { parse } from '@fantasticfour/shared';
+import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { applyMigrations, MIGRATION_FILES } from '../src/migrate.js';
 import { createQueue } from '../src/queue.js';
 import * as schema from '../src/schema.js';
@@ -170,12 +171,8 @@ describe('Storage (MySQL + Redis integration)', () => {
       const results = await Promise.allSettled(
         Array.from({ length: 5 }, () => events.create(runId, eventData)),
       );
-      for (const r of results) {
-        expect(r.status).toBe('rejected');
-        expect((r as PromiseRejectedResult).reason).toMatchObject({
-          name: 'EntityConflictError',
-        });
-      }
+      expect(results.every((r) => r.status === 'rejected')).toBe(true);
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await events.list({ runId });
       expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
@@ -372,7 +369,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       const received = await events.create(run.runId, {
         eventType: 'hook_received',
         correlationId: 'hook-guard',
-        eventData: {},
+        eventData: { payload: {} },
       });
       const marker = ulidTime(received.event!.eventId);
 
@@ -608,8 +605,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       });
 
       expect(result.hook).toBeUndefined();
-      expect(result.event?.eventType).toBe('hook_conflict');
-      expect(result.event?.eventData).toMatchObject({
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
         token: 'token-shared',
         conflictingRunId: runA.runId,
       });

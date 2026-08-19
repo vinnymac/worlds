@@ -1,3 +1,4 @@
+import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { RedisContainer } from '@testcontainers/redis';
 import { Redis } from '@upstash/redis';
 import {
@@ -329,11 +330,7 @@ describe('Storage (Upstash Redis integration)', () => {
         ),
       );
       expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
-      for (const r of results) {
-        if (r.status === 'rejected') {
-          expect(EntityConflictError.is(r.reason)).toBe(true);
-        }
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await events.list({ runId: run.runId });
       expect(
@@ -373,11 +370,7 @@ describe('Storage (Upstash Redis integration)', () => {
         });
       const results = await Promise.allSettled([replay(), replay()]);
       expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
-      for (const r of results) {
-        if (r.status === 'rejected') {
-          expect(EntityConflictError.is(r.reason)).toBe(true);
-        }
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       // Exactly one hook_created row, and never a self hook_conflict.
       const eventList = await events.list({ runId: run.runId });
@@ -610,10 +603,10 @@ describe('Storage (Upstash Redis integration)', () => {
         correlationId: 'hook-b',
         eventData: { token },
       });
-      expect(result.event?.eventType).toBe('hook_conflict');
       expect(result.hook).toBeUndefined();
-      const conflictData = result.event?.eventData as { conflictingRunId?: string } | undefined;
-      expect(conflictData?.conflictingRunId).toBe(runA.runId);
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
+        conflictingRunId: runA.runId,
+      });
     });
 
     it('persists isWebhook on the hook entity (default false)', async () => {

@@ -39,7 +39,7 @@
     "test": "vitest run",
     "test:workers": "vitest run --config vitest.workers.config.ts",
     "test:all": "pnpm test && pnpm test:workers",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@workflow/errors": "catalog:",
@@ -51,6 +51,7 @@
     "@cloudflare/vitest-pool-workers": "0.19.1",
     "@cloudflare/workers-types": "^5.20260818.1",
     "@fantasticfour/shared": "workspace:*",
+    "@fantasticfour/testing": "workspace:*",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "miniflare": "4.20260730.0",

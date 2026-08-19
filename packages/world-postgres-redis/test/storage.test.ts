@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process';
 import { setTimeout } from 'node:timers/promises';
+import { asEventRequest, expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { EntityConflictError, TooEarlyError, WorkflowRunNotFoundError } from '@workflow/errors';
 import type { Hook, Step, WorkflowRun } from '@workflow/world';
@@ -43,10 +44,11 @@ async function updateRun(
   eventType: 'run_started' | 'run_completed' | 'run_failed',
   eventData?: Record<string, unknown>,
 ): Promise<WorkflowRun> {
-  const result = await events.create(runId, {
-    eventType,
-    eventData,
-  });
+  // `eventType` is the union of all three run transitions here, so no single
+  // eventData shape narrows against it; callers pass the payload their case
+  // needs. See asEventRequest for why this widening is confined to helpers
+  // whose tag is a parameter.
+  const result = await events.create(runId, asEventRequest({ eventType, eventData }));
   if (!result.run) {
     throw new Error('Expected run to be updated');
   }
@@ -80,11 +82,10 @@ async function updateStep(
   eventType: 'step_started' | 'step_completed' | 'step_failed',
   eventData?: Record<string, unknown>,
 ): Promise<Step> {
-  const result = await events.create(runId, {
-    eventType,
-    correlationId: stepId,
-    eventData,
-  });
+  const result = await events.create(
+    runId,
+    asEventRequest({ eventType, correlationId: stepId, eventData }),
+  );
   if (!result.step) {
     throw new Error('Expected step to be updated');
   }
@@ -609,7 +610,7 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should list events in descending order when explicitly requested', async () => {
-        const _result1 = await events.create(testRunId, {
+        await events.create(testRunId, {
           eventType: 'run_started' as const,
         });
 
@@ -1194,8 +1195,10 @@ describe('Storage (Postgres integration)', () => {
         eventData: { token },
       });
 
-      expect(result.event?.eventType).toBe('hook_conflict');
-      expect(result.event?.eventData).toMatchObject({ token, conflictingRunId: testRunId });
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
+        token,
+        conflictingRunId: testRunId,
+      });
       expect(result.hook).toBeUndefined();
     });
 
@@ -1376,12 +1379,7 @@ describe('Storage (Postgres integration)', () => {
       const results = await Promise.allSettled(
         Array.from({ length: 5 }, () => events.create(runId, eventData)),
       );
-      for (const r of results) {
-        expect(r.status).toBe('rejected');
-        expect((r as PromiseRejectedResult).reason).toMatchObject({
-          name: 'EntityConflictError',
-        });
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await events.list({ runId });
       expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
@@ -1536,7 +1534,7 @@ describe('Storage (Postgres integration)', () => {
       const received = await events.create(run.runId, {
         eventType: 'hook_received',
         correlationId: 'hook-guard',
-        eventData: {},
+        eventData: { payload: {} },
       });
       const marker = ulidTime(received.event!.eventId);
 

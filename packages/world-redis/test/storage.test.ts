@@ -1,7 +1,8 @@
 import { setTimeout } from 'node:timers/promises';
 import { RedisContainer } from '@testcontainers/redis';
 import { PreconditionFailedError } from '@workflow/errors';
-import Redis from 'ioredis';
+import { expectRejectedWith } from '@fantasticfour/testing';
+import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
   createEventsStorage,
@@ -740,11 +741,7 @@ describe('Storage (Redis integration)', () => {
 
       const fulfilled = results.filter((r) => r.status === 'fulfilled');
       expect(fulfilled).toHaveLength(1);
-      for (const rejection of results.filter((r) => r.status === 'rejected')) {
-        expect((rejection as PromiseRejectedResult).reason).toMatchObject({
-          name: 'EntityConflictError',
-        });
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await events.listByCorrelationId({ correlationId: 'wait-race' });
       expect(eventList.data.filter((e) => e.eventType === 'wait_completed')).toHaveLength(1);

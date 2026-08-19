@@ -7,6 +7,7 @@ import {
   TooEarlyError,
   WorkflowRunNotFoundError,
 } from '@workflow/errors';
+import { asEventRequest, expectEventType } from '@fantasticfour/testing';
 import { ulidToDate } from '@workflow/world';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createStorage } from '../src/storage.js';
@@ -784,42 +785,58 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       ).rejects.toSatisfy((error) => EntityConflictError.is(error));
     });
 
-    it('should reject step lifecycle events on a terminal step', async () => {
-      const run = await createRun({
-        deploymentId: 'deployment-123',
-        workflowName: 'test-workflow',
-        input: [],
-      });
-      await storage.events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: 'step-1',
-        eventData: { stepName: 'test-step', input: [] },
-      });
-      await storage.events.create(run.runId, {
-        eventType: 'step_started',
-        correlationId: 'step-1',
-      });
-      await storage.events.create(run.runId, {
-        eventType: 'step_completed',
-        correlationId: 'step-1',
-        eventData: { result: ['ok'] },
-      });
+    const terminalStepEventTypes: Array<
+      [string, 'step_started' | 'step_completed' | 'step_failed']
+    > = [
+      ['step_started', 'step_started'],
+      ['step_completed', 'step_completed'],
+      ['step_failed', 'step_failed'],
+    ];
 
-      for (const eventType of ['step_started', 'step_completed', 'step_failed'] as const) {
+    it.each(terminalStepEventTypes)(
+      'should reject %s on a terminal step',
+      async (_label, eventType) => {
+        const run = await createRun({
+          deploymentId: 'deployment-123',
+          workflowName: 'test-workflow',
+          input: [],
+        });
+        await storage.events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: 'step-1',
+          eventData: { stepName: 'test-step', input: [] },
+        });
+        await storage.events.create(run.runId, {
+          eventType: 'step_started',
+          correlationId: 'step-1',
+        });
+        await storage.events.create(run.runId, {
+          eventType: 'step_completed',
+          correlationId: 'step-1',
+          eventData: { result: ['ok'] },
+        });
+
         await expect(
-          storage.events.create(run.runId, {
-            eventType,
-            correlationId: 'step-1',
-            eventData: { result: [], error: 'x', stepName: 'test-step', input: [] },
-          }),
+          storage.events.create(
+            run.runId,
+            // `eventType` arrives from test.each as the union of all terminal
+            // step events, so no single eventData shape narrows against it.
+            // The payload is deliberately a superset: the conflict is detected
+            // on step state, before payload validation.
+            asEventRequest({
+              eventType,
+              correlationId: 'step-1',
+              eventData: { result: [], error: 'x', stepName: 'test-step', input: [] },
+            }),
+          ),
         ).rejects.toSatisfy((error) => EntityConflictError.is(error));
-      }
 
-      // Step state is untouched
-      const step = await storage.steps.get(run.runId, 'step-1');
-      expect(step.status).toBe('completed');
-      expect(step.output).toEqual(['ok']);
-    });
+        // Step state is untouched
+        const step = await storage.steps.get(run.runId, 'step-1');
+        expect(step.status).toBe('completed');
+        expect(step.output).toEqual(['ok']);
+      },
+    );
 
     it('should throw TooEarlyError for step_started before retryAfter', async () => {
       const run = await createRun({
@@ -994,8 +1011,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
       // No hook entity for the thief; a hook_conflict event instead
       expect(result.hook).toBeUndefined();
-      expect(result.event?.eventType).toBe('hook_conflict');
-      expect(result.event?.eventData).toMatchObject({
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
         token: 'shared-token',
         conflictingRunId: testRunId,
       });

@@ -1,9 +1,15 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
+import type { Queue } from '@workflow/world';
 import { ValidQueueName } from '@workflow/world';
 import { afterAll, beforeAll, describe, expect, it, test, vi } from 'vitest';
 import { createWorld } from '../src/index.js';
+
+// `Queue['queue']` takes the discriminated union of real task payloads. This
+// suite exercises JetStream delivery headers rather than any payload shape, so
+// the body is deliberately arbitrary.
+const asQueueMessage = (message: unknown) => message as Parameters<Queue['queue']>[1];
 
 describe('Queue (NATS JetStream integration)', () => {
   if (process.platform === 'win32') {
@@ -62,7 +68,7 @@ describe('Queue (NATS JetStream integration)', () => {
 
   it('derives the attempt header from JetStream delivery count and redelivers after nak backoff', async () => {
     const queueName = ValidQueueName.parse('__wkf_step_attempt-demo');
-    await world.queue(queueName, { hello: 'world' });
+    await world.queue(queueName, asQueueMessage({ hello: 'world' }));
 
     // First delivery fails (500) -> nak with 5s backoff -> redelivery.
     await vi.waitFor(() => expect(received.length).toBeGreaterThanOrEqual(2), {

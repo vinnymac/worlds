@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { RedisContainer } from '@testcontainers/redis';
 import type { QueuePayload, ValidQueueName } from '@workflow/world';
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { afterAll, afterEach, beforeAll, describe, expect, it, test, vi } from 'vitest';
 import { createQueue } from '../src/queue.js';
 import { stringifyWithUint8Array } from '../src/util.js';

@@ -1,3 +1,4 @@
+import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { MySqlContainer } from '@testcontainers/mysql';
 import { EntityConflictError, TooEarlyError } from '@workflow/errors';
 import type { Step, WorkflowRun } from '@workflow/world';
@@ -149,12 +150,8 @@ describe('Storage (MySQL integration)', () => {
       const results = await Promise.allSettled(
         Array.from({ length: 5 }, () => events.create(runId, eventData)),
       );
-      for (const r of results) {
-        expect(r.status).toBe('rejected');
-        expect((r as PromiseRejectedResult).reason).toMatchObject({
-          name: 'EntityConflictError',
-        });
-      }
+      expect(results.every((r) => r.status === 'rejected')).toBe(true);
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await events.list({ runId });
       expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
@@ -378,7 +375,7 @@ describe('Storage (MySQL integration)', () => {
       const received = await events.create(run.runId, {
         eventType: 'hook_received',
         correlationId: 'hook-guard',
-        eventData: {},
+        eventData: { payload: {} },
       });
       const marker = ulidTime(received.event!.eventId);
 
@@ -601,8 +598,7 @@ describe('Storage (MySQL integration)', () => {
         eventData: { token: 'token-contested' },
       });
       expect(result.hook).toBeUndefined();
-      expect(result.event?.eventType).toBe('hook_conflict');
-      expect(result.event?.eventData).toMatchObject({
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
         token: 'token-contested',
         conflictingRunId: runA.runId,
       });

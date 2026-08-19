@@ -46,7 +46,22 @@ const READ_BATCH_SIZE = 32;
 const DEFAULT_CHUNK_PAGE_SIZE = 100;
 const MAX_CHUNK_PAGE_SIZE = 1000;
 
-export function createStreamer(config: CloudflareStreamerConfig): Streamer {
+/**
+ * `Streamer` declares `runId: string`, but core hands the streamer a run id
+ * that is still in flight, so every world in this repo awaits it. Widening the
+ * returned type puts that contract where callers can see it instead of leaving
+ * it to an untyped call site.
+ */
+export type CloudflareStreamer = Streamer & {
+  writeToStream(
+    name: string,
+    runId: string | Promise<string>,
+    chunk: string | Uint8Array,
+  ): Promise<void>;
+  closeStream(name: string, runId: string | Promise<string>): Promise<void>;
+};
+
+export function createStreamer(config: CloudflareStreamerConfig): CloudflareStreamer {
   const { env } = config;
 
   const getStreamDO = (streamName: string): StreamDOStub => {

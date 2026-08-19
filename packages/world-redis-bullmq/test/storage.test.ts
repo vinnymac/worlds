@@ -1,7 +1,8 @@
 import { setTimeout } from 'node:timers/promises';
+import { expectRejectedWith } from '@fantasticfour/testing';
 import { RedisContainer } from '@testcontainers/redis';
 import { PreconditionFailedError } from '@workflow/errors';
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
   createEventsStorage,
@@ -607,11 +608,7 @@ describe('Storage (Redis integration)', () => {
         ),
       );
       expect(stepResults.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
-      for (const r of stepResults) {
-        if (r.status === 'rejected') {
-          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
-        }
-      }
+      expectRejectedWith(stepResults, 'EntityConflictError');
       const stepEvents = await events.listByCorrelationId({
         correlationId: stepId,
         pagination: {},
@@ -1308,8 +1305,10 @@ describe('Storage (Redis integration)', () => {
         eventData: { error: 'boom', retryAfter },
       });
 
+      // ListEventsByCorrelationIdParams takes no runId; the correlation id is
+      // already run-scoped. The extra property was silently dropped before
+      // tests were typechecked.
       const stored = await events.listByCorrelationId({
-        runId: run.runId,
         correlationId: step.stepId,
       });
       const retrying = stored.data.find((e) => e.eventType === 'step_retrying');

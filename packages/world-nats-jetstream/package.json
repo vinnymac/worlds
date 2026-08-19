@@ -35,7 +35,7 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@workflow/errors": "catalog:",
@@ -46,6 +46,7 @@
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",
+    "@fantasticfour/testing": "workspace:*",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "testcontainers": "catalog:",

@@ -1,4 +1,4 @@
-import type { Container } from '@azure/cosmos';
+import type { Container, FeedOptions, JSONValue, SqlQuerySpec } from '@azure/cosmos';
 import {
   EntityConflictError,
   HookNotFoundError,
@@ -7,15 +7,51 @@ import {
 } from '@workflow/errors';
 import type { WorkflowRun, Step } from '@workflow/world';
 import { ulidToDate } from '@workflow/world';
+import type { Mock } from 'vitest';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage } from '../src/storage.js';
+
+// Mirrors the unexported CosmosDoc shape in src/storage.ts, plus an index signature for the rest.
+interface MockDoc {
+  id: string;
+  type?: string;
+  runId?: string;
+  stepId?: string;
+  hookId?: string;
+  eventId?: string;
+  token?: string;
+  [key: string]: unknown;
+}
+
+// Stands in for @azure/cosmos's QueryIterator class; the mock only needs fetchAll().
+interface MockQueryIterator<T> {
+  fetchAll: () => Promise<{ resources: T[] }>;
+}
+
+// Narrowed stand-in for @azure/cosmos's OperationInput union, limited to what storage.ts emits.
+type MockBatchOperation =
+  | { operationType: 'Create' | 'Upsert'; id?: string; resourceBody: MockDoc }
+  | { operationType: 'Replace'; id: string; resourceBody: MockDoc }
+  | { operationType: 'Delete'; id: string }
+  | {
+      operationType: 'Patch';
+      id: string;
+      resourceBody: { condition?: string; operations: { path: string; value: unknown }[] };
+    };
+
+type MockBatchResult = { code: number; result: { statusCode: number }[] };
+
+type MockBatchImpl = (
+  operations: MockBatchOperation[],
+  partitionKey: string,
+) => Promise<MockBatchResult>;
 
 describe('Storage (Azure Cosmos DB integration)', () => {
   let storage: ReturnType<typeof createStorage>;
   let mockContainer: Container;
   let mockHooksByTokenContainer: Container;
-  let mockData: Map<string, any>;
-  let mockHooksByTokenData: Map<string, any>;
+  let mockData: Map<string, MockDoc>;
+  let mockHooksByTokenData: Map<string, MockDoc>;
 
   async function createRun(workflowName = 'test-workflow'): Promise<WorkflowRun> {
     const result = await storage.events.create(null, {
@@ -54,49 +90,52 @@ describe('Storage (Azure Cosmos DB integration)', () => {
 
     mockContainer = {
       items: {
-        create: vi.fn(async (doc: any) => {
+        create: vi.fn(async (doc: MockDoc) => {
           if (mockData.has(doc.id)) {
-            const error: any = new Error('Conflict');
-            error.code = 409;
-            throw error;
+            throw Object.assign(new Error('Conflict'), { code: 409 });
           }
           mockData.set(doc.id, doc);
           return { resource: doc };
         }),
-        query: vi.fn((querySpec: any, options: any) => ({
-          fetchAll: vi.fn(async () => {
-            const resources: any[] = [];
-            const query = querySpec.query;
-            const paramMap: Record<string, any> = {};
-            for (const param of querySpec.parameters || []) {
-              paramMap[param.name] = param.value;
-            }
+        query: vi.fn(
+          (querySpec: SqlQuerySpec, options?: FeedOptions): MockQueryIterator<MockDoc> => ({
+            fetchAll: async () => {
+              const resources: MockDoc[] = [];
+              const query = querySpec.query;
+              const paramMap: Record<string, JSONValue> = {};
+              for (const param of querySpec.parameters || []) {
+                paramMap[param.name] = param.value;
+              }
 
-            for (const [_id, doc] of mockData.entries()) {
-              if (options?.partitionKey && doc.runId !== options.partitionKey) continue;
-              if (query.includes('c.type = "run"') && doc.type !== 'run') continue;
-              if (query.includes('c.type = "step"') && doc.type !== 'step') continue;
-              if (query.includes('c.type = "hook"') && doc.type !== 'hook') continue;
-              if (query.includes('c.type = "event"') && doc.type !== 'event') continue;
-              if (paramMap['@runId'] && doc.runId !== paramMap['@runId']) continue;
-              if (paramMap['@stepId'] && doc.stepId !== paramMap['@stepId']) continue;
-              if (paramMap['@hookId'] && doc.hookId !== paramMap['@hookId']) continue;
-              if (paramMap['@eventId'] && doc.eventId !== paramMap['@eventId']) continue;
-              resources.push(doc);
-            }
-            return { resources };
+              for (const [_id, doc] of mockData.entries()) {
+                if (options?.partitionKey && doc.runId !== options.partitionKey) continue;
+                if (query.includes('c.type = "run"') && doc.type !== 'run') continue;
+                if (query.includes('c.type = "step"') && doc.type !== 'step') continue;
+                if (query.includes('c.type = "hook"') && doc.type !== 'hook') continue;
+                if (query.includes('c.type = "event"') && doc.type !== 'event') continue;
+                if (paramMap['@runId'] && doc.runId !== paramMap['@runId']) continue;
+                if (paramMap['@stepId'] && doc.stepId !== paramMap['@stepId']) continue;
+                if (paramMap['@hookId'] && doc.hookId !== paramMap['@hookId']) continue;
+                if (paramMap['@eventId'] && doc.eventId !== paramMap['@eventId']) continue;
+                resources.push(doc);
+              }
+              return { resources };
+            },
           }),
-        })),
-        upsert: vi.fn(async (doc: any) => {
+        ),
+        upsert: vi.fn(async (doc: MockDoc) => {
           mockData.set(doc.id, doc);
           return { resource: doc };
         }),
         // Mirrors @azure/cosmos transactional batch: all-or-nothing within a
         // partition, and a rejected operation RESOLVES with HTTP 207 carrying the
         // failing status on result[i].statusCode (siblings 424) rather than throwing.
-        batch: vi.fn(async (operations: any[], _partitionKey: string) => {
+        batch: vi.fn<MockBatchImpl>(async (operations, _partitionKey) => {
           /** Evaluate the `from c where c.<field> <op> <number>` conditions we emit. */
-          const conditionHolds = (condition: string | undefined, doc: any): boolean => {
+          const conditionHolds = (
+            condition: string | undefined,
+            doc: MockDoc | undefined,
+          ): boolean => {
             if (!condition) return true;
             const match = /from c where c\.(\w+) (<=|<|>=|>) (-?\d+)$/.exec(condition.trim());
             if (!match) throw new Error(`mock cannot evaluate condition: ${condition}`);
@@ -151,7 +190,11 @@ describe('Storage (Azure Cosmos DB integration)', () => {
             } else if (op.operationType === 'Delete') {
               mockData.delete(op.id);
             } else if (op.operationType === 'Patch') {
-              const doc = { ...mockData.get(op.id) };
+              const existing = mockData.get(op.id);
+              if (!existing) {
+                throw new Error(`Patch on a document the mock never stored: ${op.id}`);
+              }
+              const doc: MockDoc = { ...existing };
               for (const patch of op.resourceBody.operations) {
                 doc[patch.path.replace(/^\//, '')] = patch.value;
               }
@@ -163,40 +206,38 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       },
       item: vi.fn((id: string, _partitionKey: string) => ({
         read: vi.fn(async () => ({ resource: mockData.get(id) })),
-        replace: vi.fn(async (doc: any) => {
+        replace: vi.fn(async (doc: MockDoc) => {
           mockData.set(id, doc);
           return { resource: doc };
         }),
         delete: vi.fn(async () => {
           if (!mockData.has(id)) {
-            const error: any = new Error('NotFound');
-            error.code = 404;
-            throw error;
+            throw Object.assign(new Error('NotFound'), { code: 404 });
           }
           mockData.delete(id);
           return {};
         }),
       })),
       delete: vi.fn(async () => ({})),
-    } as any;
+      // Container is a class with private members the mock can't structurally
+      // satisfy; it only implements the subset storage.ts calls.
+    } as unknown as Container;
 
     mockHooksByTokenContainer = {
       items: {
-        create: vi.fn(async (doc: any) => {
+        create: vi.fn(async (doc: MockDoc) => {
           if (mockHooksByTokenData.has(doc.id)) {
-            const error: any = new Error('Conflict');
-            error.code = 409;
-            throw error;
+            throw Object.assign(new Error('Conflict'), { code: 409 });
           }
           mockHooksByTokenData.set(doc.id, doc);
           return { resource: doc };
         }),
-        query: vi.fn(() => ({
-          fetchAll: vi.fn(async () => ({
+        query: vi.fn((): MockQueryIterator<MockDoc> => ({
+          fetchAll: async () => ({
             resources: Array.from(mockHooksByTokenData.values()),
-          })),
+          }),
         })),
-        upsert: vi.fn(async (doc: any) => {
+        upsert: vi.fn(async (doc: MockDoc) => {
           mockHooksByTokenData.set(doc.id, doc);
           return { resource: doc };
         }),
@@ -209,7 +250,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
         }),
       })),
       delete: vi.fn(async () => ({})),
-    } as any;
+    } as unknown as Container;
 
     storage = createStorage({
       container: mockContainer,
@@ -355,7 +396,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
         runId: run.runId,
         pagination: { sortOrder: 'asc' },
       });
-      const runStartedEvents = eventList.data.filter((e: any) => e.eventType === 'run_started');
+      const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
     });
   });
@@ -608,12 +649,13 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       // The fast-path compare passes, so only the in-batch Patch condition can
       // catch this -- exactly the race the guard exists for.
       const { runId, marker } = await runWithMarker();
-      const markerDoc = mockData.get(`marker:${runId}`);
+      // runWithMarker() always seeds the marker doc, so this lookup can't miss.
+      const markerDoc = mockData.get(`marker:${runId}`)!;
       expect(markerDoc.stateUpdatedAt).toBe(marker);
 
-      const batch = mockContainer.items.batch as unknown as ReturnType<typeof vi.fn>;
+      const batch = mockContainer.items.batch as unknown as Mock<MockBatchImpl>;
       const original = batch.getMockImplementation()!;
-      batch.mockImplementationOnce(async (operations: any[], partitionKey: string) => {
+      batch.mockImplementationOnce(async (operations, partitionKey) => {
         markerDoc.stateUpdatedAt = marker + 1000;
         return original(operations, partitionKey);
       });
@@ -659,7 +701,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
         { stateUpdatedAt: marker },
       );
 
-      expect(mockData.get(`marker:${runId}`).stateUpdatedAt).toBe(marker);
+      expect(mockData.get(`marker:${runId}`)!.stateUpdatedAt).toBe(marker);
       const events = await storage.events.list({ runId, pagination: { limit: 100 } });
       expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(2);
     });
@@ -689,7 +731,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
         eventData: { payload: {} },
       });
       const marker = eventTime(received.event!.eventId);
-      expect(mockData.get(`marker:${run.runId}`).stateUpdatedAt).toBe(marker);
+      expect(mockData.get(`marker:${run.runId}`)!.stateUpdatedAt).toBe(marker);
 
       await expect(
         storage.events.create(

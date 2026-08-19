@@ -5,6 +5,7 @@
  * transaction and streamer RPC protocol used in production.
  */
 
+import { expectEventType } from '@fantasticfour/testing';
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ApplyEventOutcome, ApplyEventRequest } from '../src/apply-event.js';
@@ -432,8 +433,7 @@ describe('Real Cloudflare Durable Objects', () => {
       );
 
       expect(outcome.hook).toBeUndefined();
-      expect(outcome.event?.eventType).toBe('hook_conflict');
-      expect(outcome.event?.eventData).toMatchObject({
+      expect(expectEventType(outcome.event, 'hook_conflict').eventData).toMatchObject({
         token: 'contested-token',
         conflictingRunId: 'wrun_other',
       });

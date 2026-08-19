@@ -134,18 +134,14 @@ describe('serialization', () => {
       ['deeply nested binary', { a: { b: [{ c: new Uint8Array([9]) }] } }],
     ];
 
-    for (const [label, value] of cases) {
-      it(`matches the reviver for: ${label}`, () => {
-        const text = stringify(value);
-        // The slow path, verbatim, as the reference implementation.
-        expect(parse(text)).toEqual(JSON.parse(text, uint8ArrayReviver));
-      });
-    }
+    it.each(cases)('matches the reviver for: %s', (_label, value) => {
+      const text = stringify(value);
+      // The slow path, verbatim, as the reference implementation.
+      expect(parse(text)).toEqual(JSON.parse(text, uint8ArrayReviver));
+    });
 
-    it('emits byte-identical JSON to the replacer', () => {
-      for (const [, value] of cases) {
-        expect(stringify(value)).toBe(JSON.stringify(value, uint8ArrayReplacer));
-      }
+    it.each(cases)('emits byte-identical JSON to the replacer for: %s', (_label, value) => {
+      expect(stringify(value)).toBe(JSON.stringify(value, uint8ArrayReplacer));
     });
 
     it('revives a date field nested inside a user payload, as before', () => {
@@ -161,26 +157,27 @@ describe('serialization', () => {
   // `revive` must agree with `parse` for transports that hand back decoded
   // objects instead of text.
   describe('revive parity with parse', () => {
-    const cases: unknown[] = [
-      { createdAt: new Date('2024-01-15T10:30:00Z'), name: 'x' },
-      { eventData: { retryAfter: new Date('2024-02-01T00:00:00Z') } },
-      { a: { b: { c: [{ completedAt: new Date('2024-03-01T00:00:00Z') }] } } },
-      [{ startedAt: new Date('2024-04-01T00:00:00Z') }],
-      { data: new Uint8Array([1, 0, 255]) },
-      { a: { b: [{ c: new Uint8Array([9]) }] } },
-      { createdAt: 'not-a-date' },
-      { createdAt: null },
-      {},
-      [],
+    const cases: Array<[string, unknown]> = [
+      ['top-level dates', { createdAt: new Date('2024-01-15T10:30:00Z'), name: 'x' }],
+      ['nested dates', { eventData: { retryAfter: new Date('2024-02-01T00:00:00Z') } }],
+      [
+        'deeply nested dates',
+        { a: { b: { c: [{ completedAt: new Date('2024-03-01T00:00:00Z') }] } } },
+      ],
+      ['dates inside arrays', [{ startedAt: new Date('2024-04-01T00:00:00Z') }]],
+      ['binary data', { data: new Uint8Array([1, 0, 255]) }],
+      ['deeply nested binary', { a: { b: [{ c: new Uint8Array([9]) }] } }],
+      ['invalid date string', { createdAt: 'not-a-date' }],
+      ['null date', { createdAt: null }],
+      ['empty object', {}],
+      ['empty array', []],
     ];
 
-    for (const [i, value] of cases.entries()) {
-      it(`matches parse for case ${i}`, () => {
-        const text = stringify(value);
-        // Simulates a transport that already decoded the JSON for us.
-        expect(revive(JSON.parse(text))).toEqual(parse(text));
-      });
-    }
+    it.each(cases)('matches parse for: %s', (_label, value) => {
+      const text = stringify(value);
+      // Simulates a transport that already decoded the JSON for us.
+      expect(revive(JSON.parse(text))).toEqual(parse(text));
+    });
 
     it('decodes a bare tagged Uint8Array at the root', () => {
       const restored = revive<Uint8Array>(JSON.parse(stringify(new Uint8Array([1, 2, 3]))));

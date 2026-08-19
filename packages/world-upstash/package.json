@@ -40,7 +40,7 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@upstash/qstash": "^2.8.7",
@@ -51,6 +51,7 @@
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",
+    "@fantasticfour/testing": "workspace:*",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",

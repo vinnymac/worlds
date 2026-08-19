@@ -11,6 +11,17 @@ import { applyMigrations } from '../src/migrate.js';
 
 const shouldSkipTests = process.platform === 'win32';
 
+// drizzle's mysql2 driver types execute() as [ResultSetHeader, FieldPacket[]] always,
+// but a raw SELECT actually returns [RowDataPacket[], FieldPacket[]] at runtime.
+interface RawJobRow {
+  id: number;
+  job_id: string;
+  queue_name: string;
+  payload: Buffer;
+}
+
+type RawSelectResult = [RawJobRow[], unknown[]];
+
 describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
   let mysqlContainer: Awaited<ReturnType<InstanceType<typeof MySqlContainer>['start']>>;
   let db: MySql2Database<typeof schema>;
@@ -72,13 +83,13 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
       ).slice(0, 2000),
     );
 
-    const outerArray = rawResult as any;
+    const outerArray = rawResult as unknown as RawSelectResult;
     console.log('outerArray[0] type:', typeof outerArray[0]);
     console.log('outerArray[0] is array:', Array.isArray(outerArray[0]));
     console.log('outerArray[0] length:', outerArray[0]?.length);
 
-    // drizzle mysql2 execute returns [[rows], [fields]] or similar nested structure
-    const rows = Array.isArray(outerArray[0]) ? outerArray[0] : outerArray;
+    // drizzle's mysql2 driver returns `[rows, fields]` for a raw SELECT.
+    const rows = outerArray[0];
     expect(rows.length).toBeGreaterThan(0);
     const job = rows[0];
     console.log('job keys:', Object.keys(job));
@@ -113,28 +124,29 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
         FOR UPDATE SKIP LOCKED
       `);
 
+      const rawTuple = rawResult as unknown as RawSelectResult;
+
       console.log('TX rawResult type:', typeof rawResult);
       console.log('TX rawResult is array:', Array.isArray(rawResult));
-      console.log('TX rawResult length:', (rawResult as any)?.length);
-      console.log('TX rawResult[0] type:', typeof (rawResult as any)?.[0]);
-      console.log('TX rawResult[0] is array:', Array.isArray((rawResult as any)?.[0]));
-      console.log('TX rawResult[0] length:', (rawResult as any)?.[0]?.length);
-      if (Array.isArray((rawResult as any)?.[0])) {
-        console.log(
-          'TX rawResult[0][0] keys:',
-          (rawResult as any)?.[0]?.[0] && Object.keys((rawResult as any)[0][0]),
-        );
+      console.log('TX rawResult length:', rawTuple.length);
+      console.log('TX rawResult[0] type:', typeof rawTuple[0]);
+      console.log('TX rawResult[0] is array:', Array.isArray(rawTuple[0]));
+      console.log('TX rawResult[0] length:', rawTuple[0]?.length);
+      if (Array.isArray(rawTuple[0])) {
+        console.log('TX rawResult[0][0] keys:', rawTuple[0][0] && Object.keys(rawTuple[0][0]));
       }
 
-      // Same structure as non-tx: [[rows], [fields]]
-      const outerArray = rawResult as any;
-      const rows = Array.isArray(outerArray[0]) ? outerArray[0] : outerArray;
+      // drizzle's mysql2 driver returns `[rows, fields]` for a raw SELECT.
+      const rows = rawTuple[0];
       if (!rows || rows.length === 0) return null;
       return rows[0];
     });
 
     console.log('transaction result:', result ? Object.keys(result) : 'null');
     expect(result).not.toBeNull();
+    if (result === null) {
+      throw new Error('expected a job row from the transaction');
+    }
     expect(result.queue_name).toBe('workflow_flows');
   });
 
