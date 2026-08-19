@@ -2,10 +2,12 @@ export { createDebugLogger } from './debug.js';
 export {
   DATE_FIELDS,
   dateReviver,
+  hasBinary,
   uint8ArrayReplacer,
   uint8ArrayReviver,
   stringify,
   parse,
+  revive,
   deepClone,
 } from './serialization.js';
 export {

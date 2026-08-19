@@ -23,4 +23,12 @@ export interface MysqlRedisWorldConfig {
    * the runtime fails a runaway run with `MAX_EVENTS_EXCEEDED`.
    * Default: `WORKFLOW_MAX_EVENTS`, else 25000. */
   maxEventsPerRun?: number;
+
+  /**
+   * Batch commands issued in the same event-loop tick into one write. A win
+   * once several runs are in flight and a marginal loss for a single serial
+   * caller. Blocking worker connections opt out regardless.
+   * Default: true
+   */
+  enableAutoPipelining?: boolean;
 }

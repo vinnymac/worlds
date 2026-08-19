@@ -389,7 +389,10 @@ export function createQueue(
   }
 
   async function worker(kind: QueueKind, listKey: string) {
-    const workerRedis = redis.duplicate();
+    // `duplicate()` copies the parent's options, and auto-pipelining is a
+    // storage-side setting: batching a blocking BRPOPLPUSH with other
+    // commands would stall them behind it, so it is turned off here.
+    const workerRedis = redis.duplicate({ enableAutoPipelining: false });
     const keys = keysFor(listKey);
 
     try {

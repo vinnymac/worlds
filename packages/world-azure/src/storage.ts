@@ -468,17 +468,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   /**
    * Internal helper to get the raw run document (with Cosmos system fields).
    */
-  async function getRunDoc(runId: string): Promise<CosmosDoc | undefined> {
-    const querySpec: SqlQuerySpec = {
-      query: 'SELECT * FROM c WHERE c.type = "run" AND c.runId = @runId',
-      parameters: [{ name: '@runId', value: runId }],
-    };
-
-    const { resources } = await withCosmosRetry(() =>
-      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
-    );
-
-    return resources[0] as CosmosDoc | undefined;
+  function getRunDoc(runId: string): Promise<CosmosDoc | undefined> {
+    return readRunPartitionDoc(runId, `run:${runId}`);
   }
 
   /**
@@ -495,20 +486,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   /**
    * Internal helper to get the raw step document (with Cosmos system fields).
    */
-  async function getStepDoc(runId: string, stepId: string): Promise<CosmosDoc | undefined> {
-    const querySpec: SqlQuerySpec = {
-      query: 'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId AND c.runId = @runId',
-      parameters: [
-        { name: '@stepId', value: stepId },
-        { name: '@runId', value: runId },
-      ],
-    };
-
-    const { resources } = await withCosmosRetry(() =>
-      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
-    );
-
-    return resources[0] as CosmosDoc | undefined;
+  function getStepDoc(runId: string, stepId: string): Promise<CosmosDoc | undefined> {
+    return readRunPartitionDoc(runId, `step:${runId}:${stepId}`);
   }
 
   /**
@@ -1778,26 +1757,14 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       },
 
       async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
-        const querySpec: SqlQuerySpec = {
-          query:
-            'SELECT * FROM c WHERE c.type = "event" AND c.eventId = @eventId AND c.runId = @runId',
-          parameters: [
-            { name: '@eventId', value: eventId },
-            { name: '@runId', value: runId },
-          ],
-        };
-
-        const { resources } = await withCosmosRetry(() =>
-          container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
-        );
-
-        if (resources.length === 0) {
+        const doc = await readRunPartitionDoc(runId, `event:${runId}:${eventId}`);
+        if (!doc) {
           throw new WorkflowWorldError(`Event not found: ${eventId}`, {
             status: 404,
           });
         }
 
-        return deserializeEvent(resources[0]);
+        return deserializeEvent(doc);
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {

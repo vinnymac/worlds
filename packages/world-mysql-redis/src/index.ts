@@ -29,8 +29,14 @@ export function createWorld(
   },
 ): MysqlRedisWorld {
   // Create Redis client for queue
+  // Batches commands issued in the same event-loop tick into one write;
+  // a win under concurrency, neutral for a single serial caller. Blocking
+  // worker connections opt out where they are duplicated.
+  const autoPipelining = config.enableAutoPipelining ?? true;
   const redis =
-    typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
+    typeof config.redis === 'string'
+      ? new Redis(config.redis, { enableAutoPipelining: autoPipelining })
+      : new Redis({ enableAutoPipelining: autoPipelining, ...config.redis });
 
   // Create MySQL connection pool
   const pool = mysql.createPool(config.databaseUrl);

@@ -276,15 +276,28 @@ function convertBuffersToUint8Array(value: unknown): unknown {
   }
 
   if (Array.isArray(value)) {
-    return value.map(convertBuffersToUint8Array);
+    let result: unknown[] | undefined;
+    for (let i = 0; i < value.length; i++) {
+      const converted = convertBuffersToUint8Array(value[i]);
+      if (converted !== value[i]) {
+        result ??= value.slice();
+        result[i] = converted;
+      }
+    }
+    return result ?? value;
   }
 
   if (typeof value === 'object') {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = convertBuffersToUint8Array(val);
+    const source = value as Record<string, unknown>;
+    let result: Record<string, unknown> | undefined;
+    for (const [key, val] of Object.entries(source)) {
+      const converted = convertBuffersToUint8Array(val);
+      if (converted !== val) {
+        result ??= { ...source };
+        result[key] = converted;
+      }
     }
-    return result;
+    return result ?? value;
   }
 
   return value;
@@ -298,13 +311,14 @@ function deserializeNestedArrays(value: unknown): unknown {
   if (value === null || value === undefined) return value;
 
   if (typeof value === 'string') {
+    if (!value.startsWith('{"__nested_array__":')) return value;
     try {
       const parsed = JSON.parse(value);
       if (parsed && typeof parsed === 'object' && '__nested_array__' in parsed) {
         return convertBuffersToUint8Array(parsed.__nested_array__);
       }
     } catch {
-      // Not JSON, return as-is
+      return value;
     }
     return value;
   }
@@ -634,14 +648,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const advancesStateMarker =
           stateUpdatedAt === undefined && EXTERNAL_EVENT_TYPES.has(data.eventType);
 
-        /** Read the marker and enforce the guard. Must run before any write;
-         * Firestore requires all reads first. Returns the current marker so the
-         * write side can keep it monotonic. */
-        async function readStateMarker(
-          tx: FirebaseFirestore.Transaction,
-        ): Promise<number | undefined> {
-          if (stateUpdatedAt === undefined && !advancesStateMarker) return undefined;
-          const snap = await tx.get(markerRef);
+        function validateStateMarker(snap: FirebaseFirestore.DocumentSnapshot): number | undefined {
           const raw = snap.exists
             ? (snap.data() as FirebaseFirestore.DocumentData).stateUpdatedAt
             : undefined;
@@ -653,6 +660,27 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             );
           }
           return marker;
+        }
+
+        async function readStateMarker(
+          tx: FirebaseFirestore.Transaction,
+        ): Promise<number | undefined> {
+          if (stateUpdatedAt === undefined && !advancesStateMarker) return undefined;
+          return validateStateMarker(await tx.get(markerRef));
+        }
+
+        async function readDocsWithStateMarker(
+          tx: FirebaseFirestore.Transaction,
+          refs: FirebaseFirestore.DocumentReference[],
+        ): Promise<{
+          marker: number | undefined;
+          docs: FirebaseFirestore.DocumentSnapshot[];
+        }> {
+          if (stateUpdatedAt === undefined && !advancesStateMarker) {
+            return { marker: undefined, docs: await tx.getAll(...refs) };
+          }
+          const [markerSnap, ...docs] = await tx.getAll(markerRef, ...refs);
+          return { marker: validateStateMarker(markerSnap), docs };
         }
 
         /** Advance the marker to this event's ULID time, monotonically. */
@@ -684,8 +712,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           case 'run_created': {
             const runData = eventData as RunCreatedEventRequest['eventData'];
             result = await firestore.runTransaction(async (tx) => {
-              await readStateMarker(tx);
-              const existing = await tx.get(runRef);
+              const {
+                docs: [existing],
+              } = await readDocsWithStateMarker(tx, [runRef]);
               if (existing.exists) {
                 throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
               }
@@ -740,8 +769,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 bootstrappedRun?: WorkflowRun;
                 unchangedRun?: WorkflowRun;
               }> => {
-                await readStateMarker(tx);
-                const runSnap = await tx.get(runRef);
+                const {
+                  docs: [runSnap],
+                } = await readDocsWithStateMarker(tx, [runRef]);
 
                 if (!runSnap.exists) {
                   // ============================================================
@@ -935,8 +965,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const stepRef = runRef.collection('steps').doc(correlationId);
 
             result = await firestore.runTransaction(async (tx) => {
-              await readStateMarker(tx);
-              const [runSnap, stepSnap] = await tx.getAll(runRef, stepRef);
+              const {
+                docs: [runSnap, stepSnap],
+              } = await readDocsWithStateMarker(tx, [runRef, stepRef]);
 
               const runStatus = runSnap.exists
                 ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
@@ -1004,8 +1035,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const stepRef = runRef.collection('steps').doc(correlationId);
 
             const record = await firestore.runTransaction(async (tx) => {
-              const marker = await readStateMarker(tx);
-              const stepSnap = await tx.get(stepRef);
+              const refs = eventType === 'step_started' ? [stepRef, runRef] : [stepRef];
+              const {
+                marker,
+                docs: [stepSnap, runSnap],
+              } = await readDocsWithStateMarker(tx, refs);
               if (!stepSnap.exists) {
                 throw new WorkflowWorldError(`Step "${correlationId}" not found`, {
                   status: 404,
@@ -1039,8 +1073,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 // On terminal runs, only steps that are already running may
                 // proceed (to record their completion); new work must not
                 // start on a cancelled run.
-                const runSnap = await tx.get(runRef);
-                if (runSnap.exists) {
+                if (runSnap?.exists) {
                   const runStatus = String(
                     (runSnap.data() as FirebaseFirestore.DocumentData).status,
                   );
@@ -1142,8 +1175,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const tokenRef = firestore.collection('hooks_by_token').doc(hookData.token);
 
             result = await firestore.runTransaction(async (tx) => {
-              await readStateMarker(tx);
-              const [runSnap, tokenSnap] = await tx.getAll(runRef, tokenRef);
+              const {
+                docs: [runSnap, tokenSnap],
+              } = await readDocsWithStateMarker(tx, [runRef, tokenRef]);
 
               // A hook_created landing after the terminal transition's
               // cleanup would orphan the token index forever; reject it.
@@ -1228,8 +1262,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const hookRef = runRef.collection('hooks').doc(correlationId);
 
             result = await firestore.runTransaction(async (tx) => {
-              await readStateMarker(tx);
-              const hookSnap = await tx.get(hookRef);
+              const {
+                docs: [hookSnap],
+              } = await readDocsWithStateMarker(tx, [hookRef]);
               if (!hookSnap.exists) {
                 // Typed error: core's resume-or-start pattern matches this by
                 // name via HookNotFoundError.is().
@@ -1292,8 +1327,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const waitId = `${effectiveRunId}-${correlationId}`;
 
             result = await firestore.runTransaction(async (tx) => {
-              await readStateMarker(tx);
-              const [runSnap, waitSnap] = await tx.getAll(runRef, waitRef);
+              const {
+                docs: [runSnap, waitSnap],
+              } = await readDocsWithStateMarker(tx, [runRef, waitRef]);
 
               const runStatus = runSnap.exists
                 ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
@@ -1347,8 +1383,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const waitRef = runRef.collection('waits').doc(correlationId);
 
             result = await firestore.runTransaction(async (tx) => {
-              await readStateMarker(tx);
-              const waitSnap = await tx.get(waitRef);
+              const {
+                docs: [waitSnap],
+              } = await readDocsWithStateMarker(tx, [waitRef]);
               if (!waitSnap.exists) {
                 throw new WorkflowWorldError(`Wait "${correlationId}" not found`, {
                   status: 404,

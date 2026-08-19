@@ -94,4 +94,12 @@ export interface RedisWorldConfig {
   /** Maximum events a run may accumulate, reported as `EventResult.maxEvents`.
    * Default: `WORKFLOW_MAX_EVENTS` || 25_000 */
   maxEventsPerRun?: number;
+
+  /**
+   * Batch commands issued in the same event-loop tick into one write. A win
+   * once several runs are in flight (~1.75x at 256 concurrent) and a marginal
+   * loss for a single serial caller.
+   * Default: true
+   */
+  enableAutoPipelining?: boolean;
 }

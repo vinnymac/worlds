@@ -29,7 +29,15 @@ export function stringifyWithUint8Array(obj: unknown): string {
 
 /**
  * Parse JSON with Uint8Array support.
+ *
+ * Handing JSON a reviver forces V8 off its fast path and calls into JS per
+ * node, costing several times a plain parse. This world does not revive dates,
+ * so with no binary tag in the text the reviver has nothing to do and a plain
+ * parse is exactly equivalent.
  */
 export function parseWithUint8Array<T>(json: string): T {
-  return JSON.parse(json, uint8ArrayReviver) as T;
+  if (json.includes('"__type"') || json.includes('"__uint8array"')) {
+    return JSON.parse(json, uint8ArrayReviver) as T;
+  }
+  return JSON.parse(json) as T;
 }

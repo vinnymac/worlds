@@ -1153,4 +1153,119 @@ describe('Storage (Redis integration)', () => {
       expect(await redis.get(`${keyPrefix}hook:hook-guard`)).toBeNull();
     });
   });
+
+  // The compact `run:meta:` key and the per-run hook token map are both
+  // written going forward but are absent from runs that already existed when
+  // they were introduced. Each read path has to degrade to the old behaviour
+  // rather than mistake a missing key for a missing entity.
+  describe('records written before the meta key and hook token map existed', () => {
+    it('validates events against the run body when the meta key is missing', async () => {
+      const run = await createRun();
+      await redis.del(`${keyPrefix}run:meta:${run.runId}`);
+
+      // step_created only consults status/specVersion, which now normally come
+      // from the meta key; without it the run body must still be consulted.
+      const step = await createStep(run.runId, { stepId: 'step-no-meta' });
+      expect(step.status).toBe('pending');
+    });
+
+    it('still rejects entity creation on a terminal run when the meta key is missing', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started', eventData: {} });
+      await events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: 'done' },
+      });
+      await redis.del(`${keyPrefix}run:meta:${run.runId}`);
+
+      await expect(createStep(run.runId, { stepId: 'step-after-terminal' })).rejects.toThrow(
+        /terminal state/,
+      );
+    });
+
+    it('releases hook tokens on a terminal run even without a token map', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started', eventData: {} });
+      await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-legacy',
+        eventData: { token: 'token-legacy' },
+      });
+
+      // Simulate a hook written before the token map was introduced.
+      await redis.del(`${keyPrefix}hooks:tokens:${run.runId}`);
+      expect(await redis.get(`${keyPrefix}hooks:by_token:token-legacy`)).toBe('hook-legacy');
+
+      await events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: 'done' },
+      });
+
+      // Cleanup must reclaim the hook, its token lookup, and the index.
+      expect(await redis.get(`${keyPrefix}hook:hook-legacy`)).toBeNull();
+      expect(await redis.get(`${keyPrefix}hooks:by_token:token-legacy`)).toBeNull();
+      expect(await redis.exists(`${keyPrefix}hooks:by_run:${run.runId}`)).toBe(0);
+    });
+
+    it('releases hook tokens on a terminal run via the token map', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started', eventData: {} });
+      await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-mapped',
+        eventData: { token: 'token-mapped' },
+      });
+      await events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: 'done' },
+      });
+
+      expect(await redis.get(`${keyPrefix}hook:hook-mapped`)).toBeNull();
+      expect(await redis.get(`${keyPrefix}hooks:by_token:token-mapped`)).toBeNull();
+      expect(await redis.exists(`${keyPrefix}hooks:tokens:${run.runId}`)).toBe(0);
+    });
+  });
+
+  // `parse` takes a fast path that skips JSON's reviver when the payload holds
+  // no binary. Dates still have to come back as Dates on that path.
+  describe('date revival on the non-binary fast path', () => {
+    it('revives entity timestamps as Date instances', async () => {
+      const run = await createRun();
+      const reread = await runs.get(run.runId);
+      expect(reread.createdAt).toBeInstanceOf(Date);
+      expect(reread.updatedAt).toBeInstanceOf(Date);
+    });
+
+    it('revives retryAfter inside a stored event payload', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started', eventData: {} });
+      const step = await createStep(run.runId, { stepId: 'step-retry-date' });
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+        eventData: {},
+      });
+
+      const retryAfter = new Date(Date.now() + 30_000);
+      await events.create(run.runId, {
+        eventType: 'step_retrying',
+        correlationId: step.stepId,
+        eventData: { error: 'boom', retryAfter },
+      });
+
+      const stored = await events.listByCorrelationId({
+        runId: run.runId,
+        correlationId: step.stepId,
+      });
+      const retrying = stored.data.find((e) => e.eventType === 'step_retrying');
+      expect((retrying?.eventData as { retryAfter?: unknown })?.retryAfter).toBeInstanceOf(Date);
+    });
+
+    it('revives dates when the payload also contains binary', async () => {
+      const run = await createRun({ input: [new Uint8Array([7, 8, 9])] });
+      const reread = await runs.get(run.runId);
+      expect(reread.createdAt).toBeInstanceOf(Date);
+      expect((reread.input as Uint8Array[])[0]).toBeInstanceOf(Uint8Array);
+    });
+  });
 });

@@ -368,7 +368,10 @@ export function createQueue(
     const processingKey = `${listKey}:processing:${consumerId}`;
     const ownerKey = `${processingKey}:owner`;
     // BLMOVE blocks the connection, so each worker uses its own client.
-    const workerRedis = redis.duplicate();
+    // `duplicate()` copies the parent's options, and auto-pipelining is a
+    // storage-side setting: batching a blocking call with other commands would
+    // stall them behind it, so it is turned off here.
+    const workerRedis = redis.duplicate({ enableAutoPipelining: false });
     workerClients.add(workerRedis);
 
     // Liveness heartbeat. If this process dies, the key expires and the

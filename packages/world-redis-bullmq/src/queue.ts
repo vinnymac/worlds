@@ -1,4 +1,5 @@
 import { uint8ArrayReplacer } from '@fantasticfour/shared';
+import { hasBinary } from './util.js';
 import {
   MessageId,
   parseQueueName,
@@ -52,8 +53,11 @@ interface QueueJobData {
  * world-local/world-postgres queue transports. Required because BullMQ
  * JSON-serializes job data, which would otherwise mangle binary payloads.
  */
+// Same fast path as storage: a replacer/reviver forces V8 off its fast path,
+// costing ~2.6x on serialize and ~8x on parse. Queue payloads carry the same
+// step inputs and results, so this applies per enqueue and dequeue.
 function serializeQueueMessage(message: unknown): string {
-  return JSON.stringify(message, uint8ArrayReplacer);
+  return hasBinary(message) ? JSON.stringify(message, uint8ArrayReplacer) : JSON.stringify(message);
 }
 
 function queueMessageReviver(_key: string, value: unknown): unknown {
@@ -67,7 +71,9 @@ function queueMessageReviver(_key: string, value: unknown): unknown {
 }
 
 function deserializeQueueMessage(text: string): unknown {
-  return JSON.parse(text, queueMessageReviver);
+  // Queue messages carry no Date fields, so with the tag absent a plain parse
+  // is exactly equivalent.
+  return text.includes('"__type"') ? JSON.parse(text, queueMessageReviver) : JSON.parse(text);
 }
 
 /**
@@ -115,7 +121,15 @@ export function createQueue(
   // would silently drop fields. BullMQ manages its own key prefixes and
   // rejects ioredis keyPrefix, so strip it; maxRetriesPerRequest: null is
   // required by BullMQ for blocking connections.
-  const { keyPrefix: _unsupportedByBullmq, ...redisOptions } = redis.options;
+  // Auto-pipelining is a storage-side setting. BullMQ workers hold blocking
+  // connections (BZPOPMIN and friends), where batching a blocking call
+  // together with other commands would stall them behind it, so it is dropped
+  // here rather than inherited.
+  const {
+    keyPrefix: _unsupportedByBullmq,
+    enableAutoPipelining: _storageOnly,
+    ...redisOptions
+  } = redis.options;
   const connectionOptions = {
     ...redisOptions,
     maxRetriesPerRequest: null,
