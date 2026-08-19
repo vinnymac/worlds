@@ -1,6 +1,7 @@
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import type { WorkflowRun, Step } from '@workflow/world';
-import { decodeTime } from 'ulid';
+import { connect } from 'nats';
+import { decodeTime, ulid } from 'ulid';
 import { afterAll, beforeAll, describe, expect, it, test } from 'vitest';
 import { createWorld } from '../src/index.js';
 
@@ -61,7 +62,7 @@ describe('Storage (NATS JetStream integration)', () => {
   });
 
   describe('Event idempotency', () => {
-    it('should handle duplicate run_created events', async () => {
+    it('rejects a duplicate run_created with EntityConflictError', async () => {
       const workflowName = 'test-workflow-idempotent';
       const eventData = {
         eventType: 'run_created' as const,
@@ -72,12 +73,19 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      const result2 = await world.events.create(runId, eventData);
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // A redelivered run_created must not return the existing run AND
+      // append a second run_created row; core catches EntityConflictError
+      // as "the run already exists" on its concurrent-create path.
+      await expect(world.events.create(runId, eventData)).rejects.toMatchObject({
+        name: 'EntityConflictError',
+      });
 
       const listResult = await world.runs.list({ workflowName });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const eventList = await world.events.list({ runId });
+      const runCreatedEvents = eventList.data.filter((e) => e.eventType === 'run_created');
+      expect(runCreatedEvents).toHaveLength(1);
     });
 
     it('rejects a duplicate step_created with EntityConflictError', async () => {
@@ -285,6 +293,11 @@ describe('Storage (NATS JetStream integration)', () => {
       // No hook_conflict event may be logged for the replay.
       const events = await world.events.list({ runId: run.runId });
       expect(events.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      // And exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      expect(
+        events.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
+      ).toHaveLength(1);
     });
 
     it('cross-run token conflict records hook_conflict with conflictingRunId', async () => {
@@ -349,6 +362,190 @@ describe('Storage (NATS JetStream integration)', () => {
           eventType: 'wait_completed',
           correlationId,
           eventData: {},
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+    });
+  });
+
+  describe('Creation-event races', () => {
+    // Concurrent duplicate deliveries may EITHER reject with
+    // EntityConflictError or converge on the winner's canonical eventId and
+    // fulfill; the invariant is a single creation row either way.
+
+    it('concurrent run_created deliveries produce exactly one run and one event row', async () => {
+      const workflowName = `race-run-${Date.now()}`;
+      const first = await world.events.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId: 'test-deployment', workflowName, input: [] },
+      });
+      const runId = first.run!.runId;
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          world.events.create(runId, {
+            eventType: 'run_created',
+            eventData: { deploymentId: 'test-deployment', workflowName, input: [] },
+          }),
+        ),
+      );
+      // The run entity is the arbiter: every redelivery rejects.
+      for (const r of results) {
+        expect(r.status).toBe('rejected');
+        expect((r as PromiseRejectedResult).reason).toMatchObject({
+          name: 'EntityConflictError',
+        });
+      }
+
+      const eventList = await world.events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
+    });
+
+    it('concurrent step_created deliveries converge on a single event row', async () => {
+      const run = await createRun();
+      const stepId = 'step-race';
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          world.events.create(run.runId, {
+            eventType: 'step_created',
+            correlationId: stepId,
+            eventData: { stepName: 'test-step', input: ['input1'] },
+          }),
+        ),
+      );
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
+        }
+      }
+
+      const steps = await world.steps.list({ runId: run.runId });
+      expect(steps.data).toHaveLength(1);
+      const eventList = await world.events.list({ runId: run.runId });
+      const created = eventList.data.filter(
+        (e) => e.eventType === 'step_created' && e.correlationId === stepId,
+      );
+      expect(created).toHaveLength(1);
+    });
+
+    it('concurrent wait_created deliveries converge on a single event row', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      const correlationId = 'wait-race';
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          world.events.create(run.runId, {
+            eventType: 'wait_created',
+            correlationId,
+            eventData: { resumeAt: new Date(Date.now() + 60_000) },
+          }),
+        ),
+      );
+
+      expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
+        }
+      }
+
+      const eventList = await world.events.list({ runId: run.runId });
+      const created = eventList.data.filter(
+        (e) => e.eventType === 'wait_created' && e.correlationId === correlationId,
+      );
+      expect(created).toHaveLength(1);
+    });
+
+    it('concurrent hook_created deliveries converge on a single event row', async () => {
+      const run = await createRun();
+      const hookId = 'hook-race';
+      const token = 'race-token';
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          world.events.create(run.runId, {
+            eventType: 'hook_created',
+            correlationId: hookId,
+            eventData: { token },
+          }),
+        ),
+      );
+
+      expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
+        }
+      }
+
+      const eventList = await world.events.list({ runId: run.runId });
+      expect(
+        eventList.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
+      ).toHaveLength(1);
+      // The race must never manufacture a self-conflict.
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      const holder = await world.hooks.getByToken(token);
+      expect(holder.hookId).toBe(hookId);
+    });
+
+    it('a delivery racing a crashed winner heals under the canonical eventId', async () => {
+      // Seed the orphan window by hand: step entity + creation claim written,
+      // event write lost (a crash between claim and putEvent).
+      const run = await createRun();
+      const stepId = 'step-orphan-heal';
+      const canonicalEventId = `wevt_${ulid()}`;
+
+      const nc = await connect({ servers: natsUrl });
+      try {
+        const js = nc.jetstream();
+        const stepsBucket = await js.views.kv('test_steps', { history: 10 });
+        const claimsBucket = await js.views.kv('test_creation_claims', { history: 1 });
+        await stepsBucket.create(
+          `${run.runId}.${stepId}`,
+          JSON.stringify({
+            runId: run.runId,
+            stepId,
+            stepName: 'test-step',
+            input: ['input1'],
+            status: 'pending',
+            attempt: 0,
+            specVersion: run.specVersion,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+        await claimsBucket.create(`${run.runId}.${stepId}.step_created`, canonicalEventId);
+      } finally {
+        await nc.close();
+      }
+
+      // The redelivery loses the claim, finds no durable event, and completes
+      // the crashed winner's write under its canonical id.
+      const healed = await world.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: stepId,
+        eventData: { stepName: 'test-step', input: ['input1'] },
+      });
+      expect(healed.step?.stepId).toBe(stepId);
+      expect(healed.event?.eventId).toBe(canonicalEventId);
+
+      const eventList = await world.events.list({ runId: run.runId });
+      const created = eventList.data.filter(
+        (e) => e.eventType === 'step_created' && e.correlationId === stepId,
+      );
+      expect(created).toHaveLength(1);
+      expect(created[0].eventId).toBe(canonicalEventId);
+
+      // And a further redelivery is now a true duplicate.
+      await expect(
+        world.events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: stepId,
+          eventData: { stepName: 'test-step', input: ['input1'] },
         }),
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
     });

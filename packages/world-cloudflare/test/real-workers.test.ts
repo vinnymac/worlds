@@ -79,11 +79,13 @@ describe('Real Cloudflare Durable Objects', () => {
       expect(retrieved?.createdAt).toBeInstanceOf(Date);
     });
 
-    it('should treat a duplicate run_created as an idempotent replay', async () => {
+    it('should reject a duplicate run_created with the conflict outcome', async () => {
       expectOk(await stub.applyEvent(runCreated()));
-      const replay = expectOk(await stub.applyEvent(runCreated()));
+      const replay = expectFailure(await stub.applyEvent(runCreated()));
 
-      expect(replay.run?.runId).toBe(runId);
+      // Mapped to EntityConflictError at the storage layer; core treats the
+      // 409 as benign ("the run already exists").
+      expect(replay.code).toBe('ENTITY_CONFLICT');
       // No duplicate run_created event in the log
       const events = await stub.listEvents();
       expect(events.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);

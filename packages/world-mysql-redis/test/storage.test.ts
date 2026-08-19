@@ -5,10 +5,12 @@ import type { Step, Streamer, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
+import type { RowDataPacket } from 'mysql2/promise';
 import { Redis } from 'ioredis';
 import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { parse } from '@fantasticfour/shared';
+import { applyMigrations, MIGRATION_FILES } from '../src/migrate.js';
 import { createQueue } from '../src/queue.js';
 import * as schema from '../src/schema.js';
 import {
@@ -83,103 +85,11 @@ describe('Storage (MySQL + Redis integration)', () => {
     process.env.DATABASE_URL = dbUrl;
     process.env.WORKFLOW_MYSQL_URL = dbUrl;
 
-    // Apply schema
+    // Apply the real migrations so the test schema matches production setup
     connection = await mysql.createConnection(dbUrl);
-
-    await connection.query('CREATE SCHEMA IF NOT EXISTS `workflow`');
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_runs\` (
-      \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`output\` JSON,
-      \`output_cbor\` BLOB,
-      \`deployment_id\` VARCHAR(255) NOT NULL,
-      \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
-      \`name\` VARCHAR(255) NOT NULL,
-      \`execution_context\` JSON,
-      \`execution_context_cbor\` BLOB,
-      \`input\` JSON,
-      \`input_cbor\` BLOB,
-      \`error\` TEXT,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      \`completed_at\` TIMESTAMP NULL,
-      \`started_at\` TIMESTAMP NULL,
-      \`spec_version\` INT,
-      \`expired_at\` TIMESTAMP NULL,
-      \`state_updated_at\` BIGINT NULL,
-      INDEX \`idx_workflow_runs_name\` (\`name\`),
-      INDEX \`idx_workflow_runs_status\` (\`status\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_events\` (
-      \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`type\` VARCHAR(255) NOT NULL,
-      \`correlation_id\` VARCHAR(255),
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`occurred_at\` TIMESTAMP NULL,
-      \`run_id\` VARCHAR(255) NOT NULL,
-      \`payload\` JSON,
-      \`payload_cbor\` BLOB,
-      \`spec_version\` INT,
-      INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
-      INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
-    )`);
-    // Mirrors migrations/0007_events_entity_creation_unique.sql
-    await connection.query(`CREATE UNIQUE INDEX \`workflow_events_entity_creation_unique\`
-      ON \`workflow\`.\`workflow_events\` (
-        (CASE
-          WHEN \`type\` IN ('step_created', 'hook_created', 'wait_created')
-          THEN \`run_id\`
-          ELSE NULL
-        END),
-        \`correlation_id\`,
-        \`type\`
-      )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_steps\` (
-      \`run_id\` VARCHAR(255) NOT NULL,
-      \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`step_name\` VARCHAR(255) NOT NULL,
-      \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
-      \`input\` JSON,
-      \`input_cbor\` BLOB,
-      \`output\` JSON,
-      \`output_cbor\` BLOB,
-      \`error\` TEXT,
-      \`attempt\` INT NOT NULL,
-      \`started_at\` TIMESTAMP NULL,
-      \`completed_at\` TIMESTAMP NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      \`retry_after\` TIMESTAMP NULL,
-      \`spec_version\` INT,
-      INDEX \`idx_workflow_steps_run_id\` (\`run_id\`),
-      INDEX \`idx_workflow_steps_status\` (\`status\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_hooks\` (
-      \`run_id\` VARCHAR(255) NOT NULL,
-      \`hook_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-      \`token\` VARCHAR(255) NOT NULL,
-      \`owner_id\` VARCHAR(255) NOT NULL,
-      \`project_id\` VARCHAR(255) NOT NULL,
-      \`environment\` VARCHAR(255) NOT NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`metadata\` JSON,
-      \`metadata_cbor\` BLOB,
-      \`spec_version\` INT,
-      \`is_webhook\` BOOLEAN,
-      INDEX \`idx_workflow_hooks_run_id\` (\`run_id\`),
-      INDEX \`idx_workflow_hooks_token\` (\`token\`)
-    )`);
-    await connection.query(`CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
-      \`id\` VARCHAR(255) NOT NULL,
-      \`stream_id\` VARCHAR(255) NOT NULL,
-      \`run_id\` VARCHAR(255) NULL,
-      \`data\` BLOB NOT NULL,
-      \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`eof\` BOOLEAN NOT NULL,
-      \`sequence\` BIGINT NOT NULL,
-      PRIMARY KEY (\`stream_id\`, \`id\`),
-      INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`),
-      INDEX \`idx_stream_chunks_run_id\` (\`run_id\`)
-    )`);
+    await applyMigrations(connection);
+    // Second run must be a no-op: the ledger skips every applied file.
+    await applyMigrations(connection);
 
     redisContainer = await new RedisContainer('redis:7-alpine').start();
     const redisHost = redisContainer.getHost();
@@ -203,8 +113,24 @@ describe('Storage (MySQL + Redis integration)', () => {
     await redisContainer?.stop();
   });
 
+  describe('migrations', () => {
+    it('converges on a database provisioned before the ledger existed', async () => {
+      // Simulate a pre-ledger database: schema present, ledger absent. The
+      // re-run must classify every statement as already applied (errno
+      // tolerance) and rebuild the ledger.
+      await connection.query('DROP TABLE `workflow`.`__migrations`');
+      await applyMigrations(connection);
+      const [rows] = await connection.query<RowDataPacket[]>(
+        'SELECT `tag` FROM `workflow`.`__migrations` ORDER BY `tag`',
+      );
+      expect(rows.map((row) => row.tag)).toEqual(
+        MIGRATION_FILES.map((file) => file.replace(/\.sql$/, '')),
+      );
+    });
+  });
+
   describe('Event idempotency', () => {
-    it('should handle duplicate run_created events', async () => {
+    it('rejects a duplicate run_created with EntityConflictError', async () => {
       const workflowName = 'test-workflow-idempotent';
       const eventData = {
         eventType: 'run_created' as const,
@@ -215,12 +141,44 @@ describe('Storage (MySQL + Redis integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      const result2 = await events.create(runId, eventData);
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // A redelivered run_created must not return the existing run AND
+      // append a second run_created row; core catches EntityConflictError
+      // as "the run already exists" on its concurrent-create path.
+      await expect(events.create(runId, eventData)).rejects.toMatchObject({
+        name: 'EntityConflictError',
+      });
 
       const listResult = await runs.list({ workflowName });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
+    });
+
+    it('concurrent run_created deliveries leave exactly one event row', async () => {
+      const eventData = {
+        eventType: 'run_created' as const,
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'test-workflow-run-race',
+          input: [],
+        },
+      };
+      const first = await events.create(null, eventData);
+      const runId = first.run!.runId;
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () => events.create(runId, eventData)),
+      );
+      for (const r of results) {
+        expect(r.status).toBe('rejected');
+        expect((r as PromiseRejectedResult).reason).toMatchObject({
+          name: 'EntityConflictError',
+        });
+      }
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
     });
 
     it('rejects a duplicate step_created with EntityConflictError', async () => {
@@ -601,6 +559,11 @@ describe('Storage (MySQL + Redis integration)', () => {
       // No hook_conflict event must be logged against the run's own hook
       const log = await events.list({ runId: run.runId });
       expect(log.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      // And exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      expect(
+        log.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === 'hook-dup'),
+      ).toHaveLength(1);
     });
 
     it('completes the partial write for an orphaned hook row (crash recovery)', async () => {

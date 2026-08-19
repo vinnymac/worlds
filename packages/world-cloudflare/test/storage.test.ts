@@ -605,7 +605,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
-    it('should handle duplicate run_created events', async () => {
+    it('rejects a duplicate run_created with EntityConflictError', async () => {
       // First run_created event
       const result1 = await storage.events.create(null, {
         eventType: 'run_created',
@@ -618,20 +618,25 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      // Duplicate run_created event (replay scenario)
-      const result2 = await storage.events.create(runId, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-idempotent',
-          input: [],
-        },
-      });
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // Duplicate run_created (replay scenario): must not return the
+      // existing run; core catches EntityConflictError as "the run already
+      // exists" on its concurrent-create path.
+      await expect(
+        storage.events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'test-workflow-idempotent',
+            input: [],
+          },
+        }),
+      ).rejects.toSatisfy((error) => EntityConflictError.is(error));
 
       const listResult = await storage.runs.list({ workflowName: 'test-workflow-idempotent' });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const events = await storage.events.list({ runId, pagination: {} });
+      expect(events.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
     });
 
     it('should handle duplicate hook_created events with different tokens', async () => {
@@ -956,6 +961,16 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       // The original hook still resolves to the original run
       const hook = await storage.hooks.getByToken('token-1');
       expect(hook.runId).toBe(testRunId);
+
+      // Exactly one hook_created row and no self hook_conflict: a second
+      // creation event would poison replay with ReplayDivergenceError.
+      const eventList = await storage.events.list({ runId: testRunId, pagination: {} });
+      expect(
+        eventList.data.filter(
+          (e) => e.eventType === 'hook_created' && e.correlationId === 'hook-1',
+        ),
+      ).toHaveLength(1);
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
     });
 
     it('should record hook_conflict with conflictingRunId when another run holds the token', async () => {

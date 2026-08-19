@@ -35,13 +35,22 @@ JOIN (
 ) AS `d` ON `d`.`id` = `e`.`id`
 WHERE `d`.`row_num` > 1;
 
+-- Key-width note: all three parts are VARCHAR(255) utf8mb4 (4 bytes/char),
+-- which would put the full-width key at ~3068 bytes - 4 bytes under the
+-- 3072-byte InnoDB limit for DYNAMIC rows, and past the 767-byte per-part
+-- limit for COMPACT/REDUNDANT rows (ERROR 1071 at migration time on servers
+-- with innodb_default_row_format=compact). Bound the parts instead: run ids
+-- are `wrun_` + ULID (31 chars, so SUBSTRING is the identity), `type` maxes
+-- at 12 chars, and 128 chars of correlation id is far beyond practical
+-- collision range. Worst case is now (64+128+32)*4 = 904 bytes, valid under
+-- every InnoDB row format.
 CREATE UNIQUE INDEX `workflow_events_entity_creation_unique`
 	ON `workflow`.`workflow_events` (
 		(CASE
 			WHEN `type` IN ('step_created', 'hook_created', 'wait_created')
-			THEN `run_id`
+			THEN SUBSTRING(`run_id`, 1, 64)
 			ELSE NULL
 		END),
-		`correlation_id`,
-		`type`
+		`correlation_id`(128),
+		`type`(32)
 	);

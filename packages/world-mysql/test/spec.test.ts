@@ -5,7 +5,7 @@ import { createTestSuite } from '@workflow/world-testing';
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 import mysql from 'mysql2/promise';
-import { applyMigrations } from './migrate.js';
+import { applyMigrations } from '../src/migrate.js';
 
 // Skip these tests on Windows since it relies on docker containers
 const shouldSkipTests = process.platform === 'win32';

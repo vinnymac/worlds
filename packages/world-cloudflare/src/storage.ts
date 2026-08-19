@@ -236,9 +236,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         const runs = await Promise.all(
           kvList.keys.map(async (key) => {
-            const meta = await env.WORKFLOW_INDEX.get(key.name);
-            if (!meta) return null;
-            const { runId } = JSON.parse(meta) as { runId: string };
+            // The index key is `run:<workflowName>:<runId>` and a runId never
+            // contains a colon, so the id is already in hand. Reading the
+            // entry back just to parse the same id out of its JSON cost one
+            // KV read per run on every page.
+            const runId = key.name.slice(key.name.lastIndexOf(':') + 1);
+            if (!runId) return null;
             try {
               return await runsGet(runId, { resolveData: params?.resolveData });
             } catch (error) {
@@ -319,25 +322,38 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         }
 
         // KV side effects happen after the DO transaction committed; the DO
-        // event log is the source of truth and can re-derive these.
+        // event log is the source of truth and can re-derive these. They are
+        // independent of each other, so they go out together rather than as a
+        // chain of awaits — a run with N hooks was paying 2N serial KV
+        // round trips on its terminal event.
+        const kvWrites: Promise<unknown>[] = [];
         if (outcome.runCreated) {
-          await env.WORKFLOW_INDEX.put(
-            `run:${outcome.runCreated.workflowName}:${effectiveRunId}`,
-            JSON.stringify({
-              runId: effectiveRunId,
-              createdAt: outcome.runCreated.createdAt.toISOString(),
-              status: 'pending',
-            }),
+          kvWrites.push(
+            env.WORKFLOW_INDEX.put(
+              `run:${outcome.runCreated.workflowName}:${effectiveRunId}`,
+              JSON.stringify({
+                runId: effectiveRunId,
+                createdAt: outcome.runCreated.createdAt.toISOString(),
+                status: 'pending',
+              }),
+            ),
           );
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
-          await env.WORKFLOW_INDEX.put(`hook:${outcome.hookToIndex.token}`, serialized);
-          await env.WORKFLOW_INDEX.put(`hookid:${outcome.hookToIndex.hookId}`, serialized);
+          kvWrites.push(
+            env.WORKFLOW_INDEX.put(`hook:${outcome.hookToIndex.token}`, serialized),
+            env.WORKFLOW_INDEX.put(`hookid:${outcome.hookToIndex.hookId}`, serialized),
+          );
         }
         for (const released of outcome.releasedHooks) {
-          await env.WORKFLOW_INDEX.delete(`hook:${released.token}`);
-          await env.WORKFLOW_INDEX.delete(`hookid:${released.hookId}`);
+          kvWrites.push(
+            env.WORKFLOW_INDEX.delete(`hook:${released.token}`),
+            env.WORKFLOW_INDEX.delete(`hookid:${released.hookId}`),
+          );
+        }
+        if (kvWrites.length > 0) {
+          await Promise.all(kvWrites);
         }
 
         return {

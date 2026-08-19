@@ -611,27 +611,19 @@ export function createEventsStorage(
           })
           .onConflictDoNothing()
           .returning();
-        if (runValue) {
-          runValue.output ||= runValue.outputJson;
-          runValue.input ||= runValue.inputJson;
-          runValue.executionContext ||= runValue.executionContextJson;
-          runValue.error = parseErrorJson(runValue.error);
-          run = deserializeRunError(compact(runValue));
-        } else {
-          // Event replay: fetch existing run
-          const [existingRun] = await drizzle
-            .select()
-            .from(Schema.runs)
-            .where(eq(Schema.runs.runId, effectiveRunId))
-            .limit(1);
-          if (existingRun) {
-            existingRun.output ||= existingRun.outputJson;
-            existingRun.input ||= existingRun.inputJson;
-            existingRun.executionContext ||= existingRun.executionContextJson;
-            existingRun.error = parseErrorJson(existingRun.error);
-            run = deserializeRunError(compact(existingRun));
-          }
+        if (!runValue) {
+          // Duplicate run_created: onConflictDoNothing().returning() yields
+          // no row when the run already exists. Reject with the runtime's
+          // dedup signal instead of returning the existing run and appending
+          // a second run_created row via the shared event insert below. Core
+          // treats this 409 as benign ("the run already exists").
+          throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
         }
+        runValue.output ||= runValue.outputJson;
+        runValue.input ||= runValue.inputJson;
+        runValue.executionContext ||= runValue.executionContextJson;
+        runValue.error = parseErrorJson(runValue.error);
+        run = deserializeRunError(compact(runValue));
       }
 
       // Handle run_started event: update run status

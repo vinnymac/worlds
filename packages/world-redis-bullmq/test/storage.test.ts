@@ -558,7 +558,7 @@ describe('Storage (Redis integration)', () => {
       expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
-    it('should handle duplicate run_created events', async () => {
+    it('rejects a duplicate run_created with EntityConflictError', async () => {
       // First run_created event
       const result1 = await events.create(null, {
         eventType: 'run_created',
@@ -571,20 +571,70 @@ describe('Storage (Redis integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      // Duplicate run_created event (replay scenario)
-      const result2 = await events.create(runId, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-idempotent',
-          input: [],
-        },
-      });
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // A redelivered run_created must not return the existing run AND
+      // append a second run_created row; core catches EntityConflictError
+      // as "the run already exists" on its concurrent-create path.
+      await expect(
+        events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'test-workflow-idempotent',
+            input: [],
+          },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const listResult = await runs.list({ workflowName: 'test-workflow-idempotent' });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const eventList = await events.list({ runId, pagination: {} });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
+    });
+
+    it('concurrent creation deliveries settle on exactly one event row', async () => {
+      const run = await createRun();
+
+      // Steps: five racers, one entity, one step_created row.
+      const stepId = 'step-race';
+      const stepResults = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          events.create(run.runId, {
+            eventType: 'step_created',
+            correlationId: stepId,
+            eventData: { stepName: 'test-step', input: ['input1'] },
+          }),
+        ),
+      );
+      expect(stepResults.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      for (const r of stepResults) {
+        if (r.status === 'rejected') {
+          expect(r.reason).toMatchObject({ name: 'EntityConflictError' });
+        }
+      }
+      const stepEvents = await events.listByCorrelationId({
+        correlationId: stepId,
+        pagination: {},
+      });
+      expect(stepEvents.data.map((e) => e.eventType)).toEqual(['step_created']);
+
+      // Hooks: five racers on one token, one hook_created row, no conflict.
+      const hookId = 'hook-race';
+      const hookResults = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          events.create(run.runId, {
+            eventType: 'hook_created',
+            correlationId: hookId,
+            eventData: { token: 'race-token' },
+          }),
+        ),
+      );
+      expect(hookResults.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const hookEvents = await events.listByCorrelationId({
+        correlationId: hookId,
+        pagination: {},
+      });
+      expect(hookEvents.data.map((e) => e.eventType)).toEqual(['hook_created']);
     });
 
     it('should handle duplicate hook_created events with different tokens', async () => {
@@ -796,9 +846,12 @@ describe('Storage (Redis integration)', () => {
         pagination: {},
       });
       expect(eventList.data.filter((e) => e.eventType === 'hook_conflict')).toHaveLength(0);
+      // Exactly one hook_created row: a duplicate that appended a second
+      // creation event would poison replay with ReplayDivergenceError.
+      expect(eventList.data.map((e) => e.eventType)).toEqual(['hook_created']);
     });
 
-    it('should recover a crash orphan (hook entity without hook_created event)', async () => {
+    it('rejects a legacy crash orphan (hook entity without hook_created event)', async () => {
       const run = await createRun();
       const hookId = 'hook-orphan';
       const token = 'token-orphan';
@@ -819,21 +872,23 @@ describe('Storage (Redis integration)', () => {
       await redis.set(`${keyPrefix}hooks:by_token:${token}`, hookId);
       await redis.zadd(`${keyPrefix}hooks:by_run:${run.runId}`, Date.now(), hookId);
 
-      // Replayed hook_created completes the partial write instead of
-      // recording a self hook_conflict.
-      const result = await events.create(run.runId, {
-        eventType: 'hook_created',
-        correlationId: hookId,
-        eventData: { token },
-      });
-      expect(result.hook?.hookId).toBe(hookId);
-      expect(result.event?.eventType).toBe('hook_created');
+      // Entity and creation event are now written in one atomic script, so
+      // this state can only be legacy data. A replayed hook_created rejects
+      // (the entity exists) rather than risking a duplicate append; it does
+      // NOT record a self hook_conflict.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'hook_created',
+          correlationId: hookId,
+          eventData: { token },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const eventList = await events.listByCorrelationId({
         correlationId: hookId,
         pagination: {},
       });
-      expect(eventList.data.filter((e) => e.eventType === 'hook_created')).toHaveLength(1);
+      expect(eventList.data.filter((e) => e.eventType === 'hook_created')).toHaveLength(0);
       expect(eventList.data.filter((e) => e.eventType === 'hook_conflict')).toHaveLength(0);
     });
 

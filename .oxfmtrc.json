@@ -8,6 +8,7 @@
     "**/.turbo",
     "**/.changeset",
     "**/coverage",
-    "**/CHANGELOG.md"
+    "**/CHANGELOG.md",
+    ".pi"
   ]
 }

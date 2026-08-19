@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from 'dotenv';
@@ -25,6 +25,27 @@ const MIGRATION_FILES = [
   '0006_events_entity_creation_unique.sql',
 ];
 
+// Files that must run OUTSIDE a transaction, statement by statement: 0006
+// builds its unique index CONCURRENTLY, which refuses to run inside a
+// transaction block, and a multi-statement sql.unsafe() string counts as
+// one (the simple query protocol wraps it in an implicit transaction).
+const NON_TRANSACTIONAL_MIGRATIONS = new Set(['0006_events_entity_creation_unique.sql']);
+
+/**
+ * Split a migration file into statements. Comment lines are dropped first: a
+ * semicolon inside a `--` comment would otherwise shear the statement in two
+ * (this runner has no SQL lexer, and migration comments are prose).
+ */
+function splitStatements(migrationSQL: string): string[] {
+  return migrationSQL
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n')
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+}
+
 async function setupDatabase() {
   // Load .env file if it exists
   config();
@@ -44,6 +65,15 @@ async function setupDatabase() {
     console.log('\n[1/3] Running migrations...');
     const migrationsDir = join(__dirname, '..', 'src', 'drizzle', 'migrations');
 
+    // Refuse to run against a migrations directory this list has drifted
+    // from: silently skipping an unknown file would ship a half-migrated
+    // schema.
+    const onDisk = (await readdir(migrationsDir)).filter((f) => f.endsWith('.sql'));
+    const unknown = onDisk.filter((f) => !MIGRATION_FILES.includes(f));
+    if (unknown.length > 0) {
+      throw new Error(`Migration files not in MIGRATION_FILES: ${unknown.join(', ')}`);
+    }
+
     // Track applied migrations so each file runs exactly once. Databases
     // provisioned before tracking existed have an empty table; that is safe
     // because every shipped migration is idempotent.
@@ -54,6 +84,24 @@ async function setupDatabase() {
     const appliedRows = await sql`SELECT tag FROM "workflow"."__migrations"`;
     const applied = new Set(appliedRows.map((row) => String(row.tag)));
 
+    // An INVALID index is the residue of a failed CREATE INDEX CONCURRENTLY
+    // (it is never used by queries but still taxes every write). Dropping it
+    // here is what makes a failed concurrent build recoverable by simply
+    // re-running setup: the IF NOT EXISTS in the migration would otherwise
+    // see the broken index and skip the rebuild.
+    const invalidIndexes = await sql`
+      SELECT c.relname AS name
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'workflow' AND NOT i.indisvalid
+    `;
+    for (const index of invalidIndexes) {
+      const name = String(index.name);
+      console.warn(`  Dropping INVALID index left by a failed concurrent build: ${name}`);
+      await sql.unsafe(`DROP INDEX "workflow"."${name}"`);
+    }
+
     for (const file of MIGRATION_FILES) {
       const tag = file.replace(/\.sql$/, '');
       if (applied.has(tag)) {
@@ -62,11 +110,22 @@ async function setupDatabase() {
       }
       const migrationPath = join(migrationsDir, file);
       const migrationSQL = await readFile(migrationPath, 'utf-8');
-      // Apply the migration and record it atomically.
-      await sql.begin(async (tx) => {
-        await tx.unsafe(migrationSQL);
-        await tx`INSERT INTO "workflow"."__migrations" ("tag") VALUES (${tag})`;
-      });
+      if (NON_TRANSACTIONAL_MIGRATIONS.has(file)) {
+        // Statement by statement, outside a transaction (see the set's
+        // comment). Not atomic, but every statement in such a file is
+        // individually idempotent, so a crash mid-file (index built, tag
+        // not yet recorded) heals on the next run.
+        for (const statement of splitStatements(migrationSQL)) {
+          await sql.unsafe(statement);
+        }
+        await sql`INSERT INTO "workflow"."__migrations" ("tag") VALUES (${tag})`;
+      } else {
+        // Apply the migration and record it atomically.
+        await sql.begin(async (tx) => {
+          await tx.unsafe(migrationSQL);
+          await tx`INSERT INTO "workflow"."__migrations" ("tag") VALUES (${tag})`;
+        });
+      }
       console.log(`  Applied: ${file}`);
     }
 

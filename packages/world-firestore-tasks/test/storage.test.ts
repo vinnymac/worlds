@@ -1319,6 +1319,16 @@ describe('Storage (Firestore integration)', () => {
           eventData: { token: 'token-dup' },
         }),
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
+
+      // Exactly one hook_created row and no self hook_conflict: a second
+      // creation event would poison replay with ReplayDivergenceError.
+      const eventList = await storage.events.list({ runId: testRunId, pagination: {} });
+      expect(
+        eventList.data.filter(
+          (e) => e.eventType === 'hook_created' && e.correlationId === 'hook-dup',
+        ),
+      ).toHaveLength(1);
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
     });
   });
 

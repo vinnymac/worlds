@@ -466,9 +466,11 @@ export async function applyEvent(
     case 'run_created': {
       const existing = await store.get<WorkflowRun>(RUN_KEY);
       if (existing) {
-        // Idempotent replay: return the existing run without appending a
-        // duplicate run_created event to the log.
-        return { ok: true, run: existing, releasedHooks: [] };
+        // Duplicate run_created: reject with the conflict outcome (mapped to
+        // EntityConflictError at the storage layer) instead of returning the
+        // existing run. Core treats the 409 as benign ("the run already
+        // exists"), and every world now shares this contract.
+        return failure('ENTITY_CONFLICT', `Workflow run "${runId}" already exists`);
       }
       const run = WorkflowRunSchema.parse(
         compact({

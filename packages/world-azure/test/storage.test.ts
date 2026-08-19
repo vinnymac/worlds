@@ -300,6 +300,37 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       expect(listResult.data.some((h) => h.hookId === hookId2)).toBe(true);
     });
 
+    it('rejects a duplicate hook_created of the same hook with a single event row', async () => {
+      const run = await createRun();
+      const hookId = 'hook-duplicate-same';
+      const token = 'token-duplicate-same';
+
+      const first = await storage.events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: hookId,
+        eventData: { token },
+      });
+      expect(first.hook).toBeDefined();
+
+      // Duplicate delivery of the SAME (runId, hookId): must be an
+      // EntityConflictError, NOT a self hook_conflict event.
+      await expect(
+        storage.events.create(run.runId, {
+          eventType: 'hook_created',
+          correlationId: hookId,
+          eventData: { token },
+        }),
+      ).rejects.toSatisfy((err) => EntityConflictError.is(err));
+
+      // Exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      const eventList = await storage.events.list({ runId: run.runId });
+      expect(
+        eventList.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
+      ).toHaveLength(1);
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+    });
+
     it('should not create duplicate run_started event on replay', async () => {
       const run = await createRun();
 

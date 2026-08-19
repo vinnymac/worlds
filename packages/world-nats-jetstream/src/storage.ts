@@ -398,6 +398,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   let hooksByRunBucket: KV;
   let eventsByRunBucket: KV;
   let runStateMarkersBucket: KV;
+  let creationClaimsBucket: KV;
 
   const initBuckets = async () => {
     if (!eventsBucket) {
@@ -435,6 +436,15 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       });
       // Optimistic-concurrency markers (one per run); only the latest matters.
       runStateMarkersBucket = await jetstream.views.kv(`${keyPrefix}run_state_markers`, {
+        history: 1,
+      });
+      // Exactly-once arbiter for entity-creating events: one canonical
+      // eventId per (runId, correlationId, eventType), elected via atomic
+      // create(). The NATS equivalent of world-postgres's
+      // `workflow_events_entity_creation_unique` index. The steps/hooks
+      // sub-storages below never write creation events, so only the events
+      // storage (and compaction) opens this bucket.
+      creationClaimsBucket = await jetstream.views.kv(`${keyPrefix}creation_claims`, {
         history: 1,
       });
     }
@@ -539,6 +549,68 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   async function putEvent(runId: string, eventId: string, event: unknown): Promise<void> {
     await eventsBucket.put(eventId, stringify(event));
     await eventsByRunBucket.put(`${runId}.${eventId}`, eventId);
+  }
+
+  /**
+   * Elect the canonical eventId for an entity-creating event.
+   *
+   * `creationClaimsBucket.create()` is atomic, so exactly one delivery wins
+   * the claim per (runId, correlationId, eventType). Every other delivery
+   * either rejects (the canonical event is already durable, a true
+   * duplicate -> EntityConflictError) or adopts the canonical id and
+   * completes the crashed winner's write, so concurrent redeliveries racing
+   * an orphan window converge on ONE event row instead of double-appending.
+   *
+   * `entityExisted` marks deliveries that lost the entity create: those may
+   * hit runs predating the claims bucket (no claim yet), so the event log is
+   * probed as the legacy fallback arbiter before healing.
+   */
+  async function claimCreationEvent(
+    runId: string,
+    correlationId: string,
+    eventType: Event['eventType'],
+    proposedEventId: string,
+    entityExisted: boolean,
+    conflictMessage: string,
+  ): Promise<string> {
+    const claimKey = `${runId}.${correlationId}.${eventType}`;
+    const claimed = await creationClaimsBucket
+      .create(claimKey, proposedEventId)
+      .then(() => true)
+      .catch(() => false);
+    if (claimed) {
+      if (entityExisted) {
+        // Legacy entity (predates the claims bucket) or crash orphan: the
+        // event log is the only witness. Event durable -> converge the claim
+        // on it and reject; missing -> heal under our own id.
+        const existingEvent = await loadEventsForRun(runId).then((events) =>
+          events.find((e) => e.eventType === eventType && e.correlationId === correlationId),
+        );
+        if (existingEvent) {
+          // Point the claim at the durable event so later redeliveries
+          // arbitrate against the real canonical id, not our unwritten one.
+          await creationClaimsBucket.put(claimKey, existingEvent.eventId);
+          throw new EntityConflictError(conflictMessage);
+        }
+      }
+      return proposedEventId;
+    }
+    // Lost the claim: converge on the winner's canonical eventId.
+    const claimEntry = await getLiveEntry(creationClaimsBucket, claimKey);
+    if (!claimEntry) {
+      // Claim tombstoned between create() and get() (compaction race).
+      // Reject rather than risk a duplicate append.
+      throw new EntityConflictError(conflictMessage);
+    }
+    const canonicalEventId = kvValueToString(claimEntry.value);
+    const canonicalEvent = await getLiveEntry(eventsBucket, canonicalEventId);
+    if (canonicalEvent) {
+      throw new EntityConflictError(conflictMessage);
+    }
+    // The winner crashed (or is mid-flight) between claim and event write:
+    // complete the write under its id. putEvent to the same key is
+    // idempotent, so both racers produce a single canonical row.
+    return canonicalEventId;
   }
 
   /**
@@ -684,8 +756,21 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     ): Promise<EventResult> {
       await initBuckets();
 
-      const eventId = `wevt_${ulid()}`;
+      // `let`: a delivery that loses the creation-claim arbitration adopts
+      // the winner's canonical eventId instead of appending under its own.
+      let eventId = `wevt_${ulid()}`;
+      let adoptedCreatedAt: Date | undefined;
       const now = new Date();
+
+      // Adopt a canonical eventId elected by claimCreationEvent. The
+      // timestamp is re-derived from the winner's ULID so both racers
+      // persist an identical canonical row.
+      const adoptCanonicalEventId = (canonicalEventId: string) => {
+        if (canonicalEventId !== eventId) {
+          eventId = canonicalEventId;
+          adoptedCreatedAt = new Date(idTime(canonicalEventId));
+        }
+      };
 
       // For run_created events, generate runId server-side if null or empty
       let effectiveRunId: string;
@@ -964,21 +1049,15 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           .create(effectiveRunId, stringify(newRun))
           .then(() => true)
           .catch(() => false);
-        if (created) {
-          await indexRunStatus(effectiveRunId, 'pending');
-          run = WorkflowRunSchema.parse(compact(newRun));
-        } else {
-          // Event replay: return existing run
-          const existing = await getLiveEntry(runsBucket, effectiveRunId);
-          if (!existing) {
-            throw new WorkflowWorldError(
-              `Run "${effectiveRunId}" could not be created or read back`,
-              { status: 500 },
-            );
-          }
-          const existingData = kvValueToString(existing.value);
-          run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
+        if (!created) {
+          // Duplicate run_created: reject with the runtime's dedup signal
+          // instead of returning the existing run AND appending a second
+          // run_created row to the log. Core treats this 409 as benign on
+          // its concurrent-create path ("the run already exists").
+          throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
         }
+        await indexRunStatus(effectiveRunId, 'pending');
+        run = WorkflowRunSchema.parse(compact(newRun));
       }
 
       if (data.eventType === 'run_started') {
@@ -1169,25 +1248,27 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           .create(stepKey, stringify(newStep))
           .then(() => true)
           .catch(() => false);
+        // The claims bucket elects ONE canonical eventId for this creation:
+        // a true duplicate rejects here with EntityConflictError, while a
+        // delivery racing a crashed (or in-flight) winner adopts the
+        // canonical id, so the event write below is idempotent.
+        adoptCanonicalEventId(
+          await claimCreationEvent(
+            effectiveRunId,
+            data.correlationId!,
+            'step_created',
+            eventId,
+            !created,
+            `Step "${data.correlationId}" already exists`,
+          ),
+        );
         if (created) {
           await indexStep(effectiveRunId, data.correlationId!);
           step = StepSchema.parse(compact(newStep));
         } else {
-          // Step entity exists: distinguish a redelivered step_created (creation
-          // event already durable) from a crash orphan via the event log. JetStream
-          // KV has no unique index, so this read is the only dedup surface.
-          const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
-            events.find(
-              (e) => e.eventType === 'step_created' && e.correlationId === data.correlationId,
-            ),
-          );
-          if (existingEvent) {
-            // Real duplicate: EntityConflictError is the runtime's dedup signal, the
-            // same contract as hook_created/wait_created and the upstream worlds.
-            throw new EntityConflictError(`Step "${data.correlationId}" already exists`);
-          }
-          // Crash orphan: reuse the existing entity and fall through to the
-          // event write below, which completes the partial write.
+          // Crash orphan (entity written, event write lost): reuse the
+          // existing entity and fall through to the event write below, which
+          // completes the partial write under the canonical eventId.
           const existing = await getLiveEntry(stepsBucket, stepKey);
           if (!existing) {
             throw new WorkflowWorldError(
@@ -1353,66 +1434,105 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         };
         const hookId = data.correlationId!;
 
-        // Check for duplicate token
-        const tokenEntry = await getLiveEntry(hooksTokenBucket, eventData.token);
-        const existingHookId = tokenEntry ? kvValueToString(tokenEntry.value) : null;
-        const existingHookEntry = existingHookId
-          ? await getLiveEntry(hooksBucket, existingHookId)
-          : null;
-
-        if (existingHookEntry) {
-          const existingHook = parse<Hook>(kvValueToString(existingHookEntry.value));
-
-          if (existingHook.runId === effectiveRunId && existingHook.hookId === hookId) {
-            // The *same* (runId, hookId) already holds this token: either a
-            // replayed hook_created (duplicate queue delivery / crash-retry),
-            // or an orphaned hook entity from a crash between the entity
-            // write and the event write. Distinguish by checking whether the
-            // hook_created event actually exists in the log:
-            //   - exists -> real duplicate: throw EntityConflictError so the
-            //     runtime's replay catch path swallows it, instead of
-            //     permanently logging a self hook_conflict that would replay
-            //     as HookTokenConflictError.
-            //   - missing -> complete the partial write: fall through to the
-            //     event write below, returning the persisted hook.
-            const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
-              events.find((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
-            );
-            if (existingEvent) {
-              throw new EntityConflictError(`Hook "${hookId}" already created`);
-            }
-            hook = HookSchema.parse(compact(existingHook));
-          } else {
-            // Cross-run / cross-hook conflict: a different (runId, hookId)
-            // holds this token. Record a hook_conflict event (with the
-            // conflicting holder) so the workflow fails gracefully when the
-            // hook is awaited, instead of throwing here.
-            const conflictEventData = {
-              token: eventData.token,
-              conflictingRunId: existingHook.runId,
-            };
-            const createdAt = new Date();
-            const conflictEvent = {
-              eventType: 'hook_conflict' as const,
-              correlationId: data.correlationId,
-              eventData: conflictEventData,
-              runId: effectiveRunId,
-              eventId,
-              createdAt,
-              specVersion: effectiveSpecVersion,
-            };
-
-            await putEvent(effectiveRunId, eventId, conflictEvent);
-
-            const parsedConflict = EventSchema.parse(conflictEvent);
-            const resolveData = params?.resolveData ?? 'all';
-            return {
-              event: filterEventData(parsedConflict, resolveData),
-              run,
-              step,
-              hook: undefined,
-            };
+        // Token-first arbitration. The by-token entry is claimed with an
+        // atomic create(); a plain put() would let the second of two
+        // concurrent deliveries silently overwrite the first holder. A
+        // delivery that finds the token taken classifies the holder:
+        //   - same (runId, hookId)  -> duplicate/orphan, arbitrated below
+        //   - different holder      -> hook_conflict event
+        //   - holder entity missing -> our own partial write resumes, a
+        //     foreign dangling token (crash during cleanup) heals + retries
+        let tokenOutcome: 'claimed' | 'same-hook' | { conflictingRunId: string } | null = null;
+        let existingHook: Hook | null = null;
+        for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS && tokenOutcome === null; attempt++) {
+          const tokenEntry = await getLiveEntry(hooksTokenBucket, eventData.token);
+          if (!tokenEntry) {
+            const claimed = await hooksTokenBucket
+              .create(eventData.token, hookId)
+              .then(() => true)
+              .catch(() => false);
+            if (claimed) tokenOutcome = 'claimed';
+            // Lost the race: loop and re-read the new holder.
+            continue;
           }
+          const holderHookId = kvValueToString(tokenEntry.value);
+          const holderEntry = await getLiveEntry(hooksBucket, holderHookId);
+          if (!holderEntry) {
+            if (holderHookId === hookId) {
+              // Our own hookId holds the token but its entity write was
+              // lost: resume the partial create.
+              tokenOutcome = 'claimed';
+            } else {
+              // Dangling token index (crash during hook cleanup): the owning
+              // entity is gone, so the token is free; heal and retry.
+              await hooksTokenBucket.delete(eventData.token).catch(() => {});
+            }
+            continue;
+          }
+          existingHook = parse<Hook>(kvValueToString(holderEntry.value));
+          tokenOutcome =
+            existingHook.runId === effectiveRunId && existingHook.hookId === hookId
+              ? 'same-hook'
+              : { conflictingRunId: existingHook.runId };
+        }
+        if (tokenOutcome === null) {
+          throw new WorkflowWorldError(
+            `Concurrent hook_created for token did not settle after ${MAX_CAS_ATTEMPTS} attempts`,
+            { status: 409 },
+          );
+        }
+
+        if (typeof tokenOutcome === 'object') {
+          // Cross-run / cross-hook conflict: a different (runId, hookId)
+          // holds this token. Record a hook_conflict event (with the
+          // conflicting holder) so the workflow fails gracefully when the
+          // hook is awaited, instead of throwing here. The rightful owner's
+          // token mapping is left untouched.
+          const conflictEventData = {
+            token: eventData.token,
+            conflictingRunId: tokenOutcome.conflictingRunId,
+          };
+          const createdAt = new Date();
+          const conflictEvent = {
+            eventType: 'hook_conflict' as const,
+            correlationId: data.correlationId,
+            eventData: conflictEventData,
+            runId: effectiveRunId,
+            eventId,
+            createdAt,
+            specVersion: effectiveSpecVersion,
+          };
+
+          await putEvent(effectiveRunId, eventId, conflictEvent);
+
+          const parsedConflict = EventSchema.parse(conflictEvent);
+          const resolveData = params?.resolveData ?? 'all';
+          return {
+            event: filterEventData(parsedConflict, resolveData),
+            run,
+            step,
+            hook: undefined,
+          };
+        }
+
+        if (tokenOutcome === 'same-hook') {
+          // The *same* (runId, hookId) already holds this token: a replayed
+          // hook_created, or an orphan from a crash between the entity and
+          // event writes. The claims bucket arbitrates: a true duplicate
+          // throws EntityConflictError (so the runtime's replay catch path
+          // swallows it instead of logging a self hook_conflict), an orphan
+          // adopts the canonical id and completes the write below.
+          adoptCanonicalEventId(
+            await claimCreationEvent(
+              effectiveRunId,
+              hookId,
+              'hook_created',
+              eventId,
+              true,
+              `Hook "${hookId}" already created`,
+            ),
+          );
+          hook = HookSchema.parse(compact(existingHook!));
         } else {
           const newHook: Hook = {
             runId: effectiveRunId,
@@ -1428,8 +1548,17 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           };
 
           await hooksBucket.put(hookId, stringify(newHook));
-          await hooksTokenBucket.put(eventData.token, hookId);
           await indexHook(effectiveRunId, hookId);
+          adoptCanonicalEventId(
+            await claimCreationEvent(
+              effectiveRunId,
+              hookId,
+              'hook_created',
+              eventId,
+              false,
+              `Hook "${hookId}" already created`,
+            ),
+          );
           hook = HookSchema.parse(compact(newHook));
         }
       }
@@ -1465,21 +1594,23 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           .create(waitKey, stringify(newWait))
           .then(() => true)
           .catch(() => false);
+        // Same arbitration as step_created above: a true duplicate rejects,
+        // a racer adopts the canonical eventId and completes the write.
+        adoptCanonicalEventId(
+          await claimCreationEvent(
+            effectiveRunId,
+            data.correlationId!,
+            'wait_created',
+            eventId,
+            !created,
+            `Wait "${data.correlationId}" already exists`,
+          ),
+        );
         if (created) {
           wait = WaitSchema.parse(compact(newWait));
         } else {
-          // Same duplicate/crash-orphan split as step_created above: a real
-          // duplicate (creation event already durable) throws the runtime's
-          // dedup signal; an orphan (entity written, event write lost) falls
-          // through to the event write below to complete the partial write.
-          const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
-            events.find(
-              (e) => e.eventType === 'wait_created' && e.correlationId === data.correlationId,
-            ),
-          );
-          if (existingEvent) {
-            throw new EntityConflictError(`Wait "${data.correlationId}" already exists`);
-          }
+          // Crash orphan: reuse the existing entity; the event write below
+          // completes the partial write under the canonical eventId.
           const existing = await getLiveEntry(waitsBucket, waitKey);
           if (!existing) {
             throw new WorkflowWorldError(
@@ -1515,8 +1646,9 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         wait = WaitSchema.parse(compact(result.value));
       }
 
-      // Store the event
-      const createdAt = new Date();
+      // Store the event. An adopted (canonical) eventId carries the winner's
+      // ULID-derived timestamp so racing deliveries write identical rows.
+      const createdAt = adoptedCreatedAt ?? new Date();
       const event = {
         ...data,
         runId: effectiveRunId,
@@ -1971,6 +2103,9 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
   const runStateMarkersBucket = await jetstream.views.kv(`${keyPrefix}run_state_markers`, {
     history: 1,
   });
+  const creationClaimsBucket = await jetstream.views.kv(`${keyPrefix}creation_claims`, {
+    history: 1,
+  });
 
   let compactedCount = 0;
 
@@ -2073,6 +2208,18 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
                 /* noop */
               }
             }
+          }
+        }
+
+        // Delete the run's creation-event claims (keys are
+        // `<runId>.<correlationId>.<eventType>`; runIds are ULIDs and never
+        // reused, so tombstoned claim keys are never re-created)
+        const claimSuffixes = await collectIndexKeys(creationClaimsBucket, `${runId}.`);
+        for (const suffix of claimSuffixes) {
+          try {
+            await creationClaimsBucket.delete(`${runId}.${suffix}`);
+          } catch {
+            /* noop */
           }
         }
 

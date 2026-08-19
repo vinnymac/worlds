@@ -7,7 +7,7 @@ import mysql from 'mysql2/promise';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { cleanupExpiredIdempotencyKeys, reclaimStaleJobs } from '../src/queue.js';
 import * as schema from '../src/schema.js';
-import { applyMigrations } from './migrate.js';
+import { applyMigrations } from '../src/migrate.js';
 
 const shouldSkipTests = process.platform === 'win32';
 

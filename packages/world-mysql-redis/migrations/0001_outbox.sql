@@ -8,4 +8,4 @@ CREATE TABLE IF NOT EXISTS `workflow`.`workflow_outbox` (
   `attempts` INT NOT NULL DEFAULT 0,
   `last_error` TEXT,
   INDEX `idx_outbox_created_at` (`created_at`)
-);
+) ROW_FORMAT=DYNAMIC;

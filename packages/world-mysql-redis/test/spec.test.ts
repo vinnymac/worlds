@@ -6,6 +6,7 @@ import { createTestSuite } from '@workflow/world-testing';
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 import mysql from 'mysql2/promise';
+import { applyMigrations } from '../src/migrate.js';
 
 // Skip these tests on Windows since it relies on docker containers
 const shouldSkipTests = process.platform === 'win32';
@@ -32,119 +33,10 @@ if (shouldSkipTests) {
     process.env.DATABASE_URL = dbUrl;
     process.env.WORKFLOW_MYSQL_URL = dbUrl;
 
-    // Apply schema directly using mysql2
+    // Apply the real migrations so the conformance suite runs against
+    // exactly what `world-mysql-redis-setup` provisions.
     const connection = await mysql.createConnection(dbUrl);
-
-    // Create the workflow schema and tables
-    const setupStatements = [
-      'CREATE SCHEMA IF NOT EXISTS `workflow`',
-
-      `CREATE TABLE \`workflow\`.\`workflow_runs\` (
-        \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`output\` JSON,
-        \`output_cbor\` BLOB,
-        \`deployment_id\` VARCHAR(255) NOT NULL,
-        \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
-        \`name\` VARCHAR(255) NOT NULL,
-        \`execution_context\` JSON,
-        \`execution_context_cbor\` BLOB,
-        \`input\` JSON,
-        \`input_cbor\` BLOB,
-        \`error\` TEXT,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        \`completed_at\` TIMESTAMP NULL,
-        \`started_at\` TIMESTAMP NULL,
-        \`spec_version\` INT,
-        \`expired_at\` TIMESTAMP NULL,
-        \`state_updated_at\` BIGINT NULL,
-        INDEX \`idx_workflow_runs_name\` (\`name\`),
-        INDEX \`idx_workflow_runs_status\` (\`status\`)
-      )`,
-
-      `CREATE TABLE \`workflow\`.\`workflow_events\` (
-        \`id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`type\` VARCHAR(255) NOT NULL,
-        \`correlation_id\` VARCHAR(255),
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`occurred_at\` TIMESTAMP NULL,
-        \`run_id\` VARCHAR(255) NOT NULL,
-        \`payload\` JSON,
-        \`payload_cbor\` BLOB,
-        \`spec_version\` INT,
-        INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
-        INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
-      )`,
-
-      // Mirrors migrations/0007_events_entity_creation_unique.sql so the
-      // conformance suite exercises the same duplicate-creation-event
-      // constraint the storage layer relies on.
-      `CREATE UNIQUE INDEX \`workflow_events_entity_creation_unique\`
-        ON \`workflow\`.\`workflow_events\` (
-          (CASE
-            WHEN \`type\` IN ('step_created', 'hook_created', 'wait_created')
-            THEN \`run_id\`
-            ELSE NULL
-          END),
-          \`correlation_id\`,
-          \`type\`
-        )`,
-
-      `CREATE TABLE \`workflow\`.\`workflow_steps\` (
-        \`run_id\` VARCHAR(255) NOT NULL,
-        \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`step_name\` VARCHAR(255) NOT NULL,
-        \`status\` ENUM('pending','running','completed','failed','cancelled') NOT NULL,
-        \`input\` JSON,
-        \`input_cbor\` BLOB,
-        \`output\` JSON,
-        \`output_cbor\` BLOB,
-        \`error\` TEXT,
-        \`attempt\` INT NOT NULL,
-        \`started_at\` TIMESTAMP NULL,
-        \`completed_at\` TIMESTAMP NULL,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        \`retry_after\` TIMESTAMP NULL,
-        \`spec_version\` INT,
-        INDEX \`idx_workflow_steps_run_id\` (\`run_id\`),
-        INDEX \`idx_workflow_steps_status\` (\`status\`)
-      )`,
-
-      `CREATE TABLE \`workflow\`.\`workflow_hooks\` (
-        \`run_id\` VARCHAR(255) NOT NULL,
-        \`hook_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
-        \`token\` VARCHAR(255) NOT NULL,
-        \`owner_id\` VARCHAR(255) NOT NULL,
-        \`project_id\` VARCHAR(255) NOT NULL,
-        \`environment\` VARCHAR(255) NOT NULL,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`metadata\` JSON,
-        \`metadata_cbor\` BLOB,
-        \`spec_version\` INT,
-        \`is_webhook\` BOOLEAN,
-        INDEX \`idx_workflow_hooks_run_id\` (\`run_id\`),
-        INDEX \`idx_workflow_hooks_token\` (\`token\`)
-      )`,
-
-      `CREATE TABLE \`workflow\`.\`workflow_stream_chunks\` (
-        \`id\` VARCHAR(255) NOT NULL,
-        \`stream_id\` VARCHAR(255) NOT NULL,
-        \`run_id\` VARCHAR(255) NULL,
-        \`data\` BLOB NOT NULL,
-        \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`eof\` BOOLEAN NOT NULL,
-        \`sequence\` BIGINT NOT NULL,
-        PRIMARY KEY (\`stream_id\`, \`id\`),
-        INDEX \`idx_stream_chunks_sequence\` (\`stream_id\`, \`sequence\`),
-        INDEX \`idx_stream_chunks_run_id\` (\`run_id\`)
-      )`,
-    ];
-
-    for (const stmt of setupStatements) {
-      await connection.execute(stmt);
-    }
-
+    await applyMigrations(connection);
     await connection.end();
 
     console.log('[test beforeAll] MySQL schema applied');

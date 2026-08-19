@@ -4,6 +4,7 @@ import type { Step, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
+import type { RowDataPacket } from 'mysql2/promise';
 import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import * as schema from '../src/schema.js';
@@ -13,7 +14,7 @@ import {
   createRunsStorage,
   createStepsStorage,
 } from '../src/storage.js';
-import { applyMigrations } from './migrate.js';
+import { applyMigrations, MIGRATION_FILES } from '../src/migrate.js';
 
 describe('Storage (MySQL integration)', () => {
   if (process.platform === 'win32') {
@@ -74,6 +75,8 @@ describe('Storage (MySQL integration)', () => {
     connection = await mysql.createConnection(dbUrl);
 
     await applyMigrations(connection);
+    // Second run must be a no-op: the ledger skips every applied file.
+    await applyMigrations(connection);
 
     db = drizzle(connection, { schema, mode: 'default' });
     runs = createRunsStorage(db);
@@ -89,8 +92,24 @@ describe('Storage (MySQL integration)', () => {
     await container?.stop();
   });
 
+  describe('migrations', () => {
+    it('converges on a database provisioned before the ledger existed', async () => {
+      // Simulate a pre-ledger database: schema present, ledger absent. The
+      // re-run must classify every statement as already applied (errno
+      // tolerance) and rebuild the ledger.
+      await connection.query('DROP TABLE `workflow`.`__migrations`');
+      await applyMigrations(connection);
+      const [rows] = await connection.query<RowDataPacket[]>(
+        'SELECT `tag` FROM `workflow`.`__migrations` ORDER BY `tag`',
+      );
+      expect(rows.map((row) => row.tag)).toEqual(
+        MIGRATION_FILES.map((file) => file.replace(/\.sql$/, '')),
+      );
+    });
+  });
+
   describe('Event idempotency', () => {
-    it('should handle duplicate run_created events', async () => {
+    it('rejects a duplicate run_created with EntityConflictError', async () => {
       const workflowName = 'test-workflow-idempotent';
       const eventData = {
         eventType: 'run_created' as const,
@@ -101,12 +120,44 @@ describe('Storage (MySQL integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      const result2 = await events.create(runId, eventData);
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // A redelivered run_created must not return the existing run AND
+      // append a second run_created row; core catches EntityConflictError
+      // as "the run already exists" on its concurrent-create path.
+      await expect(events.create(runId, eventData)).rejects.toMatchObject({
+        name: 'EntityConflictError',
+      });
 
       const listResult = await runs.list({ workflowName });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
+    });
+
+    it('concurrent run_created deliveries leave exactly one event row', async () => {
+      const eventData = {
+        eventType: 'run_created' as const,
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'test-workflow-run-race',
+          input: [],
+        },
+      };
+      const first = await events.create(null, eventData);
+      const runId = first.run!.runId;
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () => events.create(runId, eventData)),
+      );
+      for (const r of results) {
+        expect(r.status).toBe('rejected');
+        expect((r as PromiseRejectedResult).reason).toMatchObject({
+          name: 'EntityConflictError',
+        });
+      }
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
     });
 
     it('rejects a duplicate step_created with EntityConflictError', async () => {
@@ -501,6 +552,13 @@ describe('Storage (MySQL integration)', () => {
       // No hook_conflict event may be persisted for the run's own hook
       const eventList = await events.list({ runId: run.runId });
       expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      // And exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      expect(
+        eventList.data.filter(
+          (e) => e.eventType === 'hook_created' && e.correlationId === 'hook-replay',
+        ),
+      ).toHaveLength(1);
     });
 
     it('completes the partial write when the hook row exists without its event', async () => {
@@ -548,6 +606,101 @@ describe('Storage (MySQL integration)', () => {
         token: 'token-contested',
         conflictingRunId: runA.runId,
       });
+    });
+  });
+  // `resolveData: 'none'` now projects the payload columns out of the SQL
+  // instead of reading them and stripping them in JS. The rows must still
+  // satisfy the entity schemas, and 'all' must be unaffected.
+  describe("resolveData: 'none' column projection", () => {
+    it('omits run input/output but keeps the rest of the entity intact', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      await events.create(run.runId, {
+        eventType: 'run_completed',
+        eventData: { output: [{ big: 'x'.repeat(1000) }] },
+      });
+
+      const full = await runs.get(run.runId);
+      expect(full.output).toBeDefined();
+
+      const lean = await runs.get(run.runId, { resolveData: 'none' });
+      expect(lean.input).toBeUndefined();
+      expect(lean.output).toBeUndefined();
+      // Everything else must survive the projection.
+      expect(lean.runId).toBe(run.runId);
+      expect(lean.workflowName).toBe(full.workflowName);
+      expect(lean.deploymentId).toBe(full.deploymentId);
+      expect(lean.status).toBe('completed');
+      expect(lean.specVersion).toBe(full.specVersion);
+      expect(lean.createdAt).toBeInstanceOf(Date);
+      expect(lean.completedAt).toBeInstanceOf(Date);
+    });
+
+    it('omits step input/output but keeps the rest of the entity intact', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, 'step-projection');
+      await events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: step.stepId,
+        eventData: { result: [{ big: 'y'.repeat(1000) }] },
+      });
+
+      const full = await steps.get(run.runId, step.stepId);
+      expect(full.output).toBeDefined();
+
+      const lean = await steps.get(run.runId, step.stepId, { resolveData: 'none' });
+      expect(lean.input).toBeUndefined();
+      expect(lean.output).toBeUndefined();
+      expect(lean.stepId).toBe(step.stepId);
+      expect(lean.runId).toBe(run.runId);
+      expect(lean.stepName).toBe(full.stepName);
+      expect(lean.status).toBe('completed');
+      expect(lean.attempt).toBe(full.attempt);
+      expect(lean.createdAt).toBeInstanceOf(Date);
+    });
+
+    it('projects in list queries too', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      await createStep(run.runId, 'step-list-projection');
+
+      const runList = await runs.list({ pagination: { limit: 10 }, resolveData: 'none' });
+      expect(runList.data.length).toBeGreaterThan(0);
+      for (const r of runList.data) {
+        expect(r.input).toBeUndefined();
+        expect(r.output).toBeUndefined();
+        expect(r.runId).toBeTruthy();
+        expect(r.status).toBeTruthy();
+      }
+
+      const stepList = await steps.list({
+        runId: run.runId,
+        pagination: { limit: 10 },
+        resolveData: 'none',
+      });
+      expect(stepList.data.length).toBeGreaterThan(0);
+      for (const st of stepList.data) {
+        expect(st.input).toBeUndefined();
+        expect(st.output).toBeUndefined();
+        expect(st.stepId).toBeTruthy();
+      }
+    });
+
+    it("returns the entity from events.create under resolveData 'none'", async () => {
+      const run = await createRun();
+      const started = await events.create(
+        run.runId,
+        { eventType: 'run_started' },
+        { resolveData: 'none' },
+      );
+      expect(started.run?.runId).toBe(run.runId);
+      expect(started.run?.status).toBe('running');
+      expect(started.run?.input).toBeUndefined();
     });
   });
 });

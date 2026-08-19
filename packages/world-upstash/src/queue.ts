@@ -6,6 +6,7 @@ import type {
   QueuePrefix,
   ValidQueueName,
 } from '@workflow/world';
+import { parseQueueName } from '@workflow/world';
 import { Client, Receiver } from '@upstash/qstash';
 import { monotonicFactory } from 'ulid';
 import { debug, parse, stringify } from './util.js';
@@ -45,6 +46,14 @@ interface QStashQueueConfig {
    * @see https://upstash.com/docs/qstash/features/retry
    */
   retries?: number;
+  /**
+   * Queue transport. `'qstash'` (default) publishes via hosted QStash.
+   * `'loopback'` delivers in-process by POSTing the QStash wire body straight
+   * to the target app's flow/step routes (for tests and local development,
+   * where hosted QStash cannot reach the app). Also selectable via
+   * `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`.
+   */
+  queueMode?: 'qstash' | 'loopback';
 }
 
 /**
@@ -82,6 +91,9 @@ const MAX_REDELIVERY_DELAY_SECONDS = 7 * 24 * 60 * 60;
 const DEFAULT_QSTASH_RETRIES = 47;
 
 export function createQueue(config: QStashQueueConfig): Queue {
+  const queueMode =
+    config.queueMode ??
+    (process.env.WORKFLOW_UPSTASH_QUEUE_MODE === 'loopback' ? 'loopback' : 'qstash');
   const token = config.token || process.env.QSTASH_TOKEN;
   const targetUrl = config.targetUrl || process.env.QSTASH_TARGET_URL;
   const deploymentId =
@@ -90,24 +102,86 @@ export function createQueue(config: QStashQueueConfig): Queue {
   const enableDeduplication = config.enableDeduplication ?? true;
   const retries = config.retries ?? DEFAULT_QSTASH_RETRIES;
 
-  if (!token) {
+  if (queueMode === 'qstash' && !token) {
     throw new Error('QStash token is required. Set QSTASH_TOKEN environment variable.');
   }
 
-  if (!targetUrl) {
+  if (queueMode === 'qstash' && !targetUrl) {
     throw new Error('QStash target URL is required. Set QSTASH_TARGET_URL environment variable.');
   }
-  // TS does not preserve the narrowing above inside closures; rebind.
-  const resolvedTargetUrl: string = targetUrl;
 
-  const client = config.client || new Client({ token });
+  const client = queueMode === 'qstash' ? config.client || new Client({ token: token! }) : null;
+
+  /** Loopback delivery target, resolved lazily per publish: the
+   * world-testing harness binds its port (and sets `process.env.PORT`) only
+   * after the server is listening, which is after the world is created. */
+  function loopbackUrl(queueName: ValidQueueName): string {
+    const base = targetUrl ?? `http://localhost:${process.env.PORT ?? '3000'}`;
+    const { kind } = parseQueueName(queueName);
+    const pathname = kind === 'step' ? 'step' : 'flow';
+    return `${base.replace(/\/$/, '')}/.well-known/workflow/v1/${pathname}`;
+  }
+
+  /** deduplicationIds the loopback pump has accepted; mirrors the
+   * QStash-side dedup core relies on to collapse replayed step enqueues. */
+  const loopbackDeliveredDedupIds = new Set<string>();
+
+  /** Loopback hard-failure budget: QStash redelivers on non-2xx; the pump
+   * mirrors that with a short linear backoff, sized for tests. */
+  const LOOPBACK_MAX_DELIVERIES = 5;
+  const LOOPBACK_RETRY_DELAY_MS = 1_000;
+
+  /** Fire-and-forget delivery of the QStash wire body to the target app,
+   * honouring the publish delay and reporting the redelivery count via the
+   * `upstash-retried` header exactly as QStash would. */
+  function scheduleLoopbackDelivery(
+    body: QueueMessageBody,
+    opts: { delaySeconds?: number; headers?: Record<string, string> },
+  ): void {
+    const payload = stringify(body);
+    void (async () => {
+      if (opts.delaySeconds) {
+        await new Promise((resolve) => setTimeout(resolve, opts.delaySeconds! * 1000));
+      }
+      for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {
+        try {
+          const res = await fetch(loopbackUrl(body.queueName), {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'upstash-retried': String(attempt),
+              ...opts.headers,
+            },
+            body: payload,
+          });
+          if (res.ok) return;
+          debug(`loopback delivery got ${res.status} for ${body.messageId}`);
+        } catch (err) {
+          debug('loopback delivery failed', err);
+        }
+        await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
+      }
+      // Crash loudly in logs rather than stranding the run silently.
+      console.error(
+        `[world-upstash] loopback delivery permanently failed for message ${body.messageId}`,
+      );
+    })();
+  }
 
   async function publishBody(
     body: QueueMessageBody,
     opts: { delaySeconds?: number; deduplicationId?: string; headers?: Record<string, string> },
   ): Promise<void> {
-    await client.publish({
-      url: resolvedTargetUrl,
+    if (queueMode === 'loopback') {
+      if (opts.deduplicationId) {
+        if (loopbackDeliveredDedupIds.has(opts.deduplicationId)) return;
+        loopbackDeliveredDedupIds.add(opts.deduplicationId);
+      }
+      scheduleLoopbackDelivery(body, opts);
+      return;
+    }
+    await client!.publish({
+      url: targetUrl!,
       body: stringify(body),
       // Give QStash the same hard-failure redelivery budget core expects.
       retries,

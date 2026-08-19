@@ -21,6 +21,7 @@ import {
   createStepsStorage,
 } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
+import { stringify } from '../src/util.js';
 
 describe('Storage (Upstash Redis integration)', () => {
   if (process.platform === 'win32') {
@@ -302,6 +303,95 @@ describe('Storage (Upstash Redis integration)', () => {
     });
   });
 
+  describe('Creation-claim hardening', () => {
+    it('claim keys carry the default TTL', async () => {
+      const run = await createRun();
+      const stepId = 'step-claim-ttl';
+      await createStep(run.runId, { stepId });
+
+      const claimKey = `${keyPrefix}events:creation:${run.runId}:${stepId}:step_created`;
+      const ttl = await redis.ttl(claimKey);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(30 * 24 * 60 * 60);
+    });
+
+    it('concurrent step_created deliveries converge on a single event row', async () => {
+      const run = await createRun();
+      const stepId = 'step-claim-race';
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () =>
+          events.create(run.runId, {
+            eventType: 'step_created',
+            correlationId: stepId,
+            eventData: { stepName: 'test-step', input: ['input1'] },
+          }),
+        ),
+      );
+      expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          expect(EntityConflictError.is(r.reason)).toBe(true);
+        }
+      }
+
+      const eventList = await events.list({ runId: run.runId });
+      expect(
+        eventList.data.filter((e) => e.eventType === 'step_created' && e.correlationId === stepId),
+      ).toHaveLength(1);
+    });
+
+    it('concurrent replays over a LEGACY token claim converge on one hook_created', async () => {
+      const run = await createRun();
+      const hookId = 'hook-legacy-claim';
+      const token = 'token-legacy-claim';
+
+      // Seed pre-eventId state by hand: hook entity + legacy token claim
+      // (plain hookId, no canonical eventId) with NO hook_created event in
+      // the log (the state a crash leaves under the old claim format).
+      const legacyHook = {
+        runId: run.runId,
+        hookId,
+        token,
+        ownerId: '',
+        projectId: '',
+        environment: '',
+        isWebhook: false,
+        specVersion: run.specVersion,
+        createdAt: new Date(),
+      };
+      await redis.set(`${keyPrefix}hook:${hookId}`, stringify(legacyHook));
+      await redis.set(`${keyPrefix}hooks:by_token:${token}`, hookId);
+
+      // Two concurrent replays race the legacy-claim upgrade; the CAS lets
+      // exactly one install its eventId and the other adopts it.
+      const replay = () =>
+        events.create(run.runId, {
+          eventType: 'hook_created',
+          correlationId: hookId,
+          eventData: { token },
+        });
+      const results = await Promise.allSettled([replay(), replay()]);
+      expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          expect(EntityConflictError.is(r.reason)).toBe(true);
+        }
+      }
+
+      // Exactly one hook_created row, and never a self hook_conflict.
+      const eventList = await events.list({ runId: run.runId });
+      expect(
+        eventList.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
+      ).toHaveLength(1);
+      expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+
+      // A further replay is a true duplicate.
+      const err: unknown = await replay().catch((e: unknown) => e);
+      expect(EntityConflictError.is(err)).toBe(true);
+    });
+  });
+
   describe('Basic functionality', () => {
     it('should create and retrieve a run', async () => {
       const run = await createRun({
@@ -497,6 +587,11 @@ describe('Storage (Upstash Redis integration)', () => {
       // No hook_conflict event may be logged for a self-replay
       const eventList = await events.list({ runId: run.runId });
       expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      // And exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      expect(
+        eventList.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
+      ).toHaveLength(1);
     });
 
     it('foreign token claim persists hook_conflict with conflictingRunId', async () => {

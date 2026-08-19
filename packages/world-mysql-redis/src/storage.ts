@@ -145,6 +145,19 @@ async function advanceStateMarker(db: DrizzleOrTx, runId: string, eventId: strin
  * Parse error JSON string into a StructuredError object.
  * Used for backwards compatibility when reading from text error column.
  */
+/** True when `error` is MySQL ER_DUP_ENTRY on the given key/index name
+ * (mysql2 nests the server error under `cause` depending on the call path).
+ * Gating on the key name keeps unrelated duplicate-key violations raw. */
+function isDuplicateKeyError(error: unknown, keyName: string): boolean {
+  const cause = (error as { cause?: unknown })?.cause;
+  const errorCode = (error as { code?: string })?.code ?? (cause as { code?: string })?.code;
+  const errorMessage = [
+    (error as { message?: string })?.message,
+    (cause as { message?: string })?.message,
+  ].join(' ');
+  return errorCode === 'ER_DUP_ENTRY' && errorMessage.includes(keyName);
+}
+
 function parseErrorJson(errorJson: string | null): any {
   if (!errorJson) return null;
   try {
@@ -373,13 +386,14 @@ export function createEventsStorage(
           runInputData.workflowName &&
           runInputData.input !== undefined
         ) {
-          // MySQL reports affectedRows=1 for a fresh INSERT and 0 for the
-          // no-op ON DUPLICATE KEY UPDATE, so we can atomically detect
-          // whether this writer created the run (mirrors postgres's
-          // onConflictDoNothing().returning()).
-          const insertResult = await drizzle
-            .insert(schema.runs)
-            .values({
+          // A plain INSERT on the runs PK atomically detects whether this
+          // writer created the run (an upsert's affectedRows cannot: mysql2
+          // connects with CLIENT_FOUND_ROWS, so a lost race also reports 1
+          // and would double-append the synthetic event); only the creator
+          // writes the synthetic run_created event.
+          let bootstrapped = true;
+          try {
+            await drizzle.insert(schema.runs).values({
               runId: effectiveRunId,
               deploymentId: runInputData.deploymentId,
               workflowName: runInputData.workflowName,
@@ -387,9 +401,14 @@ export function createEventsStorage(
               input: runInputData.input as SerializedContent,
               executionContext: runInputData.executionContext as SerializedContent | undefined,
               status: 'pending',
-            })
-            .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
-          if (insertResult[0].affectedRows === 1) {
+            });
+          } catch (error: unknown) {
+            if (!isDuplicateKeyError(error, 'workflow_runs.PRIMARY')) {
+              throw error;
+            }
+            bootstrapped = false;
+          }
+          if (bootstrapped) {
             // Create synthetic run_created event
             const runCreatedEventId = `wevt_${ulid()}`;
             await drizzle.insert(schema.events).values({
@@ -584,9 +603,12 @@ export function createEventsStorage(
           input: any[];
           executionContext?: Record<string, any>;
         };
-        await drizzle
-          .insert(schema.runs)
-          .values({
+        // Plain INSERT: the runs PK is the duplicate arbiter. An upsert's
+        // affectedRows cannot distinguish a fresh insert from a no-op
+        // duplicate here, because mysql2 connects with CLIENT_FOUND_ROWS
+        // (a duplicate set to its current values also reports 1).
+        try {
+          await drizzle.insert(schema.runs).values({
             runId: effectiveRunId,
             deploymentId: eventData.deploymentId,
             workflowName: eventData.workflowName,
@@ -595,8 +617,17 @@ export function createEventsStorage(
             input: eventData.input as SerializedContent,
             executionContext: eventData.executionContext as SerializedContent | undefined,
             status: 'pending',
-          })
-          .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
+          });
+        } catch (error: unknown) {
+          if (isDuplicateKeyError(error, 'workflow_runs.PRIMARY')) {
+            // Duplicate run_created: rejecting here, before the shared event
+            // insert below, keeps a redelivery from appending a second
+            // run_created row. Core treats this 409 as benign ("the run
+            // already exists").
+            throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
+          }
+          throw error;
+        }
 
         const [runValue] = await drizzle
           .select()
@@ -1249,17 +1280,7 @@ export function createEventsStorage(
           // A duplicate creation row surfaces as EntityConflictError, the dedup
           // signal the runtime expects on redelivered creates. Gated on the index
           // name so other ER_DUP_ENTRY violations still propagate raw.
-          const cause = (error as { cause?: unknown })?.cause;
-          const errorCode =
-            (error as { code?: string })?.code ?? (cause as { code?: string })?.code;
-          const errorMessage = [
-            (error as { message?: string })?.message,
-            (cause as { message?: string })?.message,
-          ].join(' ');
-          if (
-            errorCode === 'ER_DUP_ENTRY' &&
-            errorMessage.includes('workflow_events_entity_creation_unique')
-          ) {
+          if (isDuplicateKeyError(error, 'workflow_events_entity_creation_unique')) {
             throw new EntityConflictError(
               `${data.eventType} for correlationId "${data.correlationId}" already exists in run "${effectiveRunId}"`,
             );

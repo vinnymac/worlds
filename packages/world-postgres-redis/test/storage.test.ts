@@ -136,7 +136,13 @@ describe('Storage (Postgres integration)', () => {
     process.env.DATABASE_URL = dbUrl;
     process.env.WORKFLOW_POSTGRES_URL = dbUrl;
 
-    // Apply schema
+    // Apply schema through the real setup CLI, twice: the second run must
+    // be a no-op (the applied-migrations ledger skips every file).
+    execSync('pnpm db:push', {
+      stdio: 'inherit',
+      cwd: process.cwd(),
+      env: process.env,
+    });
     execSync('pnpm db:push', {
       stdio: 'inherit',
       cwd: process.cwd(),
@@ -1213,6 +1219,13 @@ describe('Storage (Postgres integration)', () => {
       // No hook_conflict event may be written into the run's log
       const eventList = await events.list({ runId: testRunId, pagination: { sortOrder: 'asc' } });
       expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      // And exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      expect(
+        eventList.data.filter(
+          (e) => e.eventType === 'hook_created' && e.correlationId === 'hook_same',
+        ),
+      ).toHaveLength(1);
     });
 
     it('should allow token reuse after hook is disposed', async () => {
@@ -1327,20 +1340,51 @@ describe('Storage (Postgres integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      // Duplicate run_created event (replay scenario)
-      const result2 = await events.create(runId, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-run-idempotent',
-          input: [],
-        },
-      });
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // Duplicate run_created (replay scenario): must not return the
+      // existing run AND append a second run_created row. Core catches
+      // EntityConflictError as "the run already exists".
+      await expect(
+        events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'test-workflow-run-idempotent',
+            input: [],
+          },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const listResult = await runs.list({ workflowName: 'test-workflow-run-idempotent' });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
+    });
+
+    it('concurrent run_created deliveries leave exactly one event row', async () => {
+      const eventData = {
+        eventType: 'run_created' as const,
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'test-workflow-run-race',
+          input: [],
+        },
+      };
+      const first = await events.create(null, eventData);
+      const runId = first.run!.runId;
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () => events.create(runId, eventData)),
+      );
+      for (const r of results) {
+        expect(r.status).toBe('rejected');
+        expect((r as PromiseRejectedResult).reason).toMatchObject({
+          name: 'EntityConflictError',
+        });
+      }
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
     });
 
     it('should handle duplicate hook_created events with different tokens', async () => {
