@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint & Type Check
@@ -25,8 +28,6 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
-        with:
-          version: 11.11.0
 
       - name: Setup Node.js 24.x
         uses: actions/setup-node@v6
@@ -39,6 +40,11 @@ jobs:
 
       - name: Lint
         run: pnpm lint
+
+      # oxfmt is enforced locally by lint-staged, so drift only arrives via
+      # commits that bypassed the hook. Cheap to check, so check it.
+      - name: Format Check
+        run: pnpm format:check
 
       - name: Type Check
         run: pnpm typecheck

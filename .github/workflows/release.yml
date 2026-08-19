@@ -11,6 +11,12 @@ permissions:
   id-token: write
   contents: write
 
+# Never cancel a publish mid-flight, and never let two of them race: a
+# half-published changeset batch is far worse than a queued one.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Publish to npm
@@ -36,8 +42,6 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
-        with:
-          version: 11.11.0
 
       - name: Setup Node.js 24.x
         uses: actions/setup-node@v6
