@@ -35,7 +35,7 @@ interface ChunkCursor {
  * - Each chunk gets a dense, per-stream monotonic sequence number allocated
  *   inside a transaction (MAX(sequence) + 1 under a FOR UPDATE range lock),
  *   so same-millisecond writes can never collide or reorder.
- * - Readers poll with a composite (sequence, chunkId) cursor — the chunkId
+ * - Readers poll with a composite (sequence, chunkId) cursor; the chunkId
  *   tiebreaker keeps legacy rows (which used wall-clock sequences that could
  *   tie) readable without skipping.
  * - Poll interval of 100ms provides acceptable latency for most use cases.
@@ -86,7 +86,7 @@ export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer
       if (typeof parsed.c === 'string') decoded.c = parsed.c;
       if (typeof parsed.i === 'number') decoded.i = parsed.i;
     } catch {
-      // Invalid cursor — start from the beginning
+      // Invalid cursor: start from the beginning
     }
     return decoded;
   }

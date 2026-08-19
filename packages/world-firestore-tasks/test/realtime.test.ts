@@ -624,7 +624,7 @@ describe('Firestore Real-time Listeners', () => {
     }
 
     async function writeStream(streamer: ReturnType<typeof createStreamer>, name: string) {
-      // Write chunks back-to-back so several land in the same millisecond —
+      // Write chunks back-to-back so several land in the same millisecond;
       // the ordering key must not collide (previously it was the truncated
       // ULID ms-timestamp, which deadlocked/skipped same-ms chunks).
       for (let i = 0; i < 10; i++) {

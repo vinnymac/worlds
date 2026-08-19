@@ -25,7 +25,7 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Encode a chunk for storage. Both string and binary chunks are stored
- * base64-encoded so reads can decode unconditionally — Node's base64 decoder
+ * base64-encoded so reads can decode unconditionally; Node's base64 decoder
  * never throws on invalid input (it silently skips non-alphabet characters),
  * so a "decode, fall back to utf-8" strategy silently corrupts string chunks.
  */
@@ -47,7 +47,7 @@ function decodeChunk(raw: unknown): Uint8Array {
   return new Uint8Array(Buffer.from(String(raw), 'base64'));
 }
 
-/** Read the stream-closed marker, tolerating auto-deserialization ('1' → 1). */
+/** Read the stream-closed marker, tolerating auto-deserialization ('1' -> 1). */
 async function readClosedFlag(redis: Redis, closedKey: string): Promise<boolean> {
   const value = await redis.get(closedKey);
   return value != null && String(value) === '1';

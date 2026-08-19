@@ -80,7 +80,7 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
     });
 
-    it('should handle duplicate step_created events', async () => {
+    it('rejects a duplicate step_created with EntityConflictError', async () => {
       const run = await createRun();
       const stepId = 'step-idempotent';
       const eventData = {
@@ -93,13 +93,26 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      const result2 = await world.events.create(run.runId, eventData);
-      expect(result2.step).toBeDefined();
-      expect(result2.step!.stepId).toBe(stepId);
+      // Redelivered step_created: the runtime catches EntityConflictError as its
+      // dedup signal. Returning success would append a second step_created row
+      // and poison replay with ReplayDivergenceError.
+      await expect(world.events.create(run.runId, eventData)).rejects.toMatchObject({
+        name: 'EntityConflictError',
+      });
 
       const listResult = await world.steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
+
+      // The retried delivery must not append a second step_created row.
+      const eventList = await world.events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      const stepCreatedEvents = eventList.data.filter(
+        (e: any) => e.eventType === 'step_created' && e.correlationId === stepId,
+      );
+      expect(stepCreatedEvents).toHaveLength(1);
     });
 
     it('should handle duplicate hook_created events', async () => {
@@ -138,7 +151,7 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await world.events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -219,7 +232,7 @@ describe('Storage (NATS JetStream integration)', () => {
         correlationId: step.stepId,
       });
 
-      // Schedule a retry 60s out — starting again must be rejected.
+      // Schedule a retry 60s out; starting again must be rejected.
       await world.events.create(run.runId, {
         eventType: 'step_retrying',
         correlationId: step.stepId,
@@ -495,7 +508,7 @@ describe('Storage (NATS JetStream integration)', () => {
       });
       const marker = eventTime(received.event!.eventId);
 
-      // Strictly older snapshot → 412.
+      // Strictly older snapshot -> 412.
       await expect(
         world.events.create(
           run.runId,
@@ -508,7 +521,7 @@ describe('Storage (NATS JetStream integration)', () => {
         ),
       ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
 
-      // Equal snapshot must pass — rejecting an up-to-date client livelocks it.
+      // Equal snapshot must pass; rejecting an up-to-date client livelocks it.
       const equal = await world.events.create(
         run.runId,
         {
@@ -563,7 +576,7 @@ describe('Storage (NATS JetStream integration)', () => {
       await createStep(run.runId, stepId);
       await world.events.create(run.runId, { eventType: 'step_started', correlationId: stepId });
 
-      // Carries stateUpdatedAt → replay origin → must not advance the marker.
+      // Carries stateUpdatedAt -> replay origin -> must not advance the marker.
       const completed = await world.events.create(
         run.runId,
         { eventType: 'step_completed', correlationId: stepId, eventData: { result: 42 } },

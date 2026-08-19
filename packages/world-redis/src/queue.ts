@@ -8,6 +8,7 @@ import {
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
+import { createWorkflowUrl } from '@workflow/utils';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import type { RedisWorldConfig } from './config.js';
@@ -31,11 +32,11 @@ interface MessageEnvelope {
   messageId: string;
   /** original idempotency key (preserved across retries) */
   idempotencyKey?: string;
-  /** full queue name (e.g. `__wkf_workflow_wrun_…`) */
+  /** full queue name (e.g. `__wkf_workflow_wrun_...`) */
   queueName: ValidQueueName;
   /** 1-indexed attempt counter */
   attempt: number;
-  /** the workflow/step payload — forwarded as the HTTP fetch body */
+  /** the workflow/step payload, forwarded as the HTTP fetch body */
   message: QueuePayload;
 }
 
@@ -67,7 +68,7 @@ const BLOCK_TIMEOUT_SECONDS = 5;
  * layer's EntityConflictError guards. */
 
 // ============================================================
-// Lua scripts — every multi-key queue state change is atomic.
+// Lua scripts: every multi-key queue state change is atomic.
 // ============================================================
 
 /**
@@ -144,7 +145,7 @@ const LUA_ACK = `
 /**
  * Atomically defer a delivery: remove it from the worker's processing list
  * and park (a possibly updated copy of) it in the delayed zset. Used for
- * both 503 soft retries and hard-failure backoff — the message is durable
+ * both 503 soft retries and hard-failure backoff; the message is durable
  * in Redis for the entire wait, so a process restart cannot lose it.
  *
  * KEYS[1] = processing list
@@ -209,7 +210,7 @@ function computeBackoffMs(attempt: number, config: RedisWorldConfig): number {
  * envelope (or ZADDs it into `${list}:delayed` when delaySeconds is set).
  * Workers BLMOVE into a per-worker `${list}:processing:*` list, dispatch the
  * payload via HTTP fetch to `${baseUrl}/.well-known/workflow/v1/${flow|step}`,
- * and only then remove the entry — a crash mid-dispatch leaves the message in
+ * and only then remove the entry; a crash mid-dispatch leaves the message in
  * the processing list, where the reclaimer returns it to the ready list once
  * the worker's heartbeat expires. Retries and 503-soft-retry park the message
  * in the delayed zset (never an in-process timer), so restarts cannot lose
@@ -248,7 +249,7 @@ export function createQueue(
     try {
       await delay(ms, undefined, { signal: abort.signal });
     } catch {
-      // Aborted — shutting down.
+      // Aborted: shutting down.
     }
   }
 
@@ -402,14 +403,14 @@ export function createQueue(
           envelope = parseWithUint8Array<MessageEnvelope>(item);
         } catch (error) {
           console.error(`[world-redis worker] invalid envelope on ${listKey}:`, error);
-          // Poison message — drop it from the processing list.
+          // Poison message: drop it from the processing list.
           await workerRedis.lrem(processingKey, 1, item).catch(() => {});
           continue;
         }
 
         try {
           const baseUrl = resolveBaseUrl(config);
-          const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+          const url = createWorkflowUrl(baseUrl, { type: pathname });
           const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -423,7 +424,7 @@ export function createQueue(
           });
 
           if (response.ok) {
-            // Success — ack and release the idempotency reservation so the
+            // Success: ack and release the idempotency reservation so the
             // same key can be queued again later.
             await ack(workerRedis, listKey, processingKey, item, envelope);
             continue;
@@ -431,7 +432,7 @@ export function createQueue(
 
           const text = await response.text();
 
-          // 503 + { timeoutSeconds } — soft retry. Park in the delayed zset
+          // 503 + { timeoutSeconds }: soft retry. Park in the delayed zset
           // (durable across restarts) without incrementing attempt.
           if (response.status === 503) {
             let parsed: unknown;
@@ -451,7 +452,7 @@ export function createQueue(
             }
           }
 
-          // Hard failure — increment attempt and park with backoff. Drop
+          // Hard failure: increment attempt and park with backoff. Drop
           // after maxAttempts.
           if (envelope.attempt < maxAttempts) {
             const nextAttempt = envelope.attempt + 1;
@@ -469,7 +470,7 @@ export function createQueue(
             console.error(
               `[world-redis worker] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
             );
-            // Final drop — ack releases the idempotency reservation so the
+            // Final drop: ack releases the idempotency reservation so the
             // message can be re-enqueued instead of wedging the run forever.
             await ack(workerRedis, listKey, processingKey, item, envelope);
           }
@@ -502,7 +503,7 @@ export function createQueue(
     } finally {
       clearInterval(heartbeat);
       workerClients.delete(workerRedis);
-      // disconnect() (not quit()) — quit() on an already-disconnected client
+      // disconnect() (not quit()); quit() on an already-disconnected client
       // would queue the QUIT command and trigger reconnection attempts.
       workerRedis.disconnect();
     }

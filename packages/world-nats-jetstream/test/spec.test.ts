@@ -1,9 +1,7 @@
 import { GenericContainer, Wait } from 'testcontainers';
 import { createTestSuite } from '@workflow/world-testing';
-// `eventLimit` ships in world-testing 4.1.18 but is deliberately not part of
-// `createTestSuite`; opting in via the deep import is the only way to gate the
-// `EventResult.maxEvents` contract. The package publishes no `exports` map, so
-// the dist path is the public entry point for it.
+// `eventLimit` is deliberately not part of `createTestSuite`, and the package
+// publishes no `exports` map, so the dist path is the only way to opt in.
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 

@@ -580,6 +580,31 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       expect(events.data.filter((e) => e.eventType === 'step_created')).toHaveLength(1);
     });
 
+    it('should reject duplicate wait_created events with EntityConflictError', async () => {
+      const run = await createRun({
+        deploymentId: 'deployment-123',
+        workflowName: 'test-workflow',
+        input: [],
+      });
+      const waitId = 'wait-idempotent-test';
+      const eventData = {
+        eventType: 'wait_created' as const,
+        correlationId: waitId,
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      };
+
+      await storage.events.create(run.runId, eventData);
+
+      // Waits have no entity in this world — the wait marker key is the
+      // only guard against a replayed wait_created duplicating the log.
+      await expect(storage.events.create(run.runId, eventData)).rejects.toSatisfy((error) =>
+        EntityConflictError.is(error),
+      );
+
+      const events = await storage.events.list({ runId: run.runId, pagination: {} });
+      expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
+    });
+
     it('should handle duplicate run_created events', async () => {
       // First run_created event
       const result1 = await storage.events.create(null, {
@@ -655,7 +680,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await storage.events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -1010,7 +1035,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         eventData: { output: [] },
       });
 
-      // Token no longer resolves — payload deliveries cannot reach dead runs
+      // Token no longer resolves; payload deliveries cannot reach dead runs
       await expect(storage.hooks.getByToken('token-terminal')).rejects.toSatisfy((error) =>
         HookNotFoundError.is(error),
       );
@@ -1197,10 +1222,8 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       return time;
     }
 
-    /**
-     * Drive a run to the point where an externally-originated step_completed
-     * has advanced the state marker, and report the marker value.
-     */
+    /** Drive a run until an externally-originated step_completed has advanced the
+     * state marker, and report the marker value. */
     async function runWithMarker(): Promise<{ runId: string; marker: number }> {
       const run = await createRun({
         deploymentId: 'test-deployment',

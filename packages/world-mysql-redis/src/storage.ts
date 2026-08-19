@@ -38,23 +38,17 @@ import { compact } from './util.js';
 
 // Type for Drizzle client with our schema
 type Drizzle = MySql2Database<typeof schema>;
-// A drizzle client or an open transaction on one — lets the state-marker
+// A drizzle client or an open transaction on one; lets the state-marker
 // helpers run inside the guarded event-insert transaction as well as standalone.
 type DrizzleOrTx = Drizzle | Parameters<Parameters<Drizzle['transaction']>[0]>[0];
 
-/**
- * Per-run event ceiling reported to the runtime on `run_started`. Mirrors the
- * Vercel World's default; the runtime fails the run with
- * `MAX_EVENTS_EXCEEDED` once the replay log reaches it.
- */
+/** Per-run event ceiling reported on `run_started`. The runtime fails the run
+ * with `MAX_EVENTS_EXCEEDED` once the replay log reaches it. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
 
 export interface EventsStorageOptions {
-  /**
-   * Per-run event ceiling returned as `EventResult.maxEvents` on `run_started`.
-   * Defaults to `WORKFLOW_MAX_EVENTS` when it parses to a positive integer,
-   * otherwise {@link DEFAULT_MAX_EVENTS_PER_RUN}.
-   */
+  /** Per-run event ceiling returned as `EventResult.maxEvents`. Defaults to
+   * `WORKFLOW_MAX_EVENTS` when positive, else {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
   maxEventsPerRun?: number;
 }
 
@@ -74,13 +68,9 @@ function resolveMaxEventsPerRun(configured: number | undefined): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
 }
 
-/**
- * Event types that advance the per-run `state_updated_at` marker when created
- * *without* a `stateUpdatedAt` — i.e. the externally-originated events that
- * invalidate a replay snapshot. The naive "any create without stateUpdatedAt"
- * rule is wrong: the runtime also omits it on `run_created` / `run_started` /
- * `run_failed`, and advancing on those would reject every replay.
- */
+/** Event types that advance the `state_updated_at` marker when created
+ * without a `stateUpdatedAt`. Excludes `run_created` / `run_started` /
+ * `run_failed`, which core also omits it on. */
 const EXTERNAL_STATE_EVENT_TYPES: readonly string[] = ['hook_received', 'step_completed'];
 
 /** Epoch ms encoded in a `wevt_<ulid>` id. The client strips at the last `_`. */
@@ -88,14 +78,9 @@ function eventIdTime(eventId: string): number {
   return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
 }
 
-/**
- * Unlocked marker check. Fail-fast only: it rejects a stale replay-origin
- * create before any entity write, ahead of the authoritative locked check in
- * {@link lockRunState}. Rejects only when `stateUpdatedAt` is *strictly* older
- * than the marker — an equal timestamp must pass or an up-to-date client
- * livelocks. An absent marker or an absent `stateUpdatedAt` fails open, as the
- * contract specifies.
- */
+/** Unlocked fail-fast marker check, ahead of the authoritative locked check
+ * in {@link lockRunState}. Rejects only strictly-older snapshots; an absent
+ * marker or `stateUpdatedAt` fails open. */
 async function assertStateNotStale(
   db: DrizzleOrTx,
   runId: string,
@@ -115,23 +100,9 @@ async function assertStateNotStale(
   }
 }
 
-/**
- * Optimistic-concurrency preamble for an event insert
- * (`CreateEventParams.stateUpdatedAt`, @workflow/world 4.3.1).
- *
- * Takes the run row `FOR UPDATE` when this create either carries a
- * `stateUpdatedAt` (so the marker check and the insert are one serializable
- * unit) or is externally originated (so its marker advance is serialized
- * against concurrent guarded creates).
- *
- * The lock is acquired *before* the event ULID is allocated, and that ordering
- * is load-bearing: a writer that allocated an id and only then blocked on the
- * run row would commit a smaller id after a larger one. Event order is eventId
- * order, so a reader that already consumed the larger id would later see the
- * log grow backwards and fail replay with a divergence.
- *
- * @returns whether the caller must call {@link advanceStateMarker} after the insert.
- */
+/** Locks the run row so the marker check and the event insert are one
+ * serializable unit, before the event ULID is allocated so ids stay
+ * commit-ordered. Returns whether the caller must advance the marker. */
 async function lockRunState(
   tx: DrizzleOrTx,
   runId: string,
@@ -160,11 +131,8 @@ async function lockRunState(
   return advances;
 }
 
-/**
- * Advance the run's state marker to the ULID time of the event just written.
- * `GREATEST` keeps the marker monotonic without a read-modify-write, so
- * out-of-order commits cannot walk it backwards.
- */
+/** Advance the run's state marker to the ULID time of the event just written.
+ * `GREATEST` keeps it monotonic without a read-modify-write. */
 async function advanceStateMarker(db: DrizzleOrTx, runId: string, eventId: string): Promise<void> {
   const marker = eventIdTime(eventId);
   await db
@@ -201,7 +169,7 @@ function parseErrorJson(errorJson: string | null): any {
  */
 function deserializeRunError(run: any): WorkflowRun {
   // stateUpdatedAt is our internal optimistic-concurrency marker column, not a
-  // WorkflowRun field — drop it here so it never leaks onto a returned entity.
+  // WorkflowRun field; drop it here so it never leaks onto a returned entity.
   const { errorStack, errorCode, stateUpdatedAt: _stateUpdatedAt, ...rest } = run;
 
   // If no legacy fields, return as-is
@@ -333,7 +301,7 @@ export function createEventsStorage(
     async create(runId, data, params): Promise<EventResult> {
       // The event id is allocated lazily so events written before it (e.g. the
       // synthetic run_created insert in the resilient-start bootstrap) receive
-      // smaller ULIDs — event ordering is by eventId.
+      // smaller ULIDs; event ordering is by eventId.
       let eventId: string | undefined;
       const getEventId = () => (eventId ??= `wevt_${ulid()}`);
 
@@ -350,10 +318,8 @@ export function createEventsStorage(
       // specVersion is always sent by the runtime, but we provide a fallback for safety
       const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
 
-      // Optimistic-concurrency guard, pass 1 of 2. Unlocked, so purely
-      // fail-fast: it rejects a stale replay-origin create before any entity
-      // write happens. The authoritative, atomic check is pass 2, taken under
-      // the run row lock in the same transaction as the event insert below.
+      // Guard pass 1 of 2. Unlocked, so purely fail-fast: rejects a stale
+      // replay-origin create before any entity write. Pass 2 is authoritative.
       await assertStateNotStale(drizzle, effectiveRunId, params?.stateUpdatedAt);
 
       // Track entity created/updated for EventResult
@@ -884,7 +850,7 @@ export function createEventsStorage(
             ),
           );
         if (updateResult[0].affectedRows === 0) {
-          // Step not updated — a concurrent writer finalized it between the
+          // Step not updated: a concurrent writer finalized it between the
           // validation read and this UPDATE.
           const [existing] = await drizzle
             .select({ status: schema.steps.status })
@@ -1125,14 +1091,14 @@ export function createEventsStorage(
           // are trying to create, this is either a duplicate / replayed
           // processing of the same hook_created (not a real conflict), or an
           // orphaned hook row from a prior crashed attempt (the hook INSERT
-          // below landed but the events INSERT didn't — these writes are not
+          // below landed but the events INSERT didn't; these writes are not
           // in one transaction). Distinguish by checking whether the
           // hook_created event actually exists in the event log:
-          //   - exists → real duplicate: throw EntityConflictError so the
+          //   - exists -> real duplicate: throw EntityConflictError so the
           //     runtime's concurrent-replay catch path swallows it, instead of
           //     producing a self-conflict in the event log that would later
           //     replay as HookConflictError.
-          //   - missing → orphaned hook row: skip the hook insert and fall
+          //   - missing -> orphaned hook row: skip the hook insert and fall
           //     through to the events INSERT below, completing the partial
           //     write.
           if (existingHook.runId === effectiveRunId && existingHook.hookId === data.correlationId) {
@@ -1164,7 +1130,7 @@ export function createEventsStorage(
           } else {
             // Cross-hook / cross-run conflict: a different (runId, hookId)
             // holds this token. Create a hook_conflict event instead of
-            // throwing 409 — this lets the workflow continue and fail
+            // throwing 409; this lets the workflow continue and fail
             // gracefully when the hook is awaited.
             const conflictEventData = {
               token: eventData.token,
@@ -1242,7 +1208,7 @@ export function createEventsStorage(
       }
 
       // Handle hook_disposed event: delete hook entity atomically. If the
-      // DELETE affects 0 rows, a concurrent caller already disposed the hook —
+      // DELETE affects 0 rows, a concurrent caller already disposed the hook;
       // reject as a conflict instead of silently logging a duplicate disposal.
       if (data.eventType === 'hook_disposed' && data.correlationId) {
         const deleteResult = await drizzle
@@ -1259,10 +1225,8 @@ export function createEventsStorage(
           : 'eventData' in data
             ? data.eventData
             : undefined;
-      // Optimistic-concurrency guard, pass 2 of 2, plus the marker advance for
-      // externally-originated events. Both sides contend on the same run row,
-      // so a guarded insert and a concurrent hook_received / step_completed
-      // marker advance are serialized: the check and the write are atomic.
+      // Guard pass 2 of 2, plus the marker advance for externally-originated
+      // events. Both contend on the run row, so check and write are atomic.
       const value = await drizzle.transaction(async (tx) => {
         const advancesStateMarker = await lockRunState(
           tx,
@@ -1271,15 +1235,37 @@ export function createEventsStorage(
           params?.stateUpdatedAt,
         );
 
-        await tx.insert(events).values({
-          runId: effectiveRunId,
-          eventId: getEventId(),
-          correlationId: data.correlationId,
-          eventType: data.eventType,
-          eventData: storedEventData,
-          occurredAt: params?.occurredAt,
-          specVersion: effectiveSpecVersion,
-        });
+        try {
+          await tx.insert(events).values({
+            runId: effectiveRunId,
+            eventId: getEventId(),
+            correlationId: data.correlationId,
+            eventType: data.eventType,
+            eventData: storedEventData,
+            occurredAt: params?.occurredAt,
+            specVersion: effectiveSpecVersion,
+          });
+        } catch (error: unknown) {
+          // A duplicate creation row surfaces as EntityConflictError, the dedup
+          // signal the runtime expects on redelivered creates. Gated on the index
+          // name so other ER_DUP_ENTRY violations still propagate raw.
+          const cause = (error as { cause?: unknown })?.cause;
+          const errorCode =
+            (error as { code?: string })?.code ?? (cause as { code?: string })?.code;
+          const errorMessage = [
+            (error as { message?: string })?.message,
+            (cause as { message?: string })?.message,
+          ].join(' ');
+          if (
+            errorCode === 'ER_DUP_ENTRY' &&
+            errorMessage.includes('workflow_events_entity_creation_unique')
+          ) {
+            throw new EntityConflictError(
+              `${data.eventType} for correlationId "${data.correlationId}" already exists in run "${effectiveRunId}"`,
+            );
+          }
+          throw error;
+        }
 
         if (advancesStateMarker) {
           await advanceStateMarker(tx, effectiveRunId, getEventId());

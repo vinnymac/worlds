@@ -21,6 +21,9 @@ catalogs:
     '@workflow/errors':
       specifier: 4.2.1
       version: 4.2.1
+    '@workflow/utils':
+      specifier: 4.1.4
+      version: 4.1.4
     '@workflow/world':
       specifier: 4.3.1
       version: 4.3.1
@@ -121,6 +124,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -161,6 +167,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -210,6 +219,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -250,6 +262,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -302,6 +317,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -357,6 +375,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -394,6 +415,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -449,6 +473,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1
@@ -489,6 +516,9 @@ importers:
       '@workflow/errors':
         specifier: 'catalog:'
         version: 4.2.1
+      '@workflow/utils':
+        specifier: 'catalog:'
+        version: 4.1.4
       '@workflow/world':
         specifier: 'catalog:'
         version: 4.3.1

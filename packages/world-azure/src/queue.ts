@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ServiceBusClient, ServiceBusSender } from '@azure/service-bus';
 import { ServiceBusAdministrationClient } from '@azure/service-bus';
+import { createWorkflowUrl } from '@workflow/utils';
 import type { Queue, QueueOptions } from '@workflow/world';
 import {
   MessageId,
@@ -119,7 +120,7 @@ function createTestPump(config: ServiceBusConfig) {
   }
 
   async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
-    const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(resolveBaseUrl(config), { type: pathname });
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -230,7 +231,7 @@ export function createQueue(config: ServiceBusConfig): Queue & {
   /**
    * Send a message to Service Bus. `idempotencyKey` maps to the Service Bus
    * messageId, which deduplicates only when the queue has duplicate detection
-   * enabled — start() provisions/verifies that. The fallback id is a ULID so
+   * enabled; start() provisions/verifies that. The fallback id is a ULID so
    * distinct messages can never collide (Date.now() ties within a millisecond
    * would be silently dropped by duplicate detection).
    */
@@ -383,7 +384,7 @@ export function createQueue(config: ServiceBusConfig): Queue & {
           if (!info.requiresDuplicateDetection) {
             throw new Error(
               `[world-azure] Service Bus queue "${queueName}" does not have duplicate detection enabled. ` +
-                'Idempotency keys cannot deduplicate messages on this queue — recreate it with ' +
+                'Idempotency keys cannot deduplicate messages on this queue; recreate it with ' +
                 'requiresDuplicateDetection=true (duplicate detection cannot be enabled after creation).',
             );
           }

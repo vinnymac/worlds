@@ -7,6 +7,7 @@ import {
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
+import { createWorkflowUrl } from '@workflow/utils';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
@@ -251,9 +252,9 @@ export function createQueue(
     };
   };
 
-  async function dispatch(envelope: MessageEnvelope, pathname: string): Promise<Response> {
+  async function dispatch(envelope: MessageEnvelope, pathname: 'flow' | 'step'): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(baseUrl, { type: pathname });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -372,7 +373,7 @@ export function createQueue(
           typeof parsed === 'object' &&
           typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
         ) {
-          // Suspension — redeliver the same envelope (attempt unchanged)
+          // Suspension: redeliver the same envelope (attempt unchanged)
           // after the requested timeout.
           const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
           await requeueLater(workerRedis, listKey, item, item, Date.now() + timeoutMs);

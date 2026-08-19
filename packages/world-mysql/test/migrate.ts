@@ -26,7 +26,7 @@ export async function applyMigrations(connection: mysql.Connection): Promise<voi
       );
 
     for (const statement of statements) {
-      // query() (text protocol) — some DDL is not supported by the
+      // query() (text protocol); some DDL is not supported by the
       // prepared statement protocol that execute() uses.
       await connection.query(statement);
     }

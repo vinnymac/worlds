@@ -511,7 +511,7 @@ describe('Storage (Redis integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario) — must reject so the
+      // Duplicate step_created event (replay scenario), must reject so the
       // log ends with exactly one creation event. Core matches this error by
       // name and treats it as benign.
       await expect(
@@ -580,7 +580,7 @@ describe('Storage (Redis integration)', () => {
 
       await events.create(runId, { eventType: 'run_started' });
 
-      // Duplicate run_created after the run has moved on — must not
+      // Duplicate run_created after the run has moved on, must not
       // resurrect the run in the pending index.
       await expect(
         events.create(runId, {
@@ -637,7 +637,7 @@ describe('Storage (Redis integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -776,7 +776,7 @@ describe('Storage (Redis integration)', () => {
       });
 
       // A redelivered hook_created for the SAME claim must NOT emit a
-      // hook_conflict against its own token — that would fail the workflow.
+      // hook_conflict against its own token; that would fail the workflow.
       await expect(
         events.create(testRunId, {
           eventType: 'hook_created',
@@ -844,7 +844,7 @@ describe('Storage (Redis integration)', () => {
         eventData: { result: ['done'] },
       });
 
-      // Redelivered step_completed after the step finished — core swallows
+      // Redelivered step_completed after the step finished; core swallows
       // EntityConflictError and re-enqueues the workflow.
       await expect(
         events.create(testRunId, {

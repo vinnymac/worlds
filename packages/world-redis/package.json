@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "ioredis": "catalog:",
     "ulid": "catalog:"

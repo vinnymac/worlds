@@ -56,8 +56,8 @@ interface RedisStorageConfig {
 }
 
 /** Max retries for optimistic (compare-and-swap) entity updates. Statuses
- * only move forward (pending → running → terminal), so contention resolves
- * in at most a couple of iterations — hitting this limit indicates a bug. */
+ * only move forward (pending -> running -> terminal), so contention resolves
+ * in at most a couple of iterations; hitting this limit indicates a bug. */
 const MAX_CAS_ATTEMPTS = 5;
 
 /** Cap for the per-run event stream mirror (`events:stream:{runId}`), so the
@@ -68,13 +68,9 @@ const EVENT_STREAM_MAXLEN = 1000;
 /** Per-run event ceiling reported to core, mirroring the Vercel World. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
 
-/**
- * Resolve the per-run event ceiling surfaced as `EventResult.maxEvents`.
- * Explicit config wins; otherwise `WORKFLOW_MAX_EVENTS` when it is a positive
- * integer; otherwise the default. A configured value that is not a positive
- * integer is a programming error and throws rather than being silently
- * ignored.
- */
+/** Resolve the per-run event ceiling surfaced as `EventResult.maxEvents`:
+ * explicit config, then `WORKFLOW_MAX_EVENTS`, then the default. A
+ * non-positive configured value throws rather than being ignored. */
 function resolveMaxEventsPerRun(configured: number | undefined): number {
   if (configured !== undefined) {
     if (!Number.isInteger(configured) || configured <= 0) {
@@ -89,22 +85,13 @@ function resolveMaxEventsPerRun(configured: number | undefined): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
 }
 
-/**
- * Event types that may advance the per-run state marker used by the
- * `stateUpdatedAt` optimistic-concurrency guard.
- *
- * Only *externally-originated* events count: a `hook_received` or
- * `step_completed` recorded WITHOUT a `stateUpdatedAt`. Replay-origin creates
- * always carry one and must never advance the marker, and lifecycle events
- * core sends unguarded (`run_created`, `run_started`, `run_failed`) must not
- * either — advancing on those would 412-livelock every run.
- */
+/** Event types that may advance the per-run state marker: `hook_received` or
+ * `step_completed` recorded without a `stateUpdatedAt`. Advancing on the
+ * lifecycle events core sends unguarded would 412-livelock every run. */
 const EXTERNALLY_ORIGINATED_EVENT_TYPES = new Set(['hook_received', 'step_completed']);
 
-/**
- * Epoch ms encoded in the trailing ULID of an entity id (`wevt_<ulid>`).
- * Mirrors core's own decode, which strips through the LAST underscore.
- */
+/** Epoch ms encoded in the trailing ULID of an entity id (`wevt_<ulid>`).
+ * Mirrors core's decode, which strips through the LAST underscore. */
 function eventIdTime(eventId: string): number {
   return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
 }
@@ -112,18 +99,9 @@ function eventIdTime(eventId: string): number {
 /** Sentinel returned by the Lua guard prelude when the create is stale. */
 const LUA_PRECONDITION_FAILED = -9;
 
-/**
- * Lua prelude implementing the `stateUpdatedAt` optimistic-concurrency guard.
- *
- * `ARGV[argIdx]` holds the caller's `stateUpdatedAt` (empty string = the
- * caller sent none, so the guard is disabled and the create falls open).
- * `KEYS[keyIdx]` holds the per-run state marker. Rejection is *strictly*
- * older-than: an equal timestamp must pass, otherwise an up-to-date client
- * livelocks.
- *
- * Inlined into each write script so the check and the write land in the same
- * atomic Redis execution.
- */
+/** Lua prelude implementing the `stateUpdatedAt` guard. An empty
+ * `ARGV[argIdx]` disables it; rejection is strictly older-than so an
+ * up-to-date client never livelocks. Inlined so check and write are atomic. */
 function luaStateGuard(keyIdx: number, argIdx: number): string {
   return `
   if ARGV[${argIdx}] ~= '' then
@@ -135,11 +113,8 @@ function luaStateGuard(keyIdx: number, argIdx: number): string {
 `;
 }
 
-/**
- * Lua epilogue that advances the per-run state marker to `ARGV[argIdx]`
- * (empty string = no advance). Monotonic: events can be written out of order,
- * so the marker only ever moves forward.
- */
+/** Lua epilogue that advances the per-run state marker to `ARGV[argIdx]`
+ * (empty = no advance). Monotonic: the marker only ever moves forward. */
 function luaAdvanceStateMarker(keyIdx: number, argIdx: number): string {
   return `
   if ARGV[${argIdx}] ~= '' then
@@ -256,7 +231,7 @@ const LUA_CREATE_RUN_WITH_EVENT = `
 /**
  * Atomically update a run via compare-and-swap and move it between status
  * indexes. The stored JSON must be byte-identical to the caller's snapshot
- * (ARGV[1]) — otherwise nothing is written and the caller re-reads and
+ * (ARGV[1]); otherwise nothing is written and the caller re-reads and
  * re-validates, so concurrent terminal transitions can never overwrite each
  * other or leave the run in two status indexes.
  *
@@ -342,9 +317,9 @@ const LUA_CAS_UPDATE_STEP = `
 /**
  * Atomically claim a hook token and create the hook entity, indexes, and
  * creation event. The by-token key is the claim arbiter (SETNX):
- * - A DIFFERENT hookId already owning the token → cross-run conflict; the
+ * - A DIFFERENT hookId already owning the token -> cross-run conflict; the
  *   rightful owner's token mapping is left untouched.
- * - The SAME hookId owning the token with the entity present → duplicate.
+ * - The SAME hookId owning the token with the entity present -> duplicate.
  * Entity + event are written in the same atomic script, so a crash can
  * never leave a hook entity without its hook_created event (or vice versa).
  *
@@ -489,8 +464,7 @@ const LUA_CAS_COMPLETE_WAIT_WITH_EVENT = `${luaStateGuard(5, 6)}
  * ARGV[2] = event ID
  * ARGV[3] = score (timestamp)
  * ARGV[4] = has correlation ("1" or "0")
- * ARGV[5] = stateUpdatedAt guard ('' to disable — paths that already guarded
- *           atomically alongside their entity write pass '')
+ * ARGV[5] = stateUpdatedAt guard ('' to disable)
  * ARGV[6] = new state marker value ('' to leave the marker untouched)
  * Returns: [1, ''] on success, [-9, marker] when the guard rejects
  */
@@ -765,14 +739,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     );
   }
 
-  /**
-   * Store an event (entity writes already done) and mirror it.
-   *
-   * `guard` carries the caller's `stateUpdatedAt` and is `''` on paths that
-   * already evaluated the guard atomically alongside their entity write, so
-   * the check runs exactly once per create. `markerAdvance` carries the new
-   * per-run state marker for externally-originated events.
-   */
+  /** Store an event (entity writes already done) and mirror it. `guard` is `''`
+   * on paths that already checked it, so the check runs once per create;
+   * `markerAdvance` carries the new state marker. */
   async function storeEventGeneric(
     event: StoredEventShape,
     guard = '',
@@ -799,15 +768,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     await mirrorEventToStream(event);
   }
 
-  /**
-   * Compare-and-swap a run update, moving it between status indexes.
-   * Returns true when the swap landed; false when the stored run changed
-   * since `expectedJson` was read (caller re-reads and re-validates).
-   *
-   * `guard` carries the caller's `stateUpdatedAt`; the check runs inside the
-   * same Lua execution as the transition, so a stale `run_completed` can
-   * never mark the run terminal.
-   */
+  /** Compare-and-swap a run update, moving it between status indexes. Returns
+   * false when the stored run changed since `expectedJson` was read. `guard` is
+   * checked in the same Lua execution, so a stale `run_completed` cannot land. */
   async function casRunUpdate(
     runId: string,
     expectedJson: string,
@@ -1039,12 +1002,8 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       const now = new Date();
       const resolveData = params?.resolveData ?? 'all';
 
-      // ============================================================
-      // OPTIMISTIC CONCURRENCY (@workflow/world 4.3.1)
-      // ============================================================
       // `stateUpdatedAt` is the ULID time of the newest event the runtime had
-      // loaded when it built this create. Absent → the guard is disabled and
-      // the create falls open, exactly as before.
+      // loaded. Absent -> the guard is disabled and the create falls open.
       const stateUpdatedAt = params?.stateUpdatedAt;
       const guard = stateUpdatedAt === undefined ? '' : String(stateUpdatedAt);
       // Cleared once a path has evaluated `guard` atomically alongside its own
@@ -1127,7 +1086,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             updatedAt: now,
           };
           // Synthetic run_created event, written atomically with the run
-          // entity — exactly one run_created event lands regardless of how
+          // entity: exactly one run_created event lands regardless of how
           // the run_created/run_started race resolves.
           const runCreatedEventId = `wevt_${ulid()}`;
           const runCreatedEvent = {
@@ -1165,7 +1124,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             await mirrorEventToStream(runCreatedEvent);
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
           } else {
-            // Run already exists — re-read state from Lua result
+            // Run already exists: re-read state from Lua result
             const parsed = parseWithUint8Array<WorkflowRun>(result[1]);
             currentRun = { status: parsed.status, specVersion: parsed.specVersion };
           }
@@ -1494,7 +1453,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         }
 
         if (result[0] === 0) {
-          // Same (runId, hookId, token) already fully created — entity and
+          // Same (runId, hookId, token) already fully created: entity and
           // event are written atomically, so the event is guaranteed to be
           // in the log. The runtime's concurrent-replay path swallows this.
           throw new EntityConflictError(`Hook "${data.correlationId}" already created`);
@@ -1625,7 +1584,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
               status: 404,
             });
           }
-          // CAS mismatch — re-read (a concurrent completion will surface as
+          // CAS mismatch: re-read (a concurrent completion will surface as
           // EntityConflictError on the next iteration).
         }
         throw new WorkflowWorldError(
@@ -1641,12 +1600,8 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
       // Handle run_started event: transition run to running via CAS
       if (data.eventType === 'run_started') {
-        // Idempotency: if run is already running, this is a replay.
-        // Return existing run state without creating a duplicate event.
-        // `maxEvents` MUST be reported here too: core reads the per-run event
-        // ceiling only from the run_started response, so omitting it on the
-        // idempotent path would silently drop the limit on every replay after
-        // the first.
+        // Core reads the per-run event ceiling only from the run_started response, so
+        // omitting it here would drop the limit on every replay after the first.
         if (currentRun?.status === 'running') {
           const existingData = await redis.get(runKey(effectiveRunId));
           if (existingData) {
@@ -1667,7 +1622,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             // The run does not exist (run_created hasn't landed and the
             // message carried no runInput to bootstrap from). Reject so the
             // queue redelivers, instead of appending an orphan run_started
-            // event and returning `run: undefined` — which would consume the
+            // event and returning `run: undefined`, which would consume the
             // message and permanently strand the run.
             throw new WorkflowRunNotFoundError(effectiveRunId);
           }
@@ -1714,10 +1669,8 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         }
       }
 
-      // Handle run_completed event: CAS transition + cleanup hooks/waits.
-      // The guard is evaluated inside the transition script so a stale
-      // completion can never mark the run terminal; core turns the resulting
-      // 412 into an immediate re-invoke with a fresh replay.
+      // CAS transition + cleanup hooks/waits. The guard is evaluated inside the
+      // transition script so a stale completion can never mark the run terminal.
       if (data.eventType === 'run_completed') {
         const eventData = data.eventData;
         run = await applyTerminalRunTransition(

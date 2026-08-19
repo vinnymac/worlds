@@ -12,11 +12,8 @@ export interface CloudflareWorldConfig {
     WORKFLOW_STREAMS: CloudflareStreamerConfig['env']['WORKFLOW_STREAMS'];
   };
   deploymentId?: string;
-  /**
-   * Per-run event ceiling reported to the runtime on `run_started`
-   * (`EventResult.maxEvents`). Defaults to the `WORKFLOW_MAX_EVENTS`
-   * environment variable, then to 25,000.
-   */
+  /** Per-run event ceiling reported on `run_started`
+   * (`EventResult.maxEvents`). Defaults to `WORKFLOW_MAX_EVENTS`, then 25,000. */
   maxEventsPerRun?: CloudflareStorageConfig['maxEventsPerRun'];
 }
 

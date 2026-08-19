@@ -18,7 +18,7 @@ interface ChunkDoc {
   streamId: string;
   runId: string;
   /**
-   * Full monotonic ULID (prefixed) — the ordering and pagination key.
+   * Full monotonic ULID (prefixed), the ordering and pagination key.
    * ULIDs generated in the same millisecond still sort correctly because the
    * monotonic factory increments the random suffix, unlike a numeric sequence
    * derived from the millisecond timestamp alone.
@@ -54,7 +54,7 @@ function decodeChunksCursor(cursor: string): ChunksCursor | undefined {
       return decoded as ChunksCursor;
     }
   } catch {
-    // Malformed cursor — treat as start-of-stream (matches world-local).
+    // Malformed cursor: treat as start-of-stream (matches world-local).
   }
   return undefined;
 }
@@ -149,7 +149,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
 
           /**
            * Enqueue chunks in order, skipping the first `skipCount` data
-           * chunks. Returns 'eof' when the stream-end marker is reached —
+           * chunks. Returns 'eof' when the stream-end marker is reached;
            * anything ordered after the marker is never delivered.
            */
           function deliver(docs: ChunkDoc[], skipCount: number): 'eof' | 'continue' {
@@ -280,7 +280,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
     },
 
     async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Only the eof flags are needed — never fetch chunk payloads.
+      // Only the eof flags are needed; never fetch chunk payloads.
       const querySpec: SqlQuerySpec = {
         query: 'SELECT c.eof FROM c WHERE c.streamId = @streamId ORDER BY c.chunkId ASC',
         parameters: [{ name: '@streamId', value: name }],

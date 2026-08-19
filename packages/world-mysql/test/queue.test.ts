@@ -142,7 +142,7 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
     const payload = Buffer.from(encode({ runId: 'test_run_reclaim' }));
     const staleLockedAt = new Date(Date.now() - 10 * 60 * 1000);
 
-    // Orphaned job with attempts remaining → back to pending
+    // Orphaned job with attempts remaining -> back to pending
     await db.insert(schema.jobs).values({
       jobId: 'msg_reclaim_pending',
       queueName: 'workflow_flows',
@@ -153,7 +153,7 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
       lockedAt: staleLockedAt,
       lockedBy: 'dead_worker',
     });
-    // Orphaned job with attempts exhausted → failed
+    // Orphaned job with attempts exhausted -> failed
     await db.insert(schema.jobs).values({
       jobId: 'msg_reclaim_failed',
       queueName: 'workflow_flows',
@@ -164,7 +164,7 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
       lockedAt: staleLockedAt,
       lockedBy: 'dead_worker',
     });
-    // Actively processing job (fresh lock) → untouched
+    // Actively processing job (fresh lock) -> untouched
     await db.insert(schema.jobs).values({
       jobId: 'msg_reclaim_active',
       queueName: 'workflow_flows',
@@ -203,7 +203,7 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
     const payload = Buffer.from(encode({ runId: 'test_run_idem' }));
     const expiredCreatedAt = new Date(Date.now() - 10 * 60 * 1000);
 
-    // Expired key whose job is still scheduled → must survive cleanup
+    // Expired key whose job is still scheduled -> must survive cleanup
     await db.insert(schema.jobs).values({
       jobId: 'msg_idem_live',
       queueName: 'workflow_steps',
@@ -219,7 +219,7 @@ describe.skipIf(shouldSkipTests)('MySQL Queue internals', () => {
       createdAt: expiredCreatedAt,
     });
 
-    // Expired key whose job is gone (completed) → released
+    // Expired key whose job is gone (completed) -> released
     await db.insert(schema.idempotency).values({
       idempotencyKey: 'step_done',
       messageId: 'msg_idem_done',

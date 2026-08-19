@@ -54,12 +54,8 @@ export interface NatsJetStreamWorldConfig {
   /** Per-job HTTP request timeout (ms). Default: 300_000 */
   httpTimeoutMs?: number;
 
-  /**
-   * Ceiling on the number of events a single run may accumulate. Reported to
-   * the runtime on the `run_started` response (`EventResult.maxEvents`); the
-   * runtime enforces it and fails the run with `MAX_EVENTS_EXCEEDED`.
-   * Must be a positive integer.
-   * Default: process.env.WORKFLOW_MAX_EVENTS, else 25_000
-   */
+  /** Ceiling on events a run may accumulate, reported as
+   * `EventResult.maxEvents`. Must be a positive integer.
+   * Default: `WORKFLOW_MAX_EVENTS`, else 25_000 */
   maxEventsPerRun?: number;
 }

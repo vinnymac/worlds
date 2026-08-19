@@ -162,7 +162,7 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario) — core catches
+      // Duplicate step_created event (replay scenario); core catches
       // EntityConflictError (by name) as "step already exists, continuing".
       const err: unknown = await events
         .create(run.runId, {
@@ -187,6 +187,29 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(listResult.data[0].stepId).toBe(stepId);
     });
 
+    it('should throw EntityConflictError for duplicate wait_created events', async () => {
+      const run = await createRun();
+      const waitId = 'wait-idempotent-test';
+      const eventData = {
+        eventType: 'wait_created' as const,
+        correlationId: waitId,
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      };
+
+      await events.create(run.runId, eventData);
+
+      // Waits have no entity in this world — the creation-event claim is
+      // the only guard against a replayed wait_created duplicating the log.
+      const err: unknown = await events.create(run.runId, eventData).catch((e: unknown) => e);
+      expect(EntityConflictError.is(err)).toBe(true);
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
+    });
+
     it('should throw EntityConflictError for duplicate run_created events', async () => {
       // First run_created event
       const result1 = await events.create(null, {
@@ -200,7 +223,7 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      // Duplicate run_created event — core's start() treats
+      // Duplicate run_created event; core's start() treats
       // EntityConflictError as the benign "run already exists" signal.
       const err: unknown = await events
         .create(runId, {
@@ -261,7 +284,7 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });

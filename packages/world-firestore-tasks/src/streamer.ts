@@ -73,7 +73,7 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
 
   /**
    * Reader state shared by both modes. Chunks are ordered by their full
-   * monotonic ULID chunkId (string comparison) — never by a truncated
+   * monotonic ULID chunkId (string comparison), never by a truncated
    * numeric timestamp, which collides for same-millisecond writes.
    */
   interface ReadState {
@@ -403,7 +403,7 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
     },
 
     async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Project only the eof flag — metadata never needs chunk payloads.
+      // Project only the eof flag; metadata never needs chunk payloads.
       const snapshot = await chunksCol(name).select('eof').get();
       let dataCount = 0;
       let done = false;

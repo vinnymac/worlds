@@ -35,7 +35,7 @@ interface QStashQueueConfig {
    * status outside 200-299 (a hard failure). QStash's own default is small (3
    * on the free plan), well below core's retry budget: core allows up to
    * `MAX_QUEUE_DELIVERIES` (48) total deliveries before marking a run failed.
-   * We default to 47 retries — 48 total deliveries — so QStash's redelivery
+   * We default to 47 retries (48 total deliveries), so QStash's redelivery
    * budget matches core's expectation and transient failures are not dropped
    * before core would give up.
    *
@@ -224,7 +224,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
           // backoff, TooEarlyError). Returning a plain 200 would ACK the
           // QStash message permanently and strand the run, so republish the
           // same body with the requested delay before ACKing. Deliberately
-          // no deduplicationId here — the redelivery must not be swallowed
+          // no deduplicationId here; the redelivery must not be swallowed
           // by QStash dedup. If the republish fails, the thrown error falls
           // through to the 500 below and QStash redelivers this attempt.
           if (result && typeof result.timeoutSeconds === 'number') {

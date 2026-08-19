@@ -2,10 +2,8 @@ import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { createTestSuite } from '@workflow/world-testing';
-// Opt-in suite: world-testing 4.1.18 ships `eventLimit` but does not include it
-// in createTestSuite, and the package has no exports map — deep import is the
-// only way in. It asserts the world reports EventResult.maxEvents on
-// run_started and honours WORKFLOW_MAX_EVENTS.
+// Opt-in suite: `eventLimit` is not in createTestSuite and the package has no
+// exports map, so the deep import is the only way in.
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, describe, test } from 'vitest';
 

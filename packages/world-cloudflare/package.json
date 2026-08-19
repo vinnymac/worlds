@@ -43,6 +43,7 @@
   },
   "dependencies": {
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "ulid": "catalog:"
   },

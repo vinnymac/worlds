@@ -43,6 +43,7 @@
     "@azure/identity": "^4.9.1",
     "@azure/service-bus": "^7.9.5",
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "cbor-x": "^1.6.0",
     "ulid": "catalog:"

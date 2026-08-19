@@ -1,5 +1,6 @@
 import { MySqlContainer } from '@testcontainers/mysql';
 import { RedisContainer } from '@testcontainers/redis';
+import { EntityConflictError } from '@workflow/errors';
 import type { Step, Streamer, WorkflowRun } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
@@ -121,6 +122,17 @@ describe('Storage (MySQL + Redis integration)', () => {
       INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
       INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
     )`);
+    // Mirrors migrations/0007_events_entity_creation_unique.sql
+    await connection.query(`CREATE UNIQUE INDEX \`workflow_events_entity_creation_unique\`
+      ON \`workflow\`.\`workflow_events\` (
+        (CASE
+          WHEN \`type\` IN ('step_created', 'hook_created', 'wait_created')
+          THEN \`run_id\`
+          ELSE NULL
+        END),
+        \`correlation_id\`,
+        \`type\`
+      )`);
     await connection.query(`CREATE TABLE \`workflow\`.\`workflow_steps\` (
       \`run_id\` VARCHAR(255) NOT NULL,
       \`step_id\` VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -211,7 +223,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
     });
 
-    it('should handle duplicate step_created events', async () => {
+    it('rejects a duplicate step_created with EntityConflictError', async () => {
       const run = await createRun();
       const stepId = 'step-idempotent';
       const eventData = {
@@ -224,13 +236,46 @@ describe('Storage (MySQL + Redis integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      const result2 = await events.create(run.runId, eventData);
-      expect(result2.step).toBeDefined();
-      expect(result2.step!.stepId).toBe(stepId);
+      // Redelivered step_created: the runtime catches EntityConflictError as
+      // its dedup signal. Returning success would append a second
+      // step_created row and poison replay with ReplayDivergenceError.
+      await expect(events.create(run.runId, eventData)).rejects.toSatisfy((err: unknown) =>
+        EntityConflictError.is(err),
+      );
 
       const listResult = await steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'step_created')).toHaveLength(1);
+    });
+
+    it('rejects a duplicate wait_created with EntityConflictError', async () => {
+      const run = await createRun();
+      const waitId = 'wait-idempotent';
+      const eventData = {
+        eventType: 'wait_created' as const,
+        correlationId: waitId,
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      };
+
+      await events.create(run.runId, eventData);
+
+      // Waits have no entity table; the event log unique index is the only
+      // guard against a replayed wait_created duplicating the log.
+      await expect(events.create(run.runId, eventData)).rejects.toSatisfy((err: unknown) =>
+        EntityConflictError.is(err),
+      );
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
     it('should handle duplicate hook_created events', async () => {
@@ -269,7 +314,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -287,7 +332,7 @@ describe('Storage (MySQL + Redis integration)', () => {
     });
   });
 
-  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt` — the conformance
+  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt`: the conformance
   // suite has no coverage for this, so pin the semantics here.
   describe('stateUpdatedAt optimistic-concurrency guard', () => {
     const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
@@ -332,7 +377,7 @@ describe('Storage (MySQL + Redis integration)', () => {
       await events.create(run.runId, { eventType: 'run_started' });
       const marker = await completeStep(run.runId, 'step-guard-source');
 
-      // Equal must pass — `<=` here would livelock an up-to-date client.
+      // Equal must pass; `<=` here would livelock an up-to-date client.
       const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
         stateUpdatedAt: marker,
       });

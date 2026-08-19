@@ -92,10 +92,8 @@ describe('Storage (Azure Cosmos DB integration)', () => {
           return { resource: doc };
         }),
         // Mirrors @azure/cosmos transactional batch: all-or-nothing within a
-        // partition, and — as verified against the Cosmos Linux emulator —
-        // a rejected operation RESOLVES with HTTP 207 and the failing status
-        // on result[i].statusCode (siblings 424) rather than throwing. The
-        // storage layer's assertBatchCommitted path turns that into an error.
+        // partition, and a rejected operation RESOLVES with HTTP 207 carrying the
+        // failing status on result[i].statusCode (siblings 424) rather than throwing.
         batch: vi.fn(async (operations: any[], _partitionKey: string) => {
           /** Evaluate the `from c where c.<field> <op> <number>` conditions we emit. */
           const conditionHolds = (condition: string | undefined, doc: any): boolean => {
@@ -243,7 +241,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       expect(result1.run).not.toHaveProperty('type');
 
       // The runtime's start() path swallows EntityConflictError for raced
-      // duplicate creates — matching world-local/world-postgres semantics.
+      // duplicate creates, matching world-local/world-postgres semantics.
       await expect(storage.events.create(runId, eventData)).rejects.toSatisfy((err) =>
         EntityConflictError.is(err),
       );
@@ -313,7 +311,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await storage.events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -535,10 +533,8 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       return time;
     }
 
-    /**
-     * Drive a run to the point where an externally-originated step_completed
-     * has advanced the state marker, and report the marker value.
-     */
+    /** Drive a run until an externally-originated step_completed has advanced the
+     * state marker, and report the marker value. */
     async function runWithMarker(): Promise<{ runId: string; marker: number }> {
       const run = await createRun('guard-workflow');
       await storage.events.create(run.runId, { eventType: 'run_started' });

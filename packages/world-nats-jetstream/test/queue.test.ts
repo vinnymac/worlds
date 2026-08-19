@@ -64,7 +64,7 @@ describe('Queue (NATS JetStream integration)', () => {
     const queueName = ValidQueueName.parse('__wkf_step_attempt-demo');
     await world.queue(queueName, { hello: 'world' });
 
-    // First delivery fails (500) → nak with 5s backoff → redelivery.
+    // First delivery fails (500) -> nak with 5s backoff -> redelivery.
     await vi.waitFor(() => expect(received.length).toBeGreaterThanOrEqual(2), {
       timeout: 30_000,
       interval: 250,

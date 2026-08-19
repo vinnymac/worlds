@@ -103,7 +103,8 @@ All tables use CBOR serialization for efficient binary storage with JSON fallbac
 
 ## Requirements
 
-- MySQL 5.7+ (8.0+ recommended)
+- MySQL 8.0.13+ (functional indexes and window functions are required by the
+  schema migrations)
 - Redis 3.2+
 - Node.js 18+
 

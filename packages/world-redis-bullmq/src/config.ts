@@ -84,20 +84,14 @@ export interface RedisWorldConfig {
    * lives until the job completes or fails, so duplicate enqueues are dropped
    * for the entire lifetime of the pending/delayed job (the semantics the
    * workflow runtime relies on when re-enqueuing pending steps on replay).
-   * Only set this if you need the dedup guard to expire on wall-clock time —
+   * Only set this if you need the dedup guard to expire on wall-clock time;
    * it must be much larger than the longest expected queue delay/backlog,
    * otherwise duplicate step executions become possible.
    * Default: undefined (dedup key released on job completion)
    */
   idempotencyTtlMs?: number;
 
-  /**
-   * Maximum number of events a single run may accumulate. Reported to the
-   * runtime on the `run_started` response as `EventResult.maxEvents`; the
-   * runtime fails the run with `MAX_EVENTS_EXCEEDED` once the log reaches it
-   * (and may only clamp the value further down).
-   * Must be a positive integer.
-   * Default: process.env.WORKFLOW_MAX_EVENTS || 25_000
-   */
+  /** Maximum events a run may accumulate, reported as `EventResult.maxEvents`.
+   * Default: `WORKFLOW_MAX_EVENTS` || 25_000 */
   maxEventsPerRun?: number;
 }

@@ -11,7 +11,7 @@ const DEFAULT_MAX_RETRIES = 5;
 
 /**
  * `Items.batch()` in @azure/cosmos catches every failure and rethrows
- * `new Error("Batch request error: <server message>")` — a plain Error with
+ * `new Error("Batch request error: <server message>")`, a plain Error with
  * no `.code`/`.statusCode`. Detect that wrapper so callers can translate
  * batch failures (conflict re-reads, throttle retries, etag races).
  */
@@ -21,19 +21,13 @@ export function isWrappedBatchError(err: unknown): err is Error {
   return err instanceof Error && err.message.startsWith(BATCH_ERROR_PREFIX);
 }
 
-/**
- * Per-operation status meaning "rolled back because a sibling operation in the
- * same transactional batch failed" — never the root cause.
- */
+/** Per-operation status meaning "rolled back because a sibling operation in
+ * the same transactional batch failed", never the root cause. */
 const HTTP_FAILED_DEPENDENCY = 424;
 
-/**
- * A transactional-batch operation that the server rejected.
- *
- * Shaped so both classifiers keep working: the `Batch request error:` prefix
- * satisfies {@link isWrappedBatchError}, and `code` carries the real status
- * that `Items.batch()` would otherwise discard.
- */
+/** A transactional-batch operation that the server rejected. The `Batch
+ * request error:` prefix satisfies {@link isWrappedBatchError}; `code` carries
+ * the status `Items.batch()` would otherwise discard. */
 export class BatchOperationError extends Error {
   readonly code: number;
 
@@ -44,14 +38,9 @@ export class BatchOperationError extends Error {
   }
 }
 
-/**
- * Surface a rejected transactional batch as an error.
- *
- * `Items.batch()` only wraps *transport* failures — a rejected operation comes
- * back as a resolved response (HTTP 207) carrying the failing status on
- * `result[i].statusCode`, with siblings marked 424. Nothing is committed in
- * that case, so a caller that ignores the response silently drops the write.
- */
+/** Surface a rejected transactional batch as an error. `Items.batch()` wraps
+ * only transport failures; a rejected operation resolves as HTTP 207, so an
+ * unchecked response silently drops the write. */
 export function assertBatchCommitted(response: { result?: OperationResponse[] }): void {
   const results = response.result;
   if (!results) return;

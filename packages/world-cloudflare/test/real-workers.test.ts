@@ -1,7 +1,7 @@
 /**
  * Real Cloudflare Workers tests
  * These tests run in the Workers runtime using @cloudflare/vitest-pool-workers
- * and test REAL Durable Objects with SQLite storage — the same applyEvent
+ * and test REAL Durable Objects with SQLite storage; the same applyEvent
  * transaction and streamer RPC protocol used in production.
  */
 

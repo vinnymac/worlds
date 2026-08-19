@@ -43,7 +43,7 @@ function decodeChunkCursor(cursor: string | undefined): ChunkCursor | null {
  * Unlike PostgreSQL which uses NOTIFY/LISTEN for real-time push notifications,
  * MySQL lacks native pub/sub. Readers poll for new chunks instead.
  *
- * Ordering is by the monotonic ULID chunkId — never by timestamp. Chunks
+ * Ordering is by the monotonic ULID chunkId, never by timestamp. Chunks
  * written within the same millisecond (the norm for token streaming) would
  * collide on a timestamp sequence and be silently dropped or reordered.
  */

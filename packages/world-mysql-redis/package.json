@@ -53,6 +53,7 @@
   },
   "dependencies": {
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "cbor-x": "catalog:",
     "drizzle-orm": "catalog:",

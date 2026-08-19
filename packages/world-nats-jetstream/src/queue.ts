@@ -12,6 +12,7 @@ import type { JetStreamClient, JsMsg } from 'nats';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
+import { createWorkflowUrl } from '@workflow/utils';
 import type { NatsJetStreamWorldConfig } from './config.js';
 import { debug } from './util.js';
 
@@ -48,7 +49,7 @@ const ACK_WAIT_NANOS = 30 * 1_000_000_000; // 30 seconds
  * Interval at which in-flight deliveries send `working()` progress heartbeats
  * to extend the ack deadline. Must be comfortably below ACK_WAIT_NANOS so a
  * handler that outlives ack_wait (HTTP dispatch allows up to httpTimeoutMs)
- * is never redelivered — and executed concurrently — while still running.
+ * is never redelivered (and executed concurrently) while still running.
  */
 const ACK_PROGRESS_INTERVAL_MS = 10_000;
 
@@ -118,13 +119,9 @@ export function createQueue(
    */
   const inflightWorkflowRuns = new Map<string, Promise<void>>();
 
-  /**
-   * Serialization key for a delivery, or `undefined` when it may run freely.
-   *
-   * Only workflow invocations are keyed: step deliveries must stay parallel so
-   * fan-out is preserved. A payload that is not a workflow invocation (a step
-   * or health-check message on the workflow stream) falls through unserialized.
-   */
+  /** Serialization key for a delivery, or `undefined` when it may run freely.
+   * Only workflow invocations are keyed; step deliveries stay parallel so
+   * fan-out is preserved. */
   function workflowRunSerializationKey(kind: QueueKind, message: QueuePayload): string | undefined {
     if (kind !== 'workflow') return undefined;
     const invoke = WorkflowInvokePayloadSchema.safeParse(message);
@@ -132,25 +129,9 @@ export function createQueue(
     return `workflow:${invoke.data.runId}`;
   }
 
-  /**
-   * Run `task`, serialized against every other delivery sharing `key`.
-   *
-   * All worker coroutines for a stream share one durable consumer, so two
-   * deliveries for the same run are routinely handed to two workers at once.
-   * Replaying a run twice concurrently corrupts its event log: each replay
-   * allocates its own `step_created` correlationId, and neither replay can
-   * consume the other's event, which surfaces as `ReplayDivergenceError` and
-   * ultimately `CorruptedEventLogError`. Chaining deliveries per run removes
-   * that race.
-   *
-   * A failed task must not poison the chain, hence the `catch` on the
-   * predecessor; the identity check before deleting keeps a newer link from
-   * being evicted by an older one's cleanup.
-   *
-   * This mirrors the reference world-postgres implementation and shares its
-   * limitation: it serializes within a process, not across them. The storage
-   * layer's `stateUpdatedAt` guard is what covers the cross-process case.
-   */
+  /** Run `task`, serialized against every other delivery sharing `key`. Workers
+   * share one durable consumer, so two deliveries for a run would otherwise
+   * replay concurrently and corrupt its event log. Per-process only. */
   async function runSerialized(key: string | undefined, task: () => Promise<void>): Promise<void> {
     if (!key) {
       await task();
@@ -257,10 +238,10 @@ export function createQueue(
   async function dispatch(
     envelope: MessageEnvelope,
     attempt: number,
-    pathname: string,
+    pathname: 'flow' | 'step',
   ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(baseUrl, { type: pathname });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -274,14 +255,12 @@ export function createQueue(
     });
   }
 
-  /**
-   * Dispatch one delivery and settle it (ack / nak). Never throws: every
-   * failure mode is translated into a nak so JetStream owns the redelivery.
-   */
+  /** Dispatch one delivery and settle it (ack / nak). Never throws: every
+   * failure is translated into a nak so JetStream owns the redelivery. */
   async function deliver(
     msg: JsMsg,
     envelope: MessageEnvelope,
-    pathname: string,
+    pathname: 'flow' | 'step',
     streamName: string,
   ): Promise<void> {
     try {
@@ -351,7 +330,7 @@ export function createQueue(
           throw err;
         }
         // The durable already exists with an older configuration (e.g. the
-        // previous max_deliver: 3) — reconcile the retry policy in place.
+        // previous max_deliver: 3); reconcile the retry policy in place.
         await jsm.consumers.update(streamName, consumerName, {
           max_deliver: MAX_DELIVER,
           ack_wait: ACK_WAIT_NANOS,
@@ -379,12 +358,9 @@ export function createQueue(
           continue;
         }
 
-        // Extend the ack deadline for as long as this delivery is ours. That
-        // covers both the in-flight dispatch (HTTP handlers may run up to
-        // httpTimeoutMs, default 300s, far beyond ack_wait's 30s) and any
-        // time spent queued behind another replay of the same run — a
-        // waiting message that stopped heartbeating would be redelivered to
-        // another worker and reintroduce the concurrency we are removing.
+        // Extend the ack deadline while this delivery is ours: dispatch may run to
+        // httpTimeoutMs, and a message queued behind another replay of the same run
+        // would otherwise be redelivered to a second worker.
         const progressTimer = setInterval(() => {
           msg.working();
         }, ACK_PROGRESS_INTERVAL_MS);

@@ -48,7 +48,7 @@ describe('Firestore Container Smoke Test', () => {
   it('should start container successfully', () => {
     expect(container).toBeDefined();
     expect(container.getEmulatorEndpoint()).toBeTruthy();
-    console.log(`[Smoke Test] ✓ Container startup time: ${startupTime}ms`);
+    console.log(`[Smoke Test] Container startup time: ${startupTime}ms`);
   });
 
   it('should connect to Firestore emulator', async () => {
@@ -57,7 +57,7 @@ describe('Firestore Container Smoke Test', () => {
     // Try to list collections (should be empty initially)
     const collections = await firestore.listCollections();
     expect(collections).toBeInstanceOf(Array);
-    console.log(`[Smoke Test] ✓ Connected to Firestore, found ${collections.length} collections`);
+    console.log(`[Smoke Test] Connected to Firestore, found ${collections.length} collections`);
   });
 
   it('should perform basic CRUD operations', async () => {
@@ -91,7 +91,7 @@ describe('Firestore Container Smoke Test', () => {
     const deletedDoc = await firestore.collection(collectionName).doc(docId).get();
     expect(deletedDoc.exists).toBe(false);
 
-    console.log('[Smoke Test] ✓ CRUD operations successful');
+    console.log('[Smoke Test] CRUD operations successful');
   });
 
   it('should support subcollections', async () => {
@@ -109,7 +109,7 @@ describe('Firestore Container Smoke Test', () => {
     expect(childDoc.exists).toBe(true);
     expect(childDoc.data()?.name).toBe('Child Document');
 
-    console.log('[Smoke Test] ✓ Subcollections working');
+    console.log('[Smoke Test] Subcollections working');
   });
 
   it('should support collection group queries', async () => {
@@ -131,6 +131,6 @@ describe('Firestore Container Smoke Test', () => {
       .get();
 
     expect(snapshot.docs.length).toBe(2);
-    console.log('[Smoke Test] ✓ Collection group queries working');
+    console.log('[Smoke Test] Collection group queries working');
   });
 });

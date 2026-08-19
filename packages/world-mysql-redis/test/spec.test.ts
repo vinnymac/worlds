@@ -2,7 +2,7 @@ import { MySqlContainer } from '@testcontainers/mysql';
 import { RedisContainer } from '@testcontainers/redis';
 import { createTestSuite } from '@workflow/world-testing';
 // Not re-exported from the package entry point and not wired into
-// createTestSuite (world-testing 4.1.18) — opt in via the deep import.
+// createTestSuite (world-testing 4.1.18); opt in via the deep import.
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 import mysql from 'mysql2/promise';
@@ -75,6 +75,20 @@ if (shouldSkipTests) {
         INDEX \`idx_workflow_events_run_id\` (\`run_id\`),
         INDEX \`idx_workflow_events_correlation_id\` (\`correlation_id\`)
       )`,
+
+      // Mirrors migrations/0007_events_entity_creation_unique.sql so the
+      // conformance suite exercises the same duplicate-creation-event
+      // constraint the storage layer relies on.
+      `CREATE UNIQUE INDEX \`workflow_events_entity_creation_unique\`
+        ON \`workflow\`.\`workflow_events\` (
+          (CASE
+            WHEN \`type\` IN ('step_created', 'hook_created', 'wait_created')
+            THEN \`run_id\`
+            ELSE NULL
+          END),
+          \`correlation_id\`,
+          \`type\`
+        )`,
 
       `CREATE TABLE \`workflow\`.\`workflow_steps\` (
         \`run_id\` VARCHAR(255) NOT NULL,

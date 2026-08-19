@@ -36,8 +36,8 @@ interface StreamChunkEvent {
 /**
  * Compare two Redis stream entry IDs (`<ms>-<seq>`) numerically.
  *
- * String comparison is NOT safe here: within one millisecond `…-10` compares
- * lexicographically smaller than `…-9`, which would drop chunks (and the eof
+ * String comparison is NOT safe here: within one millisecond `...-10` compares
+ * lexicographically smaller than `...-9`, which would drop chunks (and the eof
  * marker) once the sequence number crosses a digit boundary.
  */
 function compareStreamEntryIds(a: string, b: string): number {

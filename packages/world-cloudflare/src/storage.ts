@@ -82,25 +82,17 @@ export interface CloudflareStorageConfig {
     WORKFLOW_INDEX: KVNamespace;
   };
   deploymentId: string;
-  /**
-   * Per-run event ceiling reported to the runtime as `EventResult.maxEvents`.
-   * Defaults to `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}.
-   */
+  /** Per-run event ceiling reported as `EventResult.maxEvents`. Defaults to
+   * `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
   maxEventsPerRun?: number;
 }
 
-/**
- * Default per-run event ceiling. Mirrors `@workflow/world-local`, which in
- * turn mirrors the Vercel World.
- */
+/** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
 
-/**
- * Resolve the per-run event ceiling: explicit config wins, then the
- * `WORKFLOW_MAX_EVENTS` environment variable, then the default. An explicitly
- * configured value must be a positive integer — a bad value is a
- * misconfiguration, not something to silently paper over.
- */
+/** Resolve the per-run event ceiling: explicit config, then
+ * `WORKFLOW_MAX_EVENTS`, then the default. An explicit value must be a
+ * positive integer. */
 function resolveMaxEventsPerRun(configured: number | undefined): number {
   if (configured !== undefined) {
     if (!Number.isInteger(configured) || configured <= 0) {
@@ -299,7 +291,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // global index. The check-then-write across KV and the DO is not
         // atomic (KV has no compare-and-swap); the DO-side hook_created event
         // marker keeps same-run replays exactly-once, while cross-run token
-        // races remain best-effort — matching KV's consistency model.
+        // races remain best-effort, matching KV's consistency model.
         let tokenHolder: ApplyEventRequest['tokenHolder'];
         if (data.eventType === 'hook_created') {
           const raw = await env.WORKFLOW_INDEX.get(`hook:${data.eventData.token}`);

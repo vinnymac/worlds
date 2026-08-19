@@ -1083,7 +1083,7 @@ describe('Storage (Firestore integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await storage.events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -1363,7 +1363,7 @@ describe('Storage (Firestore integration)', () => {
         input: [],
       });
 
-      // Create many events back-to-back (several share a millisecond) —
+      // Create many events back-to-back (several share a millisecond);
       // eventId (monotonic ULID) ordering must not skip any of them.
       const total = 10;
       for (let i = 0; i < total; i++) {
@@ -1458,10 +1458,8 @@ describe('Storage (Firestore integration)', () => {
       return time;
     }
 
-    /**
-     * Drive a run to the point where an externally-originated step_completed
-     * has advanced the state marker, and report the marker value.
-     */
+    /** Drive a run until an externally-originated step_completed has advanced the
+     * state marker, and report the marker value. */
     async function runWithMarker(): Promise<{ runId: string; marker: number }> {
       const run = await createRun({
         deploymentId: 'test-deployment',

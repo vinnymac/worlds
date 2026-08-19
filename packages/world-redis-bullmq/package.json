@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "bullmq": "^5.64.1",
     "ioredis": "catalog:",

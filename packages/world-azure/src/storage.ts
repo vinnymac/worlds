@@ -68,27 +68,18 @@ type CosmosDoc = Record<string, unknown>;
  */
 const MAX_TRANSITION_ATTEMPTS = 5;
 
-/**
- * Id of the per-run optimistic-concurrency marker document. It lives in the
- * run's own partition so it can participate in the same transactional batch as
- * the event it guards.
- */
+/** Id of the per-run concurrency marker document. Lives in the run's own
+ * partition so it can join the same transactional batch as the event. */
 function stateMarkerId(runId: string): string {
   return `marker:${runId}`;
 }
 
-/**
- * Event types that advance the state marker when created outside a replay
- * (i.e. without a `stateUpdatedAt` snapshot). Deliberately narrow: core also
- * omits `stateUpdatedAt` on `run_created` / `run_started` / `run_failed`, and
- * advancing on those would reject every subsequent replay-origin create.
- */
+/** Event types that advance the state marker when created outside a replay.
+ * Narrow by design: core also omits `stateUpdatedAt` on `run_created` /
+ * `run_started` / `run_failed`, and advancing there would reject replays. */
 const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
 
-/**
- * Default per-run event ceiling. Mirrors `@workflow/world-local`, which in
- * turn mirrors the Vercel World.
- */
+/** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
 
 interface CosmosStorageConfig {
@@ -97,30 +88,23 @@ interface CosmosStorageConfig {
   /** Secondary container for O(1) hook lookup by token (partition key: /token) */
   hooksByTokenContainer: Container;
   deploymentId: string;
-  /**
-   * Per-run event ceiling reported to the runtime as `EventResult.maxEvents`.
-   * Defaults to `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}.
-   */
+  /** Per-run event ceiling reported as `EventResult.maxEvents`. Defaults to
+   * `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
   maxEventsPerRun?: number;
 }
 
-/**
- * Extra transactional-batch operations that enforce (or advance) the per-run
- * state marker, plus the snapshot they were built from. Threaded into every
- * batch so the guard commits or rolls back together with the event.
- */
+/** Transactional-batch operations enforcing or advancing the state marker,
+ * plus the snapshot they were built from. Threaded into every batch so the
+ * guard commits or rolls back with the event. */
 interface StateGuard {
   operations: OperationInput[];
   /** `CreateEventParams.stateUpdatedAt`, when the caller sent one. */
   stateUpdatedAt?: number;
 }
 
-/**
- * Resolve the per-run event ceiling: explicit config wins, then the
- * `WORKFLOW_MAX_EVENTS` environment variable, then the default. An explicitly
- * configured value must be a positive integer — a bad value is a
- * misconfiguration, not something to silently paper over.
- */
+/** Resolve the per-run event ceiling: explicit config, then
+ * `WORKFLOW_MAX_EVENTS`, then the default. An explicit value must be a
+ * positive integer. */
 function resolveMaxEventsPerRun(configured: number | undefined): number {
   if (configured !== undefined) {
     if (!Number.isInteger(configured) || configured <= 0) {
@@ -136,11 +120,8 @@ function resolveMaxEventsPerRun(configured: number | undefined): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
 }
 
-/**
- * ULID time (epoch ms) embedded in a prefixed event id, or undefined when the
- * id is not a decodable ULID. Mirrors core's `latestEventStateUpdatedAt`,
- * which likewise fails open rather than livelocking on an undecodable id.
- */
+/** ULID time (epoch ms) of a prefixed event id, or undefined when it is not
+ * a decodable ULID. Mirrors core, which likewise fails open. */
 function eventIdTime(eventId: string): number | undefined {
   const underscore = eventId.lastIndexOf('_');
   const rawUlid = underscore === -1 ? eventId : eventId.slice(underscore + 1);
@@ -425,22 +406,17 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   const ulid = monotonicFactory();
   const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
 
-  /**
-   * Read the per-run state marker, or undefined when the run predates the
-   * marker (legacy runs) or has recorded no externally-originated event yet.
-   */
+  /** Read the per-run state marker, or undefined for legacy runs and runs with
+   * no externally-originated event yet. */
   async function readStateMarker(runId: string): Promise<number | undefined> {
     const doc = await readRunPartitionDoc(runId, stateMarkerId(runId));
     const value = doc?.stateUpdatedAt;
     return typeof value === 'number' ? value : undefined;
   }
 
-  /**
-   * Re-read the marker after a rejected batch and translate the rejection into
-   * the contract error when the guard was the cause. Batch failures arrive
-   * without a usable status (see util.ts), so the cause is established by
-   * re-reading rather than by inspecting the error.
-   */
+  /** Re-read the marker after a rejected batch and translate the rejection into
+   * the contract error when the guard caused it. Batch failures arrive without
+   * a usable status (see util.ts). */
   async function throwIfStale(runId: string, stateUpdatedAt: number): Promise<void> {
     const marker = await readStateMarker(runId);
     if (marker !== undefined && stateUpdatedAt < marker) {
@@ -451,15 +427,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     }
   }
 
-  /**
-   * Execute a same-partition transactional batch with 429 retry.
-   * All event + entity mutations go through here so the event log and the
-   * materialized entities can never diverge on partial failure.
-   *
-   * `guard` appends the optimistic-concurrency operations, making the marker
-   * check (or advance) atomic with the event write: a batch is all-or-nothing,
-   * so a failed guard condition rolls the event back too.
-   */
+  /** Execute a same-partition transactional batch with 429 retry. All event +
+   * entity mutations go through here, and `guard` appends the concurrency
+   * operations so the marker check commits atomically with the event. */
   async function commitBatch(
     operations: OperationInput[],
     partitionKey: string,
@@ -485,10 +455,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     }
   }
 
-  /**
-   * Commit an event document that has no same-partition entity mutation.
-   * Still a batch, so the state guard commits atomically with the event.
-   */
+  /** Commit an event document with no same-partition entity mutation. Still a
+   * batch, so the state guard commits atomically with the event. */
   function commitEventDoc(eventDoc: CosmosDoc, runId: string, guard: StateGuard) {
     return commitBatch(
       [{ operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) }],
@@ -636,7 +604,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
    * same-partition transactional batch, with the replace guarded by the
    * document etag. On a concurrent write the read-guard-write cycle retries,
    * so a run that raced into a terminal state surfaces as the proper
-   * contract error instead of being resurrected — and a terminal event can
+   * contract error instead of being resurrected, and a terminal event can
    * never be appended without its entity transition.
    */
   async function updateRunFromEvent(
@@ -792,7 +760,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       );
     } catch (error: unknown) {
       // See createRunFromEvent: batch errors are opaque, so re-read to
-      // classify. Duplicate step_created → EntityConflictError, which the
+      // classify. Duplicate step_created -> EntityConflictError, which the
       // runtime's concurrent-replay catch path swallows.
       if (isConflictError(error) || isWrappedBatchError(error)) {
         const existing = await getStepDoc(runId, stepId);
@@ -857,7 +825,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           if (!doc.startedAt) {
             doc.startedAt = now.toISOString();
           }
-          // The step is running now — clear any pending retry schedule.
+          // The step is running now; clear any pending retry schedule.
           delete doc.retryAfter;
           if (eventData?.attempt !== undefined) {
             doc.attempt = eventData.attempt;
@@ -923,7 +891,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
   /**
    * Internal: create a wait entity (called from events.create for wait_created).
-   * Duplicate wait_created for the same correlationId → EntityConflictError,
+   * Duplicate wait_created for the same correlationId -> EntityConflictError,
    * which the runtime's suspended-replay catch path swallows.
    */
   async function createWaitFromEvent(
@@ -971,7 +939,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
   /**
    * Internal: transition a wait entity to completed (called from events.create
-   * for wait_completed). Duplicate completions → EntityConflictError so
+   * for wait_completed). Duplicate completions -> EntityConflictError so
    * at-least-once wake-up deliveries never append duplicate wait events.
    */
   async function completeWaitFromEvent(
@@ -1027,7 +995,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
    * Internal: dispose a hook (called from events.create for hook_disposed).
    * Deletes the hook document atomically with the hook_disposed event and
    * releases the token claim so future workflows can reuse the token before
-   * the run completes. A concurrent dispose → EntityConflictError (matching
+   * the run completes. A concurrent dispose -> EntityConflictError (matching
    * the postgres DELETE ... RETURNING semantics).
    */
   async function disposeHookFromEvent(
@@ -1116,11 +1084,11 @@ export function createStorage(config: CosmosStorageConfig): Storage {
    * Writes the hook documents first and the hook_created event last, so a crash
    * mid-way leaves recoverable orphaned hook docs (no event). Semantics match the
    * reference worlds:
-   * - Same-entity duplicate (event already in the log) → EntityConflictError, so
+   * - Same-entity duplicate (event already in the log) -> EntityConflictError, so
    *   the runtime's concurrent-replay catch path swallows it (matching step_created).
-   * - Crash-orphaned hook docs (no event in the log) → complete the partial write
+   * - Crash-orphaned hook docs (no event in the log) -> complete the partial write
    *   by emitting the missing hook_created event.
-   * - A different run/hook already holding the token → store a hook_conflict event
+   * - A different run/hook already holding the token -> store a hook_conflict event
    *   (with conflictingRunId) instead, letting the workflow fail gracefully when
    *   the hook is awaited.
    */
@@ -1222,7 +1190,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       return handleClaimedToken(existingClaim);
     }
 
-    // Claim the token first — it is the uniqueness anchor. A 409 here means a
+    // Claim the token first; it is the uniqueness anchor. A 409 here means a
     // concurrent writer won the race; re-read and classify.
     // Note: Can't use upsert() due to emulator bug - it throws 409 instead of upserting
     try {
@@ -1328,7 +1296,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters.push({ name: '@status', value: params.status });
         }
 
-        // Order and paginate by runId (monotonic ULID) — createdAt has
+        // Order and paginate by runId (monotonic ULID); createdAt has
         // millisecond precision, so cursor pagination on it can skip runs
         // sharing the boundary timestamp.
         if (params?.pagination?.cursor) {
@@ -1445,7 +1413,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
                 effectiveRunId,
               );
             } catch (error: unknown) {
-              // A concurrent run_created won the race — the run exists,
+              // A concurrent run_created won the race; the run exists,
               // which is all the bootstrap needs.
               if (isConflictError(error) || isWrappedBatchError(error)) {
                 if (!(await getRunDoc(effectiveRunId))) throw error;
@@ -1493,20 +1461,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const parsed = EventSchema.parse(parsedInput);
         const result: EventResult = { event: parsed };
 
-        // ============================================================
-        // GUARD: optimistic concurrency (CreateEventParams.stateUpdatedAt).
-        //
-        // Cosmos has no serializable read, so the check is expressed as a
-        // conditional Patch on the marker document inside the SAME
-        // transactional batch as the event write. A concurrent
-        // externally-originated event moves the marker past the snapshot, the
-        // condition fails, and the batch (event included) rolls back — which
-        // commitBatch then re-reads and reports as PreconditionFailedError.
-        //
-        // Strictly-older snapshots are rejected; an equal snapshot passes (an
-        // up-to-date client must never livelock) and an absent snapshot fails
-        // open, disabling the guard for that create.
-        // ============================================================
+        // Cosmos has no serializable read, so the guard is a conditional Patch on the
+        // marker inside the same transactional batch as the event write. Strictly
+        // older snapshots are rejected; equal passes and absent fails open.
         const stateUpdatedAt = params?.stateUpdatedAt;
         const guard: StateGuard = { operations: [], stateUpdatedAt };
         if (stateUpdatedAt !== undefined) {
@@ -1534,12 +1491,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           // No marker document => run predates the guard (or has recorded no
           // externally-originated event): nothing to be stale against.
         } else if (EXTERNAL_EVENT_TYPES.has(data.eventType)) {
-          // Externally originated: this event becomes the new marker.
-          //
-          // Written as an unconditional Upsert so a parallel step fan-out never
-          // contends on an etag. Two advances racing can leave the marker a few
-          // ms behind the newest event, which only ever weakens the guard
-          // (fail-open) — it can never produce a spurious rejection.
+          // Externally originated: this event becomes the new marker. Unconditional
+          // Upsert so a fan-out never contends on an etag; a racing advance can only
+          // leave the marker behind, which weakens the guard but never rejects.
           const time = eventIdTime(eventId);
           const marker = await readStateMarker(effectiveRunId);
           if (time !== undefined && (marker === undefined || time > marker)) {
@@ -1558,10 +1512,10 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         // These run BEFORE the event document is written so rejected
         // duplicates can never corrupt the replay log. The runtime
         // relies on these errors (see @workflow/core step/run handlers):
-        // - RunExpiredError: run already terminal → skip the message
-        // - EntityConflictError: duplicate/terminal entity → treat as
+        // - RunExpiredError: run already terminal -> skip the message
+        // - EntityConflictError: duplicate/terminal entity -> treat as
         //   an idempotent concurrent replay and continue
-        // - TooEarlyError: step retryAfter not reached → defer via queue
+        // - TooEarlyError: step retryAfter not reached -> defer via queue
         // ============================================================
         const runGuardedEvents = [
           'run_started',
@@ -1669,7 +1623,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
         // Entity side effects. All entity-bearing events commit the event
         // document and the entity mutation in one same-partition
-        // transactional batch — the event doc is never written separately
+        // transactional batch; the event doc is never written separately
         // for these cases.
         switch (data.eventType) {
           case 'run_created': {
@@ -1796,7 +1750,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         }
 
         // Preload all events for run_started to reduce TTFB.
-        // Ordered by eventId (monotonic ULID) — createdAt has millisecond
+        // Ordered by eventId (monotonic ULID); createdAt has millisecond
         // precision, so concurrent events can tie and replay order would
         // become nondeterministic.
         if (data.eventType === 'run_started' && result.run) {
@@ -1853,7 +1807,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
 
         // Order and paginate by eventId (monotonic ULID). createdAt has
-        // millisecond precision, so concurrent events can tie — replay order
+        // millisecond precision, so concurrent events can tie; replay order
         // would become nondeterministic and cursor pagination could skip
         // events sharing the boundary timestamp.
         const conditions: string[] = ['c.type = "event"', 'c.runId = @runId'];
@@ -1895,7 +1849,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const sortOrder = params.pagination?.sortOrder || 'asc';
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
 
-        // Order and paginate by eventId (monotonic ULID) — see events.list.
+        // Order and paginate by eventId (monotonic ULID), see events.list.
         const conditions: string[] = ['c.type = "event"', 'c.correlationId = @correlationId'];
         const parameters: { name: string; value: string | number }[] = [
           { name: '@correlationId', value: correlationId },
@@ -1938,7 +1892,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           return filterData(step, params?.resolveData, ['input', 'output']);
         }
 
-        // The contract allows omitting runId — fall back to a cross-partition
+        // The contract allows omitting runId; fall back to a cross-partition
         // lookup by stepId.
         const querySpec: SqlQuerySpec = {
           query: 'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId',
@@ -1965,7 +1919,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           { name: '@runId', value: runId },
         ];
 
-        // Order and paginate by stepId — createdAt has millisecond precision,
+        // Order and paginate by stepId; createdAt has millisecond precision,
         // so cursor pagination on it can skip steps sharing the boundary
         // timestamp (matches the postgres reference).
         if (params?.pagination?.cursor) {
@@ -2048,7 +2002,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           { name: '@runId', value: runId },
         ];
 
-        // Order and paginate by hookId — createdAt has millisecond precision,
+        // Order and paginate by hookId; createdAt has millisecond precision,
         // so cursor pagination on it can skip hooks sharing the boundary
         // timestamp (matches the postgres reference).
         if (params?.pagination?.cursor) {

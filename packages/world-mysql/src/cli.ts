@@ -28,6 +28,7 @@ async function setupDatabase() {
       '0001_events_occurred_at.sql',
       '0002_spec_current_queue_streams.sql',
       '0003_runs_state_updated_at.sql',
+      '0004_events_entity_creation_unique.sql',
     ];
 
     for (const file of migrationFiles) {
@@ -44,7 +45,7 @@ async function setupDatabase() {
         );
 
       for (const statement of statements) {
-        // query() (text protocol) — some DDL is not supported by the
+        // query() (text protocol); some DDL is not supported by the
         // prepared statement protocol that execute() uses.
         await connection.query(statement);
       }

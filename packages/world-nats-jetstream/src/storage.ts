@@ -60,14 +60,9 @@ const DEFAULT_TERMINAL_RUN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** Default per-run event ceiling; mirrors the Vercel World. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
 
-/**
- * Resolve the per-run event ceiling reported to the runtime on `run_started`.
- *
- * Explicit config wins; otherwise `WORKFLOW_MAX_EVENTS` (the variable the
- * conformance suite sets on the server it spawns); otherwise the default.
- * A present-but-nonsensical value is a misconfiguration, so it throws rather
- * than silently reverting to the default and leaving runs unbounded.
- */
+/** Resolve the per-run event ceiling reported on `run_started`: explicit
+ * config, then `WORKFLOW_MAX_EVENTS`, then the default. A nonsensical
+ * configured value throws rather than leaving runs unbounded. */
 function resolveMaxEventsPerRun(configured?: number): number {
   if (configured !== undefined) {
     if (!Number.isInteger(configured) || configured <= 0) {
@@ -84,12 +79,8 @@ function resolveMaxEventsPerRun(configured?: number): number {
   return parsed;
 }
 
-/**
- * Decode the ULID time embedded in a prefixed id (e.g. `wevt_01J...`).
- *
- * Matches how the runtime derives `stateUpdatedAt` from the last event it
- * loaded: strip through the *last* underscore, then decode.
- */
+/** Decode the ULID time embedded in a prefixed id (e.g. `wevt_01J...`).
+ * Matches the runtime: strip through the *last* underscore, then decode. */
 function idTime(id: string): number {
   return decodeTime(id.slice(id.lastIndexOf('_') + 1));
 }
@@ -179,7 +170,7 @@ async function casMutate<T>(
       return { type: 'updated', value: result.value };
     } catch (err) {
       if (!isWrongLastSequence(err)) throw err;
-      // Lost the race — re-read and re-validate.
+      // Lost the race: re-read and re-validate.
     }
   }
   throw new WorkflowWorldError(
@@ -252,7 +243,7 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
  *
  * The prefix is pushed down as a server-side subject filter; an empty bucket
  * or a prefix with no matches yields an empty list. Infrastructure failures
- * (connection loss, etc.) propagate — swallowing them here would silently
+ * (connection loss, etc.) propagate; swallowing them here would silently
  * turn index lookups into empty results.
  */
 async function collectIndexKeys(bucket: KV, prefix: string): Promise<string[]> {
@@ -345,7 +336,7 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
           }
         }
       } else {
-        // No status filter — fall back to a scan of live entries
+        // No status filter: fall back to a scan of live entries
         for await (const entry of listLiveEntries(runsBucket)) {
           const data = kvValueToString(entry.value);
           const run: WorkflowRun = parse<WorkflowRun>(data);
@@ -497,12 +488,8 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   // Optimistic-concurrency marker (CreateEventParams.stateUpdatedAt)
   // ------------------------------------------------------------------
 
-  /**
-   * Read a run's state marker: the ULID time of the most recent
-   * *externally-originated* event recorded for it.
-   *
-   * `null` means no such event has been recorded yet, which passes the guard.
-   */
+  /** Read a run's state marker: the ULID time of the most recent
+   * externally-originated event. `null` (none yet) passes the guard. */
   async function readStateMarker(runId: string): Promise<number | null> {
     const entry = await getLiveEntry(runStateMarkersBucket, runId);
     if (!entry) return null;
@@ -513,19 +500,15 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     return marker;
   }
 
-  /**
-   * Advance a run's state marker to `markerTime`, never backwards.
-   *
-   * Revision-checked (CAS) like every other read-modify-write in this module:
-   * a lost update would regress the marker and silently disable the guard for
-   * every later create.
-   */
+  /** Advance a run's state marker to `markerTime`, never backwards.
+   * Revision-checked: a lost update would regress the marker and silently
+   * disable the guard for every later create. */
   async function advanceStateMarker(runId: string, markerTime: number): Promise<void> {
     for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
       const entry = await getLiveEntry(runStateMarkersBucket, runId);
       if (!entry) {
         // `create` only succeeds while the key is absent, so a concurrent
-        // writer cannot be clobbered — it just sends us round again.
+        // writer cannot be clobbered; it just sends us round again.
         const created = await runStateMarkersBucket
           .create(runId, `${markerTime}`)
           .then(() => true)
@@ -543,7 +526,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         return;
       } catch (err) {
         if (!isWrongLastSequence(err)) throw err;
-        // Lost the race — re-read and re-compare.
+        // Lost the race: re-read and re-compare.
       }
     }
     throw new WorkflowWorldError(
@@ -809,7 +792,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             await putEvent(effectiveRunId, runCreatedEventId, runCreatedEvent);
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
           } else {
-            // Run already exists (concurrent run_created won the race) —
+            // Run already exists (concurrent run_created won the race):
             // re-read so downstream logic sees the real state.
             const existing = await getLiveEntry(runsBucket, effectiveRunId);
             if (existing) {
@@ -934,23 +917,9 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         }
       }
 
-      // Optimistic-concurrency guard (@workflow/world 4.3.1). A replay-origin
-      // create carries the ULID time of the newest event the runtime had
-      // loaded. Reject it when an externally-originated event was recorded
-      // after that snapshot, so the runtime reloads instead of writing from a
-      // stale view of the log. An equal timestamp must pass (an up-to-date
-      // client is never rejected — that would livelock it), and an absent
-      // `stateUpdatedAt` disables the guard for this create.
-      //
-      // Checked here, immediately before the first entity mutation, rather
-      // than at the top of `create`: this is as close to the write as a
-      // multi-bucket KV store allows. The marker only ever moves forward, so
-      // a marker advance landing between this read and the write can only
-      // make the guard fail *open* — exactly how a backend that ignores the
-      // field behaves — and can never reject a client that is up to date.
-      //
-      // Legacy (specVersion < 2) runs return above and are never guarded;
-      // they predate the replay model the guard protects.
+      // Reject a replay-origin create whose snapshot predates the newest
+      // externally-originated event; equal passes, absent disables the guard.
+      // Checked here, as close to the write as a multi-bucket KV store allows.
       if (params?.stateUpdatedAt !== undefined) {
         const marker = await readStateMarker(effectiveRunId);
         if (marker !== null && params.stateUpdatedAt < marker) {
@@ -989,7 +958,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
         // Atomically create the run so only the first writer wins. A
         // concurrent resilient-start (run_started on the queue) may have
-        // already created — and even started — this run; overwriting it
+        // already created (and even started) this run; overwriting it
         // here would reset a running run back to 'pending'.
         const created = await runsBucket
           .create(effectiveRunId, stringify(newRun))
@@ -1055,7 +1024,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         });
 
         if (result.type === 'unchanged') {
-          // A concurrent run_started won the CAS race — same replay
+          // A concurrent run_started won the CAS race; same replay
           // semantics as the pre-check above: no duplicate event.
           const parsedRun = WorkflowRunSchema.parse(compact(result.value));
           const resolveData = params?.resolveData ?? 'all';
@@ -1204,7 +1173,21 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           await indexStep(effectiveRunId, data.correlationId!);
           step = StepSchema.parse(compact(newStep));
         } else {
-          // Event replay: return existing step
+          // Step entity exists: distinguish a redelivered step_created (creation
+          // event already durable) from a crash orphan via the event log. JetStream
+          // KV has no unique index, so this read is the only dedup surface.
+          const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
+            events.find(
+              (e) => e.eventType === 'step_created' && e.correlationId === data.correlationId,
+            ),
+          );
+          if (existingEvent) {
+            // Real duplicate: EntityConflictError is the runtime's dedup signal, the
+            // same contract as hook_created/wait_created and the upstream worlds.
+            throw new EntityConflictError(`Step "${data.correlationId}" already exists`);
+          }
+          // Crash orphan: reuse the existing entity and fall through to the
+          // event write below, which completes the partial write.
           const existing = await getLiveEntry(stepsBucket, stepKey);
           if (!existing) {
             throw new WorkflowWorldError(
@@ -1386,11 +1369,11 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             // or an orphaned hook entity from a crash between the entity
             // write and the event write. Distinguish by checking whether the
             // hook_created event actually exists in the log:
-            //   - exists → real duplicate: throw EntityConflictError so the
+            //   - exists -> real duplicate: throw EntityConflictError so the
             //     runtime's replay catch path swallows it, instead of
             //     permanently logging a self hook_conflict that would replay
             //     as HookTokenConflictError.
-            //   - missing → complete the partial write: fall through to the
+            //   - missing -> complete the partial write: fall through to the
             //     event write below, returning the persisted hook.
             const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
               events.find((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
@@ -1482,10 +1465,30 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           .create(waitKey, stringify(newWait))
           .then(() => true)
           .catch(() => false);
-        if (!created) {
-          throw new EntityConflictError(`Wait "${data.correlationId}" already exists`);
+        if (created) {
+          wait = WaitSchema.parse(compact(newWait));
+        } else {
+          // Same duplicate/crash-orphan split as step_created above: a real
+          // duplicate (creation event already durable) throws the runtime's
+          // dedup signal; an orphan (entity written, event write lost) falls
+          // through to the event write below to complete the partial write.
+          const existingEvent = await loadEventsForRun(effectiveRunId).then((events) =>
+            events.find(
+              (e) => e.eventType === 'wait_created' && e.correlationId === data.correlationId,
+            ),
+          );
+          if (existingEvent) {
+            throw new EntityConflictError(`Wait "${data.correlationId}" already exists`);
+          }
+          const existing = await getLiveEntry(waitsBucket, waitKey);
+          if (!existing) {
+            throw new WorkflowWorldError(
+              `Wait "${data.correlationId}" could not be created or read back`,
+              { status: 500 },
+            );
+          }
+          wait = WaitSchema.parse(compact(parse<Wait>(kvValueToString(existing.value))));
         }
-        wait = WaitSchema.parse(compact(newWait));
       }
 
       if (data.eventType === 'wait_completed') {
@@ -1529,14 +1532,9 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       await putEvent(effectiveRunId, eventId, event);
 
-      // Only *externally-originated* events advance the state marker: a
-      // `hook_received` or `step_completed` recorded without a
-      // `stateUpdatedAt`. Replay-origin creates carry one, and the runtime
-      // also creates `run_created`/`run_started`/`run_failed` without one —
-      // advancing on those would reject every subsequent replay of the run.
-      //
-      // Advanced only after the event is durable: a marker ahead of the log
-      // is unreachable by any client and would livelock the run.
+      // Only externally-originated events advance the marker; advancing on the
+      // lifecycle events core sends unguarded would reject every replay. Advanced
+      // only after the event is durable, or the marker outruns the log.
       if (
         params?.stateUpdatedAt === undefined &&
         (data.eventType === 'hook_received' || data.eventType === 'step_completed')
@@ -1551,7 +1549,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       let allEvents: Event[] | undefined;
       if (data.eventType === 'run_started' && run) {
         const eventsList = await loadEventsForRun(effectiveRunId);
-        // Sort by eventId ascending (monotonic ULIDs — the log order)
+        // Sort by eventId ascending (monotonic ULIDs, the log order)
         eventsList.sort((a, b) => compareIds(a.eventId, b.eventId));
         allEvents = eventsList.map((e) =>
           filterEventData(EventSchema.parse(compact(e)), resolveData),
@@ -1603,7 +1601,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       const events = await loadEventsForRun(params.runId);
 
-      // Sort by eventId (monotonic ULIDs — the log order)
+      // Sort by eventId (monotonic ULIDs, the log order)
       if (sortOrder === 'asc') {
         events.sort((a, b) => compareIds(a.eventId, b.eventId));
       } else {
@@ -1642,7 +1640,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       const events: Event[] = [];
 
-      // correlationIds are not indexed — scan live entries (one per event)
+      // correlationIds are not indexed; scan live entries (one per event)
       for await (const entry of listLiveEntries(eventsBucket)) {
         const data = kvValueToString(entry.value);
         const event = parse<Event>(data);
@@ -1652,7 +1650,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         }
       }
 
-      // Sort by eventId (monotonic ULIDs — the log order)
+      // Sort by eventId (monotonic ULIDs, the log order)
       if (sortOrder === 'asc') {
         events.sort((a, b) => compareIds(a.eventId, b.eventId));
       } else {
@@ -1984,7 +1982,7 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
       try {
         const entry = await getLiveEntry(runsBucket, runId);
         if (!entry) {
-          // Stale index — clean up
+          // Stale index: clean up
           try {
             await runsByStatusBucket.delete(`${status}.${runId}`);
           } catch {

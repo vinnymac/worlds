@@ -159,7 +159,7 @@ createWorld({ queueConcurrency: 20 }); // 20 workers per queue
 
 ### Connection Pooling
 
-The world automatically sets connection pool size to `2 × workers + 5`.
+The world automatically sets connection pool size to `2 * workers + 5`.
 
 ## Error Handling
 

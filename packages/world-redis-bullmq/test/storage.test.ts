@@ -499,7 +499,7 @@ describe('Storage (Redis integration)', () => {
   });
 
   describe('Event idempotency', () => {
-    it('should handle duplicate step_created events', async () => {
+    it('rejects a duplicate step_created with EntityConflictError', async () => {
       const run = await createRun();
       const stepId = 'step-idempotent-test';
 
@@ -512,19 +512,50 @@ describe('Storage (Redis integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario)
-      const result2 = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: stepId,
-        eventData: { stepName: 'test-step', input: ['input1'] },
-      });
-      expect(result2.step).toBeDefined();
-      expect(result2.step!.stepId).toBe(stepId);
+      // Redelivered step_created: the runtime catches EntityConflictError as
+      // its dedup signal. Returning success would append a second
+      // step_created row and poison replay with ReplayDivergenceError.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: stepId,
+          eventData: { stepName: 'test-step', input: ['input1'] },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
-      // Verify step appears in list query (critical!)
       const listResult = await steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'step_created')).toHaveLength(1);
+    });
+
+    it('rejects a duplicate wait_created with EntityConflictError', async () => {
+      const run = await createRun();
+      const waitId = 'wait-idempotent-test';
+      const eventData = {
+        eventType: 'wait_created' as const,
+        correlationId: waitId,
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      };
+
+      await events.create(run.runId, eventData);
+
+      // Waits have no entity in this world; the event log is the only
+      // dedup surface guarding a replayed wait_created.
+      await expect(events.create(run.runId, eventData)).rejects.toMatchObject({
+        name: 'EntityConflictError',
+      });
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
     it('should handle duplicate run_created events', async () => {
@@ -594,7 +625,7 @@ describe('Storage (Redis integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -877,7 +908,7 @@ describe('Storage (Redis integration)', () => {
       const streamer = createStreamer({ redis, keyPrefix });
       try {
         // Pre-populate a stream with entries in the same millisecond whose
-        // sequence numbers cross the 9 → 10 digit boundary. Lexicographic ID
+        // sequence numbers cross the 9 -> 10 digit boundary. Lexicographic ID
         // comparison would drop entries 7-10 through 7-12 and the eof marker.
         const streamName = 'digit-boundary-stream';
         const key = `${keyPrefix}stream:${streamName}`;

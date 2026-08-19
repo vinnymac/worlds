@@ -985,7 +985,7 @@ describe('Storage (Postgres integration)', () => {
         (error) => EntityConflictError.is(error),
       );
 
-      // Run stays parseable and completed — never a cancelled run with output
+      // Run stays parseable and completed, never a cancelled run with output
       const persisted = await runs.get(run.runId);
       expect(persisted.status).toBe('completed');
     });
@@ -1247,7 +1247,7 @@ describe('Storage (Postgres integration)', () => {
   });
 
   describe('Event idempotency - creation events', () => {
-    it('should handle duplicate step_created events', async () => {
+    it('rejects a duplicate step_created with EntityConflictError', async () => {
       const run = await createRun(events, {
         deploymentId: 'deployment-idempotency',
         workflowName: 'test-workflow-idempotency',
@@ -1264,19 +1264,54 @@ describe('Storage (Postgres integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario)
-      const result2 = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: stepId,
-        eventData: { stepName: 'test-step', input: ['input1'] },
-      });
-      expect(result2.step).toBeDefined();
-      expect(result2.step!.stepId).toBe(stepId);
+      // Redelivered step_created: the runtime catches EntityConflictError as
+      // its dedup signal. Returning success would append a second
+      // step_created row and poison replay with ReplayDivergenceError.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: stepId,
+          eventData: { stepName: 'test-step', input: ['input1'] },
+        }),
+      ).rejects.toSatisfy((error) => EntityConflictError.is(error));
 
-      // Verify step appears in list query (critical!)
       const listResult = await steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'step_created')).toHaveLength(1);
+    });
+
+    it('rejects a duplicate wait_created with EntityConflictError', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-idempotency',
+        workflowName: 'test-workflow-wait-idempotency',
+        input: [],
+      });
+      const waitId = 'wait-idempotent-test';
+      const eventData = {
+        eventType: 'wait_created' as const,
+        correlationId: waitId,
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      };
+
+      await events.create(run.runId, eventData);
+
+      // Waits have no entity table; the event log unique index is the only
+      // guard against a replayed wait_created duplicating the log.
+      await expect(events.create(run.runId, eventData)).rejects.toSatisfy((error) =>
+        EntityConflictError.is(error),
+      );
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
     it('should handle duplicate run_created events', async () => {
@@ -1354,7 +1389,7 @@ describe('Storage (Postgres integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -1372,7 +1407,7 @@ describe('Storage (Postgres integration)', () => {
     });
   });
 
-  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt` — the conformance
+  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt`: the conformance
   // suite has no coverage for this, so pin the semantics here.
   describe('stateUpdatedAt optimistic-concurrency guard', () => {
     const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
@@ -1425,7 +1460,7 @@ describe('Storage (Postgres integration)', () => {
       const run = await startRun('state-guard-equal');
       const marker = await completeStep(run.runId, 'step-guard-source');
 
-      // Equal must pass — `<=` here would livelock an up-to-date client.
+      // Equal must pass; `<=` here would livelock an up-to-date client.
       const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
         stateUpdatedAt: marker,
       });

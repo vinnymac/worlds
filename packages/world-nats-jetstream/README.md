@@ -289,19 +289,19 @@ nats-server -js -m 8GB --store_dir /fast/ssd/path
 
 **Choose NATS JetStream when you need:**
 
-- ✅ Self-hosted infrastructure with minimal operational complexity
-- ✅ Built-in clustering without external coordination (etcd, Consul)
-- ✅ Exceptional performance (500k+ msgs/sec)
-- ✅ Single binary deployment (no Docker required)
-- ✅ Native streaming capabilities
-- ✅ Zero cloud dependencies
+- Self-hosted infrastructure with minimal operational complexity
+- Built-in clustering without external coordination (etcd, Consul)
+- Exceptional performance (500k+ msgs/sec)
+- Single binary deployment (no Docker required)
+- Native streaming capabilities
+- Zero cloud dependencies
 
 **Consider alternatives if you:**
 
-- ❌ Already use Redis/PostgreSQL and want to minimize infrastructure
-- ❌ Need managed cloud service (use Cloudflare, Firestore, or Upstash)
-- ❌ Require SQL query capabilities (use PostgreSQL worlds)
-- ❌ Have existing NATS expertise bottleneck
+- Already use Redis/PostgreSQL and want to minimize infrastructure
+- Need managed cloud service (use Cloudflare, Firestore, or Upstash)
+- Require SQL query capabilities (use PostgreSQL worlds)
+- Have existing NATS expertise bottleneck
 
 ## Migration Guide
 

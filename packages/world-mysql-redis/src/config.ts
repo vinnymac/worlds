@@ -19,11 +19,8 @@ export interface MysqlRedisWorldConfig {
   backoffDelayMs?: number;
   /** Backoff strategy. Default: 'exponential' */
   backoffType?: 'fixed' | 'exponential';
-  /**
-   * Per-run event ceiling reported to the runtime on `run_started`
-   * (`EventResult.maxEvents`). The runtime fails a runaway run with
-   * `MAX_EVENTS_EXCEEDED` once its replay log reaches this many events.
-   * Default: `WORKFLOW_MAX_EVENTS`, else 25000.
-   */
+  /** Per-run event ceiling reported on `run_started` (`EventResult.maxEvents`);
+   * the runtime fails a runaway run with `MAX_EVENTS_EXCEEDED`.
+   * Default: `WORKFLOW_MAX_EVENTS`, else 25000. */
   maxEventsPerRun?: number;
 }

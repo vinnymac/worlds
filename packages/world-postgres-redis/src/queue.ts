@@ -7,6 +7,7 @@ import {
   QueuePayloadSchema,
   type ValidQueueName,
 } from '@workflow/world';
+import { createWorkflowUrl } from '@workflow/utils';
 import { eq } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
@@ -106,8 +107,8 @@ interface OutboxQueuePayload {
  *   HTTP fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
  * - All delayed redelivery (sleep()/503 soft-retry, failure backoff) goes
  *   through a Redis sorted set scored by delivery time, so pending wake-ups
- *   survive process restarts. A poller promotes due items — and in-flight
- *   items whose visibility deadline expired (crashed worker) — back to the
+ *   survive process restarts. A poller promotes due items, and in-flight
+ *   items whose visibility deadline expired (crashed worker), back to the
  *   ready list.
  */
 export function createQueue(
@@ -188,7 +189,7 @@ export function createQueue(
           return { messageId };
         }
       } catch (err) {
-        // Redis unreachable: fall through — the outbox UNIQUE constraint
+        // Redis unreachable: fall through; the outbox UNIQUE constraint
         // still dedups concurrent enqueues, and delivery-side dedup plus
         // storage-level conflict guards make duplicates benign.
         debug(`Queue: dedup check failed for ${idempotencyKey}:`, err);
@@ -272,9 +273,9 @@ export function createQueue(
     };
   };
 
-  async function dispatch(envelope: MessageEnvelope, pathname: string): Promise<Response> {
+  async function dispatch(envelope: MessageEnvelope, pathname: 'flow' | 'step'): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(baseUrl, { type: pathname });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -329,7 +330,7 @@ export function createQueue(
         },
       });
     } catch (err) {
-      // Run may already be terminal (EntityConflictError) — that's fine.
+      // Run may already be terminal (EntityConflictError); that's fine.
       debug(`Queue: could not record run_failed for dropped message ${envelope.messageId}:`, err);
     }
   }
@@ -456,7 +457,7 @@ export function createQueue(
       // without dispatching. The original owns retry/reschedule handling.
       // Byte-identical duplicates share the in-flight zset member with the
       // original, so acking here would strip the original's visibility
-      // protection — leave that entry for the original's own ack.
+      // protection: leave that entry for the original's own ack.
       if (existing.item !== item) {
         await ack();
       }
