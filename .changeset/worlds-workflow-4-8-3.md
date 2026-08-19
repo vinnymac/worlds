@@ -11,10 +11,4 @@
 "@fantasticfour/world-upstash": minor
 ---
 
-Full support for workflow 4.8.3 (`@workflow/world` 4.3.1 contract): the
-`stateUpdatedAt` optimistic-concurrency guard (stale lifecycle events are
-rejected with a typed `PreconditionFailedError`, atomically per backend) and
-a configurable per-run event ceiling returned as `maxEvents` on `run_started`
-(`maxEventsPerRun` config option, `WORKFLOW_MAX_EVENTS` env var, default
-25,000). SQL worlds ship a `state_updated_at` migration; the new `eventLimit`
-conformance suite is wired in where the backend supports it.
+Add full support for workflow 4.8.3 across every world, along with fixes for duplicate creation events, concurrent replay, fat payload encoding, Azure batch verification, and Firestore error codes.
