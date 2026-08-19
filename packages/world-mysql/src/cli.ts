@@ -1,10 +1,10 @@
-import { config } from 'dotenv';
+import { loadOptionalEnvFile } from '@fantasticfour/shared';
 import mysql from 'mysql2/promise';
 import { applyMigrations } from './migrate.js';
 
 async function setupDatabase() {
-  // Load .env file if it exists
-  config();
+  // Load .env file if it exists.
+  loadOptionalEnvFile();
 
   const connectionString =
     process.env.DATABASE_URL || 'mysql://root:root@localhost:3306/mysql_test';
@@ -12,8 +12,11 @@ async function setupDatabase() {
   console.log('Setting up MySQL database schema...');
   console.log(`Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`);
 
+  let connection: Awaited<ReturnType<typeof mysql.createConnection>> | undefined;
+  let exitCode = 0;
+
   try {
-    const connection = await mysql.createConnection(connectionString);
+    connection = await mysql.createConnection(connectionString);
 
     console.log('\nRunning migrations...');
     await applyMigrations(connection, console.log);
@@ -27,13 +30,14 @@ async function setupDatabase() {
     console.log('  - workflow.workflow_stream_chunks');
     console.log('  - workflow.workflow_jobs');
     console.log('  - workflow.workflow_job_idempotency');
-
-    await connection.end();
-    process.exit(0);
   } catch (error) {
+    exitCode = 1;
     console.error('Failed to setup database:', error);
-    process.exit(1);
+  } finally {
+    await connection?.end().catch(() => {});
   }
+
+  process.exit(exitCode);
 }
 
 // Check if running as main module

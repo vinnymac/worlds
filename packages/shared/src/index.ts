@@ -1,4 +1,5 @@
 export { createDebugLogger } from './debug.js';
+export { loadOptionalEnvFile } from './env.js';
 export {
   DATE_FIELDS,
   dateReviver,

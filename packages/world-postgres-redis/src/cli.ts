@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { config } from 'dotenv';
+import { loadOptionalEnvFile } from '@fantasticfour/shared';
 import postgres from 'postgres';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -47,8 +47,8 @@ function splitStatements(migrationSQL: string): string[] {
 }
 
 async function setupDatabase() {
-  // Load .env file if it exists
-  config();
+  // Load .env file if it exists.
+  loadOptionalEnvFile();
 
   const connectionString =
     process.env.WORKFLOW_POSTGRES_URL ||
@@ -58,8 +58,11 @@ async function setupDatabase() {
   console.log('Setting up database schema...');
   console.log(`Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`);
 
+  let sql: ReturnType<typeof postgres> | undefined;
+  let exitCode = 0;
+
   try {
-    const sql = postgres(connectionString);
+    sql = postgres(connectionString);
 
     // ---- Step 1: Run migrations ----
     console.log('\n[1/3] Running migrations...');
@@ -167,12 +170,15 @@ async function setupDatabase() {
       console.log('\nSetup complete. All tables and triggers verified.');
     }
 
-    await sql.end();
-    process.exit(allPresent ? 0 : 1);
+    exitCode = allPresent ? 0 : 1;
   } catch (error) {
+    exitCode = 1;
     console.error('Failed to setup database:', error);
-    process.exit(1);
+  } finally {
+    await sql?.end().catch(() => {});
   }
+
+  process.exit(exitCode);
 }
 
 // Check if running as main module

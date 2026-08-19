@@ -1,9 +1,9 @@
-import { config } from 'dotenv';
+import { loadOptionalEnvFile } from '@fantasticfour/shared';
 import { Redis } from 'ioredis';
 
 async function setupRedis() {
-  // Load .env file if it exists
-  config();
+  // Load .env file if it exists.
+  loadOptionalEnvFile();
 
   const connectionString =
     process.env.WORKFLOW_REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379';
@@ -14,8 +14,11 @@ async function setupRedis() {
   console.log(`Connection: ${connectionString.replace(/^(\w+:\/\/)([^@]+)@/, '$1[redacted]@')}`);
   console.log(`Key Prefix: ${keyPrefix}`);
 
+  let redis: Redis | undefined;
+  let exitCode = 0;
+
   try {
-    const redis = new Redis(connectionString);
+    redis = new Redis(connectionString);
 
     // Test connection
     await redis.ping();
@@ -58,13 +61,14 @@ async function setupRedis() {
     console.log(`  - Sorted Sets: ${keyPrefix}runs:*, ${keyPrefix}steps:*, ${keyPrefix}events:*`);
     console.log(`  - Streams: ${keyPrefix}stream:*`);
     console.log(`  - BullMQ Queues: workflow_flows, workflow_steps`);
-
-    await redis.quit();
-    process.exit(0);
   } catch (error) {
+    exitCode = 1;
     console.error('Failed to setup Redis:', error);
-    process.exit(1);
+  } finally {
+    await redis?.quit().catch(() => {});
   }
+
+  process.exit(exitCode);
 }
 
 // Check if running as main module

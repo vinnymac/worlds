@@ -12,7 +12,6 @@ catalog:
   '@workflow/world': 4.3.1
   '@workflow/world-testing': 4.1.18
   cbor-x: ^1.6.0
-  dotenv: ^17.4.2
   drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2
   ioredis: ^5.10.1

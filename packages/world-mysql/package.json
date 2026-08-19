@@ -71,7 +71,6 @@
     "@testcontainers/mysql": "catalog:",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
-    "dotenv": "catalog:",
     "drizzle-kit": "catalog:",
     "testcontainers": "catalog:",
     "tsdown": "catalog:",

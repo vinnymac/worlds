@@ -11,7 +11,4 @@ export default defineConfig({
   clean: true,
   outDir: 'dist',
   outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
-  deps: {
-    neverBundle: ['dotenv', 'dotenv/config'],
-  },
 });
