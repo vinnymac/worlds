@@ -55,7 +55,7 @@ function decodeCursor(cursor: string | undefined): number {
  *
  * Each workflow stream maps to a JetStream stream with Limits retention:
  * chunks are retained (bounded by max_msgs/max_age) regardless of consumer
- * presence, so readers that attach after the writer — the normal flow —
+ * presence, so readers that attach after the writer (the normal flow)
  * can replay every chunk from the beginning. Chunk index `i` corresponds
  * to stream sequence `i + 1` (each stream carries a single subject).
  *
@@ -319,7 +319,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
 
             // Create ephemeral consumer for this reader. Chunk index i is
             // stream sequence i + 1, so starting at resolvedStartIndex means
-            // opt_start_seq = resolvedStartIndex + 1 — this is the single
+            // opt_start_seq = resolvedStartIndex + 1; this is the single
             // skip mechanism (no additional client-side skipping).
             const consumerInfo = await jsm.consumers.add(streamName, {
               name: consumerName,

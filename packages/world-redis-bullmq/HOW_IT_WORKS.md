@@ -161,9 +161,9 @@ if (process.env.NEXT_RUNTIME !== 'edge') {
 
 ```
 create (pending)
-  ↓
+  v
 update (running) - sets startedAt
-  ↓
+  v
 update (completed/failed/cancelled) - sets completedAt
 ```
 
@@ -171,11 +171,11 @@ update (completed/failed/cancelled) - sets completedAt
 
 ```
 create (pending, attempt=1)
-  ↓
+  v
 update (running) - sets startedAt
-  ↓
+  v
 update (completed/failed) - sets completedAt
-  ↓
+  v
 [retry] update (attempt=N)
 ```
 
@@ -183,9 +183,9 @@ update (completed/failed) - sets completedAt
 
 ```
 writeToStream (chunk)
-  ↓
+  v
 writeToStream (chunk)
-  ↓
+  v
 closeStream (eof=true)
 ```
 

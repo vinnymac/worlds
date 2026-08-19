@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   unit:
     name: Unit Tests (${{ matrix.package }})
@@ -19,30 +22,65 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package:
-          - '@fantasticfour/world-cloudflare'
-          - '@fantasticfour/world-firestore-tasks'
-          - '@fantasticfour/world-mysql'
-          - '@fantasticfour/world-mysql-redis'
-          - '@fantasticfour/world-nats-jetstream'
-          - '@fantasticfour/world-postgres-redis'
-          - '@fantasticfour/world-redis'
-          - '@fantasticfour/world-redis-bullmq'
-          - '@fantasticfour/world-upstash'
+        # Each leg pre-pulls only the images it actually starts. Pulling the
+        # whole set everywhere meant 9 of 10 legs downloading the ~1GB
+        # google-cloud-cli emulator that only world-firestore-tasks uses.
+        include:
+          - package: '@fantasticfour/shared'
+            images: ''
+          - package: '@fantasticfour/testing'
+            images: ''
+          - package: '@fantasticfour/world-cloudflare'
+            images: ''
+          - package: '@fantasticfour/world-firestore-tasks'
+            images: 'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+          - package: '@fantasticfour/world-mysql'
+            images: 'mysql:8.0'
+          - package: '@fantasticfour/world-mysql-redis'
+            images: 'mysql:8.0 redis:7-alpine'
+          - package: '@fantasticfour/world-nats-jetstream'
+            images: 'nats:2.10-alpine'
+          - package: '@fantasticfour/world-postgres-redis'
+            images: 'postgres:15-alpine redis:7-alpine'
+          - package: '@fantasticfour/world-redis'
+            images: 'redis:7-alpine'
+          - package: '@fantasticfour/world-redis-bullmq'
+            images: 'redis:7-alpine'
+          - package: '@fantasticfour/world-upstash'
+            images: 'ghcr.io/vinnymac/serverless-redis-http:latest redis:7-alpine'
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Detached so the image download overlaps pnpm install + build instead of
+      # following them. Pulls are network-bound, install/build are CPU-bound, so
+      # the two barely contend. Actions has no background-step primitive, so the
+      # pull is detached with nohup and a later step blocks on a sentinel file.
+      # Redirecting to a log file is what lets this step return immediately:
+      # an inherited stdout pipe would keep the step open until the pull ends.
+      - name: Pre-pull Testcontainers images
+        if: matrix.images != ''
+        env:
+          PREPULL_IMAGES: testcontainers/ryuk:0.8.1 ${{ matrix.images }}
+        # `|| true` per image: the pre-pull is a latency optimization, not a
+        # gate. Testcontainers pulls on demand anyway, so a registry hiccup
+        # should slow the run down, not fail it.
+        run: |
+          # shellcheck disable=SC2016 # expansion is deferred to the inner shell
+          nohup bash -c '
+            printf "%s\n" $PREPULL_IMAGES \
+              | xargs -n1 -P4 -I{} sh -c "docker pull {} || true"
+            touch "$RUNNER_TEMP/prepull.done"
+          ' > "$RUNNER_TEMP/prepull.log" 2>&1 &
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11.11.0
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Setup Node.js 24.x
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.x
           cache: 'pnpm'
@@ -51,40 +89,83 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Packages
-        run: pnpm build --force
+        run: pnpm build
 
-      - name: Pre-pull Testcontainers images
+      # Bounded so a wedged registry costs five minutes, not the job timeout.
+      # Falling through without the sentinel is fine: Testcontainers pulls on
+      # demand, so the run gets slower rather than broken.
+      - name: Wait for image pulls
+        if: matrix.images != ''
         run: |
-          docker pull testcontainers/ryuk:0.8.1 || true
-          docker pull postgres:15-alpine || true
-          docker pull redis:7-alpine || true
-          docker pull mysql:8.0 || true
-          docker pull nats:2.10-alpine || true
-          docker pull ghcr.io/vinnymac/serverless-redis-http:latest || true
-          docker pull gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators || true
+          for _ in $(seq 1 300); do
+            if [ -f "$RUNNER_TEMP/prepull.done" ]; then break; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/prepull.log" 2>/dev/null || true
+          if [ ! -f "$RUNNER_TEMP/prepull.done" ]; then
+            echo "::warning::Pre-pull unfinished after 300s; Testcontainers will pull on demand."
+          fi
 
       - name: Run Unit Tests for ${{ matrix.package }}
         run: pnpm --filter "${{ matrix.package }}" test
 
+  workers:
+    name: Cloudflare Workers Runtime
+    # Needs no containers: @cloudflare/vitest-pool-workers runs the suite
+    # against real workerd, which is the only place Durable Object transaction
+    # semantics and DO SQLite storage get exercised for real.
+    runs-on: ubuntu-24.04-arm
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.x
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Packages
+        run: pnpm build
+
+      - name: Run Workers Runtime Tests
+        run: pnpm --filter "@fantasticfour/world-cloudflare" test:workers
+
   azure-tests:
     name: Azure Cosmos DB Tests
     runs-on: ubuntu-latest
-    continue-on-error: true # Don't block on Azure failures - emulator is slow and can be flaky
     timeout-minutes: 30 # Account for 5-minute emulator startup
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Same detach-and-wait shape as the unit legs: the ~1GB emulator image
+      # downloads while pnpm install and build run.
+      - name: Pre-pull Cosmos DB Emulator
+        run: |
+          # shellcheck disable=SC2016 # expansion is deferred to the inner shell
+          nohup bash -c '
+            docker pull mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview || true
+            touch "$RUNNER_TEMP/prepull.done"
+          ' > "$RUNNER_TEMP/prepull.log" 2>&1 &
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11.11.0
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Setup Node.js 24.x
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.x
           cache: 'pnpm'
@@ -93,10 +174,18 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Packages
-        run: pnpm build --force
+        run: pnpm build
 
-      - name: Pre-pull Cosmos DB Emulator
-        run: docker pull mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview || true
+      - name: Wait for emulator pull
+        run: |
+          for _ in $(seq 1 600); do
+            if [ -f "$RUNNER_TEMP/prepull.done" ]; then break; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/prepull.log" 2>/dev/null || true
+          if [ ! -f "$RUNNER_TEMP/prepull.done" ]; then
+            echo "::warning::Emulator pre-pull unfinished after 600s; Testcontainers will pull on demand."
+          fi
 
       - name: Run Azure Tests
         run: pnpm --filter "@fantasticfour/world-azure" test

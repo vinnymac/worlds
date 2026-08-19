@@ -1,6 +1,8 @@
 import { setTimeout } from 'node:timers/promises';
 import { RedisContainer } from '@testcontainers/redis';
-import Redis from 'ioredis';
+import { PreconditionFailedError } from '@workflow/errors';
+import { expectRejectedWith } from '@fantasticfour/testing';
+import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
   createEventsStorage,
@@ -510,7 +512,7 @@ describe('Storage (Redis integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario) — must reject so the
+      // Duplicate step_created event (replay scenario), must reject so the
       // log ends with exactly one creation event. Core matches this error by
       // name and treats it as benign.
       await expect(
@@ -579,7 +581,7 @@ describe('Storage (Redis integration)', () => {
 
       await events.create(runId, { eventType: 'run_started' });
 
-      // Duplicate run_created after the run has moved on — must not
+      // Duplicate run_created after the run has moved on, must not
       // resurrect the run in the pending index.
       await expect(
         events.create(runId, {
@@ -636,7 +638,7 @@ describe('Storage (Redis integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -739,11 +741,7 @@ describe('Storage (Redis integration)', () => {
 
       const fulfilled = results.filter((r) => r.status === 'fulfilled');
       expect(fulfilled).toHaveLength(1);
-      for (const rejection of results.filter((r) => r.status === 'rejected')) {
-        expect((rejection as PromiseRejectedResult).reason).toMatchObject({
-          name: 'EntityConflictError',
-        });
-      }
+      expectRejectedWith(results, 'EntityConflictError');
 
       const eventList = await events.listByCorrelationId({ correlationId: 'wait-race' });
       expect(eventList.data.filter((e) => e.eventType === 'wait_completed')).toHaveLength(1);
@@ -775,7 +773,7 @@ describe('Storage (Redis integration)', () => {
       });
 
       // A redelivered hook_created for the SAME claim must NOT emit a
-      // hook_conflict against its own token — that would fail the workflow.
+      // hook_conflict against its own token; that would fail the workflow.
       await expect(
         events.create(testRunId, {
           eventType: 'hook_created',
@@ -843,7 +841,7 @@ describe('Storage (Redis integration)', () => {
         eventData: { result: ['done'] },
       });
 
-      // Redelivered step_completed after the step finished — core swallows
+      // Redelivered step_completed after the step finished; core swallows
       // EntityConflictError and re-enqueues the workflow.
       await expect(
         events.create(testRunId, {
@@ -1035,6 +1033,221 @@ describe('Storage (Redis integration)', () => {
       }
 
       expect(seen.toSorted()).toEqual(completedIds.toSorted());
+    });
+  });
+
+  describe('binary payload serialization', () => {
+    it('round-trips Uint8Array through storage using the tagged base64 encoding', async () => {
+      const payload = new Uint8Array([0, 1, 2, 250, 255]);
+      const run = await createRun({ input: [payload] });
+
+      const fetched = await runs.get(run.runId);
+      const roundTripped = (fetched.input as unknown[])[0];
+      expect(roundTripped).toBeInstanceOf(Uint8Array);
+      expect(Array.from(roundTripped as Uint8Array)).toEqual([0, 1, 2, 250, 255]);
+
+      const raw = await redis.get(`${keyPrefix}run:${run.runId}`);
+      expect(raw).toContain('"__type":"Uint8Array"');
+      expect(raw).not.toContain('__uint8array');
+    });
+
+    it('still reads the legacy number-array encoding already in Redis', async () => {
+      const run = await createRun({ input: [new Uint8Array([1, 2, 3])] });
+      const raw = await redis.get(`${keyPrefix}run:${run.runId}`);
+      const legacy = raw!.replace(
+        /\{"__type":"Uint8Array","data":"[^"]*"\}/,
+        '{"__uint8array":true,"data":[1,2,3]}',
+      );
+      expect(legacy).toContain('__uint8array');
+      await redis.set(`${keyPrefix}run:${run.runId}`, legacy);
+
+      const fetched = await runs.get(run.runId);
+      const roundTripped = (fetched.input as unknown[])[0];
+      expect(roundTripped).toBeInstanceOf(Uint8Array);
+      expect(Array.from(roundTripped as Uint8Array)).toEqual([1, 2, 3]);
+    });
+
+    it('round-trips a fat binary payload through a step result', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, { stepId: 'fat-step' });
+      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
+
+      const payload = new Uint8Array(64 * 1024);
+      for (let i = 0; i < payload.length; i++) {
+        payload[i] = i % 256;
+      }
+      const result = await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: step.stepId,
+        eventData: { result: payload },
+      });
+
+      const output = result.step?.output as Uint8Array;
+      expect(output).toBeInstanceOf(Uint8Array);
+      expect(output.length).toBe(payload.length);
+      expect(output[1000]).toBe(payload[1000]);
+
+      const raw = await redis.get(`${keyPrefix}step:${run.runId}:${step.stepId}`);
+      expect(raw).toContain('"__type":"Uint8Array"');
+      expect(raw).not.toContain('__uint8array');
+    });
+  });
+
+  describe('maxEvents (EventResult.maxEvents)', () => {
+    it('reports the default per-run event ceiling on run_started', async () => {
+      const run = await createRun();
+      const result = await events.create(run.runId, { eventType: 'run_started' });
+      expect(result.maxEvents).toBe(25_000);
+    });
+
+    it('reports the ceiling again on the idempotent run_started replay', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const replay = await events.create(run.runId, { eventType: 'run_started' });
+      expect(replay.run?.status).toBe('running');
+      expect(replay.maxEvents).toBe(25_000);
+    });
+
+    it('honours an explicit maxEventsPerRun config', async () => {
+      const scoped = createEventsStorage({ redis, keyPrefix, maxEventsPerRun: 10 });
+      const created = await scoped.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId: 'd', workflowName: 'capped', input: [] },
+      });
+      expect(created.maxEvents).toBe(10);
+      const started = await scoped.create(created.run!.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(10);
+    });
+
+    it('rejects a maxEventsPerRun that is not a positive integer', () => {
+      expect(() => createEventsStorage({ redis, keyPrefix, maxEventsPerRun: 0 })).toThrow(
+        TypeError,
+      );
+      expect(() => createEventsStorage({ redis, keyPrefix, maxEventsPerRun: 1.5 })).toThrow(
+        TypeError,
+      );
+    });
+  });
+
+  describe('optimistic concurrency (stateUpdatedAt guard)', () => {
+    const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
+
+    /** Create a run that is running with one completed step, so the per-run
+     * state marker has been advanced by an externally-originated event. */
+    async function runWithMarker() {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, { stepId: 'external-step' });
+      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
+      await events.create(run.runId, {
+        eventType: 'step_completed',
+        correlationId: step.stepId,
+        eventData: { result: 'ok' },
+      });
+      const raw = await redis.get(runStateKey(run.runId));
+      expect(raw).not.toBeNull();
+      return { run, marker: Number(raw) };
+    }
+
+    it('does not advance the marker on run lifecycle events', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      expect(await redis.get(runStateKey(run.runId))).toBeNull();
+    });
+
+    it('advances the marker on an externally-originated step_completed', async () => {
+      const { marker } = await runWithMarker();
+      expect(marker).toBeGreaterThan(0);
+    });
+
+    it('does not advance the marker for a replay-origin create', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      const step = await createStep(run.runId, { stepId: 'replay-step' });
+      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
+      await events.create(
+        run.runId,
+        {
+          eventType: 'step_completed',
+          correlationId: step.stepId,
+          eventData: { result: 'ok' },
+        },
+        { stateUpdatedAt: Date.now() },
+      );
+      expect(await redis.get(runStateKey(run.runId))).toBeNull();
+    });
+
+    it('rejects a strictly older stateUpdatedAt with PreconditionFailedError', async () => {
+      const { run, marker } = await runWithMarker();
+      await expect(
+        events.create(
+          run.runId,
+          {
+            eventType: 'step_created',
+            correlationId: 'stale-step',
+            eventData: { stepName: 'stale', input: [] },
+          },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toThrow(PreconditionFailedError);
+      // The guarded write must not have landed.
+      expect(await redis.get(`${keyPrefix}step:${run.runId}:stale-step`)).toBeNull();
+    });
+
+    it('accepts an equal stateUpdatedAt (anti-livelock)', async () => {
+      const { run, marker } = await runWithMarker();
+      const result = await events.create(
+        run.runId,
+        {
+          eventType: 'step_created',
+          correlationId: 'equal-step',
+          eventData: { stepName: 'equal', input: [] },
+        },
+        { stateUpdatedAt: marker },
+      );
+      expect(result.step?.stepId).toBe('equal-step');
+    });
+
+    it('falls open when no stateUpdatedAt is supplied', async () => {
+      const { run } = await runWithMarker();
+      const result = await events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'unguarded-step',
+        eventData: { stepName: 'unguarded', input: [] },
+      });
+      expect(result.step?.stepId).toBe('unguarded-step');
+    });
+
+    it('rejects a stale run_completed without marking the run terminal', async () => {
+      const { run, marker } = await runWithMarker();
+      await expect(
+        events.create(
+          run.runId,
+          { eventType: 'run_completed', eventData: { output: [] } },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toThrow(PreconditionFailedError);
+
+      const current = await runs.get(run.runId);
+      expect(current.status).toBe('running');
+    });
+
+    it('rejects a stale hook_disposed', async () => {
+      const { run, marker } = await runWithMarker();
+      await events.create(run.runId, {
+        eventType: 'hook_created',
+        correlationId: 'hook-guard',
+        eventData: { token: 'token-guard' },
+      });
+
+      await expect(
+        events.create(
+          run.runId,
+          { eventType: 'hook_disposed', correlationId: 'hook-guard' },
+          { stateUpdatedAt: marker - 1 },
+        ),
+      ).rejects.toThrow(PreconditionFailedError);
     });
   });
 });

@@ -17,10 +17,13 @@
  * - step_started before step.retryAfter -> TooEarlyError
  * - error/output/completedAt are cleared whenever a run re-enters a
  *   non-final status (WorkflowRunSchema is a discriminated union)
+ * - a create carrying a `stateUpdatedAt` snapshot older than the run's
+ *   externally-originated state marker -> PreconditionFailedError (4.3.1
+ *   optimistic-concurrency guard)
  *
  * Errors are returned as structured outcomes (never thrown) because custom
  * error classes do not survive the Durable Object RPC boundary with their
- * `name` intact — and `@workflow/errors` matches errors by name via `.is()`.
+ * `name` intact, and `@workflow/errors` matches errors by name via `.is()`.
  * The storage layer converts outcomes back into the typed errors.
  */
 
@@ -41,6 +44,7 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  ulidToDate,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { compact } from './util.js';
@@ -50,6 +54,11 @@ const RUN_KEY = 'run';
 /** Key prefixes for per-entity storage. ULID-suffixed keys list in order. */
 export const EVENT_KEY_PREFIX = 'event:';
 export const STEP_KEY_PREFIX = 'step:';
+// Waits have no entity in this world; the marker key exists only so a
+// redelivered wait_created conflicts instead of appending a second
+// creation event (events are keyed by eventId, so the log itself cannot
+// dedupe by correlationId).
+export const WAIT_KEY_PREFIX = 'wait:';
 export const HOOK_KEY_PREFIX = 'hook:';
 /**
  * Marker recording that a hook_created event was committed for a hookId.
@@ -58,6 +67,14 @@ export const HOOK_KEY_PREFIX = 'hook:';
  * rejected as a duplicate instead of resurrecting the hook.
  */
 const HOOK_EVENT_MARKER_PREFIX = 'hookevent:';
+/** Per-run concurrency marker: ULID time (epoch ms) of the most recent
+ * externally-originated event. See {@link EXTERNAL_EVENT_TYPES}. */
+const STATE_MARKER_KEY = 'statemarker';
+
+/** Event types that advance the state marker when created outside a replay.
+ * Narrow by design: core also omits `stateUpdatedAt` on `run_created` /
+ * `run_started` / `run_failed`, and advancing there would reject replays. */
+const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
 
 export interface EventStoreListOptions {
   prefix: string;
@@ -91,6 +108,10 @@ export interface ApplyEventRequest {
    * (hook_created only). `null` means the token is unclaimed.
    */
   tokenHolder?: { runId: string; hookId: string } | null;
+  /** `CreateEventParams.stateUpdatedAt`: epoch ms of the newest event the
+   * caller had loaded. Present only on replay-context creates; absent creates
+   * are treated as externally originated and fail open. */
+  stateUpdatedAt?: number;
 }
 
 export type ApplyEventErrorCode =
@@ -100,6 +121,7 @@ export type ApplyEventErrorCode =
   | 'ENTITY_CONFLICT'
   | 'RUN_EXPIRED'
   | 'TOO_EARLY'
+  | 'PRECONDITION_FAILED'
   | 'RUN_NOT_SUPPORTED'
   | 'LEGACY_RUN_NOT_SUPPORTED';
 
@@ -199,6 +221,28 @@ export async function listByPrefix<T>(
   };
 }
 
+/** Advance the per-run state marker for an externally-originated event.
+ * Replay-origin creates carry a `stateUpdatedAt` and must not advance it. A
+ * non-decodable event id leaves the marker untouched, failing open. */
+async function advanceStateMarker(
+  store: EventStore,
+  ctx: ApplyEventContext,
+  event: Event,
+): Promise<void> {
+  if (ctx.stateUpdatedAt !== undefined) return;
+  if (!EXTERNAL_EVENT_TYPES.has(event.eventType)) return;
+
+  const underscore = event.eventId.lastIndexOf('_');
+  const rawUlid = underscore === -1 ? event.eventId : event.eventId.slice(underscore + 1);
+  const time = ulidToDate(rawUlid)?.getTime();
+  if (time === undefined) return;
+
+  const current = await store.get<number>(STATE_MARKER_KEY);
+  if (current === undefined || time > current) {
+    await store.put(STATE_MARKER_KEY, time);
+  }
+}
+
 /** Delete all hook entities for the run, returning the released tokens. */
 async function releaseAllHooks(
   store: EventStore,
@@ -237,11 +281,26 @@ export async function applyEvent(
 
   const putEvent = async (event: Event): Promise<void> => {
     await store.put(`${EVENT_KEY_PREFIX}${event.eventId}`, event);
+    await advanceStateMarker(store, ctx, event);
   };
+
+  // Runs inside the caller's storage transaction, so the marker read and the
+  // event append are atomic. Strictly older snapshots are rejected; equal
+  // passes and absent fails open.
+  if (ctx.stateUpdatedAt !== undefined) {
+    const marker = await store.get<number>(STATE_MARKER_KEY);
+    if (marker !== undefined && ctx.stateUpdatedAt < marker) {
+      return failure(
+        'PRECONDITION_FAILED',
+        `Event creation for run "${runId}" is based on a stale snapshot ` +
+          `(stateUpdatedAt ${ctx.stateUpdatedAt} < ${marker})`,
+      );
+    }
+  }
 
   // ============================================================
   // VALIDATION: current run state (skipped for run_created and for
-  // step_completed / step_retrying, matching upstream — those only operate
+  // step_completed / step_retrying, matching upstream; those only operate
   // on running steps regardless of run state).
   // ============================================================
   let currentRun: WorkflowRun | undefined;
@@ -395,7 +454,7 @@ export async function applyEvent(
 
   // Non-run_created events require the run to exist (after the resilient
   // start bootstrap had its chance). step_completed / step_retrying skip the
-  // run read entirely — their step guard above already proves the run exists.
+  // run read entirely; their step guard above already proves the run exists.
   if (!skipRunValidation && data.eventType !== 'run_started' && !currentRun) {
     return failure('RUN_NOT_FOUND', `Workflow run "${runId}" not found`);
   }
@@ -407,9 +466,11 @@ export async function applyEvent(
     case 'run_created': {
       const existing = await store.get<WorkflowRun>(RUN_KEY);
       if (existing) {
-        // Idempotent replay: return the existing run without appending a
-        // duplicate run_created event to the log.
-        return { ok: true, run: existing, releasedHooks: [] };
+        // Duplicate run_created: reject with the conflict outcome (mapped to
+        // EntityConflictError at the storage layer) instead of returning the
+        // existing run. Core treats the 409 as benign ("the run already
+        // exists"), and every world now shares this contract.
+        return failure('ENTITY_CONFLICT', `Workflow run "${runId}" already exists`);
       }
       const run = WorkflowRunSchema.parse(
         compact({
@@ -445,7 +506,7 @@ export async function applyEvent(
         return failure('RUN_NOT_FOUND', `Workflow run "${runId}" not found`);
       }
       // Idempotent for concurrent invocations / queue redeliveries: if the
-      // run is already running this is a replay — no duplicate event.
+      // run is already running this is a replay: no duplicate event.
       if (currentRun.status === 'running') {
         return { ok: true, run: currentRun, releasedHooks: [] };
       }
@@ -740,8 +801,22 @@ export async function applyEvent(
       };
     }
 
-    // hook_received, hook_conflict, wait_created, wait_completed are
-    // event-only at the storage level for this world.
+    case 'wait_created': {
+      const waitKey = `${WAIT_KEY_PREFIX}${data.correlationId}`;
+      const existing = await store.get<{ eventId: string }>(waitKey);
+      if (existing) {
+        // Core catches EntityConflictError for exactly this replay case
+        // ("Wait already exists, continuing").
+        return failure('ENTITY_CONFLICT', `Wait "${data.correlationId}" already exists`);
+      }
+      const event = buildEvent({ ...data });
+      await store.put(waitKey, { eventId: event.eventId });
+      await putEvent(event);
+      return { ok: true, event, releasedHooks: [] };
+    }
+
+    // hook_received, hook_conflict, wait_completed are event-only at the
+    // storage level for this world.
     default: {
       const event = buildEvent({ ...data });
       await putEvent(event);

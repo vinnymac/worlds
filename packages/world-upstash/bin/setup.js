@@ -12,7 +12,7 @@
  */
 
 console.log('');
-console.log('🚀 @fantasticfour/world-upstash');
+console.log('@fantasticfour/world-upstash');
 console.log('');
 console.log('This world is serverless and requires no local setup.');
 console.log('');

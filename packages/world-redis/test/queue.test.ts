@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { RedisContainer } from '@testcontainers/redis';
 import type { QueuePayload, ValidQueueName } from '@workflow/world';
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { afterAll, afterEach, beforeAll, describe, expect, it, test, vi } from 'vitest';
 import { createQueue } from '../src/queue.js';
 import { stringifyWithUint8Array } from '../src/util.js';
@@ -65,7 +65,7 @@ describe('Queue (Redis integration)', () => {
     redis = new Redis(container.getConnectionUrl());
 
     // The HTTP server routes requests through a real createQueueHandler so
-    // both transport directions (worker serialize → handler revive) are
+    // both transport directions (worker serialize -> handler revive) are
     // exercised end to end.
     server = createServer((req, res) => {
       let data = '';
@@ -162,7 +162,7 @@ describe('Queue (Redis integration)', () => {
     });
     queues.push(producer);
 
-    // Enqueue with a delay but NEVER start this instance — the message must
+    // Enqueue with a delay but NEVER start this instance; the message must
     // be durable in Redis, not held by an in-process timer.
     await producer.queue(queueName, payload, { delaySeconds: 1 });
     const delayed = await redis.zcard(`${jobPrefix}flows:delayed`);

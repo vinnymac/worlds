@@ -3,7 +3,7 @@
  *
  * The mock Durable Object stubs delegate to the SAME transactional
  * event-application core (`apply-event.ts`) as the real WorkflowRunDO, so
- * unit tests exercise the real guard/idempotency/pagination logic — only the
+ * unit tests exercise the real guard/idempotency/pagination logic; only the
  * storage medium (an in-memory sorted map) is mocked.
  */
 

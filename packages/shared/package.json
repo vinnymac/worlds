@@ -26,7 +26,7 @@
     "dev": "tsc --watch",
     "clean": "tsc --build --clean && rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "devDependencies": {
     "@types/node": "catalog:",
@@ -45,5 +45,5 @@
   "volta": {
     "extends": "../../package.json"
   },
-  "packageManager": "pnpm@11.11.0"
+  "packageManager": "pnpm@11.22.0"
 }

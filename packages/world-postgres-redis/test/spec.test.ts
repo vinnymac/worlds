@@ -2,6 +2,9 @@ import { execSync } from 'node:child_process';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { RedisContainer } from '@testcontainers/redis';
 import { createTestSuite } from '@workflow/world-testing';
+// Not re-exported from the package entry point and not wired into
+// createTestSuite (world-testing 4.1.18); opt in via the deep import.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on a docker container
@@ -44,4 +47,5 @@ if (process.platform === 'win32') {
 
   test('smoke', () => {});
   createTestSuite('@fantasticfour/world-postgres-redis');
+  eventLimit('@fantasticfour/world-postgres-redis');
 }

@@ -72,11 +72,14 @@ export const runs = schema.table(
     startedAt: timestamp('started_at', { fsp: 3 }),
     specVersion: int('spec_version'),
     expiredAt: timestamp('expired_at', { fsp: 3 }),
+    /** Epoch-ms ULID time of the most recent externally-originated event for this
+     * run. Not part of the `WorkflowRun` contract, stripped before return. */
+    stateUpdatedAt: bigint('state_updated_at', { mode: 'number' }),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
       'input' | 'output' | 'executionContext'
-    >
+    > & { stateUpdatedAt?: number }
   >,
   (tb) => [
     index('idx_workflow_runs_name').on(tb.workflowName),

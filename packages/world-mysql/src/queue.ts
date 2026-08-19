@@ -8,6 +8,7 @@ import {
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
+import { createWorkflowUrl } from '@workflow/utils';
 import { decode, encode } from 'cbor-x';
 import { eq, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
@@ -85,7 +86,7 @@ function resolveBaseUrl(config: MysqlQueueConfig): string {
  * JSON transport that preserves Uint8Array values via a tagged envelope
  * ({ __type: 'Uint8Array', data: '<base64>' }). Required for the resilient
  * start path where runInput.input (binary serialized data) is sent through
- * the queue — plain JSON.stringify would mangle it into index-keyed objects.
+ * the queue; plain JSON.stringify would mangle it into index-keyed objects.
  */
 function encodeTaggedJson(value: unknown): string {
   // Pre-walk instead of a JSON.stringify replacer: Buffer.prototype.toJSON
@@ -127,8 +128,8 @@ function decodeTaggedJson(text: string): unknown {
 /**
  * Delete expired idempotency keys, but only when the deduped job is gone
  * (completed jobs are deleted; their keys are released in completeJob).
- * Keys whose job is still pending/processing — e.g. scheduled far in the
- * future by a 503 timeoutSeconds or a long retryAfter — must survive the
+ * Keys whose job is still pending/processing, e.g. scheduled far in the
+ * future by a 503 timeoutSeconds or a long retryAfter, must survive the
  * TTL, otherwise a replay re-enqueue would insert a duplicate job.
  */
 export async function cleanupExpiredIdempotencyKeys(db: Drizzle, ttlMs: number): Promise<number> {
@@ -289,7 +290,7 @@ async function enqueueJob(
       return { messageId };
     });
   } catch (error: unknown) {
-    // Concurrent INSERTs racing on the same idempotency key — treat the
+    // Concurrent INSERTs racing on the same idempotency key; treat the
     // duplicate-key error as a hit.
     const errorCode =
       (error as { code?: string; cause?: { code?: string } })?.code ??
@@ -448,10 +449,10 @@ export function createQueue(
     envelope: JobEnvelope,
     messageId: string,
     attempt: number,
-    pathname: string,
+    pathname: 'flow' | 'step',
   ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(baseUrl, { type: pathname });
     return fetch(url, {
       method: 'POST',
       headers: {

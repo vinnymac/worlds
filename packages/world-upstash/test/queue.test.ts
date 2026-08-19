@@ -187,7 +187,7 @@ describe('QStash queue', () => {
 
       await httpHandler(deliveryRequest(String(first.request.body)));
       const second = publishedRequest(publishSpy, 1);
-      // timeoutSeconds: 0 means immediate redelivery — no delay set
+      // timeoutSeconds: 0 means immediate redelivery, no delay set
       expect(second.request.delay).toBeUndefined();
       expect(second.body.deliveryCount).toBe(1);
 

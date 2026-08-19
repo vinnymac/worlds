@@ -388,6 +388,7 @@ describe('Firestore Real-time Listeners', () => {
       await storage.events.create(run2.runId, {
         eventType: 'hook_received',
         correlationId,
+        eventData: { payload: {} },
       });
 
       await setTimeout(100);
@@ -588,8 +589,8 @@ describe('Firestore Real-time Listeners', () => {
         input: [],
       });
 
-      try {
-        await firestore.runTransaction(async (transaction) => {
+      await expect(
+        firestore.runTransaction(async (transaction) => {
           const runRef = firestore.collection('workflow_runs').doc(run.runId);
 
           transaction.update(runRef, {
@@ -599,10 +600,8 @@ describe('Firestore Real-time Listeners', () => {
 
           // Intentionally throw error to test rollback
           throw new Error('Intentional error for rollback test');
-        });
-      } catch (error: any) {
-        expect(error.message).toBe('Intentional error for rollback test');
-      }
+        }),
+      ).rejects.toThrow('Intentional error for rollback test');
 
       // Verify status was NOT updated (transaction rolled back)
       const unchangedRun = await storage.runs.get(run.runId);
@@ -624,7 +623,7 @@ describe('Firestore Real-time Listeners', () => {
     }
 
     async function writeStream(streamer: ReturnType<typeof createStreamer>, name: string) {
-      // Write chunks back-to-back so several land in the same millisecond —
+      // Write chunks back-to-back so several land in the same millisecond;
       // the ordering key must not collide (previously it was the truncated
       // ULID ms-timestamp, which deadlocked/skipped same-ms chunks).
       for (let i = 0; i < 10; i++) {
@@ -633,17 +632,26 @@ describe('Firestore Real-time Listeners', () => {
       await streamer.closeStream(name, 'run-stream-test');
     }
 
-    for (const mode of ['listener', 'polling'] as const) {
-      it(`should deliver same-millisecond chunks in order and terminate (${mode})`, async () => {
+    const streamModes: Array<[string, 'listener' | 'polling']> = [
+      ['listener', 'listener'],
+      ['polling', 'polling'],
+    ];
+
+    it.each(streamModes)(
+      'should deliver same-millisecond chunks in order and terminate (%s)',
+      async (_label, mode) => {
         const streamer = createStreamer({ firestore, mode, pollIntervalMs: 50 });
         const name = `stream-${mode}-${Date.now()}`;
         await writeStream(streamer, name);
 
         const chunks = await collectStream(await streamer.readFromStream(name));
         expect(chunks).toEqual(Array.from({ length: 10 }, (_, i) => `chunk-${i}`));
-      });
+      },
+    );
 
-      it(`should honor positive and negative startIndex (${mode})`, async () => {
+    it.each(streamModes)(
+      'should honor positive and negative startIndex (%s)',
+      async (_label, mode) => {
         const streamer = createStreamer({ firestore, mode, pollIntervalMs: 50 });
         const name = `stream-${mode}-start-${Date.now()}`;
         await writeStream(streamer, name);
@@ -653,8 +661,8 @@ describe('Firestore Real-time Listeners', () => {
 
         const lastThree = await collectStream(await streamer.readFromStream(name, -3));
         expect(lastThree).toEqual(['chunk-7', 'chunk-8', 'chunk-9']);
-      });
-    }
+      },
+    );
 
     it('should stream chunks written after the reader attached (listener)', async () => {
       const streamer = createStreamer({ firestore, mode: 'listener' });

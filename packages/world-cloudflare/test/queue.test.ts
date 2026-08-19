@@ -1,6 +1,8 @@
 import { parse, stringify } from '@fantasticfour/shared';
 import type { ValidQueueName } from '@workflow/world';
+import type { Mock } from 'vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CloudflareQueueConfig, InflightClaimStub } from '../src/queue.js';
 import { createQueue } from '../src/queue.js';
 
 interface SentMessage {
@@ -8,9 +10,22 @@ interface SentMessage {
   options?: { contentType?: string; delaySeconds?: number };
 }
 
-interface MockClaimStub {
-  claimInflight: ReturnType<typeof vi.fn>;
-  releaseInflight: ReturnType<typeof vi.fn>;
+type QueueEnv = CloudflareQueueConfig['env'];
+
+/**
+ * The queue API's message parameter is the discriminated union of real task
+ * payloads. These tests exercise the transport and codec rather than any one
+ * payload shape, so arbitrary objects go through this one cast instead of an
+ * `as` at every call site.
+ */
+type QueueMessage = Parameters<ReturnType<typeof createQueue>['queue']>[1];
+const asMessage = (value: unknown): QueueMessage => value as QueueMessage;
+
+// Typed against the real stub surface so the namespace stays assignable to
+// InflightClaimNamespace while keeping the vi.fn assertion helpers.
+interface MockClaimStub extends InflightClaimStub {
+  claimInflight: Mock<InflightClaimStub['claimInflight']>;
+  releaseInflight: Mock<InflightClaimStub['releaseInflight']>;
 }
 
 function createMockClaimNamespace() {
@@ -57,10 +72,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
   let sent: SentMessage[];
   let mockQueue: { send: ReturnType<typeof vi.fn> };
   let claimNamespace: ReturnType<typeof createMockClaimNamespace>;
-  let mockEnv: {
-    WORKFLOW_QUEUE: { send: ReturnType<typeof vi.fn> };
-    WORKFLOW_DB: ReturnType<typeof createMockClaimNamespace>['namespace'];
-  };
+  let mockEnv: QueueEnv;
   let queue: ReturnType<typeof createQueue>;
 
   // Save original env vars
@@ -77,7 +89,9 @@ describe('Queue (Cloudflare Queues integration)', () => {
     claimNamespace = createMockClaimNamespace();
 
     mockEnv = {
-      WORKFLOW_QUEUE: mockQueue,
+      // `mockQueue.send` is a vi.fn, whose Mock signature is wider than the
+      // CloudflareQueue binding it stands in for.
+      WORKFLOW_QUEUE: mockQueue as unknown as QueueEnv['WORKFLOW_QUEUE'],
       WORKFLOW_DB: claimNamespace.namespace,
     };
   });
@@ -103,7 +117,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
 
     it('should send a tagged-JSON text envelope', async () => {
       const queueName = 'test-queue' as ValidQueueName;
-      const message = { data: 'test-message' };
+      const message = asMessage({ data: 'test-message' });
 
       const result = await queue.queue(queueName, message);
 
@@ -130,21 +144,21 @@ describe('Queue (Cloudflare Queues integration)', () => {
       const queueName = 'test-queue' as ValidQueueName;
       const idempotencyKey = 'unique-key-123';
 
-      await queue.queue(queueName, { data: 'test' }, { idempotencyKey });
+      await queue.queue(queueName, asMessage({ data: 'test' }), { idempotencyKey });
 
       const envelope = parse<{ idempotencyKey?: string }>(sent[0].body);
       expect(envelope.idempotencyKey).toBe(idempotencyKey);
     });
 
     it('should pass delaySeconds through to Cloudflare Queues', async () => {
-      await queue.queue('test-queue' as ValidQueueName, {}, { delaySeconds: 42 });
+      await queue.queue('test-queue' as ValidQueueName, asMessage({}), { delaySeconds: 42 });
 
       expect(sent[0].options).toMatchObject({ delaySeconds: 42 });
     });
 
     it('should generate unique monotonic message IDs', async () => {
-      const first = await queue.queue('test-queue' as ValidQueueName, {});
-      const second = await queue.queue('test-queue' as ValidQueueName, {});
+      const first = await queue.queue('test-queue' as ValidQueueName, asMessage({}));
+      const second = await queue.queue('test-queue' as ValidQueueName, asMessage({}));
 
       expect(first.messageId).toMatch(/^msg_/);
       expect(second.messageId).toMatch(/^msg_/);
@@ -166,7 +180,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
     });
 
     it('should handle complex message payloads', async () => {
-      const message = {
+      const message = asMessage({
         nested: {
           object: {
             with: ['arrays', 'and', 'strings'],
@@ -174,7 +188,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         },
         number: 42,
         boolean: true,
-      };
+      });
 
       await queue.queue('test-queue' as ValidQueueName, message);
 
@@ -200,15 +214,14 @@ describe('Queue (Cloudflare Queues integration)', () => {
       queue.createQueueHandler('test:', vi.fn());
 
       const queueName = 'test:queue' as ValidQueueName;
-      const message = { data: 'test' };
+      const message = asMessage({ data: 'test' });
 
-      // Attempt to queue - embedded world will handle it
-      try {
-        await queue.queue(queueName, message);
-      } catch {
-        // Embedded world may throw if no handler, that's OK for this test
-        // We're just verifying Cloudflare Queue wasn't called
-      }
+      // 'test:queue' doesn't match the __wkf_(workflow|step)_ naming
+      // convention, so parseQueueName() rejects it before the embedded
+      // world/test pump ever runs.
+      await expect(queue.queue(queueName, message)).rejects.toThrow(
+        'Invalid queue name: test:queue',
+      );
 
       // Main assertion: Cloudflare Queue should NOT be called
       expect(mockQueue.send).not.toHaveBeenCalled();
@@ -226,11 +239,9 @@ describe('Queue (Cloudflare Queues integration)', () => {
 
       queue.createQueueHandler('test:', vi.fn());
 
-      try {
-        await queue.queue('test:queue' as ValidQueueName, { data: 'test' });
-      } catch {
-        // Ignore errors from embedded world
-      }
+      await expect(
+        queue.queue('test:queue' as ValidQueueName, asMessage({ data: 'test' })),
+      ).rejects.toThrow('Invalid queue name: test:queue');
 
       // Main assertion: Cloudflare Queue should NOT be called
       expect(mockQueue.send).not.toHaveBeenCalled();
@@ -242,25 +253,19 @@ describe('Queue (Cloudflare Queues integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      const first = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 1 },
-        { idempotencyKey: 'step-abc' },
-      );
-      const second = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 1 },
-        { idempotencyKey: 'step-abc' },
-      );
+      const first = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 1 }), {
+        idempotencyKey: 'step-abc',
+      });
+      const second = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 1 }), {
+        idempotencyKey: 'step-abc',
+      });
 
       // Same inflight message: the duplicate enqueue returns the original id
       expect(second.messageId).toBe(first.messageId);
 
-      const third = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 2 },
-        { idempotencyKey: 'step-other' },
-      );
+      const third = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 2 }), {
+        idempotencyKey: 'step-other',
+      });
       expect(third.messageId).not.toBe(first.messageId);
     });
   });
@@ -398,7 +403,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
       // Retryable non-2xx: the consumer maps this onto message.retry()
       expect(response.status).toBe(503);
       expect(response.headers.get('Retry-After')).toBe('30');
-      const body = await response.json();
+      const body = (await response.json()) as { timeoutSeconds?: number };
       expect(body.timeoutSeconds).toBe(30);
     });
 
@@ -450,7 +455,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         }),
       );
       expect(second.status).toBe(200);
-      const body = await second.json();
+      const body = (await second.json()) as { duplicate?: boolean };
       expect(body.duplicate).toBe(true);
       expect(handler).toHaveBeenCalledTimes(1);
 
@@ -532,7 +537,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
 
       expect(response.status).toBe(500);
       expect(response.headers.get('Retry-After')).toBeDefined();
-      const errorBody = await response.json();
+      const errorBody = (await response.json()) as { error?: string };
       expect(errorBody.error).toContain('Handler error');
     });
 
@@ -589,7 +594,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
       );
 
       expect(response.status).toBe(503);
-      const body = await response.json();
+      const body = (await response.json()) as { timeoutSeconds?: number };
       expect(body.timeoutSeconds).toBe(5);
 
       const [message] = handler.mock.calls[0];

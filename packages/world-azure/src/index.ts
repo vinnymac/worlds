@@ -17,6 +17,9 @@ export interface AzureWorldConfig {
   /** Service Bus queue name. Defaults to 'workflow-queue' */
   queueName?: string;
   deploymentId?: string;
+  /** Per-run event ceiling reported on `run_started`
+   * (`EventResult.maxEvents`). Defaults to `WORKFLOW_MAX_EVENTS`, then 25,000. */
+  maxEventsPerRun?: number;
 }
 
 /**
@@ -255,6 +258,7 @@ export function createAzureWorld(
         container: db.container(CONTAINER_WORKFLOW_RUNS),
         hooksByTokenContainer: db.container(CONTAINER_HOOKS_BY_TOKEN),
         deploymentId,
+        maxEventsPerRun: config.maxEventsPerRun,
       });
 
       streamerInstance = createStreamer({
@@ -269,7 +273,7 @@ export function createAzureWorld(
 
     async close() {
       await queue.close();
-      // Only tear down clients this world created itself — injected clients
+      // Only tear down clients this world created itself; injected clients
       // stay owned by the caller.
       if (!config.serviceBusClient && serviceBusClient) {
         await serviceBusClient.close();

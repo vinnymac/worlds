@@ -37,21 +37,22 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@google-cloud/firestore": "^7.10.0",
     "@google-cloud/tasks": "^6.2.1",
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "ulid": "catalog:"
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",
-    "@testcontainers/gcloud": "11.8.1",
+    "@testcontainers/gcloud": "12.1.0",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
-    "axios": "1.13.2",
+    "axios": "1.19.0",
     "testcontainers": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:",
@@ -60,5 +61,5 @@
   "volta": {
     "extends": "../../package.json"
   },
-  "packageManager": "pnpm@11.11.0"
+  "packageManager": "pnpm@11.22.0"
 }

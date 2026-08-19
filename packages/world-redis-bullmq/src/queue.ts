@@ -1,4 +1,5 @@
 import { uint8ArrayReplacer } from '@fantasticfour/shared';
+import { hasBinary } from './util.js';
 import {
   MessageId,
   parseQueueName,
@@ -6,6 +7,7 @@ import {
   type QueueKind,
   type ValidQueueName,
 } from '@workflow/world';
+import { createWorkflowUrl } from '@workflow/utils';
 import { DelayedError, type Job, Queue, Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
@@ -34,10 +36,10 @@ const QUEUE_PATHNAMES = {
 } as const satisfies Record<QueueKind, string>;
 
 interface QueueJobData {
-  /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_…`) */
+  /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_...`) */
   queueName: ValidQueueName;
   /**
-   * The queue payload, serialized with the tagged-JSON transport — forwarded
+   * The queue payload, serialized with the tagged-JSON transport, forwarded
    * verbatim as the fetch body. Pre-serializing keeps Uint8Array values (e.g.
    * the resilient-start runInput.input) intact through BullMQ's own JSON
    * serialization of job data.
@@ -51,8 +53,11 @@ interface QueueJobData {
  * world-local/world-postgres queue transports. Required because BullMQ
  * JSON-serializes job data, which would otherwise mangle binary payloads.
  */
+// Same fast path as storage: a replacer/reviver forces V8 off its fast path,
+// costing ~2.6x on serialize and ~8x on parse. Queue payloads carry the same
+// step inputs and results, so this applies per enqueue and dequeue.
 function serializeQueueMessage(message: unknown): string {
-  return JSON.stringify(message, uint8ArrayReplacer);
+  return hasBinary(message) ? JSON.stringify(message, uint8ArrayReplacer) : JSON.stringify(message);
 }
 
 function queueMessageReviver(_key: string, value: unknown): unknown {
@@ -66,7 +71,9 @@ function queueMessageReviver(_key: string, value: unknown): unknown {
 }
 
 function deserializeQueueMessage(text: string): unknown {
-  return JSON.parse(text, queueMessageReviver);
+  // Queue messages carry no Date fields, so with the tag absent a plain parse
+  // is exactly equivalent.
+  return text.includes('"__type"') ? JSON.parse(text, queueMessageReviver) : JSON.parse(text);
 }
 
 /**
@@ -83,7 +90,7 @@ function resolveBaseUrl(config: RedisWorldConfig): string {
 
 /**
  * BullMQ-backed Queue. Job dispatch happens via HTTP fetch to the user's
- * server — this package does not embed a workflow runtime.
+ * server; this package does not embed a workflow runtime.
  */
 export function createQueue(
   redis: Redis,
@@ -109,12 +116,20 @@ export function createQueue(
   const maxStalledCount = config.maxStalledCount ?? 1;
   const idempotencyTtlMs = config.idempotencyTtlMs;
 
-  // Reuse the full ioredis options (tls, username, path, sentinels, …) so
-  // rediss:// and ACL setups work for the queue half too — an allowlist here
+  // Reuse the full ioredis options (tls, username, path, sentinels, ...) so
+  // rediss:// and ACL setups work for the queue half too; an allowlist here
   // would silently drop fields. BullMQ manages its own key prefixes and
   // rejects ioredis keyPrefix, so strip it; maxRetriesPerRequest: null is
   // required by BullMQ for blocking connections.
-  const { keyPrefix: _unsupportedByBullmq, ...redisOptions } = redis.options;
+  // Auto-pipelining is a storage-side setting. BullMQ workers hold blocking
+  // connections (BZPOPMIN and friends), where batching a blocking call
+  // together with other commands would stall them behind it, so it is dropped
+  // here rather than inherited.
+  const {
+    keyPrefix: _unsupportedByBullmq,
+    enableAutoPipelining: _storageOnly,
+    ...redisOptions
+  } = redis.options;
   const connectionOptions = {
     ...redisOptions,
     maxRetriesPerRequest: null,
@@ -136,9 +151,9 @@ export function createQueue(
     const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
 
     // Core treats queue() success as a durability guarantee, so add()
-    // failures must propagate. BullMQ does NOT throw on dedup hits — the
-    // addJob script returns the existing job id — so any rejection here is a
-    // real failure (connection loss, OOM, …) and swallowing it would strand
+    // failures must propagate. BullMQ does NOT throw on dedup hits; the
+    // addJob script returns the existing job id, so any rejection here is a
+    // real failure (connection loss, OOM, ...) and swallowing it would strand
     // the run.
     await bullQueue.add(
       queueName,
@@ -150,7 +165,7 @@ export function createQueue(
         backoff: { type: backoffType, delay: backoffDelayMs },
         // BullMQ native deduplication. Without a ttl the dedup key lives
         // until the job completes or fails (BullMQ deletes it on
-        // finalization) — the release-on-completion semantics core relies on
+        // finalization), the release-on-completion semantics core relies on
         // when it re-enqueues pending steps with the same idempotencyKey on
         // every replay. A ttl is only applied when explicitly configured.
         ...(opts?.idempotencyKey && {
@@ -171,7 +186,7 @@ export function createQueue(
     const pathname = QUEUE_PATHNAMES[kind];
     return async (job: Job<QueueJobData>, token?: string) => {
       const baseUrl = resolveBaseUrl(config);
-      const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+      const url = createWorkflowUrl(baseUrl, { type: pathname });
       const messageId = job.id ?? `msg_${generateMessageId()}`;
 
       const response = await fetch(url, {
@@ -191,7 +206,7 @@ export function createQueue(
       const text = await response.text();
 
       // 503 with { timeoutSeconds } means "retry later without consuming an
-      // attempt" — defer the job via BullMQ's delayed queue. BullMQ requires
+      // attempt": defer the job via BullMQ's delayed queue. BullMQ requires
       // throwing DelayedError after moveToDelayed so the worker skips its
       // completion/failure machinery for this invocation.
       if (response.status === 503) {

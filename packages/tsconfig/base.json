@@ -9,7 +9,10 @@
     "sourceMap": true,
     "strict": true,
     "target": "ES2022",
-    "lib": ["ES2022"]
+    // Every package declares engines.node >= 24, so ES2023 library APIs
+    // (Array#toSorted, Array#findLast, ...) are always present at runtime.
+    // Only `lib` moves; `target` stays at ES2022 so emitted syntax is unchanged.
+    "lib": ["ES2023"]
   },
   "exclude": ["node_modules"]
 }

@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -40,12 +41,139 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from '@upstash/redis';
-import { monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory } from 'ulid';
 import { compact, stringify, parse } from './util.js';
 
 interface UpstashStorageConfig {
   redis: Redis;
   keyPrefix: string;
+  /** See `UpstashWorldConfig.maxEventsPerRun`. */
+  maxEventsPerRun?: number;
+  /** See `UpstashWorldConfig.claimTtlSeconds`. */
+  claimTtlSeconds?: number;
+}
+
+/** Per-run event ceiling reported to core, mirroring the Vercel World. */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/** Resolve the per-run event ceiling surfaced as `EventResult.maxEvents`:
+ * explicit config, then `WORKFLOW_MAX_EVENTS`, then the default. A
+ * non-positive configured value throws rather than being ignored. */
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new TypeError(
+        `maxEventsPerRun must be a positive integer, received ${String(configured)}`,
+      );
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
+}
+
+/** Event types that may advance the per-run state marker: `hook_received` or
+ * `step_completed` recorded without a `stateUpdatedAt`. Advancing on the
+ * lifecycle events core sends unguarded would 412-livelock every run. */
+const EXTERNALLY_ORIGINATED_EVENT_TYPES = new Set(['hook_received', 'step_completed']);
+
+/** Default TTL for creation-event claim keys: 30 days. */
+const DEFAULT_CLAIM_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+/** Resolve the creation-claim TTL: explicit config, then
+ * `WORKFLOW_UPSTASH_CLAIM_TTL_SECONDS`, then the 30-day default. `0` retains
+ * claims forever; anything else must be a positive integer. */
+function resolveClaimTtlSeconds(configured: number | undefined): number {
+  const validate = (value: number, source: string): number => {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new TypeError(`${source} must be a non-negative integer, received ${String(value)}`);
+    }
+    return value;
+  };
+  if (configured !== undefined) {
+    return validate(configured, 'claimTtlSeconds');
+  }
+  const raw = process.env.WORKFLOW_UPSTASH_CLAIM_TTL_SECONDS;
+  if (raw !== undefined && raw !== '') {
+    return validate(Number(raw), 'WORKFLOW_UPSTASH_CLAIM_TTL_SECONDS');
+  }
+  return DEFAULT_CLAIM_TTL_SECONDS;
+}
+
+/** Epoch ms encoded in the trailing ULID of an entity id (`wevt_<ulid>`).
+ * Mirrors core's decode, which strips through the LAST underscore. */
+function eventIdTime(eventId: string): number {
+  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+}
+
+/** Sentinel returned by the Lua guard prelude when the create is stale. */
+const LUA_PRECONDITION_FAILED = -9;
+
+/** Lua prelude implementing the `stateUpdatedAt` guard. An empty
+ * `ARGV[argIdx]` disables it; rejection is strictly older-than so an
+ * up-to-date client never livelocks. EVAL is the only atomic path here. */
+function luaStateGuard(keyIdx: number, argIdx: number): string {
+  return `
+  if ARGV[${argIdx}] ~= '' then
+    local marker = redis.call('GET', KEYS[${keyIdx}])
+    if marker and tonumber(ARGV[${argIdx}]) < tonumber(marker) then
+      return {${LUA_PRECONDITION_FAILED}, marker}
+    end
+  end
+`;
+}
+
+/** Atomically move a run between status indexes, guarded by `stateUpdatedAt`.
+ * Returns [1, ''] on success, [-9, marker] when the guard rejects. */
+const LUA_TRANSITION_RUN_STATUS = `${luaStateGuard(4, 4)}
+  redis.call('SET', KEYS[1], ARGV[1])
+  redis.call('ZREM', KEYS[2], ARGV[2])
+  redis.call('ZADD', KEYS[3], tonumber(ARGV[3]), ARGV[2])
+  return {1, ''}
+`;
+
+/** Compare-and-set upgrade of a LEGACY hook token claim (a value that
+ * predates inline eventIds). Only a legacy-shaped value (no `"eventId"`
+ * field) is replaced, so exactly one concurrent upgrader wins — a plain SET
+ * would let two racers install different canonical eventIds (last writer
+ * wins) and re-open the duplicate hook_created window. New claims are never
+ * legacy-shaped, so a lost CAS means a sibling redelivery of the SAME hook
+ * already upgraded the claim.
+ * Returns 1 when this caller's claim was installed, 0 otherwise. */
+const LUA_UPGRADE_LEGACY_TOKEN_CLAIM = `
+  local current = redis.call('GET', KEYS[1])
+  if current and not string.find(current, '"eventId"', 1, true) then
+    redis.call('SET', KEYS[1], ARGV[1])
+    return 1
+  end
+  return 0
+`;
+
+/** Atomically append an event to the log and its indexes, applying the
+ * `stateUpdatedAt` guard and advancing the run state marker.
+ * Returns [1, ''] on success, [-9, marker] when the guard rejects. */
+const LUA_APPEND_EVENT = `${luaStateGuard(4, 5)}
+  redis.call('SET', KEYS[1], ARGV[1])
+  redis.call('ZADD', KEYS[2], tonumber(ARGV[3]), ARGV[2])
+  if ARGV[4] == '1' then
+    redis.call('ZADD', KEYS[3], tonumber(ARGV[3]), ARGV[2])
+  end
+  if ARGV[6] ~= '' then
+    local previous = redis.call('GET', KEYS[4])
+    if not previous or tonumber(ARGV[6]) > tonumber(previous) then
+      redis.call('SET', KEYS[4], ARGV[6])
+    end
+  end
+  return {1, ''}
+`;
+
+/** Throw the typed 412 core matches by error name. */
+function throwPreconditionFailed(runId: string, stateUpdatedAt: number, marker: string): never {
+  throw new PreconditionFailedError(
+    `Event for run "${runId}" is stale: stateUpdatedAt ${stateUpdatedAt} predates the run's ` +
+      `state marker ${marker}`,
+  );
 }
 
 /**
@@ -113,7 +241,7 @@ interface HookTokenClaim {
 /**
  * Parse a hook token claim value.
  *
- * New format: JSON `{ runId, hookId, eventId }` — @upstash/redis
+ * New format: JSON `{ runId, hookId, eventId }`; @upstash/redis
  * auto-deserialization returns it as an object. Legacy format (pre-1.4):
  * a plain hookId string with no ownership metadata.
  */
@@ -140,7 +268,7 @@ function parseHookTokenClaim(raw: unknown): HookTokenClaim | null {
         return parseHookTokenClaim(parsed);
       }
     } catch {
-      // Not JSON — fall through to the legacy plain-hookId format.
+      // Not JSON: fall through to the legacy plain-hookId format.
     }
     return { hookId: raw };
   }
@@ -187,7 +315,7 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
       const data = await redis.get<string>(runKey(id));
       if (!data) {
         // Core retries runs.get on WorkflowRunNotFoundError (matched by name)
-        // to absorb the create/start race — a generic error would not match.
+        // to absorb the create/start race; a generic error would not match.
         throw new WorkflowRunNotFoundError(id);
       }
       const run = parse<WorkflowRun>(data);
@@ -241,11 +369,16 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
 export function createEventsStorage(config: UpstashStorageConfig): Storage['events'] {
   const { redis, keyPrefix } = config;
   const ulid = monotonicFactory();
+  const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
+  const claimTtlSeconds = resolveClaimTtlSeconds(config.claimTtlSeconds);
 
   const eventKey = (id: string) => `${keyPrefix}event:${id}`;
   const eventsIndexKey = (runId: string) => `${keyPrefix}events:by_run:${runId}`;
   const eventsByCorrelationKey = (correlationId: string) =>
     `${keyPrefix}events:by_correlation:${correlationId}`;
+  // Optimistic-concurrency marker: epoch ms of the ULID time of the most
+  // recent externally-originated event for the run.
+  const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
   // Exactly-once arbiter for entity-creating events (SETNX stores the
   // canonical eventId). This is the Redis equivalent of world-postgres's
   // `workflow_events_entity_creation_unique` constraint: it prevents two
@@ -254,6 +387,21 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
   // partial write.
   const creationEventClaimKey = (runId: string, correlationId: string, eventType: string) =>
     `${keyPrefix}events:creation:${runId}:${correlationId}:${eventType}`;
+
+  /** SET NX a creation-event claim, expiring per `claimTtlSeconds` (claims
+   * are pure dedup overhead once a run is terminal, and nothing else deletes
+   * them). Duplicates race within delivery windows, so the month-long
+   * default TTL is wide margin; after expiry the canonical-event existence
+   * probe still rejects replays of completed writes. Returns true when this
+   * caller won the claim. */
+  const claimCreationEventSlot = async (claimKey: string, id: string): Promise<boolean> => {
+    const result = await redis.set(
+      claimKey,
+      id,
+      claimTtlSeconds > 0 ? { nx: true, ex: claimTtlSeconds } : { nx: true },
+    );
+    return result === 'OK';
+  };
 
   const runKey = (id: string) => `${keyPrefix}run:${id}`;
   const runsIndexKey = () => `${keyPrefix}runs:index`;
@@ -270,7 +418,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
   /**
    * Probe the event log for an existing hook_created event for this
    * (runId, hookId). Used by the legacy-claim recovery path to detect
-   * "already published" before appending — legacy token claims (plain
+   * "already published" before appending; legacy token claims (plain
    * hookId, no eventId) cannot arbitrate publication on their own.
    */
   async function findHookCreatedEventId(runId: string, hookId: string): Promise<string | null> {
@@ -286,6 +434,61 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
     }
     return null;
+  }
+
+  /** Move a run between status indexes in one guarded, atomic EVAL. `guard`
+   * carries the caller's `stateUpdatedAt` so a stale lifecycle event can never
+   * mark the run terminal. */
+  async function transitionRunStatus(
+    runId: string,
+    oldStatus: string,
+    newStatus: string,
+    updatedRun: unknown,
+    at: Date,
+    guard = '',
+  ): Promise<void> {
+    const result = await redis.eval<string[], [number, string]>(
+      LUA_TRANSITION_RUN_STATUS,
+      [runKey(runId), runsByStatusKey(oldStatus), runsByStatusKey(newStatus), runStateKey(runId)],
+      [stringify(updatedRun), runId, at.getTime().toString(), guard],
+    );
+    if (result[0] === LUA_PRECONDITION_FAILED) {
+      throwPreconditionFailed(runId, Number(guard), String(result[1]));
+    }
+  }
+
+  /** Append an event and its index entries in one guarded, atomic EVAL. `guard`
+   * is `''` on paths that already checked it, so the check runs exactly once
+   * per create. */
+  async function appendEvent(
+    runId: string,
+    id: string,
+    event: unknown,
+    createdAt: Date,
+    correlationId: string | undefined,
+    guard = '',
+    markerAdvance = '',
+  ): Promise<void> {
+    const result = await redis.eval<string[], [number, string]>(
+      LUA_APPEND_EVENT,
+      [
+        eventKey(id),
+        eventsIndexKey(runId),
+        correlationId ? eventsByCorrelationKey(correlationId) : '__unused__',
+        runStateKey(runId),
+      ],
+      [
+        stringify(event),
+        id,
+        createdAt.getTime().toString(),
+        correlationId ? '1' : '0',
+        guard,
+        markerAdvance,
+      ],
+    );
+    if (result[0] === LUA_PRECONDITION_FAILED) {
+      throwPreconditionFailed(runId, Number(guard), String(result[1]));
+    }
   }
 
   async function cleanupHooks(runId: string): Promise<void> {
@@ -324,10 +527,9 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             completedAt: now,
             updatedAt: now,
           };
-          await redis.set(runKey(runId), stringify(updatedRun));
-
-          await redis.zrem(runsByStatusKey(existing.status), runId);
-          await redis.zadd(runsByStatusKey('cancelled'), { score: now.getTime(), member: runId });
+          // Legacy runs (specVersion < 2) predate the optimistic-concurrency
+          // guard, so neither the guard nor the state marker applies here.
+          await transitionRunStatus(runId, existing.status, 'cancelled', updatedRun, now);
 
           await cleanupHooks(runId);
 
@@ -350,12 +552,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await redis.set(eventKey(eventId), stringify(event));
-        const score = createdAt.getTime();
-        await redis.zadd(eventsIndexKey(runId), { score, member: eventId });
-        if (data.correlationId) {
-          await redis.zadd(eventsByCorrelationKey(data.correlationId), { score, member: eventId });
-        }
+        await appendEvent(runId, eventId, event, createdAt, data.correlationId);
 
         const parsed = EventSchema.parse(event);
         return { event: filterEventData(parsed, resolveData) };
@@ -383,6 +580,22 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       let adoptedEventCreatedAt: Date | undefined;
       const now = new Date();
 
+      // `stateUpdatedAt` is the ULID time of the newest event the runtime had
+      // loaded. Absent -> the guard is disabled and the create falls open.
+      const stateUpdatedAt = params?.stateUpdatedAt;
+      const guard = stateUpdatedAt === undefined ? '' : String(stateUpdatedAt);
+      // Cleared once a path has evaluated `guard` atomically alongside its own
+      // entity write, so the event append below does not re-check it (a second
+      // check could reject after the entity was already mutated).
+      let residualGuard = guard;
+      // Only externally-originated events advance the marker (see
+      // EXTERNALLY_ORIGINATED_EVENT_TYPES). Resolved at append time because
+      // `eventId` may be replaced by an adopted canonical id.
+      const markerAdvanceFor = (id: string) =>
+        stateUpdatedAt === undefined && EXTERNALLY_ORIGINATED_EVENT_TYPES.has(data.eventType)
+          ? String(eventIdTime(id))
+          : '';
+
       let effectiveRunId: string;
       if (data.eventType === 'run_created' && (!runId || runId === '')) {
         effectiveRunId = `wrun_${ulid()}`;
@@ -407,14 +620,18 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         status: string;
         specVersion?: number;
       } | null = null;
+      // The run body from the validation read, reused by every branch below.
+      // Each re-read here is a billed HTTP request on this transport, not just
+      // a round trip.
+      let existingRun: WorkflowRun | null = null;
       const skipRunValidationEvents = ['step_completed', 'step_retrying'];
       if (data.eventType !== 'run_created' && !skipRunValidationEvents.includes(data.eventType)) {
         const runData = await redis.get<string>(runKey(effectiveRunId));
         if (runData) {
-          const parsed = parse<WorkflowRun>(runData);
+          existingRun = parse<WorkflowRun>(runData);
           currentRun = {
-            status: parsed.status,
-            specVersion: parsed.specVersion,
+            status: existingRun.status,
+            specVersion: existingRun.specVersion,
           };
         }
       }
@@ -486,12 +703,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
               member: runCreatedEventId,
             });
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
+            existingRun = newRun as WorkflowRun;
           } else {
-            // Run already exists — re-read state
+            // Run already exists: re-read state
             const runData = await redis.get<string>(runKey(effectiveRunId));
             if (runData) {
               const parsed = parse<WorkflowRun>(runData);
               currentRun = { status: parsed.status, specVersion: parsed.specVersion };
+              existingRun = parsed;
             }
           }
         }
@@ -514,7 +733,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         const runTerminalEvents = ['run_started', 'run_completed', 'run_failed'];
 
         if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
-          const fullRunData = await redis.get<string>(runKey(effectiveRunId));
+          const fullRunData = existingRun;
 
           const createdAt = new Date();
           const event = {
@@ -559,17 +778,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         }
       }
 
-      let validatedStep: { status: string; startedAt?: Date; retryAfter?: Date } | null = null;
+      // Held whole so the mutation branches below reuse it rather than
+      // re-fetching the step (including its input) on a billed request.
+      let validatedStep: Step | null = null;
       const stepEventsNeedingValidation = ['step_started', 'step_retrying'];
       if (stepEventsNeedingValidation.includes(data.eventType) && data.correlationId) {
         const stepData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId));
         if (stepData) {
-          const parsed = parse<Step>(stepData);
-          validatedStep = {
-            status: parsed.status,
-            startedAt: parsed.startedAt,
-            retryAfter: parsed.retryAfter,
-          };
+          validatedStep = parse<Step>(stepData);
         }
 
         if (!validatedStep) {
@@ -593,12 +809,15 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         }
       }
 
+      // The body is kept so `hook_disposed` need not re-read it for the token.
+      let validatedHook: Hook | null = null;
       const hookEventsRequiringExistence = ['hook_disposed', 'hook_received'];
       if (hookEventsRequiringExistence.includes(data.eventType) && data.correlationId) {
         const existingHook = await redis.get<string>(hookKey(data.correlationId));
         if (!existingHook) {
           throw new HookNotFoundError(data.correlationId);
         }
+        validatedHook = parse<Hook>(existingHook);
       }
 
       if (data.eventType === 'run_created') {
@@ -629,7 +848,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
         // Duplicate run_created (e.g. the resilient-start bootstrap won the
         // race, or a duplicate start with a client-provided runId). Throw
-        // instead of appending a second run_created event — core catches
+        // instead of appending a second run_created event; core catches
         // EntityConflictError from start() as the benign "run already
         // exists" signal, and a duplicate event would corrupt the log.
         if (wasCreated !== 1) {
@@ -648,49 +867,44 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
 
       if (data.eventType === 'run_started') {
-        // Idempotency: if run is already past pending, this is a replay.
-        // Return existing run state without creating a duplicate event.
+        // Core reads the per-run event ceiling only from the run_started response, so
+        // omitting it here would drop the limit on every replay after the first.
         if (currentRun?.status === 'running') {
-          const existingData = await redis.get<string>(runKey(effectiveRunId));
-          if (existingData) {
-            run = WorkflowRunSchema.parse(compact(parse<WorkflowRun>(existingData)));
+          // Resume path, hit on every re-invocation.
+          if (existingRun) {
+            run = WorkflowRunSchema.parse(compact(existingRun));
           }
           const resolveData = params?.resolveData ?? 'all';
-          return { run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined };
+          return {
+            run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined,
+            ...(run ? { maxEvents: maxEventsPerRun } : {}),
+          };
         }
 
-        const existingData = await redis.get<string>(runKey(effectiveRunId));
-        if (!existingData) {
-          // No run entity and no runInput bootstrap above — surface a
+        if (!existingRun) {
+          // No run entity and no runInput bootstrap above; surface a
           // retryable not-found instead of logging an orphan run_started
           // event. QStash will retry once run_created lands.
           throw new WorkflowRunNotFoundError(effectiveRunId);
         }
-        const existing = parse<WorkflowRun>(existingData);
+        const existing = existingRun;
         const updatedRun = {
           ...existing,
           status: 'running' as const,
           startedAt: now,
           updatedAt: now,
         };
-        await redis.set(runKey(effectiveRunId), stringify(updatedRun));
-
-        await redis.zrem(runsByStatusKey(existing.status), existing.runId);
-        await redis.zadd(runsByStatusKey('running'), {
-          score: now.getTime(),
-          member: effectiveRunId,
-        });
+        await transitionRunStatus(effectiveRunId, existing.status, 'running', updatedRun, now);
 
         run = WorkflowRunSchema.parse(compact(updatedRun));
       }
 
       if (data.eventType === 'run_completed') {
         const eventData = (data as any).eventData as { output?: any };
-        const existingData = await redis.get<string>(runKey(effectiveRunId));
-        if (!existingData) {
+        if (!existingRun) {
           throw new WorkflowRunNotFoundError(effectiveRunId);
         }
-        const existing = parse<WorkflowRun>(existingData);
+        const existing = existingRun;
         const updatedRun = {
           ...existing,
           status: 'completed' as const,
@@ -698,13 +912,18 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           completedAt: now,
           updatedAt: now,
         };
-        await redis.set(runKey(effectiveRunId), stringify(updatedRun));
-
-        await redis.zrem(runsByStatusKey(existing.status), existing.runId);
-        await redis.zadd(runsByStatusKey('completed'), {
-          score: now.getTime(),
-          member: effectiveRunId,
-        });
+        // The guard is evaluated inside the transition script so a stale
+        // completion can never mark the run terminal; core turns the resulting
+        // 412 into an immediate re-invoke with a fresh replay.
+        await transitionRunStatus(
+          effectiveRunId,
+          existing.status,
+          'completed',
+          updatedRun,
+          now,
+          guard,
+        );
+        residualGuard = '';
 
         await cleanupHooks(effectiveRunId);
 
@@ -721,11 +940,10 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             ? eventData.error
             : (eventData.error?.message ?? 'Unknown error');
 
-        const existingData = await redis.get<string>(runKey(effectiveRunId));
-        if (!existingData) {
+        if (!existingRun) {
           throw new WorkflowRunNotFoundError(effectiveRunId);
         }
-        const existing = parse<WorkflowRun>(existingData);
+        const existing = existingRun;
         const updatedRun = {
           ...existing,
           status: 'failed' as const,
@@ -737,13 +955,15 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           completedAt: now,
           updatedAt: now,
         };
-        await redis.set(runKey(effectiveRunId), stringify(updatedRun));
-
-        await redis.zrem(runsByStatusKey(existing.status), existing.runId);
-        await redis.zadd(runsByStatusKey('failed'), {
-          score: now.getTime(),
-          member: effectiveRunId,
-        });
+        await transitionRunStatus(
+          effectiveRunId,
+          existing.status,
+          'failed',
+          updatedRun,
+          now,
+          guard,
+        );
+        residualGuard = '';
 
         await cleanupHooks(effectiveRunId);
 
@@ -751,24 +971,25 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
 
       if (data.eventType === 'run_cancelled') {
-        const existingData = await redis.get<string>(runKey(effectiveRunId));
-        if (!existingData) {
+        if (!existingRun) {
           throw new WorkflowRunNotFoundError(effectiveRunId);
         }
-        const existing = parse<WorkflowRun>(existingData);
+        const existing = existingRun;
         const updatedRun = {
           ...existing,
           status: 'cancelled' as const,
           completedAt: now,
           updatedAt: now,
         };
-        await redis.set(runKey(effectiveRunId), stringify(updatedRun));
-
-        await redis.zrem(runsByStatusKey(existing.status), existing.runId);
-        await redis.zadd(runsByStatusKey('cancelled'), {
-          score: now.getTime(),
-          member: effectiveRunId,
-        });
+        await transitionRunStatus(
+          effectiveRunId,
+          existing.status,
+          'cancelled',
+          updatedRun,
+          now,
+          guard,
+        );
+        residualGuard = '';
 
         await cleanupHooks(effectiveRunId);
 
@@ -807,7 +1028,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         if (wasCreated === 1) {
           step = StepSchema.parse(compact(newStep));
         } else {
-          // Entity already exists — duplicate delivery or crash orphan.
+          // Entity already exists: duplicate delivery or crash orphan.
           // Which one is decided by the creation-event claim below.
           const existingData = await redis.get<string>(
             stepKey(effectiveRunId, data.correlationId!),
@@ -823,12 +1044,32 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         // continuing". A crash orphan (entity written, event lost) adopts
         // the canonical eventId and completes the partial write.
         const claimKey = creationEventClaimKey(effectiveRunId, data.correlationId!, 'step_created');
-        const claimedEvent = await redis.setnx(claimKey, eventId);
-        if (claimedEvent !== 1) {
+        const claimedEvent = await claimCreationEventSlot(claimKey, eventId);
+        if (!claimedEvent) {
           const canonicalEventId = String(await redis.get(claimKey));
           const existingEvent = await redis.get(eventKey(canonicalEventId));
           if (existingEvent) {
             throw new EntityConflictError(`Step "${data.correlationId}" already exists`);
+          }
+          eventId = canonicalEventId;
+          adoptedEventCreatedAt = ulidToDate(canonicalEventId.replace(/^wevt_/, '')) ?? undefined;
+        }
+      }
+
+      // wait_created has no entity in this world — the creation-event claim
+      // is the only dedup surface. Same split as step_created above: a real
+      // duplicate (event already in the log) throws EntityConflictError,
+      // which core catches as "wait already exists, continuing"; a crash
+      // orphan (claim written, event lost) adopts the canonical eventId and
+      // completes the partial write.
+      if (data.eventType === 'wait_created') {
+        const claimKey = creationEventClaimKey(effectiveRunId, data.correlationId!, 'wait_created');
+        const claimedEvent = await claimCreationEventSlot(claimKey, eventId);
+        if (!claimedEvent) {
+          const canonicalEventId = String(await redis.get(claimKey));
+          const existingEvent = await redis.get(eventKey(canonicalEventId));
+          if (existingEvent) {
+            throw new EntityConflictError(`Wait "${data.correlationId}" already exists`);
           }
           eventId = canonicalEventId;
           adoptedEventCreatedAt = ulidToDate(canonicalEventId.replace(/^wevt_/, '')) ?? undefined;
@@ -848,9 +1089,8 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         }
 
         const isFirstStart = !validatedStep?.startedAt;
-        const existingData = await redis.get<string>(stepKey(effectiveRunId, data.correlationId!));
-        if (existingData) {
-          const existing = parse<Step>(existingData);
+        const existing = validatedStep;
+        if (existing) {
           const updatedStep = {
             ...existing,
             status: 'running' as const,
@@ -1010,7 +1250,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             if (claim.eventId) {
               const existingEvent = await redis.get(eventKey(claim.eventId));
               if (existingEvent) {
-                // Real duplicate — the event is already in the log. Core
+                // Real duplicate: the event is already in the log. Core
                 // catches EntityConflictError and continues.
                 throw new EntityConflictError(`Hook "${hookId}" already created`);
               }
@@ -1024,10 +1264,31 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
               if (existingEventId) {
                 throw new EntityConflictError(`Hook "${hookId}" already created`);
               }
-              // Upgrade the claim with this retry's eventId. This narrows
-              // (but cannot fully close) the cross-process race for claims
-              // written before eventId was persisted inline.
-              await redis.set(tokenKey, stringify({ runId: effectiveRunId, hookId, eventId }));
+              // Upgrade the claim with this retry's eventId via an atomic
+              // CAS: only one concurrent upgrader may win. A plain SET here
+              // let two racers install different canonical eventIds (last
+              // writer wins) and double-append hook_created. The loser
+              // adopts the winner's eventId instead.
+              const upgraded = await redis.eval<string[], number>(
+                LUA_UPGRADE_LEGACY_TOKEN_CLAIM,
+                [tokenKey],
+                [stringify({ runId: effectiveRunId, hookId, eventId })],
+              );
+              if (upgraded !== 1) {
+                const winner = parseHookTokenClaim(await redis.get(tokenKey));
+                if (!winner?.eventId) {
+                  // The claim vanished or is unreadable mid-arbitration;
+                  // reject rather than risk a duplicate append.
+                  throw new EntityConflictError(`Hook "${hookId}" already created`);
+                }
+                const existingEvent = await redis.get(eventKey(winner.eventId));
+                if (existingEvent) {
+                  throw new EntityConflictError(`Hook "${hookId}" already created`);
+                }
+                eventId = winner.eventId;
+                adoptedEventCreatedAt =
+                  ulidToDate(winner.eventId.replace(/^wevt_/, '')) ?? undefined;
+              }
             }
 
             const existingData = await redis.get<string>(hookKey(hookId));
@@ -1061,15 +1322,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
               specVersion: effectiveSpecVersion,
             };
 
-            await redis.set(eventKey(eventId), stringify(conflictEvent));
-            const score = createdAt.getTime();
-            await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
-            if (data.correlationId) {
-              await redis.zadd(eventsByCorrelationKey(data.correlationId), {
-                score,
-                member: eventId,
-              });
-            }
+            await appendEvent(
+              effectiveRunId,
+              eventId,
+              conflictEvent,
+              createdAt,
+              data.correlationId,
+              residualGuard,
+            );
 
             const parsedConflict = EventSchema.parse(conflictEvent);
             const resolveData = params?.resolveData ?? 'all';
@@ -1084,9 +1344,8 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
 
       if (data.eventType === 'hook_disposed' && data.correlationId) {
-        const hookData = await redis.get<string>(hookKey(data.correlationId));
-        if (hookData) {
-          const existingHook = parse<Hook>(hookData);
+        const existingHook = validatedHook;
+        if (existingHook) {
           await redis.del(hookKey(data.correlationId));
           await redis.del(hooksByTokenKey(existingHook.token));
           await redis.zrem(hooksIndexKey(effectiveRunId), data.correlationId);
@@ -1107,13 +1366,15 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         delete (event as any).eventData;
       }
 
-      await redis.set(eventKey(eventId), stringify(event));
-
-      const score = createdAt.getTime();
-      await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
-      if (data.correlationId) {
-        await redis.zadd(eventsByCorrelationKey(data.correlationId), { score, member: eventId });
-      }
+      await appendEvent(
+        effectiveRunId,
+        eventId,
+        event,
+        createdAt,
+        data.correlationId,
+        residualGuard,
+        markerAdvanceFor(eventId),
+      );
 
       const parsed = EventSchema.parse(event);
       const resolveData = params?.resolveData ?? 'all';
@@ -1144,6 +1405,9 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         step,
         hook,
         events: allEvents,
+        // Server-owned per-run event ceiling; the runtime enforces it. Only
+        // meaningful when a run entity is attached (run-lifecycle responses).
+        ...(run ? { maxEvents: maxEventsPerRun } : {}),
       };
     },
 

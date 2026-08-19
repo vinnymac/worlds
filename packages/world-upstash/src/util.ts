@@ -1,20 +1,22 @@
 import { createDebugLogger } from '@fantasticfour/shared';
 import type { Redis } from '@upstash/redis';
 
-import { parse as sharedParse } from '@fantasticfour/shared';
+import { revive, parse as sharedParse } from '@fantasticfour/shared';
 
 export { compact } from '@fantasticfour/shared';
 export { stringify } from '@fantasticfour/shared';
 
 /**
  * Parse with Uint8Array and Date support.
- * Handles @upstash/redis auto-deserialization: if the input is already an
- * object (not a string), re-serialize it first so the JSON revivers can
- * convert ISO date strings to Date objects and tagged markers to Uint8Array.
+ *
+ * Handles @upstash/redis auto-deserialization: the client often hands back an
+ * already-decoded object rather than text. That case walks the value directly
+ * instead of re-serializing it just to run it back through `parse`, which cost
+ * a full stringify *and* parse on every read — and over a REST transport every
+ * read takes this path.
  */
 export function parse<T>(input: string | unknown): T {
-  const text = typeof input === 'string' ? input : JSON.stringify(input);
-  return sharedParse<T>(text);
+  return typeof input === 'string' ? sharedParse<T>(input) : revive<T>(input);
 }
 export const debug = createDebugLogger('upstash-world');
 

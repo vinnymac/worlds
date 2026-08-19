@@ -187,7 +187,9 @@ describe('Cloudflare Durable Objects Features', () => {
       });
 
       expect(result.keys.length).toBe(2);
-      expect(result.keys.every((k: any) => k.name.startsWith('run:workflow-a:'))).toBe(true);
+      expect(result.keys.every((k: { name: string }) => k.name.startsWith('run:workflow-a:'))).toBe(
+        true,
+      );
     });
 
     it('should handle KV pagination for large result sets', async () => {

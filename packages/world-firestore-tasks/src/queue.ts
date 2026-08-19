@@ -2,6 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { parse, stringify } from '@fantasticfour/shared';
 import type { Firestore } from '@google-cloud/firestore';
 import type { CloudTasksClient } from '@google-cloud/tasks';
+import { createWorkflowUrl } from '@workflow/utils';
 import type { Queue } from '@workflow/world';
 import {
   MessageId,
@@ -69,7 +70,7 @@ function sanitizeTaskName(name: string): string {
 }
 
 /**
- * gRPC status code 6 (ALREADY_EXISTS) — Cloud Tasks rejects a duplicate task
+ * gRPC status code 6 (ALREADY_EXISTS); Cloud Tasks rejects a duplicate task
  * name within ~1h of completion, which is our dedup signal.
  */
 function isAlreadyExistsError(err: unknown): boolean {
@@ -104,7 +105,7 @@ function createTestPump(config: CloudTasksConfig) {
   /**
    * Inflight messages by idempotency key. The runtime re-enqueues pending
    * steps on every workflow replay with `idempotencyKey: stepId` and relies
-   * on the queue to dedupe — without this, a step gets delivered (and
+   * on the queue to dedupe; without this, a step gets delivered (and
    * executed) concurrently multiple times, appending duplicate step events
    * that corrupt the event log on replay.
    */
@@ -132,7 +133,7 @@ function createTestPump(config: CloudTasksConfig) {
   /**
    * Retry a failed delivery with exponential backoff, or drop it once
    * maxAttempts is exhausted. Fetch-level exceptions (connection refused,
-   * timeouts) take this path too — a transient network error must not
+   * timeouts) take this path too; a transient network error must not
    * permanently swallow the message.
    */
   function retryOrDrop(envelope: PumpEnvelope, pathname: Pathname, reason: string) {
@@ -149,7 +150,7 @@ function createTestPump(config: CloudTasksConfig) {
   }
 
   async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
-    const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(resolveBaseUrl(config), { type: pathname });
     let response: Response;
     try {
       response = await fetch(url, {
@@ -301,7 +302,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
         const attemptStr = req.headers.get('X-CloudTasks-TaskExecutionCount') || '0';
         const attempt = Number.parseInt(attemptStr, 10) + 1;
 
-        // Dedup check only — the marker is written AFTER the handler
+        // Dedup check only; the marker is written AFTER the handler
         // succeeds. Writing it up front would permanently swallow the
         // message when the handler fails: Cloud Tasks redelivers, the guard
         // sees the marker, and acks without running the handler.
@@ -325,7 +326,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
 
         // { timeoutSeconds } is core's retry/sleep signal: the message must
         // be redelivered after the delay (workflow suspension, step retry
-        // backoff, TooEarlyError). Schedule a fresh task — an unnamed task
+        // backoff, TooEarlyError). Schedule a fresh task; an unnamed task
         // is not subject to name-based dedup, and the original delivery can
         // safely be acked below.
         if (result && typeof result.timeoutSeconds === 'number') {
@@ -359,7 +360,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
 
         return new Response('OK', { status: 200 });
       } catch (error) {
-        // Non-2xx → Cloud Tasks redelivers with backoff. The processed_tasks
+        // Non-2xx -> Cloud Tasks redelivers with backoff. The processed_tasks
         // marker was not written, so the retry will run the handler again.
         return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
       }

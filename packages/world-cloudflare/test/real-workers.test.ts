@@ -1,10 +1,11 @@
 /**
  * Real Cloudflare Workers tests
  * These tests run in the Workers runtime using @cloudflare/vitest-pool-workers
- * and test REAL Durable Objects with SQLite storage — the same applyEvent
+ * and test REAL Durable Objects with SQLite storage; the same applyEvent
  * transaction and streamer RPC protocol used in production.
  */
 
+import { expectEventType } from '@fantasticfour/testing';
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ApplyEventOutcome, ApplyEventRequest } from '../src/apply-event.js';
@@ -79,11 +80,13 @@ describe('Real Cloudflare Durable Objects', () => {
       expect(retrieved?.createdAt).toBeInstanceOf(Date);
     });
 
-    it('should treat a duplicate run_created as an idempotent replay', async () => {
+    it('should reject a duplicate run_created with the conflict outcome', async () => {
       expectOk(await stub.applyEvent(runCreated()));
-      const replay = expectOk(await stub.applyEvent(runCreated()));
+      const replay = expectFailure(await stub.applyEvent(runCreated()));
 
-      expect(replay.run?.runId).toBe(runId);
+      // Mapped to EntityConflictError at the storage layer; core treats the
+      // 409 as benign ("the run already exists").
+      expect(replay.code).toBe('ENTITY_CONFLICT');
       // No duplicate run_created event in the log
       const events = await stub.listEvents();
       expect(events.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
@@ -430,8 +433,7 @@ describe('Real Cloudflare Durable Objects', () => {
       );
 
       expect(outcome.hook).toBeUndefined();
-      expect(outcome.event?.eventType).toBe('hook_conflict');
-      expect(outcome.event?.eventData).toMatchObject({
+      expect(expectEventType(outcome.event, 'hook_conflict').eventData).toMatchObject({
         token: 'contested-token',
         conflictingRunId: 'wrun_other',
       });

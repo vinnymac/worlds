@@ -1,3 +1,9 @@
+-- All tables pin ROW_FORMAT=DYNAMIC: several key columns are VARCHAR(255)
+-- utf8mb4 (1020 bytes), past the 767-byte per-key-part index limit of
+-- COMPACT/REDUNDANT rows, so a server configured with
+-- innodb_default_row_format=compact would fail these CREATE TABLEs outright
+-- (and the wide events unique index added later).
+
 -- Create schema
 CREATE SCHEMA IF NOT EXISTS `workflow`;
 
@@ -22,7 +28,7 @@ CREATE TABLE `workflow`.`workflow_runs` (
   `expired_at` TIMESTAMP NULL,
   INDEX `idx_workflow_runs_name` (`name`),
   INDEX `idx_workflow_runs_status` (`status`)
-);
+) ROW_FORMAT=DYNAMIC;
 
 -- Create events table
 CREATE TABLE `workflow`.`workflow_events` (
@@ -36,7 +42,7 @@ CREATE TABLE `workflow`.`workflow_events` (
   `spec_version` INT,
   INDEX `idx_workflow_events_run_id` (`run_id`),
   INDEX `idx_workflow_events_correlation_id` (`correlation_id`)
-);
+) ROW_FORMAT=DYNAMIC;
 
 -- Create steps table
 CREATE TABLE `workflow`.`workflow_steps` (
@@ -58,7 +64,7 @@ CREATE TABLE `workflow`.`workflow_steps` (
   `spec_version` INT,
   INDEX `idx_workflow_steps_run_id` (`run_id`),
   INDEX `idx_workflow_steps_status` (`status`)
-);
+) ROW_FORMAT=DYNAMIC;
 
 -- Create hooks table
 CREATE TABLE `workflow`.`workflow_hooks` (
@@ -75,7 +81,7 @@ CREATE TABLE `workflow`.`workflow_hooks` (
   `is_webhook` BOOLEAN,
   INDEX `idx_workflow_hooks_run_id` (`run_id`),
   INDEX `idx_workflow_hooks_token` (`token`)
-);
+) ROW_FORMAT=DYNAMIC;
 
 -- Create stream chunks table
 CREATE TABLE `workflow`.`workflow_stream_chunks` (
@@ -87,4 +93,4 @@ CREATE TABLE `workflow`.`workflow_stream_chunks` (
   `sequence` BIGINT NOT NULL,
   PRIMARY KEY (`stream_id`, `id`),
   INDEX `idx_stream_chunks_sequence` (`stream_id`, `sequence`)
-);
+) ROW_FORMAT=DYNAMIC;

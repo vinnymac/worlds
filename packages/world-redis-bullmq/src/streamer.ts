@@ -12,6 +12,9 @@ import { Mutex, Rc } from './util.js';
 interface StreamPublishMessage {
   streamId: string;
   entryId: string;
+  /** Base64 chunk, inline so subscribers need no XRANGE per notification. */
+  data: string;
+  eof: boolean;
 }
 
 function parseStreamPublishMessage(raw: string): StreamPublishMessage | null {
@@ -22,9 +25,10 @@ function parseStreamPublishMessage(raw: string): StreamPublishMessage | null {
     return null;
   }
   if (!parsed || typeof parsed !== 'object') return null;
-  const { streamId, entryId } = parsed as Record<string, unknown>;
+  const { streamId, entryId, data, eof } = parsed as Record<string, unknown>;
   if (typeof streamId !== 'string' || typeof entryId !== 'string') return null;
-  return { streamId, entryId };
+  if (typeof data !== 'string' || typeof eof !== 'boolean') return null;
+  return { streamId, entryId, data, eof };
 }
 
 interface StreamChunkEvent {
@@ -36,8 +40,8 @@ interface StreamChunkEvent {
 /**
  * Compare two Redis stream entry IDs (`<ms>-<seq>`) numerically.
  *
- * String comparison is NOT safe here: within one millisecond `…-10` compares
- * lexicographically smaller than `…-9`, which would drop chunks (and the eof
+ * String comparison is NOT safe here: within one millisecond `...-10` compares
+ * lexicographically smaller than `...-9`, which would drop chunks (and the eof
  * marker) once the sequence number crosses a digit boundary.
  */
 function compareStreamEntryIds(a: string, b: string): number {
@@ -50,6 +54,44 @@ interface StreamerConfig {
   redis: Redis;
   keyPrefix: string;
 }
+
+/**
+ * Append a chunk, index the stream under its run, and notify subscribers in one
+ * round trip. These were three sequential awaits per chunk, and the publish
+ * could not be pipelined with the rest because it needs the entry ID `XADD`
+ * generates; Lua makes that dependency server-side. The chunk rides along in
+ * the message so subscribers no longer `XRANGE` per notification.
+ *
+ * KEYS[1] = stream key
+ * KEYS[2] = streams-by-run key
+ * ARGV[1] = notification channel
+ * ARGV[2] = stream name
+ * ARGV[3] = base64 chunk data
+ * ARGV[4] = 'true' | 'false' (eof marker)
+ * Returns: the generated stream entry ID
+ */
+const LUA_APPEND_AND_PUBLISH = `
+  local streamKey = KEYS[1]
+  local runIndexKey = KEYS[2]
+  local channel = ARGV[1]
+  local streamId = ARGV[2]
+  local data = ARGV[3]
+  local eof = ARGV[4]
+
+  local entryId = redis.call('XADD', streamKey, '*', 'data', data, 'eof', eof)
+  redis.call('SADD', runIndexKey, streamId)
+  redis.call('PUBLISH', channel, cjson.encode({
+    streamId = streamId,
+    entryId = entryId,
+    data = data,
+    eof = eof == 'true'
+  }))
+  return entryId
+`;
+
+type RedisWithStreamScript = Redis & {
+  wfStreamAppend(...args: string[]): Promise<string>;
+};
 
 /**
  * Create a streamer implementation using Redis Streams.
@@ -87,6 +129,9 @@ export function createStreamer(config: StreamerConfig): Streamer & { close(): Pr
     }
   };
 
+  redis.defineCommand('wfStreamAppend', { numberOfKeys: 2, lua: LUA_APPEND_AND_PUBLISH });
+  const scripted = redis as RedisWithStreamScript;
+
   const streamKey = (name: string) => `${keyPrefix}stream:${name}`;
   // Per-run index of stream names, mirroring the `<entity>:by_run:<runId>`
   // convention used by storage. Populated on every write/close so
@@ -114,23 +159,11 @@ export function createStreamer(config: StreamerConfig): Streamer & { close(): Pr
       }
 
       await withStreamMutex(key, async () => {
-        // Read the specific entry from the stream using its auto-generated ID
-        const results = await redis.xrange(
-          streamKey(parsed.streamId),
-          parsed.entryId,
-          parsed.entryId,
-        );
-
-        if (results.length === 0) return;
-
-        const [id, fields] = results[0];
-        const data = Buffer.from(fields[1] as string, 'base64');
-        const eof = fields[3] === 'true';
-
+        // The chunk travels with the notification, so no XRANGE per message.
         events.emit(key, {
-          id,
-          data,
-          eof,
+          id: parsed.entryId,
+          data: Buffer.from(parsed.data, 'base64'),
+          eof: parsed.eof,
         });
       });
     } catch (error) {
@@ -151,29 +184,19 @@ export function createStreamer(config: StreamerConfig): Streamer & { close(): Pr
       const runId = await _runId;
 
       const data = !Buffer.isBuffer(chunk) ? Buffer.from(chunk) : chunk;
-
-      // Add chunk to Redis Stream with auto-generated ID
-      const entryId = (await redis.xadd(
-        streamKey(name),
-        '*',
-        'data',
-        data.toString('base64'),
-        'eof',
-        'false',
-      ))!;
-
-      // Register this stream under its run so listStreamsByRunId can find it.
-      // SADD is idempotent, so repeating it per chunk is safe.
-      await redis.sadd(streamsByRunKey(runId), name);
+      const encoded = data.toString('base64');
 
       // CRITICAL: Wait for subscription to be ready before publishing
       // Otherwise the message might be published before anyone is subscribed
       await subscriptionReady;
 
-      // Notify subscribers with the auto-generated entry ID
-      await redis.publish(
+      await scripted.wfStreamAppend(
+        streamKey(name),
+        streamsByRunKey(runId),
         STREAM_CHANNEL,
-        JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
+        name,
+        encoded,
+        'false',
       );
     },
 
@@ -181,20 +204,19 @@ export function createStreamer(config: StreamerConfig): Streamer & { close(): Pr
       // Await runId if it's a promise to ensure proper flushing
       const runId = await _runId;
 
-      // Add final chunk with eof=true, using auto-generated ID
-      const entryId = (await redis.xadd(streamKey(name), '*', 'data', '', 'eof', 'true'))!;
-
-      // Ensure the stream is indexed even if it closes without any data write.
-      await redis.sadd(streamsByRunKey(runId), name);
-
       // CRITICAL: Wait for subscription to be ready before publishing
       // Otherwise the message might be published before anyone is subscribed
       await subscriptionReady;
 
-      // Notify subscribers with the auto-generated entry ID
-      await redis.publish(
+      // Final chunk carries eof=true. Same single-round-trip append as above,
+      // which also keeps the stream indexed when it closes without any data.
+      await scripted.wfStreamAppend(
+        streamKey(name),
+        streamsByRunKey(runId),
         STREAM_CHANNEL,
-        JSON.stringify({ streamId: name, entryId } satisfies StreamPublishMessage),
+        name,
+        '',
+        'true',
       );
     },
 

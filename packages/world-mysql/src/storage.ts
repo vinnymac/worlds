@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -28,18 +29,108 @@ import {
   StepSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
-import { and, desc, eq, gt, lt, notInArray, sql } from 'drizzle-orm';
+import { and, desc, eq, getTableColumns, gt, lt, notInArray, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory } from 'ulid';
 import type { SerializedContent } from './schema.js';
 import * as schema from './schema.js';
 import { compact } from './util.js';
 
 // Type for Drizzle client with our schema
 type Drizzle = MySql2Database<typeof schema>;
-// A drizzle client or an open transaction on one — lets helpers run inside
+// A drizzle client or an open transaction on one; lets helpers run inside
 // the events.create() transaction as well as standalone.
 type DrizzleOrTx = Drizzle | Parameters<Parameters<Drizzle['transaction']>[0]>[0];
+
+/** Per-run event ceiling reported on `run_started`. The runtime fails the run
+ * with `MAX_EVENTS_EXCEEDED` once the replay log reaches it. */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+export interface EventsStorageOptions {
+  /** Per-run event ceiling returned as `EventResult.maxEvents`. Defaults to
+   * `WORKFLOW_MAX_EVENTS` when positive, else {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
+  maxEventsPerRun?: number;
+}
+
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new TypeError(
+        `maxEventsPerRun must be a positive integer, received ${String(configured)}`,
+      );
+    }
+    return configured;
+  }
+  // Env is an operator escape hatch, so it fails open to the default rather
+  // than crashing a deployment over a malformed value.
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
+}
+
+/** Event types that advance the `state_updated_at` marker when created
+ * without a `stateUpdatedAt`. Excludes `run_created` / `run_started` /
+ * `run_failed`, which core also omits it on. */
+const EXTERNAL_STATE_EVENT_TYPES: readonly string[] = ['hook_received', 'step_completed'];
+
+/** Epoch ms encoded in a `wevt_<ulid>` id. The client strips at the last `_`. */
+function eventIdTime(eventId: string): number {
+  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+}
+
+/** Locks the run row so the marker check and the event insert are one
+ * serializable unit, before the event ULID is allocated so ids stay
+ * commit-ordered. Returns whether the caller must advance the marker. */
+async function lockRunState(
+  tx: DrizzleOrTx,
+  runId: string,
+  eventType: string,
+  stateUpdatedAt: number | undefined,
+): Promise<boolean> {
+  const guarded = stateUpdatedAt !== undefined;
+  const advances = !guarded && EXTERNAL_STATE_EVENT_TYPES.includes(eventType);
+  if (!guarded && !advances) return false;
+
+  const [row] = await tx
+    .select({ stateUpdatedAt: schema.runs.stateUpdatedAt })
+    .from(schema.runs)
+    .where(eq(schema.runs.runId, runId))
+    .limit(1)
+    .for('update');
+
+  if (guarded) {
+    const marker = row?.stateUpdatedAt;
+    if (marker != null && stateUpdatedAt < marker) {
+      throw new PreconditionFailedError(
+        `Workflow run "${runId}" advanced past the caller's snapshot (stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
+      );
+    }
+  }
+  return advances;
+}
+
+/** True when `error` is MySQL ER_DUP_ENTRY on the given key/index name
+ * (mysql2 nests the server error under `cause` depending on the call path).
+ * Gating on the key name keeps unrelated duplicate-key violations raw. */
+function isDuplicateKeyError(error: unknown, keyName: string): boolean {
+  const cause = (error as { cause?: unknown })?.cause;
+  const errorCode = (error as { code?: string })?.code ?? (cause as { code?: string })?.code;
+  const errorMessage = [
+    (error as { message?: string })?.message,
+    (cause as { message?: string })?.message,
+  ].join(' ');
+  return errorCode === 'ER_DUP_ENTRY' && errorMessage.includes(keyName);
+}
+
+/** Advance the run's state marker to the ULID time of the event just written.
+ * `GREATEST` keeps it monotonic without a read-modify-write. */
+async function advanceStateMarker(tx: DrizzleOrTx, runId: string, eventId: string): Promise<void> {
+  const marker = eventIdTime(eventId);
+  await tx
+    .update(schema.runs)
+    .set({ stateUpdatedAt: sql`GREATEST(COALESCE(${schema.runs.stateUpdatedAt}, 0), ${marker})` })
+    .where(eq(schema.runs.runId, runId));
+}
 
 /**
  * Parse error JSON string into a StructuredError object.
@@ -68,7 +159,9 @@ function parseErrorJson(errorJson: string | null): any {
  * Deserialize run data, handling legacy error fields.
  */
 function deserializeRunError(run: any): WorkflowRun {
-  const { errorStack, errorCode, ...rest } = run;
+  // stateUpdatedAt is our internal optimistic-concurrency marker column, not a
+  // WorkflowRun field; drop it here so it never leaks onto a returned entity.
+  const { errorStack, errorCode, stateUpdatedAt: _stateUpdatedAt, ...rest } = run;
 
   // If no legacy fields, return as-is
   if (!errorStack && !errorCode) {
@@ -132,12 +225,31 @@ function applyCborFallbackEvent(value: any): any {
   return value;
 }
 
+/** Payload columns stripped for `resolveData: 'none'`. */
+const DATA_COLUMNS = ['input', 'inputJson', 'output', 'outputJson'];
+
+/** `resolveData: 'none'` callers discard input/output, so these projections
+ * keep the payload columns inside MySQL rather than reading them across the
+ * wire and stripping them in JS. Derived from the live table definition so a
+ * new column cannot silently reintroduce the blob. */
+function columnsWithoutData<T extends object>(table: T) {
+  const cols: Record<string, unknown> = { ...getTableColumns(table as any) };
+  for (const c of DATA_COLUMNS) delete cols[c];
+  return cols as any;
+}
+const runColumnsWithoutData = columnsWithoutData(schema.runs);
+const stepColumnsWithoutData = columnsWithoutData(schema.steps);
+
 export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
   const runs = schema.runs;
 
   return {
     get: (async (id: string, params?: any) => {
-      const [value] = await drizzle.select().from(runs).where(eq(runs.runId, id)).limit(1);
+      const [value] = await drizzle
+        .select(params?.resolveData === 'none' ? runColumnsWithoutData : undefined)
+        .from(runs)
+        .where(eq(runs.runId, id))
+        .limit(1);
       if (!value) {
         throw new WorkflowRunNotFoundError(id);
       }
@@ -153,7 +265,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
       const fromCursor = params?.pagination?.cursor;
 
       const all = await drizzle
-        .select()
+        .select(params?.resolveData === 'none' ? runColumnsWithoutData : undefined)
         .from(runs)
         .where(
           and(
@@ -209,9 +321,13 @@ type MutationOutcome =
       conflictEventData: { token: string; conflictingRunId: string };
     };
 
-export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
+export function createEventsStorage(
+  drizzle: Drizzle,
+  options: EventsStorageOptions = {},
+): Storage['events'] {
   const ulid = monotonicFactory();
   const events = schema.events;
+  const maxEvents = resolveMaxEventsPerRun(options.maxEventsPerRun);
 
   // Terminal statuses, used both for JS checks and as atomic guards in
   // UPDATE ... WHERE clauses (prevents TOCTOU races between validation
@@ -220,9 +336,13 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
   const isTerminal = (status: string): boolean =>
     (terminalStatuses as readonly string[]).includes(status);
 
-  async function fetchRun(db: DrizzleOrTx, runId: string): Promise<WorkflowRun | undefined> {
+  async function fetchRun(
+    db: DrizzleOrTx,
+    runId: string,
+    resolveData: ResolveData = 'all',
+  ): Promise<WorkflowRun | undefined> {
     const [value] = await db
-      .select()
+      .select(resolveData === 'none' ? runColumnsWithoutData : undefined)
       .from(schema.runs)
       .where(eq(schema.runs.runId, runId))
       .limit(1);
@@ -236,9 +356,10 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
     db: DrizzleOrTx,
     runId: string,
     stepId: string,
+    resolveData: ResolveData = 'all',
   ): Promise<Step | undefined> {
     const [value] = await db
-      .select()
+      .select(resolveData === 'none' ? stepColumnsWithoutData : undefined)
       .from(schema.steps)
       .where(and(eq(schema.steps.runId, runId), eq(schema.steps.stepId, stepId)))
       .limit(1);
@@ -261,7 +382,19 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
   // MySQL has no INSERT ... RETURNING, so insert then re-read the
   // server-generated timestamps for the event row.
   async function insertEvent(db: DrizzleOrTx, values: EventRowInsert): Promise<InsertedEventRow> {
-    await db.insert(events).values(values);
+    try {
+      await db.insert(events).values(values);
+    } catch (error: unknown) {
+      // A duplicate creation row surfaces as EntityConflictError, the dedup
+      // signal the runtime expects on redelivered creates. Gated on the index
+      // name so other ER_DUP_ENTRY violations still propagate raw.
+      if (isDuplicateKeyError(error, 'workflow_events_entity_creation_unique')) {
+        throw new EntityConflictError(
+          `${values.eventType} for correlationId "${values.correlationId}" already exists in run "${values.runId}"`,
+        );
+      }
+      throw error;
+    }
     const [created] = await db
       .select({ createdAt: events.createdAt, occurredAt: events.occurredAt })
       .from(events)
@@ -329,14 +462,14 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             runInputData.workflowName &&
             runInputData.input !== undefined
           ) {
-            // Create run + run_created event atomically. The insert result's
-            // affectedRows tells us whether WE created the row (1) or lost the
-            // race to a concurrent run_created (0) — only the creator writes
-            // the synthetic run_created event.
+            // Create run + run_created event atomically. A plain INSERT on
+            // the runs PK arbitrates the race (an upsert's affectedRows
+            // cannot: mysql2 connects with CLIENT_FOUND_ROWS, so a lost race
+            // also reports 1 and would double-append the synthetic event);
+            // only the creator writes the synthetic run_created event.
             currentRun = await drizzle.transaction(async (tx) => {
-              const [inserted] = await tx
-                .insert(schema.runs)
-                .values({
+              try {
+                await tx.insert(schema.runs).values({
                   runId: effectiveRunId,
                   deploymentId: runInputData.deploymentId!,
                   workflowName: runInputData.workflowName!,
@@ -344,31 +477,33 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
                   executionContext: runInputData.executionContext as SerializedContent | undefined,
                   status: 'pending',
                   specVersion: effectiveSpecVersion,
-                })
-                .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
-              if (inserted.affectedRows === 1) {
-                await tx.insert(events).values({
-                  runId: effectiveRunId,
-                  eventId: `wevt_${ulid()}`,
-                  eventType: 'run_created',
-                  eventData: {
-                    deploymentId: runInputData.deploymentId,
-                    workflowName: runInputData.workflowName,
-                    input: runInputData.input,
-                    executionContext: runInputData.executionContext,
-                  },
-                  specVersion: effectiveSpecVersion,
                 });
-                return { status: 'pending' };
+              } catch (error: unknown) {
+                if (!isDuplicateKeyError(error, 'workflow_runs.PRIMARY')) {
+                  throw error;
+                }
+                // Run already exists (concurrent run_created won the race).
+                // Re-read so downstream logic sees the real state.
+                const [existing] = await tx
+                  .select({ status: schema.runs.status })
+                  .from(schema.runs)
+                  .where(eq(schema.runs.runId, effectiveRunId))
+                  .limit(1);
+                return existing ?? null;
               }
-              // Run already exists (concurrent run_created won the race).
-              // Re-read so downstream logic sees the real state.
-              const [existing] = await tx
-                .select({ status: schema.runs.status })
-                .from(schema.runs)
-                .where(eq(schema.runs.runId, effectiveRunId))
-                .limit(1);
-              return existing ?? null;
+              await tx.insert(events).values({
+                runId: effectiveRunId,
+                eventId: `wevt_${ulid()}`,
+                eventType: 'run_created',
+                eventData: {
+                  deploymentId: runInputData.deploymentId,
+                  workflowName: runInputData.workflowName,
+                  input: runInputData.input,
+                  executionContext: runInputData.executionContext,
+                },
+                specVersion: effectiveSpecVersion,
+              });
+              return { status: 'pending' };
             });
           }
         }
@@ -404,6 +539,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           return {
             event: filterEventData(parsed, resolveData),
             run: fullRun,
+            ...(fullRun ? { maxEvents } : {}),
           };
         }
 
@@ -491,13 +627,23 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
 
       // ============================================================
       // Entity creation/updates based on event type. Each entity write
-      // commits atomically with its event log entry — a crash cannot
+      // commits atomically with its event log entry; a crash cannot
       // leave a mutated entity without the corresponding event.
       // ============================================================
       const outcome = await drizzle.transaction(async (tx): Promise<MutationOutcome> => {
         let run: WorkflowRun | undefined;
         let step: Step | undefined;
         let hook: Hook | undefined;
+
+        // Taking the run row lock here, before any entity write and before the event
+        // ULID is allocated, makes the marker check and this insert one serializable
+        // unit; a rejection rolls the whole create back.
+        const advancesStateMarker = await lockRunState(
+          tx,
+          effectiveRunId,
+          data.eventType,
+          params?.stateUpdatedAt,
+        );
 
         // Handle run_created event: create the run entity
         if (data.eventType === 'run_created') {
@@ -507,9 +653,12 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             input: any[];
             executionContext?: Record<string, any>;
           };
-          await tx
-            .insert(schema.runs)
-            .values({
+          // Plain INSERT: the runs PK is the duplicate arbiter. An upsert's
+          // affectedRows cannot distinguish a fresh insert from a no-op
+          // duplicate here, because mysql2 connects with CLIENT_FOUND_ROWS
+          // (a duplicate set to its current values also reports 1).
+          try {
+            await tx.insert(schema.runs).values({
               runId: effectiveRunId,
               deploymentId: eventData.deploymentId,
               workflowName: eventData.workflowName,
@@ -517,9 +666,18 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               executionContext: eventData.executionContext as SerializedContent | undefined,
               status: 'pending',
               specVersion: effectiveSpecVersion,
-            })
-            .onDuplicateKeyUpdate({ set: { runId: effectiveRunId } });
-          run = await fetchRun(tx, effectiveRunId);
+            });
+          } catch (error: unknown) {
+            if (isDuplicateKeyError(error, 'workflow_runs.PRIMARY')) {
+              // Duplicate run_created: rejecting inside the transaction
+              // aborts before the event insert below, so a redelivery cannot
+              // append a second run_created row. Core treats this 409 as
+              // benign ("the run already exists").
+              throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
+            }
+            throw error;
+          }
+          run = await fetchRun(tx, effectiveRunId, resolveData);
         }
 
         // Handle run_started event: update run status
@@ -527,7 +685,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           // Idempotency: if run is already past pending, this is a replay.
           // Return existing run state without creating a duplicate event.
           if (currentRun?.status === 'running') {
-            run = await fetchRun(tx, effectiveRunId);
+            run = await fetchRun(tx, effectiveRunId, resolveData);
             return { kind: 'run-started-replay', run };
           }
 
@@ -559,7 +717,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           }
-          run = await fetchRun(tx, effectiveRunId);
+          run = await fetchRun(tx, effectiveRunId, resolveData);
         }
 
         // Handle run_completed event: update run status and cleanup hooks.
@@ -595,7 +753,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           }
-          run = await fetchRun(tx, effectiveRunId);
+          run = await fetchRun(tx, effectiveRunId, resolveData);
           // Delete all hooks for this run to allow token reuse
           await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
         }
@@ -645,7 +803,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           }
-          run = await fetchRun(tx, effectiveRunId);
+          run = await fetchRun(tx, effectiveRunId, resolveData);
           // Delete all hooks for this run to allow token reuse
           await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
         }
@@ -683,7 +841,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           }
-          run = await fetchRun(tx, effectiveRunId);
+          run = await fetchRun(tx, effectiveRunId, resolveData);
           // Delete all hooks for this run to allow token reuse
           await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
         }
@@ -706,16 +864,16 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               specVersion: effectiveSpecVersion,
             })
             .onDuplicateKeyUpdate({ set: { stepId: data.correlationId! } });
-          step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+          step = await fetchStep(tx, effectiveRunId, data.correlationId!, resolveData);
         }
 
         // Handle step_started event: increment attempt, set status to 'running'.
         // The terminal-state guard is part of the UPDATE, not just the earlier
-        // validation read — that closes the race where another writer
+        // validation read; that closes the race where another writer
         // completes/fails the step between validation and start.
         if (data.eventType === 'step_started') {
           // Retried steps may be scheduled for later. Enforce the backoff
-          // recorded by step_retrying — the runtime converts TooEarlyError
+          // recorded by step_retrying; the runtime converts TooEarlyError
           // into a delayed re-enqueue.
           if (validatedStep?.retryAfter && validatedStep.retryAfter.getTime() > Date.now()) {
             throw new TooEarlyError(
@@ -731,7 +889,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
             .set({
               status: 'running',
               attempt: sql`${schema.steps.attempt} + 1`,
-              // Only set startedAt on first start — COALESCE so concurrent
+              // Only set startedAt on first start; COALESCE so concurrent
               // step_started calls can't clobber the original timestamp.
               startedAt: sql`COALESCE(${schema.steps.startedAt}, ${now})`,
               // Always clear retryAfter now that the step has started
@@ -764,7 +922,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               `Cannot modify step in terminal state "${existing.status}"`,
             );
           }
-          step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+          step = await fetchStep(tx, effectiveRunId, data.correlationId!, resolveData);
         }
 
         // Handle step_completed event: update step status.
@@ -807,7 +965,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           } else {
-            step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+            step = await fetchStep(tx, effectiveRunId, data.correlationId!, resolveData);
           }
         }
 
@@ -862,7 +1020,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           } else {
-            step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+            step = await fetchStep(tx, effectiveRunId, data.correlationId!, resolveData);
           }
         }
 
@@ -918,7 +1076,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               );
             }
           } else {
-            step = await fetchStep(tx, effectiveRunId, data.correlationId!);
+            step = await fetchStep(tx, effectiveRunId, data.correlationId!, resolveData);
           }
         }
 
@@ -975,7 +1133,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               }
             } else {
               // A different (runId, hookId) holds this token. Create a
-              // hook_conflict event instead of throwing 409 — this lets the
+              // hook_conflict event instead of throwing 409; this lets the
               // workflow continue and fail gracefully when the hook is awaited.
               const conflictEventData = {
                 token: eventData.token,
@@ -1032,7 +1190,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           }
         }
 
-        // Strip eventData from run_started — it belongs on run_created only.
+        // Strip eventData from run_started; it belongs on run_created only.
         const storedEventData =
           data.eventType === 'run_started'
             ? undefined
@@ -1050,12 +1208,20 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           specVersion: effectiveSpecVersion,
         });
 
+        if (advancesStateMarker) {
+          await advanceStateMarker(tx, effectiveRunId, getEventId());
+        }
+
         return { kind: 'event-created', eventRow, run, step, hook };
       });
 
       if (outcome.kind === 'run-started-replay') {
+        // Core reads maxEvents only off the run_started response, so the
+        // idempotent replay path must carry it too or the ceiling silently
+        // disappears on every replay after the first.
         return {
           run: outcome.run ? (filterRunData(outcome.run, resolveData) as WorkflowRun) : undefined,
+          ...(outcome.run ? { maxEvents } : {}),
         };
       }
 
@@ -1109,6 +1275,7 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         step: outcome.step,
         hook: outcome.hook,
         events: allEvents,
+        ...(outcome.run ? { maxEvents } : {}),
       };
     },
     async get(runId, eventId, params) {
@@ -1259,7 +1426,11 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
         ? and(eq(steps.stepId, stepId), eq(steps.runId, runId))
         : eq(steps.stepId, stepId);
 
-      const [value] = await drizzle.select().from(steps).where(whereClause).limit(1);
+      const [value] = await drizzle
+        .select(params?.resolveData === 'none' ? stepColumnsWithoutData : undefined)
+        .from(steps)
+        .where(whereClause)
+        .limit(1);
 
       if (!value) {
         throw new WorkflowWorldError(`Step not found: ${stepId}`, {
@@ -1278,7 +1449,7 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
       const fromCursor = params?.pagination?.cursor;
 
       const all = await drizzle
-        .select()
+        .select(params?.resolveData === 'none' ? stepColumnsWithoutData : undefined)
         .from(steps)
         .where(
           and(
@@ -1307,10 +1478,10 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
   };
 }
 
-export function createStorage(drizzle: Drizzle): Storage {
+export function createStorage(drizzle: Drizzle, options: EventsStorageOptions = {}): Storage {
   return {
     runs: createRunsStorage(drizzle),
-    events: createEventsStorage(drizzle),
+    events: createEventsStorage(drizzle, options),
     hooks: createHooksStorage(drizzle),
     steps: createStepsStorage(drizzle),
   };

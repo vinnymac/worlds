@@ -46,6 +46,7 @@ lerna-debug.log*
 # Temp
 tmp/
 temp/
+scratchpad/
 
 # Platform specific
 .vercel

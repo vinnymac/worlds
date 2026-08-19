@@ -80,10 +80,14 @@ export function decodeCbor(buffer: unknown): unknown {
     return undefined;
   }
 
-  // Reconstruct any Buffers that were JSON-serialized by Cosmos DB
+  if (buffer instanceof Uint8Array || Buffer.isBuffer(buffer)) {
+    return decode(buffer as Uint8Array);
+  }
+
+  // Reconstruct binary data serialized by Cosmos DB.
   buffer = reconstructBuffers(buffer);
 
-  // Handle case where data might already be decoded (for backwards compatibility)
+  // Preserve decoded values written by earlier versions.
   if (!(buffer instanceof Uint8Array) && !Buffer.isBuffer(buffer)) {
     return buffer;
   }

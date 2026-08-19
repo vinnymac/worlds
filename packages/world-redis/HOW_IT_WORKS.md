@@ -69,7 +69,7 @@ graph LR
 ### Queue Implementation
 
 - **Redis Lists**: Two ready lists (`{prefix}flows`, `{prefix}steps`)
-- **Delayed Set**: `{list}:delayed` sorted set scored by deliver-at time — `delaySeconds`, 503 soft retries, and failure backoff all park messages here durably (never in-process timers), so restarts cannot lose deferred deliveries
+- **Delayed Set**: `{list}:delayed` sorted set scored by deliver-at time; `delaySeconds`, 503 soft retries, and failure backoff all park messages here durably (never in-process timers), so restarts cannot lose deferred deliveries
 - **Processing Lists**: Workers BLMOVE into per-worker `{list}:processing:{consumer}` lists; a reclaimer returns entries to the ready list when a worker's heartbeat expires (crash between dequeue and dispatch cannot lose the message)
 - **Workers**: Configurable concurrency (default: 10)
 - **Idempotency**: Per-key reservations (`{list}:idempotent:{key}`, SET NX with 24-hour TTL), reserved atomically with the enqueue and released on completion or final drop
@@ -161,9 +161,9 @@ if (process.env.NEXT_RUNTIME !== 'edge') {
 
 ```
 create (pending)
-  ↓
+  v
 update (running) - sets startedAt
-  ↓
+  v
 update (completed/failed/cancelled) - sets completedAt
 ```
 
@@ -171,11 +171,11 @@ update (completed/failed/cancelled) - sets completedAt
 
 ```
 create (pending, attempt=1)
-  ↓
+  v
 update (running) - sets startedAt
-  ↓
+  v
 update (completed/failed) - sets completedAt
-  ↓
+  v
 [retry] update (attempt=N)
 ```
 
@@ -183,9 +183,9 @@ update (completed/failed) - sets completedAt
 
 ```
 writeToStream (chunk)
-  ↓
+  v
 writeToStream (chunk)
-  ↓
+  v
 closeStream (eof=true)
 ```
 
@@ -203,7 +203,7 @@ The Redis world uses the **embedded world pattern**:
 
 ## Error Handling
 
-- **Error taxonomy**: The specific `@workflow/errors` classes core discriminates by name — `EntityConflictError` (duplicate creations, terminal-state conflicts), `RunExpiredError` (operations on terminal runs), `TooEarlyError` (step retry backoff not reached), `WorkflowRunNotFoundError`, and `HookNotFoundError`
+- **Error taxonomy**: The specific `@workflow/errors` classes core discriminates by name: `EntityConflictError` (duplicate creations, terminal-state conflicts), `RunExpiredError` (operations on terminal runs), `TooEarlyError` (step retry backoff not reached), `WorkflowRunNotFoundError`, and `HookNotFoundError`
 - **Validation**: Entity existence and terminal-state checks before operations; entity transitions use compare-and-swap Lua scripts so concurrent events cannot overwrite each other
 - **Idempotency**: Creation events write entity + event in one atomic Lua script; duplicates reject with `EntityConflictError` so the event log holds exactly one creation event
 - **Worker Errors**: Logged but don't crash worker process (workers retry BLMOVE after 1s delay on error); in-flight messages survive crashes via processing-list reclaim

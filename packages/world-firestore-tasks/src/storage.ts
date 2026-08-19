@@ -3,6 +3,7 @@ import { FieldValue } from '@google-cloud/firestore';
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -39,6 +40,7 @@ import {
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
+  ulidToDate,
   validateUlidTimestamp,
   WaitSchema,
 } from '@workflow/world';
@@ -48,6 +50,49 @@ import { compact, debug } from './util.js';
 interface FirestoreStorageConfig {
   firestore: Firestore;
   deploymentId: string;
+  /** Per-run event ceiling reported as `EventResult.maxEvents`. Defaults to
+   * `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
+  maxEventsPerRun?: number;
+}
+
+/** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/** Subcollection + document holding the per-run concurrency marker. Kept out
+ * of the run document so advancing it never contends with lifecycle
+ * transitions or a parallel step fan-out. */
+const STATE_MARKER_COLLECTION = 'meta';
+const STATE_MARKER_DOC = 'state';
+
+/** Event types that advance the state marker when created outside a replay.
+ * Narrow by design: core also omits `stateUpdatedAt` on `run_created` /
+ * `run_started` / `run_failed`, and advancing there would reject replays. */
+const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
+
+/** Resolve the per-run event ceiling: explicit config, then
+ * `WORKFLOW_MAX_EVENTS`, then the default. An explicit value must be a
+ * positive integer. */
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new WorkflowWorldError(
+        `maxEventsPerRun must be a positive integer, received ${configured}`,
+        { status: 500 },
+      );
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
+}
+
+/** ULID time (epoch ms) of a prefixed event id, or undefined when it is not
+ * a decodable ULID. Mirrors core, which likewise fails open. */
+function eventIdTime(eventId: string): number | undefined {
+  const underscore = eventId.lastIndexOf('_');
+  const rawUlid = underscore === -1 ? eventId : eventId.slice(underscore + 1);
+  return ulidToDate(rawUlid)?.getTime();
 }
 
 interface SerializedError {
@@ -231,15 +276,28 @@ function convertBuffersToUint8Array(value: unknown): unknown {
   }
 
   if (Array.isArray(value)) {
-    return value.map(convertBuffersToUint8Array);
+    let result: unknown[] | undefined;
+    for (let i = 0; i < value.length; i++) {
+      const converted = convertBuffersToUint8Array(value[i]);
+      if (converted !== value[i]) {
+        result ??= value.slice();
+        result[i] = converted;
+      }
+    }
+    return result ?? value;
   }
 
   if (typeof value === 'object') {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = convertBuffersToUint8Array(val);
+    const source = value as Record<string, unknown>;
+    let result: Record<string, unknown> | undefined;
+    for (const [key, val] of Object.entries(source)) {
+      const converted = convertBuffersToUint8Array(val);
+      if (converted !== val) {
+        result ??= { ...source };
+        result[key] = converted;
+      }
     }
-    return result;
+    return result ?? value;
   }
 
   return value;
@@ -253,13 +311,14 @@ function deserializeNestedArrays(value: unknown): unknown {
   if (value === null || value === undefined) return value;
 
   if (typeof value === 'string') {
+    if (!value.startsWith('{"__nested_array__":')) return value;
     try {
       const parsed = JSON.parse(value);
       if (parsed && typeof parsed === 'object' && '__nested_array__' in parsed) {
         return convertBuffersToUint8Array(parsed.__nested_array__);
       }
     } catch {
-      // Not JSON, return as-is
+      return value;
     }
     return value;
   }
@@ -302,13 +361,19 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 /**
  * Serialize an error object for Firestore storage.
  */
-function serializeError(error: unknown): SerializedError | undefined {
+/** `overrides.code` carries `eventData.errorCode`, naming a run_failed reason
+ * (e.g. MAX_EVENTS_EXCEEDED). Custom error classes do not survive the wire,
+ * so `run.error.code` is the only channel for it. */
+function serializeError(
+  error: unknown,
+  overrides: { code?: unknown } = {},
+): SerializedError | undefined {
   if (!error) return undefined;
   const err = error as { message?: string; stack?: string; code?: string };
   return {
     message: err.message || '',
     stack: err.stack,
-    code: err.code,
+    code: typeof overrides.code === 'string' ? overrides.code : err.code,
   };
 }
 
@@ -382,6 +447,7 @@ function eventFromDoc(data: FirebaseFirestore.DocumentData): Event {
 export function createStorage(config: FirestoreStorageConfig): Storage {
   const { firestore } = config;
   const ulid = monotonicFactory();
+  const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
 
   /**
    * Internal helper to get a run from Firestore.
@@ -507,7 +573,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams,
+        params?: CreateEventParams,
       ): Promise<EventResult> {
         // For run_created events, generate a runId if null
         const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
@@ -542,7 +608,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
          * Allocate the event record. Called INSIDE transactions AFTER all
          * validation reads have passed, so a writer blocked on contended
          * documents never carries a stale (older) eventId into a later
-         * commit — replays observe events in eventId order.
+         * commit; replays observe events in eventId order.
          */
         function allocateEvent(overrides?: Partial<Record<string, unknown>>): {
           eventId: string;
@@ -560,7 +626,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             createdAt: new Date(),
             ...overrides,
           };
-          // Strip eventData from run_started events before storage — the run
+          // Strip eventData from run_started events before storage; the run
           // input belongs on run_created only.
           if (record.eventType === 'run_started') {
             delete record.eventData;
@@ -569,6 +635,65 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             record.correlationId = correlationId;
           }
           return { eventId, eventRef: eventsCol.doc(eventId), record };
+        }
+
+        // The marker read happens inside the same transaction as the event write, so
+        // it is a transaction precondition: an externally-originated event landing
+        // in between aborts and retries against the newer marker.
+        const stateUpdatedAt = params?.stateUpdatedAt;
+        const markerRef = runRef.collection(STATE_MARKER_COLLECTION).doc(STATE_MARKER_DOC);
+        /** Whether this create is externally originated and therefore owns the
+         * marker. Replay-origin creates carry a `stateUpdatedAt` and must never
+         * advance it, or a run would reject its own later writes. */
+        const advancesStateMarker =
+          stateUpdatedAt === undefined && EXTERNAL_EVENT_TYPES.has(data.eventType);
+
+        function validateStateMarker(snap: FirebaseFirestore.DocumentSnapshot): number | undefined {
+          const raw = snap.exists
+            ? (snap.data() as FirebaseFirestore.DocumentData).stateUpdatedAt
+            : undefined;
+          const marker = typeof raw === 'number' ? raw : undefined;
+          if (stateUpdatedAt !== undefined && marker !== undefined && stateUpdatedAt < marker) {
+            throw new PreconditionFailedError(
+              `Event creation for run "${effectiveRunId}" is based on a stale snapshot ` +
+                `(stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
+            );
+          }
+          return marker;
+        }
+
+        async function readStateMarker(
+          tx: FirebaseFirestore.Transaction,
+        ): Promise<number | undefined> {
+          if (stateUpdatedAt === undefined && !advancesStateMarker) return undefined;
+          return validateStateMarker(await tx.get(markerRef));
+        }
+
+        async function readDocsWithStateMarker(
+          tx: FirebaseFirestore.Transaction,
+          refs: FirebaseFirestore.DocumentReference[],
+        ): Promise<{
+          marker: number | undefined;
+          docs: FirebaseFirestore.DocumentSnapshot[];
+        }> {
+          if (stateUpdatedAt === undefined && !advancesStateMarker) {
+            return { marker: undefined, docs: await tx.getAll(...refs) };
+          }
+          const [markerSnap, ...docs] = await tx.getAll(markerRef, ...refs);
+          return { marker: validateStateMarker(markerSnap), docs };
+        }
+
+        /** Advance the marker to this event's ULID time, monotonically. */
+        function advanceStateMarker(
+          tx: FirebaseFirestore.Transaction,
+          eventId: string,
+          marker: number | undefined,
+        ): void {
+          if (!advancesStateMarker) return;
+          const time = eventIdTime(eventId);
+          if (time === undefined) return;
+          if (marker !== undefined && time <= marker) return;
+          tx.set(markerRef, { stateUpdatedAt: time }, { merge: true });
         }
 
         const isRunTerminalEvent =
@@ -587,7 +712,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           case 'run_created': {
             const runData = eventData as RunCreatedEventRequest['eventData'];
             result = await firestore.runTransaction(async (tx) => {
-              const existing = await tx.get(runRef);
+              const {
+                docs: [existing],
+              } = await readDocsWithStateMarker(tx, [runRef]);
               if (existing.exists) {
                 throw new EntityConflictError(`Workflow run "${effectiveRunId}" already exists`);
               }
@@ -642,7 +769,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 bootstrappedRun?: WorkflowRun;
                 unchangedRun?: WorkflowRun;
               }> => {
-                const runSnap = await tx.get(runRef);
+                const {
+                  docs: [runSnap],
+                } = await readDocsWithStateMarker(tx, [runRef]);
 
                 if (!runSnap.exists) {
                   // ============================================================
@@ -716,7 +845,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 // terminal state.
                 if (isTerminalWorkflowRunStatus(currentRun.status)) {
                   // Idempotent operation: run_cancelled on an already cancelled
-                  // run is allowed — record the event and return the run
+                  // run is allowed: record the event and return the run
                   // unchanged.
                   if (eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
                     const { eventRef, record } = allocateEvent();
@@ -778,7 +907,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                     updates.completedAt = now;
                     updates.output = FieldValue.delete();
                     if (eventData?.error !== undefined) {
-                      updates.error = serializeError(eventData.error);
+                      updates.error = serializeError(eventData.error, {
+                        code: eventData.errorCode,
+                      });
                     }
                     break;
                   }
@@ -834,7 +965,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const stepRef = runRef.collection('steps').doc(correlationId);
 
             result = await firestore.runTransaction(async (tx) => {
-              const [runSnap, stepSnap] = await tx.getAll(runRef, stepRef);
+              const {
+                docs: [runSnap, stepSnap],
+              } = await readDocsWithStateMarker(tx, [runRef, stepRef]);
 
               const runStatus = runSnap.exists
                 ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
@@ -902,7 +1035,11 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const stepRef = runRef.collection('steps').doc(correlationId);
 
             const record = await firestore.runTransaction(async (tx) => {
-              const stepSnap = await tx.get(stepRef);
+              const refs = eventType === 'step_started' ? [stepRef, runRef] : [stepRef];
+              const {
+                marker,
+                docs: [stepSnap, runSnap],
+              } = await readDocsWithStateMarker(tx, refs);
               if (!stepSnap.exists) {
                 throw new WorkflowWorldError(`Step "${correlationId}" not found`, {
                   status: 404,
@@ -912,7 +1049,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
               // Terminal-state validation: steps cannot be modified once
               // completed or failed. The runtime relies on this to dedupe
-              // redelivered step messages — without it, a late step_started
+              // redelivered step messages; without it, a late step_started
               // lands in the event log after step_completed and corrupts
               // replay.
               if (isTerminalStepStatus(currentStep.status)) {
@@ -936,8 +1073,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 // On terminal runs, only steps that are already running may
                 // proceed (to record their completion); new work must not
                 // start on a cancelled run.
-                const runSnap = await tx.get(runRef);
-                if (runSnap.exists) {
+                if (runSnap?.exists) {
                   const runStatus = String(
                     (runSnap.data() as FirebaseFirestore.DocumentData).status,
                   );
@@ -994,9 +1130,10 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 }
               }
 
-              const { eventRef, record } = allocateEvent();
+              const { eventId, eventRef, record } = allocateEvent();
               tx.set(eventRef, record);
               tx.update(stepRef, updates);
+              advanceStateMarker(tx, eventId, marker);
               return record;
             });
 
@@ -1013,14 +1150,14 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           //
           // Token uniqueness semantics:
           // - Same (runId, hookId) already owns the token and its
-          //   hook_created event is in the log → duplicate/replayed
+          //   hook_created event is in the log -> duplicate/replayed
           //   processing: throw EntityConflictError so the runtime's
           //   concurrent-replay catch path swallows it (matching
           //   step_created).
-          // - Same (runId, hookId) without a hook_created event →
+          // - Same (runId, hookId) without a hook_created event ->
           //   crash-orphaned hook entity from a pre-transactional version:
           //   complete the partial write by publishing the missing event.
-          // - A different (runId, hookId) owns the token → record a
+          // - A different (runId, hookId) owns the token -> record a
           //   hook_conflict event so the workflow can fail gracefully when
           //   the hook is awaited.
           // ============================================================
@@ -1038,10 +1175,12 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const tokenRef = firestore.collection('hooks_by_token').doc(hookData.token);
 
             result = await firestore.runTransaction(async (tx) => {
-              const [runSnap, tokenSnap] = await tx.getAll(runRef, tokenRef);
+              const {
+                docs: [runSnap, tokenSnap],
+              } = await readDocsWithStateMarker(tx, [runRef, tokenRef]);
 
               // A hook_created landing after the terminal transition's
-              // cleanup would orphan the token index forever — reject it.
+              // cleanup would orphan the token index forever; reject it.
               const runStatus = runSnap.exists
                 ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
                 : undefined;
@@ -1123,7 +1262,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const hookRef = runRef.collection('hooks').doc(correlationId);
 
             result = await firestore.runTransaction(async (tx) => {
-              const hookSnap = await tx.get(hookRef);
+              const {
+                docs: [hookSnap],
+              } = await readDocsWithStateMarker(tx, [hookRef]);
               if (!hookSnap.exists) {
                 // Typed error: core's resume-or-start pattern matches this by
                 // name via HookNotFoundError.is().
@@ -1143,7 +1284,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           }
 
           // ============================================================
-          // hook_received: event-only, but the hook must still exist —
+          // hook_received: event-only, but the hook must still exist;
           // a payload delivered concurrently with disposal must not be
           // silently appended to the event log.
           // ============================================================
@@ -1154,6 +1295,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               });
             }
             result = await firestore.runTransaction(async (tx) => {
+              const marker = await readStateMarker(tx);
               // Hooks live in per-run subcollections; match postgres semantics
               // (global lookup by hookId) with a collection-group query.
               const hookQuery = await tx.get(
@@ -1162,8 +1304,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               if (hookQuery.empty) {
                 throw new HookNotFoundError(correlationId);
               }
-              const { eventRef, record } = allocateEvent();
+              const { eventId, eventRef, record } = allocateEvent();
               tx.set(eventRef, record);
+              advanceStateMarker(tx, eventId, marker);
               return { event: EventSchema.parse(record) };
             });
             break;
@@ -1171,7 +1314,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
 
           // ============================================================
           // wait_created: create wait entity + event atomically. Duplicates
-          // are rejected with EntityConflictError — core relies on this to
+          // are rejected with EntityConflictError; core relies on this to
           // dedupe concurrent replays.
           // ============================================================
           case 'wait_created': {
@@ -1184,7 +1327,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const waitId = `${effectiveRunId}-${correlationId}`;
 
             result = await firestore.runTransaction(async (tx) => {
-              const [runSnap, waitSnap] = await tx.getAll(runRef, waitRef);
+              const {
+                docs: [runSnap, waitSnap],
+              } = await readDocsWithStateMarker(tx, [runRef, waitRef]);
 
               const runStatus = runSnap.exists
                 ? String((runSnap.data() as FirebaseFirestore.DocumentData).status)
@@ -1238,7 +1383,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             const waitRef = runRef.collection('waits').doc(correlationId);
 
             result = await firestore.runTransaction(async (tx) => {
-              const waitSnap = await tx.get(waitRef);
+              const {
+                docs: [waitSnap],
+              } = await readDocsWithStateMarker(tx, [waitRef]);
               if (!waitSnap.exists) {
                 throw new WorkflowWorldError(`Wait "${correlationId}" not found`, {
                   status: 404,
@@ -1267,12 +1414,16 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             break;
           }
 
-          // hook_conflict (and any future event-only types): standalone
-          // event write, no entity mutation.
+          // hook_conflict (and any future event-only types): no entity
+          // mutation, but still transactional so a create carrying a
+          // `stateUpdatedAt` snapshot is guarded like every other type.
           default: {
-            const { eventRef, record } = allocateEvent();
-            await eventRef.set(record);
-            result = { event: EventSchema.parse(record) };
+            result = await firestore.runTransaction(async (tx) => {
+              await readStateMarker(tx);
+              const { eventRef, record } = allocateEvent();
+              tx.set(eventRef, record);
+              return { event: EventSchema.parse(record) };
+            });
             break;
           }
         }
@@ -1283,6 +1434,13 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           result.events = eventsSnapshot.docs.map((doc) => eventFromDoc(doc.data()));
           result.cursor = result.events.at(-1)?.eventId ?? null;
           result.hasMore = false;
+        }
+
+        // The runtime reads the per-run event ceiling from the run_started
+        // response only, so it must also be present on the idempotent
+        // already-running replay path (which returns no event).
+        if (data.eventType === 'run_started' && result.run) {
+          result.maxEvents = maxEventsPerRun;
         }
 
         return result;
@@ -1310,7 +1468,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
 
-        // Order and paginate by the monotonic eventId (ULID) — never
+        // Order and paginate by the monotonic eventId (ULID), never
         // createdAt, whose millisecond ties and out-of-commit-order writes
         // make cursors skip events.
         let query: Query = firestore

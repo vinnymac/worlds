@@ -36,20 +36,21 @@
     "dev": "tsdown --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@azure/cosmos": "^4.3.1",
     "@azure/identity": "^4.9.1",
     "@azure/service-bus": "^7.9.5",
     "@workflow/errors": "catalog:",
+    "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
     "cbor-x": "^1.6.0",
     "ulid": "catalog:"
   },
   "devDependencies": {
     "@fantasticfour/shared": "workspace:*",
-    "@testcontainers/azure-cosmosdb-emulator": "11.14.0",
+    "@testcontainers/azure-cosmosdb-emulator": "12.1.0",
     "@types/node": "catalog:",
     "@workflow/world-testing": "catalog:",
     "testcontainers": "catalog:",
@@ -60,5 +61,5 @@
   "volta": {
     "extends": "../../package.json"
   },
-  "packageManager": "pnpm@11.11.0"
+  "packageManager": "pnpm@11.22.0"
 }

@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint & Type Check
@@ -21,15 +24,13 @@ jobs:
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11.11.0
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Setup Node.js 24.x
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.x
           cache: 'pnpm'
@@ -39,6 +40,11 @@ jobs:
 
       - name: Lint
         run: pnpm lint
+
+      # oxfmt is enforced locally by lint-staged, so drift only arrives via
+      # commits that bypassed the hook. Cheap to check, so check it.
+      - name: Format Check
+        run: pnpm format:check
 
       - name: Type Check
         run: pnpm typecheck

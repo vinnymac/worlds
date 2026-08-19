@@ -6,25 +6,25 @@ Various implementations of [Vercel workflow](https://useworkflow.dev/) [Worlds](
 
 This monorepo contains various World implementations published under the `@fantasticfour` organization:
 
-- **[@fantasticfour/world-redis](./packages/world-redis)** — Pure Redis-based World implementation using Redis Lists for lightweight and simple workflow execution.
+- **[@fantasticfour/world-redis](./packages/world-redis)**: Pure Redis-based World implementation using Redis Lists for lightweight and simple workflow execution.
 
-- **[@fantasticfour/world-redis-bullmq](./packages/world-redis-bullmq)** — Production-grade Redis World implementation using BullMQ for robust job queue management.
+- **[@fantasticfour/world-redis-bullmq](./packages/world-redis-bullmq)**: Production-grade Redis World implementation using BullMQ for robust job queue management.
 
-- **[@fantasticfour/world-postgres-redis](./packages/world-postgres-redis)** — Hybrid World implementation using PostgreSQL for durable storage with Redis Lists for queue management.
+- **[@fantasticfour/world-postgres-redis](./packages/world-postgres-redis)**: Hybrid World implementation using PostgreSQL for durable storage with Redis Lists for queue management.
 
-- **[@fantasticfour/world-mysql](./packages/world-mysql)** — World implementation using pure MySQL for storage, queueing, and streaming - no external dependencies (no Redis, no QStash).
+- **[@fantasticfour/world-mysql](./packages/world-mysql)**: World implementation using pure MySQL for storage, queueing, and streaming - no external dependencies (no Redis, no QStash).
 
-- **[@fantasticfour/world-mysql-redis](./packages/world-mysql-redis)** — Hybrid World implementation using MySQL for durable storage with Redis Lists for queue management.
+- **[@fantasticfour/world-mysql-redis](./packages/world-mysql-redis)**: Hybrid World implementation using MySQL for durable storage with Redis Lists for queue management.
 
-- **[@fantasticfour/world-upstash](./packages/world-upstash)** — Serverless World implementation using Upstash Redis and QStash for edge-ready durable workflows.
+- **[@fantasticfour/world-upstash](./packages/world-upstash)**: Serverless World implementation using Upstash Redis and QStash for edge-ready durable workflows.
 
-- **[@fantasticfour/world-nats-jetstream](./packages/world-nats-jetstream)** — NATS JetStream-based World implementation for self-hosted workflow execution with built-in clustering.
+- **[@fantasticfour/world-nats-jetstream](./packages/world-nats-jetstream)**: NATS JetStream-based World implementation for self-hosted workflow execution with built-in clustering.
 
-- **[@fantasticfour/world-azure](./packages/world-azure)** — Azure Cosmos DB + Service Bus World implementation with Change Feed streaming.
+- **[@fantasticfour/world-azure](./packages/world-azure)**: Azure Cosmos DB + Service Bus World implementation with Change Feed streaming.
 
-- **[@fantasticfour/world-cloudflare](./packages/world-cloudflare)** — Cloudflare Durable Objects World implementation with edge-native SQLite storage and global <10ms latency.
+- **[@fantasticfour/world-cloudflare](./packages/world-cloudflare)**: Cloudflare Durable Objects World implementation with edge-native SQLite storage and global <10ms latency.
 
-- **[@fantasticfour/world-firestore-tasks](./packages/world-firestore-tasks)** — GCP Firestore + Cloud Tasks World implementation with real-time streaming and excellent developer experience.
+- **[@fantasticfour/world-firestore-tasks](./packages/world-firestore-tasks)**: GCP Firestore + Cloud Tasks World implementation with real-time streaming and excellent developer experience.
 
 ## Development
 

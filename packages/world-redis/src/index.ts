@@ -11,8 +11,8 @@ import {
 } from './storage.js';
 import { createStreamer, type StreamStats } from './streamer.js';
 
-function createStorage(redis: Redis, keyPrefix: string): Storage {
-  const config = { redis, keyPrefix };
+function createStorage(redis: Redis, keyPrefix: string, maxEventsPerRun?: number): Storage {
+  const config = { redis, keyPrefix, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -41,12 +41,19 @@ export function createWorld(
     keyPrefix: process.env.WORKFLOW_REDIS_KEY_PREFIX || 'workflow:',
   },
 ): RedisWorld {
+  // Batches commands issued in the same event-loop tick into one write. Does
+  // nothing for a single serial run but collapses syscalls under concurrency
+  // (measured 1.75x at 256 concurrent invocations). Blocking connections opt
+  // out explicitly where they are duplicated.
+  const autoPipelining = config.enableAutoPipelining ?? true;
   const redis =
-    typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
+    typeof config.redis === 'string'
+      ? new Redis(config.redis, { enableAutoPipelining: autoPipelining })
+      : new Redis({ enableAutoPipelining: autoPipelining, ...config.redis });
 
   const keyPrefix = config.keyPrefix || 'workflow:';
 
-  const storage = createStorage(redis, keyPrefix);
+  const storage = createStorage(redis, keyPrefix, config.maxEventsPerRun);
   const streamer = createStreamer({ redis, keyPrefix });
 
   const queue = createQueue(redis, config);

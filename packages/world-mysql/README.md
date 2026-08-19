@@ -112,7 +112,11 @@ Creates the following tables:
 
 ## Requirements
 
-**Critical**: MySQL 8.0.1+ required for `SKIP LOCKED` support
+**Critical**: MySQL 8.0.13+ required: `SKIP LOCKED` (8.0.1) plus functional
+index key parts and window functions (8.0.13), used by the
+`workflow_events_entity_creation_unique` migration. All tables pin
+`ROW_FORMAT=DYNAMIC`, so a server configured with
+`innodb_default_row_format=compact` works out of the box.
 
 Compatible providers:
 
@@ -159,7 +163,7 @@ createWorld({ queueConcurrency: 20 }); // 20 workers per queue
 
 ### Connection Pooling
 
-The world automatically sets connection pool size to `2 × workers + 5`.
+The world automatically sets connection pool size to `2 * workers + 5`.
 
 ## Error Handling
 

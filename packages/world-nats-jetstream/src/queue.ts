@@ -6,11 +6,13 @@ import {
   type QueueKind,
   type QueuePayload,
   type ValidQueueName,
+  WorkflowInvokePayloadSchema,
 } from '@workflow/world';
-import type { JetStreamClient } from 'nats';
+import type { JetStreamClient, JsMsg } from 'nats';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
+import { createWorkflowUrl } from '@workflow/utils';
 import type { NatsJetStreamWorldConfig } from './config.js';
 import { debug } from './util.js';
 
@@ -47,7 +49,7 @@ const ACK_WAIT_NANOS = 30 * 1_000_000_000; // 30 seconds
  * Interval at which in-flight deliveries send `working()` progress heartbeats
  * to extend the ack deadline. Must be comfortably below ACK_WAIT_NANOS so a
  * handler that outlives ack_wait (HTTP dispatch allows up to httpTimeoutMs)
- * is never redelivered — and executed concurrently — while still running.
+ * is never redelivered (and executed concurrently) while still running.
  */
 const ACK_PROGRESS_INTERVAL_MS = 10_000;
 
@@ -111,6 +113,42 @@ export function createQueue(
   };
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'nats-jetstream';
+
+  /**
+   * In-flight workflow replays, keyed by run. See `runSerialized`.
+   */
+  const inflightWorkflowRuns = new Map<string, Promise<void>>();
+
+  /** Serialization key for a delivery, or `undefined` when it may run freely.
+   * Only workflow invocations are keyed; step deliveries stay parallel so
+   * fan-out is preserved. */
+  function workflowRunSerializationKey(kind: QueueKind, message: QueuePayload): string | undefined {
+    if (kind !== 'workflow') return undefined;
+    const invoke = WorkflowInvokePayloadSchema.safeParse(message);
+    if (!invoke.success) return undefined;
+    return `workflow:${invoke.data.runId}`;
+  }
+
+  /** Run `task`, serialized against every other delivery sharing `key`. Workers
+   * share one durable consumer, so two deliveries for a run would otherwise
+   * replay concurrently and corrupt its event log. Per-process only. */
+  async function runSerialized(key: string | undefined, task: () => Promise<void>): Promise<void> {
+    if (!key) {
+      await task();
+      return;
+    }
+    const previous = inflightWorkflowRuns.get(key);
+    const execution = (previous ?? Promise.resolve())
+      .catch(() => {})
+      .then(task)
+      .finally(() => {
+        if (inflightWorkflowRuns.get(key) === execution) {
+          inflightWorkflowRuns.delete(key);
+        }
+      });
+    inflightWorkflowRuns.set(key, execution);
+    await execution;
+  }
 
   let initialized = false;
   const initStreams = async () => {
@@ -200,10 +238,10 @@ export function createQueue(
   async function dispatch(
     envelope: MessageEnvelope,
     attempt: number,
-    pathname: string,
+    pathname: 'flow' | 'step',
   ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = `${baseUrl}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(baseUrl, { type: pathname });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -215,6 +253,60 @@ export function createQueue(
       body: stringify(envelope.message),
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
+  }
+
+  /** Dispatch one delivery and settle it (ack / nak). Never throws: every
+   * failure is translated into a nak so JetStream owns the redelivery. */
+  async function deliver(
+    msg: JsMsg,
+    envelope: MessageEnvelope,
+    pathname: 'flow' | 'step',
+    streamName: string,
+  ): Promise<void> {
+    try {
+      // Derive the attempt from JetStream's delivery count (1-based) so
+      // redeliveries surface as attempt 2, 3, ... and core's poison-pill
+      // escalation (attempt > MAX_QUEUE_DELIVERIES) can trigger.
+      const response = await dispatch(envelope, msg.info.deliveryCount, pathname);
+
+      if (response.ok) {
+        msg.ack();
+        health.lastSuccessfulFetch = Date.now();
+        health.totalProcessed++;
+        return;
+      }
+
+      const text = await response.text();
+
+      if (response.status === 503) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = null;
+        }
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
+        ) {
+          // JetStream supports a custom nak delay (in ms).
+          const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
+          msg.nak(timeoutMs);
+          return;
+        }
+      }
+
+      msg.nak(NAK_DELAY_MS);
+      health.totalFailed++;
+      console.error(
+        `[world-nats-jetstream worker] HTTP ${response.status} on ${streamName}: ${text}`,
+      );
+    } catch (error) {
+      console.error(`[world-nats-jetstream worker] dispatch error from ${streamName}:`, error);
+      msg.nak(NAK_DELAY_MS);
+      health.totalFailed++;
+    }
   }
 
   async function worker(kind: QueueKind, streamName: string) {
@@ -238,7 +330,7 @@ export function createQueue(
           throw err;
         }
         // The durable already exists with an older configuration (e.g. the
-        // previous max_deliver: 3) — reconcile the retry policy in place.
+        // previous max_deliver: 3); reconcile the retry policy in place.
         await jsm.consumers.update(streamName, consumerName, {
           max_deliver: MAX_DELIVER,
           ack_wait: ACK_WAIT_NANOS,
@@ -266,57 +358,17 @@ export function createQueue(
           continue;
         }
 
-        // Extend the ack deadline while the dispatch is in flight. HTTP
-        // handlers may legitimately run up to httpTimeoutMs (default 300s),
-        // far beyond ack_wait (30s) — without heartbeats JetStream would
-        // redeliver the message mid-execution and run it concurrently.
+        // Extend the ack deadline while this delivery is ours: dispatch may run to
+        // httpTimeoutMs, and a message queued behind another replay of the same run
+        // would otherwise be redelivered to a second worker.
         const progressTimer = setInterval(() => {
           msg.working();
         }, ACK_PROGRESS_INTERVAL_MS);
 
         try {
-          // Derive the attempt from JetStream's delivery count (1-based) so
-          // redeliveries surface as attempt 2, 3, ... and core's poison-pill
-          // escalation (attempt > MAX_QUEUE_DELIVERIES) can trigger.
-          const response = await dispatch(envelope, msg.info.deliveryCount, pathname);
-
-          if (response.ok) {
-            msg.ack();
-            health.lastSuccessfulFetch = Date.now();
-            health.totalProcessed++;
-            continue;
-          }
-
-          const text = await response.text();
-
-          if (response.status === 503) {
-            let parsed: unknown;
-            try {
-              parsed = JSON.parse(text);
-            } catch {
-              parsed = null;
-            }
-            if (
-              parsed &&
-              typeof parsed === 'object' &&
-              typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
-            ) {
-              // JetStream supports a custom nak delay (in ms).
-              const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-              msg.nak(timeoutMs);
-              continue;
-            }
-          }
-
-          msg.nak(NAK_DELAY_MS);
-          health.totalFailed++;
-          console.error(
-            `[world-nats-jetstream worker] HTTP ${response.status} on ${streamName}: ${text}`,
+          await runSerialized(workflowRunSerializationKey(kind, envelope.message), () =>
+            deliver(msg, envelope, pathname, streamName),
           );
-        } catch (error) {
-          console.error(`[world-nats-jetstream worker] dispatch error from ${streamName}:`, error);
-          msg.nak(NAK_DELAY_MS);
-          health.totalFailed++;
         } finally {
           clearInterval(progressTimer);
         }

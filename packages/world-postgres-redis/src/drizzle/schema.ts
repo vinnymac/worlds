@@ -6,7 +6,9 @@ import {
   type WorkflowRun,
   WorkflowRunStatusSchema,
 } from '@workflow/world';
+import { sql } from 'drizzle-orm';
 import {
+  bigint,
   boolean,
   customType,
   index,
@@ -76,11 +78,14 @@ export const runs = schema.table(
     startedAt: timestamp('started_at'),
     specVersion: integer('spec_version'),
     expiredAt: timestamp('expired_at'),
+    /** Epoch-ms ULID time of the most recent externally-originated event for this
+     * run. Not part of the `WorkflowRun` contract, stripped before return. */
+    stateUpdatedAt: bigint('state_updated_at', { mode: 'number' }),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
       'input' | 'output' | 'executionContext'
-    >
+    > & { stateUpdatedAt?: number }
   >,
   (tb) => [index().on(tb.workflowName), index().on(tb.status)],
 );
@@ -99,7 +104,16 @@ export const events = schema.table(
     eventData: Cbor<unknown>()('payload_cbor'),
     specVersion: integer('spec_version'),
   } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
-  (tb) => [index().on(tb.runId), index().on(tb.correlationId)],
+  (tb) => [
+    index().on(tb.runId),
+    index().on(tb.correlationId),
+    // A redelivered creation event must conflict (surfaced as
+    // EntityConflictError) instead of appending a second row. Partial so
+    // repeatable event types stay unconstrained.
+    uniqueIndex('workflow_events_entity_creation_unique')
+      .on(tb.runId, tb.correlationId, tb.eventType)
+      .where(sql`"type" IN ('step_created', 'hook_created', 'wait_created')`),
+  ],
 );
 
 export const steps = schema.table(
@@ -176,7 +190,7 @@ export const streams = schema.table(
   {
     chunkId: varchar('id').$type<`chnk_${string}`>().notNull(),
     streamId: varchar('stream_id').notNull(),
-    /** Owning workflow run — nullable because pre-existing rows predate it. */
+    /** Owning workflow run; nullable because pre-existing rows predate it. */
     runId: varchar('run_id'),
     chunkData: bytea('data').notNull(),
     createdAt: timestamp('created_at').defaultNow().notNull(),

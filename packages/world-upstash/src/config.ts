@@ -67,4 +67,23 @@ export interface UpstashWorldConfig {
    * @see https://upstash.com/docs/qstash/features/retry
    */
   qstashRetries?: number;
+
+  /** Maximum events a run may accumulate, reported as `EventResult.maxEvents`.
+   * @default process.env.WORKFLOW_MAX_EVENTS || 25_000 */
+  maxEventsPerRun?: number;
+
+  /** Queue transport. `'qstash'` (default) publishes via hosted QStash;
+   * `'loopback'` delivers in-process by POSTing the QStash wire body straight
+   * to the target app's flow/step routes (for tests and local development).
+   * Also selectable via `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`. */
+  queueMode?: 'qstash' | 'loopback';
+
+  /** TTL (seconds) on creation-event claim keys, the SETNX arbiters that
+   * dedup entity-creating events. Claims are pure overhead once a run is
+   * terminal, and nothing else deletes them, so the TTL bounds billable
+   * growth. Duplicates race within delivery windows (seconds to minutes),
+   * making a month-long TTL a wide safety margin. `0` retains claims
+   * forever.
+   * @default process.env.WORKFLOW_UPSTASH_CLAIM_TTL_SECONDS || 2_592_000 (30 days) */
+  claimTtlSeconds?: number;
 }

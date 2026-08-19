@@ -2,6 +2,9 @@ import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { createTestSuite } from '@workflow/world-testing';
+// Opt-in suite: `eventLimit` is not in createTestSuite and the package has no
+// exports map, so the deep import is the only way in.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, describe, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on a docker container
@@ -56,5 +59,6 @@ if (process.platform === 'win32') {
   // to handle slow CI environments (especially Firestore emulator)
   describe('@fantasticfour/world-firestore-tasks spec tests', { timeout: 120_000 }, () => {
     createTestSuite('@fantasticfour/world-firestore-tasks');
+    eventLimit('@fantasticfour/world-firestore-tasks');
   });
 }

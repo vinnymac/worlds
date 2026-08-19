@@ -139,11 +139,11 @@ export async function POST(request: Request) {
 | Feature             | world-upstash     | world-redis-bullmq | world-firestore-tasks       |
 | ------------------- | ----------------- | ------------------ | --------------------------- |
 | Infrastructure      | None (serverless) | Redis + BullMQ     | GCP Firestore + Cloud Tasks |
-| Real-time streaming | ❌ (use polling)  | ✅                 | ✅                          |
-| Edge runtime        | ✅                | ❌                 | ❌                          |
-| Global replication  | ✅                | ❌                 | ✅                          |
+| Real-time streaming | No (use polling)  | Yes                | Yes                         |
+| Edge runtime        | Yes               | No                 | No                          |
+| Global replication  | Yes               | No                 | Yes                         |
 | Cost model          | Pay-per-use       | Fixed server costs | Pay-per-use                 |
-| Local development   | Limited           | ✅                 | ✅ (emulators)              |
+| Local development   | Limited           | Yes                | Yes (emulators)             |
 
 ## Local Development
 

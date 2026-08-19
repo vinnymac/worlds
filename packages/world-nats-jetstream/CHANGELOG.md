@@ -49,7 +49,7 @@
 
   Workers no longer execute workflows in-process via `@workflow/world-local`.
   Instead, each world dispatches jobs over HTTP to the user's app server at
-  `${baseUrl}/.well-known/workflow/v1/{flow|step}` — the same convention used by
+  `${baseUrl}/.well-known/workflow/v1/{flow|step}`, the same convention used by
   the Workflow DevKit. Three header fields carry the envelope:
 
   - `x-vqs-queue-name`
@@ -77,9 +77,9 @@
 
   New config knobs on each world (all optional):
 
-  - `baseUrl` — overrides `process.env.WORKFLOW_BASE_URL` /
+  - `baseUrl`: overrides `process.env.WORKFLOW_BASE_URL` /
     `http://localhost:${process.env.PORT ?? 3000}`
-  - `httpTimeoutMs` — per-job request timeout (default 300_000)
+  - `httpTimeoutMs`: per-job request timeout (default 300_000)
   - `maxAttempts` / `backoffDelayMs` / `backoffType` where applicable
 
   **Why:**
@@ -120,17 +120,17 @@
 
   ## New Package
 
-  - `@fantasticfour/shared` — common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
+  - `@fantasticfour/shared`: common utilities extracted from world packages: debug logging (`createDebugLogger`), JSON serialization helpers (`stringify`, `parse`, `dateReviver`, `uint8ArrayReplacer`/`uint8ArrayReviver`, `deepClone`), correlation context (`withCorrelation`, `getCorrelationId`, `createCorrelatedLogger`), health-check primitives (`HealthCheckResult`, `ComponentHealth`, `HealthCheckable`, `timeOperation`), `Cborized` type, and small utilities (`compact`, `Mutex`, `Rc`).
 
-  ## Critical Bug Fixes — Event Idempotency
+  ## Critical Bug Fixes: Event Idempotency
 
   Event-sourced systems must be idempotent. Replaying creation events (for recovery, debugging, or state reconstruction) was causing entities to disappear from list queries because the "Always-Add Pattern" implementation skipped index updates and returned `undefined` on duplicates.
 
   Fixed in:
 
-  - `world-redis-bullmq`, `world-upstash`, `world-redis` — SETNX-based handlers for `run_created`, `step_created`, `hook_created` now always update indexes (ZADD is idempotent) and return the existing entity on replay.
-  - `world-postgres-redis` — Drizzle `.onConflictDoNothing()` paths now fetch and return the existing row instead of `undefined`.
-  - `world-nats-jetstream` — KV-bucket creation handlers now read back the existing entity when the key already exists rather than returning `undefined`.
+  - `world-redis-bullmq`, `world-upstash`, `world-redis`: SETNX-based handlers for `run_created`, `step_created`, `hook_created` now always update indexes (ZADD is idempotent) and return the existing entity on replay.
+  - `world-postgres-redis`: Drizzle `.onConflictDoNothing()` paths now fetch and return the existing row instead of `undefined`.
+  - `world-nats-jetstream`: KV-bucket creation handlers now read back the existing entity when the key already exists rather than returning `undefined`.
 
   Naming: `existed` renamed to `wasCreated` for clarity.
 
@@ -232,9 +232,9 @@
 
   Production dependencies upgraded from beta to stable 4.1.1:
 
-  - @workflow/errors: 4.1.0-beta.20 → 4.1.1
-  - @workflow/world: 4.1.0-beta.17 → 4.1.1
-  - @workflow/world-local: 4.1.0-beta.51 → 4.1.1
+  - @workflow/errors: 4.1.0-beta.20 -> 4.1.1
+  - @workflow/world: 4.1.0-beta.17 -> 4.1.1
+  - @workflow/world-local: 4.1.0-beta.51 -> 4.1.1
 
   Dev dependency kept on compatible beta version:
 

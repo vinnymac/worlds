@@ -27,6 +27,9 @@ export interface FirestoreTasksWorldConfig {
    * Polling interval (ms) when streamerMode is 'polling'. Default: 1000
    */
   streamerPollIntervalMs?: number;
+  /** Per-run event ceiling reported on `run_started`
+   * (`EventResult.maxEvents`). Defaults to `WORKFLOW_MAX_EVENTS`, then 25,000. */
+  maxEventsPerRun?: number;
 }
 
 export function createFirestoreTasksWorld(
@@ -72,6 +75,7 @@ export function createFirestoreTasksWorld(
   const storage = createStorage({
     firestore: firestoreInstance,
     deploymentId,
+    maxEventsPerRun: config.maxEventsPerRun,
   });
 
   const queue = createQueue({

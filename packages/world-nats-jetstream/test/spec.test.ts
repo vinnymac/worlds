@@ -1,5 +1,8 @@
 import { GenericContainer, Wait } from 'testcontainers';
 import { createTestSuite } from '@workflow/world-testing';
+// `eventLimit` is deliberately not part of `createTestSuite`, and the package
+// publishes no `exports` map, so the dist path is the only way to opt in.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 
 // Skip these tests on Windows since it relies on a docker container
@@ -36,4 +39,5 @@ if (process.platform === 'win32') {
 
   test('smoke', () => {});
   createTestSuite('@fantasticfour/world-nats-jetstream');
+  eventLimit('@fantasticfour/world-nats-jetstream');
 }

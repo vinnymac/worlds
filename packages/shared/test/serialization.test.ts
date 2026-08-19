@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { DATE_FIELDS, dateReviver, deepClone, parse, stringify } from '../src/serialization.js';
+import {
+  DATE_FIELDS,
+  dateReviver,
+  deepClone,
+  hasBinary,
+  parse,
+  revive,
+  stringify,
+  uint8ArrayReplacer,
+  uint8ArrayReviver,
+} from '../src/serialization.js';
 
 describe('serialization', () => {
   describe('DATE_FIELDS', () => {
@@ -100,6 +110,98 @@ describe('serialization', () => {
       });
       const restored = parse<{ data: Uint8Array }>(json);
       expect(restored.data).toEqual(new Uint8Array([0, 0, 0]));
+    });
+  });
+
+  // `parse`/`stringify` skip JSON's reviver/replacer when the payload holds no
+  // binary. That fast path must stay indistinguishable from the slow one.
+  describe('fast path parity with the reviver/replacer', () => {
+    const cases: Array<[string, unknown]> = [
+      ['top-level dates', { createdAt: new Date('2024-01-15T10:30:00Z'), name: 'x' }],
+      ['nested dates', { eventData: { retryAfter: new Date('2024-02-01T00:00:00Z') }, other: 1 }],
+      [
+        'deeply nested dates',
+        { a: { b: { c: [{ completedAt: new Date('2024-03-01T00:00:00Z') }] } } },
+      ],
+      ['dates inside arrays', [{ startedAt: new Date('2024-04-01T00:00:00Z') }]],
+      ['invalid date string', { createdAt: 'not-a-date' }],
+      ['non-string date field', { createdAt: 12345 }],
+      ['null values', { createdAt: null, nested: { updatedAt: null } }],
+      ['empty object', {}],
+      ['empty array', []],
+      ['scalar', 42],
+      ['binary alongside dates', { createdAt: new Date(0), b: new Uint8Array([1, 0, 255]) }],
+      ['deeply nested binary', { a: { b: [{ c: new Uint8Array([9]) }] } }],
+    ];
+
+    it.each(cases)('matches the reviver for: %s', (_label, value) => {
+      const text = stringify(value);
+      // The slow path, verbatim, as the reference implementation.
+      expect(parse(text)).toEqual(JSON.parse(text, uint8ArrayReviver));
+    });
+
+    it.each(cases)('emits byte-identical JSON to the replacer for: %s', (_label, value) => {
+      expect(stringify(value)).toBe(JSON.stringify(value, uint8ArrayReplacer));
+    });
+
+    it('revives a date field nested inside a user payload, as before', () => {
+      // The reviver has always done this at any depth; the fast path must not
+      // quietly narrow it.
+      const restored = parse<{ input: Array<{ createdAt: unknown }> }>(
+        JSON.stringify({ input: [{ createdAt: '2024-01-15T10:30:00.000Z' }] }),
+      );
+      expect(restored.input[0].createdAt).toBeInstanceOf(Date);
+    });
+  });
+
+  // `revive` must agree with `parse` for transports that hand back decoded
+  // objects instead of text.
+  describe('revive parity with parse', () => {
+    const cases: Array<[string, unknown]> = [
+      ['top-level dates', { createdAt: new Date('2024-01-15T10:30:00Z'), name: 'x' }],
+      ['nested dates', { eventData: { retryAfter: new Date('2024-02-01T00:00:00Z') } }],
+      [
+        'deeply nested dates',
+        { a: { b: { c: [{ completedAt: new Date('2024-03-01T00:00:00Z') }] } } },
+      ],
+      ['dates inside arrays', [{ startedAt: new Date('2024-04-01T00:00:00Z') }]],
+      ['binary data', { data: new Uint8Array([1, 0, 255]) }],
+      ['deeply nested binary', { a: { b: [{ c: new Uint8Array([9]) }] } }],
+      ['invalid date string', { createdAt: 'not-a-date' }],
+      ['null date', { createdAt: null }],
+      ['empty object', {}],
+      ['empty array', []],
+    ];
+
+    it.each(cases)('matches parse for: %s', (_label, value) => {
+      const text = stringify(value);
+      // Simulates a transport that already decoded the JSON for us.
+      expect(revive(JSON.parse(text))).toEqual(parse(text));
+    });
+
+    it('decodes a bare tagged Uint8Array at the root', () => {
+      const restored = revive<Uint8Array>(JSON.parse(stringify(new Uint8Array([1, 2, 3]))));
+      expect(restored).toBeInstanceOf(Uint8Array);
+      expect(Array.from(restored)).toEqual([1, 2, 3]);
+    });
+
+    it('passes scalars through', () => {
+      expect(revive(42)).toBe(42);
+      expect(revive(null)).toBe(null);
+    });
+  });
+
+  describe('hasBinary', () => {
+    it('detects Uint8Array at any depth', () => {
+      expect(hasBinary({ a: { b: [{ c: new Uint8Array([1]) }] } })).toBe(true);
+      expect(hasBinary([[[new Uint8Array([1])]]])).toBe(true);
+      expect(hasBinary(new Uint8Array([1]))).toBe(true);
+    });
+
+    it('returns false for graphs without binary', () => {
+      expect(hasBinary({ a: { b: [1, 'x', null, true] } })).toBe(false);
+      expect(hasBinary(null)).toBe(false);
+      expect(hasBinary('string')).toBe(false);
     });
   });
 

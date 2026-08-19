@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    // real-workers.test.ts imports the virtual `cloudflare:test` module. The
+    // package root types are the pool API; the ambient module declaration only
+    // comes in through the `/types` subpath.
+    "types": ["@cloudflare/workers-types", "node", "@cloudflare/vitest-pool-workers/types"]
+  },
+  "include": ["src", "test", "vitest.config.ts", "vitest.workers.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

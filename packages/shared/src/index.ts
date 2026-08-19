@@ -1,11 +1,14 @@
 export { createDebugLogger } from './debug.js';
+export { loadOptionalEnvFile } from './env.js';
 export {
   DATE_FIELDS,
   dateReviver,
+  hasBinary,
   uint8ArrayReplacer,
   uint8ArrayReviver,
   stringify,
   parse,
+  revive,
   deepClone,
 } from './serialization.js';
 export {

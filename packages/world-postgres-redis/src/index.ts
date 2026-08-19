@@ -9,16 +9,17 @@ import { createRunUpdateSubscriber, type RunUpdateListener } from './notify.js';
 import { createQueue } from './queue.js';
 import {
   createEventsStorage,
+  type EventsStorageOptions,
   createHooksStorage,
   createRunsStorage,
   createStepsStorage,
 } from './storage.js';
 import { createStreamer } from './streamer.js';
 
-function createStorage(drizzle: Drizzle): Storage {
+function createStorage(drizzle: Drizzle, options: EventsStorageOptions): Storage {
   return {
     runs: createRunsStorage(drizzle),
-    events: createEventsStorage(drizzle),
+    events: createEventsStorage(drizzle, options),
     hooks: createHooksStorage(drizzle),
     steps: createStepsStorage(drizzle),
   };
@@ -40,13 +41,19 @@ export function createWorld(
   subscribeToRunUpdates(listener: RunUpdateListener): () => void;
 } {
   // Create Redis client for queue
+  // Batches commands issued in the same event-loop tick into one write;
+  // a win under concurrency, neutral for a single serial caller. Blocking
+  // worker connections opt out where they are duplicated.
+  const autoPipelining = config.enableAutoPipelining ?? true;
   const redis =
-    typeof config.redis === 'string' ? new Redis(config.redis) : new Redis(config.redis);
+    typeof config.redis === 'string'
+      ? new Redis(config.redis, { enableAutoPipelining: autoPipelining })
+      : new Redis({ enableAutoPipelining: autoPipelining, ...config.redis });
 
   const postgres = createPostgres(config.connectionString);
   const drizzle = createClient(postgres);
   const queue = createQueue(redis, drizzle, config);
-  const storage = createStorage(drizzle);
+  const storage = createStorage(drizzle, { maxEventsPerRun: config.maxEventsPerRun });
   const streamer = createStreamer(postgres, drizzle);
 
   // Health check (Enhancement 3)

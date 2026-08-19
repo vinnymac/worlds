@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
+import { createWorkflowUrl } from '@workflow/utils';
 import {
   MessageId,
   parseQueueName,
@@ -90,7 +91,7 @@ export interface InflightClaimNamespace {
  * Wire format for messages on the Cloudflare Queue (and the HTTP push from a
  * queue consumer Worker to the workflow endpoint). Serialized with the shared
  * tagged-JSON codec so binary payloads (`runInput.input` at spec >= 3 is a
- * Uint8Array) survive the round-trip — plain JSON.stringify would mangle them.
+ * Uint8Array) survive the round-trip; plain JSON.stringify would mangle them.
  */
 interface QueueEnvelope {
   messageId: string;
@@ -162,7 +163,7 @@ function createTestPump(config: CloudflareQueueConfig) {
   }
 
   async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
-    const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
+    const url = createWorkflowUrl(resolveBaseUrl(config), { type: pathname });
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -269,7 +270,7 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
     async queue(queueName, message, opts) {
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
-        // flight — core re-enqueues every still-pending step on every replay
+        // flight; core re-enqueues every still-pending step on every replay
         // with idempotencyKey = stepId and relies on queue-level dedup.
         const existing = testPump.inflight(opts?.idempotencyKey);
         if (existing) {

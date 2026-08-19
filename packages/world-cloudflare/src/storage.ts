@@ -1,6 +1,7 @@
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   RunExpiredError,
   RunNotSupportedError,
   TooEarlyError,
@@ -81,6 +82,30 @@ export interface CloudflareStorageConfig {
     WORKFLOW_INDEX: KVNamespace;
   };
   deploymentId: string;
+  /** Per-run event ceiling reported as `EventResult.maxEvents`. Defaults to
+   * `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
+  maxEventsPerRun?: number;
+}
+
+/** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
+const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/** Resolve the per-run event ceiling: explicit config, then
+ * `WORKFLOW_MAX_EVENTS`, then the default. An explicit value must be a
+ * positive integer. */
+function resolveMaxEventsPerRun(configured: number | undefined): number {
+  if (configured !== undefined) {
+    if (!Number.isInteger(configured) || configured <= 0) {
+      throw new WorkflowWorldError(
+        `maxEventsPerRun must be a positive integer, received ${configured}`,
+        { status: 500 },
+      );
+    }
+    return configured;
+  }
+  const raw = process.env.WORKFLOW_MAX_EVENTS;
+  const parsed = raw !== undefined ? Number(raw) : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
 }
 
 interface KVNamespace {
@@ -150,6 +175,8 @@ function throwOutcomeError(
       throw new RunExpiredError(outcome.message);
     case 'TOO_EARLY':
       throw new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds });
+    case 'PRECONDITION_FAILED':
+      throw new PreconditionFailedError(outcome.message);
     case 'RUN_NOT_SUPPORTED':
       throw new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT);
     case 'LEGACY_RUN_NOT_SUPPORTED':
@@ -160,6 +187,7 @@ function throwOutcomeError(
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const ulid = monotonicFactory();
+  const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
 
   // Helper to get or create a DO for a run
   const getRunDO = (runId: string): WorkflowRunDOStub => {
@@ -208,9 +236,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         const runs = await Promise.all(
           kvList.keys.map(async (key) => {
-            const meta = await env.WORKFLOW_INDEX.get(key.name);
-            if (!meta) return null;
-            const { runId } = JSON.parse(meta) as { runId: string };
+            // The index key is `run:<workflowName>:<runId>` and a runId never
+            // contains a colon, so the id is already in hand. Reading the
+            // entry back just to parse the same id out of its JSON cost one
+            // KV read per run on every page.
+            const runId = key.name.slice(key.name.lastIndexOf(':') + 1);
+            if (!runId) return null;
             try {
               return await runsGet(runId, { resolveData: params?.resolveData });
             } catch (error) {
@@ -243,7 +274,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams,
+        params?: CreateEventParams,
       ): Promise<EventResult> {
         // For run_created events, generate a runId server-side if absent.
         let effectiveRunId: string;
@@ -263,7 +294,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // global index. The check-then-write across KV and the DO is not
         // atomic (KV has no compare-and-swap); the DO-side hook_created event
         // marker keeps same-run replays exactly-once, while cross-run token
-        // races remain best-effort — matching KV's consistency model.
+        // races remain best-effort, matching KV's consistency model.
         let tokenHolder: ApplyEventRequest['tokenHolder'];
         if (data.eventType === 'hook_created') {
           const raw = await env.WORKFLOW_INDEX.get(`hook:${data.eventData.token}`);
@@ -277,33 +308,52 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         // Guards, event append, and entity mutation run in ONE DO storage
         // transaction (see apply-event.ts). The event is schema-validated
-        // before anything is persisted.
-        const outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder });
+        // before anything is persisted. `stateUpdatedAt` rides along so the
+        // optimistic-concurrency check is atomic with the append.
+        const outcome = await stub.applyEvent({
+          runId: effectiveRunId,
+          data,
+          tokenHolder,
+          stateUpdatedAt: params?.stateUpdatedAt,
+        });
 
         if (!outcome.ok) {
           throwOutcomeError(outcome, effectiveRunId, data);
         }
 
         // KV side effects happen after the DO transaction committed; the DO
-        // event log is the source of truth and can re-derive these.
+        // event log is the source of truth and can re-derive these. They are
+        // independent of each other, so they go out together rather than as a
+        // chain of awaits — a run with N hooks was paying 2N serial KV
+        // round trips on its terminal event.
+        const kvWrites: Promise<unknown>[] = [];
         if (outcome.runCreated) {
-          await env.WORKFLOW_INDEX.put(
-            `run:${outcome.runCreated.workflowName}:${effectiveRunId}`,
-            JSON.stringify({
-              runId: effectiveRunId,
-              createdAt: outcome.runCreated.createdAt.toISOString(),
-              status: 'pending',
-            }),
+          kvWrites.push(
+            env.WORKFLOW_INDEX.put(
+              `run:${outcome.runCreated.workflowName}:${effectiveRunId}`,
+              JSON.stringify({
+                runId: effectiveRunId,
+                createdAt: outcome.runCreated.createdAt.toISOString(),
+                status: 'pending',
+              }),
+            ),
           );
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
-          await env.WORKFLOW_INDEX.put(`hook:${outcome.hookToIndex.token}`, serialized);
-          await env.WORKFLOW_INDEX.put(`hookid:${outcome.hookToIndex.hookId}`, serialized);
+          kvWrites.push(
+            env.WORKFLOW_INDEX.put(`hook:${outcome.hookToIndex.token}`, serialized),
+            env.WORKFLOW_INDEX.put(`hookid:${outcome.hookToIndex.hookId}`, serialized),
+          );
         }
         for (const released of outcome.releasedHooks) {
-          await env.WORKFLOW_INDEX.delete(`hook:${released.token}`);
-          await env.WORKFLOW_INDEX.delete(`hookid:${released.hookId}`);
+          kvWrites.push(
+            env.WORKFLOW_INDEX.delete(`hook:${released.token}`),
+            env.WORKFLOW_INDEX.delete(`hookid:${released.hookId}`),
+          );
+        }
+        if (kvWrites.length > 0) {
+          await Promise.all(kvWrites);
         }
 
         return {
@@ -312,6 +362,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           step: outcome.step,
           hook: outcome.hook,
           events: outcome.events,
+          // The runtime reads the ceiling from the run_started response only,
+          // so it must also be present on the idempotent already-running
+          // replay path -- keying off the request type covers both.
+          ...(data.eventType === 'run_started' && outcome.run
+            ? { maxEvents: maxEventsPerRun }
+            : {}),
         };
       },
 

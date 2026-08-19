@@ -1,9 +1,11 @@
 import { execSync } from 'node:child_process';
 import { setTimeout } from 'node:timers/promises';
+import { asEventRequest, expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { EntityConflictError, TooEarlyError, WorkflowRunNotFoundError } from '@workflow/errors';
 import type { Hook, Step, WorkflowRun } from '@workflow/world';
 import postgres from 'postgres';
+import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createClient } from '../src/drizzle/index.js';
 import {
@@ -42,10 +44,11 @@ async function updateRun(
   eventType: 'run_started' | 'run_completed' | 'run_failed',
   eventData?: Record<string, unknown>,
 ): Promise<WorkflowRun> {
-  const result = await events.create(runId, {
-    eventType,
-    eventData,
-  });
+  // `eventType` is the union of all three run transitions here, so no single
+  // eventData shape narrows against it; callers pass the payload their case
+  // needs. See asEventRequest for why this widening is confined to helpers
+  // whose tag is a parameter.
+  const result = await events.create(runId, asEventRequest({ eventType, eventData }));
   if (!result.run) {
     throw new Error('Expected run to be updated');
   }
@@ -79,11 +82,10 @@ async function updateStep(
   eventType: 'step_started' | 'step_completed' | 'step_failed',
   eventData?: Record<string, unknown>,
 ): Promise<Step> {
-  const result = await events.create(runId, {
-    eventType,
-    correlationId: stepId,
-    eventData,
-  });
+  const result = await events.create(
+    runId,
+    asEventRequest({ eventType, correlationId: stepId, eventData }),
+  );
   if (!result.step) {
     throw new Error('Expected step to be updated');
   }
@@ -135,7 +137,13 @@ describe('Storage (Postgres integration)', () => {
     process.env.DATABASE_URL = dbUrl;
     process.env.WORKFLOW_POSTGRES_URL = dbUrl;
 
-    // Apply schema
+    // Apply schema through the real setup CLI, twice: the second run must
+    // be a no-op (the applied-migrations ledger skips every file).
+    execSync('pnpm db:push', {
+      stdio: 'inherit',
+      cwd: process.cwd(),
+      env: process.env,
+    });
     execSync('pnpm db:push', {
       stdio: 'inherit',
       cwd: process.cwd(),
@@ -602,7 +610,7 @@ describe('Storage (Postgres integration)', () => {
       });
 
       it('should list events in descending order when explicitly requested', async () => {
-        const _result1 = await events.create(testRunId, {
+        await events.create(testRunId, {
           eventType: 'run_started' as const,
         });
 
@@ -984,7 +992,7 @@ describe('Storage (Postgres integration)', () => {
         (error) => EntityConflictError.is(error),
       );
 
-      // Run stays parseable and completed — never a cancelled run with output
+      // Run stays parseable and completed, never a cancelled run with output
       const persisted = await runs.get(run.runId);
       expect(persisted.status).toBe('completed');
     });
@@ -1187,8 +1195,10 @@ describe('Storage (Postgres integration)', () => {
         eventData: { token },
       });
 
-      expect(result.event?.eventType).toBe('hook_conflict');
-      expect(result.event?.eventData).toMatchObject({ token, conflictingRunId: testRunId });
+      expect(expectEventType(result.event, 'hook_conflict').eventData).toMatchObject({
+        token,
+        conflictingRunId: testRunId,
+      });
       expect(result.hook).toBeUndefined();
     });
 
@@ -1212,6 +1222,13 @@ describe('Storage (Postgres integration)', () => {
       // No hook_conflict event may be written into the run's log
       const eventList = await events.list({ runId: testRunId, pagination: { sortOrder: 'asc' } });
       expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
+      // And exactly one hook_created row: a second one would poison replay
+      // with ReplayDivergenceError.
+      expect(
+        eventList.data.filter(
+          (e) => e.eventType === 'hook_created' && e.correlationId === 'hook_same',
+        ),
+      ).toHaveLength(1);
     });
 
     it('should allow token reuse after hook is disposed', async () => {
@@ -1246,7 +1263,7 @@ describe('Storage (Postgres integration)', () => {
   });
 
   describe('Event idempotency - creation events', () => {
-    it('should handle duplicate step_created events', async () => {
+    it('rejects a duplicate step_created with EntityConflictError', async () => {
       const run = await createRun(events, {
         deploymentId: 'deployment-idempotency',
         workflowName: 'test-workflow-idempotency',
@@ -1263,19 +1280,54 @@ describe('Storage (Postgres integration)', () => {
       expect(result1.step).toBeDefined();
       expect(result1.step!.stepId).toBe(stepId);
 
-      // Duplicate step_created event (replay scenario)
-      const result2 = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: stepId,
-        eventData: { stepName: 'test-step', input: ['input1'] },
-      });
-      expect(result2.step).toBeDefined();
-      expect(result2.step!.stepId).toBe(stepId);
+      // Redelivered step_created: the runtime catches EntityConflictError as
+      // its dedup signal. Returning success would append a second
+      // step_created row and poison replay with ReplayDivergenceError.
+      await expect(
+        events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: stepId,
+          eventData: { stepName: 'test-step', input: ['input1'] },
+        }),
+      ).rejects.toSatisfy((error) => EntityConflictError.is(error));
 
-      // Verify step appears in list query (critical!)
       const listResult = await steps.list({ runId: run.runId });
       expect(listResult.data).toHaveLength(1);
       expect(listResult.data[0].stepId).toBe(stepId);
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'step_created')).toHaveLength(1);
+    });
+
+    it('rejects a duplicate wait_created with EntityConflictError', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-idempotency',
+        workflowName: 'test-workflow-wait-idempotency',
+        input: [],
+      });
+      const waitId = 'wait-idempotent-test';
+      const eventData = {
+        eventType: 'wait_created' as const,
+        correlationId: waitId,
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      };
+
+      await events.create(run.runId, eventData);
+
+      // Waits have no entity table; the event log unique index is the only
+      // guard against a replayed wait_created duplicating the log.
+      await expect(events.create(run.runId, eventData)).rejects.toSatisfy((error) =>
+        EntityConflictError.is(error),
+      );
+
+      const eventList = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
     it('should handle duplicate run_created events', async () => {
@@ -1291,20 +1343,46 @@ describe('Storage (Postgres integration)', () => {
       expect(result1.run).toBeDefined();
       const runId = result1.run!.runId;
 
-      // Duplicate run_created event (replay scenario)
-      const result2 = await events.create(runId, {
-        eventType: 'run_created',
-        eventData: {
-          deploymentId: 'test-deployment',
-          workflowName: 'test-workflow-run-idempotent',
-          input: [],
-        },
-      });
-      expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      // Duplicate run_created (replay scenario): must not return the
+      // existing run AND append a second run_created row. Core catches
+      // EntityConflictError as "the run already exists".
+      await expect(
+        events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'test-deployment',
+            workflowName: 'test-workflow-run-idempotent',
+            input: [],
+          },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const listResult = await runs.list({ workflowName: 'test-workflow-run-idempotent' });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
+    });
+
+    it('concurrent run_created deliveries leave exactly one event row', async () => {
+      const eventData = {
+        eventType: 'run_created' as const,
+        eventData: {
+          deploymentId: 'test-deployment',
+          workflowName: 'test-workflow-run-race',
+          input: [],
+        },
+      };
+      const first = await events.create(null, eventData);
+      const runId = first.run!.runId;
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }, () => events.create(runId, eventData)),
+      );
+      expectRejectedWith(results, 'EntityConflictError');
+
+      const eventList = await events.list({ runId });
+      expect(eventList.data.filter((e) => e.eventType === 'run_created')).toHaveLength(1);
     });
 
     it('should handle duplicate hook_created events with different tokens', async () => {
@@ -1353,7 +1431,7 @@ describe('Storage (Postgres integration)', () => {
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
       const originalStartedAt = result1.run!.startedAt!;
 
-      // Second run_started (replay scenario — should be idempotent)
+      // Second run_started (replay scenario, should be idempotent)
       const result2 = await events.create(run.runId, {
         eventType: 'run_started',
       });
@@ -1368,6 +1446,121 @@ describe('Storage (Postgres integration)', () => {
       });
       const runStartedEvents = eventList.data.filter((e) => e.eventType === 'run_started');
       expect(runStartedEvents).toHaveLength(1);
+    });
+  });
+
+  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt`: the conformance
+  // suite has no coverage for this, so pin the semantics here.
+  describe('stateUpdatedAt optimistic-concurrency guard', () => {
+    const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
+
+    async function startRun(workflowName: string): Promise<WorkflowRun> {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-state-guard',
+        workflowName,
+        input: [],
+      });
+      await updateRun(events, run.runId, 'run_started');
+      return run;
+    }
+
+    async function completeStep(runId: string, stepId: string): Promise<number> {
+      await createStep(events, runId, { stepId, stepName: 'guarded-step', input: [] });
+      await updateStep(events, runId, stepId, 'step_started');
+      const completed = await events.create(runId, {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: { result: [] },
+      });
+      return ulidTime(completed.event!.eventId);
+    }
+
+    function stepCreated(stepId: string) {
+      return {
+        eventType: 'step_created' as const,
+        correlationId: stepId,
+        eventData: { stepName: 'guarded-step', input: [] },
+      };
+    }
+
+    it('rejects a snapshot strictly older than the marker with PreconditionFailedError', async () => {
+      const run = await startRun('state-guard-stale');
+      const marker = await completeStep(run.runId, 'step-guard-source');
+
+      await expect(
+        events.create(run.runId, stepCreated('step-guard-stale'), {
+          stateUpdatedAt: marker - 1,
+        }),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+
+      // The unlocked fail-fast check runs before any entity write.
+      const stepList = await steps.list({ runId: run.runId });
+      expect(stepList.data.some((s) => s.stepId === 'step-guard-stale')).toBe(false);
+    });
+
+    it('accepts an equal snapshot and an absent snapshot, and never advances on replay creates', async () => {
+      const run = await startRun('state-guard-equal');
+      const marker = await completeStep(run.runId, 'step-guard-source');
+
+      // Equal must pass; `<=` here would livelock an up-to-date client.
+      const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
+        stateUpdatedAt: marker,
+      });
+      expect(equal.step?.stepId).toBe('step-guard-equal');
+
+      // Replay-origin creates carry a stateUpdatedAt and must not advance the
+      // marker, so the same snapshot still passes afterwards.
+      const again = await events.create(run.runId, stepCreated('step-guard-equal-2'), {
+        stateUpdatedAt: marker,
+      });
+      expect(again.step?.stepId).toBe('step-guard-equal-2');
+
+      // Absent stateUpdatedAt fails open.
+      const unguarded = await events.create(run.runId, stepCreated('step-guard-absent'));
+      expect(unguarded.step?.stepId).toBe('step-guard-absent');
+    });
+
+    it('advances the marker on hook_received but not on run lifecycle events', async () => {
+      const run = await startRun('state-guard-hook');
+
+      // run_created / run_started omit stateUpdatedAt but are not externally
+      // originated: advancing on them would reject every replay.
+      const beforeHook = await events.create(run.runId, stepCreated('step-guard-pre-hook'), {
+        stateUpdatedAt: 1,
+      });
+      expect(beforeHook.step?.stepId).toBe('step-guard-pre-hook');
+
+      await createHook(events, run.runId, { hookId: 'hook-guard', token: 'token-guard' });
+      const received = await events.create(run.runId, {
+        eventType: 'hook_received',
+        correlationId: 'hook-guard',
+        eventData: { payload: {} },
+      });
+      const marker = ulidTime(received.event!.eventId);
+
+      await expect(
+        events.create(run.runId, stepCreated('step-guard-post-hook'), {
+          stateUpdatedAt: marker - 1,
+        }),
+      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+    });
+  });
+
+  describe('maxEvents', () => {
+    it('reports the per-run event ceiling on both run_started paths', async () => {
+      const run = await createRun(events, {
+        deploymentId: 'deployment-max-events',
+        workflowName: 'max-events',
+        input: [],
+      });
+
+      const started = await events.create(run.runId, { eventType: 'run_started' });
+      expect(started.maxEvents).toBe(25_000);
+
+      // The idempotent replay path is the easy miss: core reads maxEvents only
+      // off the run_started response, so it must be carried here too.
+      const replayed = await events.create(run.runId, { eventType: 'run_started' });
+      expect(replayed.maxEvents).toBe(25_000);
     });
   });
 
