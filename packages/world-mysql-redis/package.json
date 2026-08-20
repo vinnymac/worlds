@@ -37,6 +37,10 @@
       "types": "./dist/cli.d.ts",
       "default": "./dist/cli.js"
     },
+    "./health": {
+      "types": "./dist/health.d.ts",
+      "default": "./dist/health.js"
+    },
     "./migrations/*.sql": "./migrations/*.sql"
   },
   "publishConfig": {

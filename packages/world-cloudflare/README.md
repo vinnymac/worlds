@@ -26,8 +26,17 @@ pnpm add @fantasticfour/world-cloudflare
 
 ## Usage
 
+The world talks to its Durable Objects over RPC through the `WORKFLOW_DB` and
+`WORKFLOW_STREAMS` bindings, so it cannot register those classes for you: only
+your Worker's entrypoint can. Re-export them from your entrypoint or `wrangler
+deploy` fails with `Your Worker depends on the following Durable Objects, which
+are not exported in your entrypoint file`.
+
 ```typescript
 import { createCloudflareWorld } from '@fantasticfour/world-cloudflare';
+
+// Required: wrangler binds these to the classes named in wrangler.toml.
+export { StreamDO, WorkflowRunDO } from '@fantasticfour/world-cloudflare/worker';
 
 // In your Cloudflare Worker
 export default {
@@ -63,21 +72,36 @@ export default {
 
 Configure in `wrangler.toml`:
 
+All four bindings are required, and the binding names are fixed: `createCloudflareWorld`
+reads them off `env` by name.
+
 ```toml
 name = "my-workflow-app"
-main = "src/index.ts"
-compatibility_date = "2024-01-01"
+main = "src/index.ts" # the entrypoint that re-exports StreamDO and WorkflowRunDO
+compatibility_date = "2024-11-27"
+compatibility_flags = ["nodejs_compat"]
 
 [[durable_objects.bindings]]
-name = "WORKFLOW_DO"
-class_name = "WorkflowDurableObject"
+name = "WORKFLOW_DB"
+class_name = "WorkflowRunDO"
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_STREAMS"
+class_name = "StreamDO"
+
+# Both classes use DO SQLite storage, so they must be introduced as
+# new_sqlite_classes. Without this migration the bindings resolve but every
+# storage call fails at runtime.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowRunDO", "StreamDO"]
 
 [[queues.producers]]
 queue = "workflow-queue"
 binding = "WORKFLOW_QUEUE"
 
 [[kv_namespaces]]
-binding = "WORKFLOW_KV"
+binding = "WORKFLOW_INDEX"
 id = "your-kv-namespace-id"
 ```
 

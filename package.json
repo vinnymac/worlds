@@ -9,11 +9,13 @@
     "type": "git",
     "url": "https://github.com/vinnymac/worlds.git"
   },
+  "type": "module",
   "scripts": {
     "build": "turbo build",
     "dev": "turbo dev",
     "test": "turbo test",
-    "typecheck": "turbo typecheck",
+    "test:packaging": "turbo build && vitest run --config vitest.packaging.config.ts",
+    "typecheck": "turbo typecheck && tsc -p tsconfig.packaging.json",
     "clean": "turbo clean",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
@@ -27,12 +29,14 @@
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.0",
+    "@types/node": "catalog:",
     "husky": "^9.1.7",
     "lint-staged": "^17.3.0",
     "oxfmt": "0.64.0",
     "oxlint": "1.79.0",
     "turbo": "^2.10.11",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vitest": "catalog:"
   },
   "lint-staged": {
     "**/*.{js,jsx,ts,tsx,mjs,mts,json}": "npx oxfmt",
