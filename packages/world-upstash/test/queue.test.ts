@@ -1,7 +1,7 @@
 import type { MessageId, QueuePayload, QueuePrefix, ValidQueueName } from '@workflow/world';
 import { Client } from '@upstash/qstash';
-import { describe, expect, it, vi } from 'vitest';
-import { parse } from '../src/util.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { parse, stringify } from '../src/util.js';
 import { createQueue } from '../src/queue.js';
 
 const QUEUE_NAME = '__wkf_workflow_test' as ValidQueueName;
@@ -13,6 +13,7 @@ interface PublishedBody {
   message: unknown;
   messageId: MessageId;
   deliveryCount?: number;
+  republishCount?: number;
 }
 
 interface HandlerMeta {
@@ -168,13 +169,45 @@ describe('QStash queue', () => {
       expect(republished.retries).toBe(47);
       // The redelivery must not be swallowed by QStash dedup
       expect(republished.deduplicationId).toBeUndefined();
-      // Same logical message, with the completed delivery recorded
+      // Same logical message. No delivery *failed*, so the attempt counter
+      // core sees stays put; only the soft-republish counter moves.
       expect(republishedBody.messageId).toBe(body.messageId);
       expect(republishedBody.message).toEqual({ runId: 'wrun_1' });
-      expect(republishedBody.deliveryCount).toBe(1);
+      expect(republishedBody.deliveryCount).toBe(0);
+      expect(republishedBody.republishCount).toBe(1);
     });
 
-    it('carries deliveryCount across republishes so attempt keeps increasing', async () => {
+    it('does not let timeoutSeconds republishes inflate attempt toward MAX_QUEUE_DELIVERIES', async () => {
+      // Regression: core returns { timeoutSeconds: 0 } to mean "re-invoke me
+      // with a fresh replay" (e.g. when the stateUpdatedAt precondition guard
+      // exhausts its reloads under concurrent step completion). Counting those
+      // as deliveries drove `attempt` past core's MAX_QUEUE_DELIVERIES (48),
+      // which failed the run with "exceeded max deliveries (49/48)" even
+      // though nothing had actually failed.
+      const { queue, publishSpy } = makeQueue();
+      await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload);
+
+      const attempts: number[] = [];
+      const httpHandler = queue.createQueueHandler(QUEUE_PREFIX, async (_message, meta) => {
+        attempts.push(meta.attempt);
+        return { timeoutSeconds: 0 };
+      });
+
+      // Drive far more soft republishes than core's 48-delivery budget.
+      let body = String(publishedRequest(publishSpy).request.body);
+      for (let i = 0; i < 60; i++) {
+        const response = await httpHandler(deliveryRequest(body));
+        expect(response.status).toBe(200);
+        body = String(publishedRequest(publishSpy, i + 1).request.body);
+      }
+
+      // Every delivery is the first real one; none of them failed.
+      expect(attempts).toEqual(Array.from({ length: 60 }, () => 1));
+      expect(parse<PublishedBody>(body).deliveryCount).toBe(0);
+      expect(parse<PublishedBody>(body).republishCount).toBe(60);
+    });
+
+    it('still carries genuine failed deliveries across a timeoutSeconds republish', async () => {
       const { queue, publishSpy } = makeQueue();
       await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload);
       const first = publishedRequest(publishSpy);
@@ -185,17 +218,35 @@ describe('QStash queue', () => {
         return { timeoutSeconds: 0 };
       });
 
-      await httpHandler(deliveryRequest(String(first.request.body)));
+      // QStash redelivered this message twice before it succeeded.
+      await httpHandler(deliveryRequest(String(first.request.body), { 'upstash-retried': '2' }));
       const second = publishedRequest(publishSpy, 1);
-      // timeoutSeconds: 0 means immediate redelivery, no delay set
-      expect(second.request.delay).toBeUndefined();
-      expect(second.body.deliveryCount).toBe(1);
+      expect(attempts).toEqual([3]);
+      // The two hard failures persist; the soft republish adds nothing.
+      expect(second.body.deliveryCount).toBe(2);
 
       await httpHandler(deliveryRequest(String(second.request.body)));
-      const third = publishedRequest(publishSpy, 2);
-      expect(third.body.deliveryCount).toBe(2);
+      expect(attempts).toEqual([3, 3]);
+      expect(publishedRequest(publishSpy, 2).body.deliveryCount).toBe(2);
+    });
 
-      expect(attempts).toEqual([1, 2]);
+    it('fails the delivery once a message exceeds the soft-republish safety limit', async () => {
+      const { queue, publishSpy } = makeQueue();
+      await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload);
+      const { request, body } = publishedRequest(publishSpy);
+
+      const httpHandler = queue.createQueueHandler(QUEUE_PREFIX, async () => ({
+        timeoutSeconds: 0,
+      }));
+
+      // A message already at the ceiling must not be republished again.
+      const atLimit = stringify({ ...body, republishCount: 256 });
+      const response = await httpHandler(deliveryRequest(atLimit));
+
+      expect(response.status).toBe(500);
+      // Only the original queue() publish; no further soft republish.
+      expect(publishSpy).toHaveBeenCalledTimes(1);
+      expect(String(request.body)).toBeTruthy();
     });
 
     it('does not republish when the handler returns void', async () => {
@@ -262,5 +313,61 @@ describe('QStash queue', () => {
       expect(payload.runInput.input[0]).toBeInstanceOf(Uint8Array);
       expect(Array.from(payload.runInput.input[0] as Uint8Array)).toEqual([9, 8, 7]);
     });
+  });
+});
+
+describe('loopback queue', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('releases the dedup reservation when delivery permanently fails', async () => {
+    // The pump mirrors QStash dedup with an in-process Set. If it gives up on a
+    // message without releasing the key, core's next re-enqueue of that same
+    // step is silently swallowed and the run wedges forever. world-redis
+    // releases its reservation on final drop for exactly this reason.
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockRejectedValue(new Error('connection refused'));
+    vi.stubGlobal('fetch', fetchMock);
+    // Keep the expected permanent-failure log out of the test output.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const queue = createQueue({ queueMode: 'loopback', targetUrl: TARGET_URL });
+
+    await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload, {
+      idempotencyKey: 'step-abc',
+    });
+    // Drain the pump's 5 attempts and their 1s linear backoffs.
+    await vi.advanceTimersByTimeAsync(10_000);
+    const afterFirst = fetchMock.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // Core re-enqueues the same step on the next replay. It must not be dropped.
+    await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload, {
+      idempotencyKey: 'step-abc',
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(afterFirst);
+  });
+
+  it('still collapses a duplicate enqueue while the delivery is in flight', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(new Response('OK', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const queue = createQueue({ queueMode: 'loopback', targetUrl: TARGET_URL });
+
+    await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload, {
+      idempotencyKey: 'step-abc',
+    });
+    await queue.queue(QUEUE_NAME, { runId: 'wrun_1' } as QueuePayload, {
+      idempotencyKey: 'step-abc',
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
