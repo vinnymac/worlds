@@ -8,7 +8,7 @@ import {
   type ValidQueueName,
   WorkflowInvokePayloadSchema,
 } from '@workflow/world';
-import type { JetStreamClient, JsMsg } from 'nats';
+import type { JetStreamClient, JsMsg, KV } from 'nats';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
@@ -54,15 +54,37 @@ const ACK_WAIT_NANOS = 30 * 1_000_000_000; // 30 seconds
 const ACK_PROGRESS_INTERVAL_MS = 10_000;
 
 /**
- * JetStream delivery cap. Core's poison-pill escalation triggers at
- * MAX_QUEUE_DELIVERIES (48) attempts and marks the run/step failed; this cap
- * only exists as a backstop above that so JetStream never silently drops a
- * message before core has had a chance to record the failure.
+ * Safety ceiling on `{ timeoutSeconds }` soft naks for a single message,
+ * mirroring world-upstash's MAX_SOFT_REPUBLISHES and world-local's
+ * MAX_LOCAL_SAFETY_LIMIT.
+ *
+ * Suspensions are legitimate control flow and must not consume core's delivery
+ * budget, but an unbounded soft loop would spin a message forever. Past this
+ * ceiling the delivery is nak'd as a real failure so it starts counting toward
+ * core's own cap and the run ends with a recorded error.
  */
-const MAX_DELIVER = 64;
+const MAX_SOFT_NAKS = 256;
+
+/**
+ * JetStream delivery cap. Core's poison-pill escalation triggers at
+ * MAX_QUEUE_DELIVERIES (48) *failed* attempts and marks the run/step failed;
+ * this cap only exists as a backstop above that so JetStream never silently
+ * drops a message before core has had a chance to record the failure.
+ *
+ * Soft naks share JetStream's delivery counter (there is no way to redeliver
+ * without incrementing `num_delivered`), so the cap has to clear the soft
+ * ceiling plus core's failure budget, not just core's budget alone.
+ */
+const MAX_DELIVER = MAX_SOFT_NAKS + 64;
 
 /** Redelivery delay for failed dispatches (matches world-local's 5s linear backoff). */
 const NAK_DELAY_MS = 5_000;
+
+/**
+ * How long a soft-nak counter outlives its message. Matched to the streams'
+ * `max_age` so a counter cannot outlive the message it describes.
+ */
+const SOFT_NAK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 const QUEUE_PATHNAMES = {
   workflow: 'flow',
@@ -148,6 +170,62 @@ export function createQueue(
       });
     inflightWorkflowRuns.set(key, execution);
     await execution;
+  }
+
+  /**
+   * Per-message tally of `{ timeoutSeconds }` suspensions.
+   *
+   * `{ timeoutSeconds }` is core's *control-flow* signal, not a failed
+   * delivery: `sleep()`, step retry backoff, `TooEarlyError`, and
+   * `{ timeoutSeconds: 0 }` ("re-invoke me with a fresh replay", returned
+   * whenever the `stateUpdatedAt` precondition guard exhausts its reloads or
+   * `run_completed` is rejected as stale). JetStream's only durable redelivery
+   * timer is `nak(delay)`, which unavoidably increments `num_delivered`, so the
+   * suspensions are counted here and subtracted back out before the delivery is
+   * reported to core as an `attempt`.
+   *
+   * Kept in KV rather than in memory so the tally survives a worker restart or
+   * a consumer rebalance; losing it would silently restore the old behaviour of
+   * counting suspensions against core's budget.
+   */
+  let softNakBucket: KV | undefined;
+  const getSoftNakBucket = async (): Promise<KV> => {
+    if (!softNakBucket) {
+      const jetstream = await getJetStream();
+      softNakBucket = await jetstream.views.kv(`${prefix}queue_soft_naks`, {
+        history: 1,
+        ttl: SOFT_NAK_TTL_MS,
+      });
+    }
+    return softNakBucket;
+  };
+
+  /** Stable per-message key. `streamSequence` identifies the message within its
+   * stream and does not change across redeliveries, unlike `deliveryCount`. */
+  function softNakKey(kind: QueueKind, msg: JsMsg): string {
+    return `${kind}_${msg.info.streamSequence}`;
+  }
+
+  async function readSoftNaks(key: string): Promise<number> {
+    const entry = await (await getSoftNakBucket()).get(key);
+    if (!entry) return 0;
+    const value = Number.parseInt(new TextDecoder().decode(entry.value), 10);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  async function writeSoftNaks(key: string, count: number): Promise<void> {
+    await (await getSoftNakBucket()).put(key, new TextEncoder().encode(String(count)));
+  }
+
+  /** Drop a settled message's tally. Best effort: the delivery is already
+   * acked, so a failure here must not resurrect it (the bucket TTL is the
+   * backstop). */
+  function clearSoftNaks(key: string): void {
+    void getSoftNakBucket()
+      .then((bucket) => bucket.purge(key))
+      .catch((err) => {
+        debug(`failed to purge soft-nak counter ${key}`, { err });
+      });
   }
 
   let initialized = false;
@@ -262,17 +340,25 @@ export function createQueue(
     envelope: MessageEnvelope,
     pathname: 'flow' | 'step',
     streamName: string,
+    kind: QueueKind,
   ): Promise<void> {
+    const key = softNakKey(kind, msg);
     try {
-      // Derive the attempt from JetStream's delivery count (1-based) so
-      // redeliveries surface as attempt 2, 3, ... and core's poison-pill
-      // escalation (attempt > MAX_QUEUE_DELIVERIES) can trigger.
-      const response = await dispatch(envelope, msg.info.deliveryCount, pathname);
+      // Report only *failed* deliveries as the attempt, so core's poison-pill
+      // escalation (attempt > MAX_QUEUE_DELIVERIES) still fires on a genuinely
+      // stuck message but a run that merely suspends is never killed as a
+      // runaway. The first delivery cannot have suspended yet, so the happy
+      // path skips the KV read entirely.
+      const softNaks = msg.info.deliveryCount > 1 ? await readSoftNaks(key) : 0;
+      const attempt = Math.max(1, msg.info.deliveryCount - softNaks);
+
+      const response = await dispatch(envelope, attempt, pathname);
 
       if (response.ok) {
         msg.ack();
         health.lastSuccessfulFetch = Date.now();
         health.totalProcessed++;
+        if (softNaks > 0) clearSoftNaks(key);
         return;
       }
 
@@ -290,6 +376,23 @@ export function createQueue(
           typeof parsed === 'object' &&
           typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
         ) {
+          const next = softNaks + 1;
+          if (next > MAX_SOFT_NAKS) {
+            // Refuse to keep the soft loop going. Nak'ing without recording the
+            // suspension makes this delivery count as a real failure, so the
+            // attempt climbs and core ends the run with a recorded error
+            // instead of the message spinning silently until max_deliver.
+            console.error(
+              `[world-nats-jetstream worker] message ${envelope.messageId} exceeded ${MAX_SOFT_NAKS} timeoutSeconds naks on ${streamName}`,
+            );
+            msg.nak(NAK_DELAY_MS);
+            health.totalFailed++;
+            return;
+          }
+          // Record the suspension BEFORE nak'ing: JetStream may redeliver the
+          // moment the delay elapses, and a redelivery that read a stale count
+          // would report an inflated attempt.
+          await writeSoftNaks(key, next);
           // JetStream supports a custom nak delay (in ms).
           const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
           msg.nak(timeoutMs);
@@ -367,7 +470,7 @@ export function createQueue(
 
         try {
           await runSerialized(workflowRunSerializationKey(kind, envelope.message), () =>
-            deliver(msg, envelope, pathname, streamName),
+            deliver(msg, envelope, pathname, streamName, kind),
           );
         } finally {
           clearInterval(progressTimer);
