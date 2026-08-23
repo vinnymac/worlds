@@ -22,7 +22,12 @@ queue = "workflow-queue"
 queue = "workflow-queue"
 max_batch_size = 10
 max_batch_timeout = 5
-max_retries = 3
+# Core's poison-pill escalation triggers at MAX_QUEUE_DELIVERIES (48) failed
+# attempts and marks the run/step failed. This cap has to clear that, otherwise
+# Cloudflare dead-letters the message first and the run wedges with no
+# run_failed event ever recorded. Suspensions do not consume retries (the
+# handler re-sends a delayed copy instead), so this budget is failures only.
+max_retries = 50
 dead_letter_queue = "workflow-dlq"
 
 # KV namespace for global indexing
