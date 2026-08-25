@@ -19,6 +19,7 @@ interface MockDoc {
   stepId?: string;
   hookId?: string;
   eventId?: string;
+  correlationId?: string;
   token?: string;
   [key: string]: unknown;
 }
@@ -107,6 +108,13 @@ describe('Storage (Azure Cosmos DB integration)', () => {
                 paramMap[param.name] = param.value;
               }
 
+              // `ORDER BY c.<field> ASC|DESC ... LIMIT @limit` and the
+              // `c.eventId >|< @cursor` predicate are modelled here so
+              // pagination is exercised rather than assumed.
+              const orderBy = /ORDER BY c\.(\w+) (ASC|DESC)/.exec(query);
+              const cursorOp = /c\.eventId (>|<) @cursor/.exec(query)?.[1];
+              const cursor = paramMap['@cursor'];
+
               for (const [_id, doc] of mockData.entries()) {
                 if (options?.partitionKey && doc.runId !== options.partitionKey) continue;
                 if (query.includes('c.type = "run"') && doc.type !== 'run') continue;
@@ -117,9 +125,32 @@ describe('Storage (Azure Cosmos DB integration)', () => {
                 if (paramMap['@stepId'] && doc.stepId !== paramMap['@stepId']) continue;
                 if (paramMap['@hookId'] && doc.hookId !== paramMap['@hookId']) continue;
                 if (paramMap['@eventId'] && doc.eventId !== paramMap['@eventId']) continue;
+                if (
+                  paramMap['@correlationId'] &&
+                  doc.correlationId !== paramMap['@correlationId']
+                ) {
+                  continue;
+                }
+                if (cursorOp && typeof cursor === 'string') {
+                  const eventId = doc.eventId ?? '';
+                  if (cursorOp === '>' ? eventId <= cursor : eventId >= cursor) continue;
+                }
                 resources.push(doc);
               }
-              return { resources };
+
+              if (orderBy) {
+                const [, field, direction] = orderBy;
+                resources.sort((left, right) => {
+                  const a = String(left[field] ?? '');
+                  const b = String(right[field] ?? '');
+                  return direction === 'ASC' ? a.localeCompare(b) : b.localeCompare(a);
+                });
+              }
+
+              const limit = paramMap['@limit'];
+              return {
+                resources: typeof limit === 'number' ? resources.slice(0, limit) : resources,
+              };
             },
           }),
         ),
@@ -807,6 +838,111 @@ describe('Storage (Azure Cosmos DB integration)', () => {
           maxEventsPerRun: 0,
         }),
       ).toThrow(/positive integer/);
+    });
+  });
+
+  describe('events.listByCorrelationId run scoping', () => {
+    const sharedCorrelationId = 'step-shared-correlation';
+
+    // Entities live in their run's partition here, so the cross-run case is
+    // two runs walking the same step lifecycle under one correlation id.
+    // Interleave them so an unscoped lookup alternates between the runs.
+    async function seedInterleavedRuns() {
+      const runA = await createRun('scoping-workflow-a');
+      const runB = await createRun('scoping-workflow-b');
+
+      const a1 = await storage.events.create(runA.runId, {
+        eventType: 'step_created',
+        correlationId: sharedCorrelationId,
+        eventData: { stepName: 'shared-step', input: [] },
+      });
+      const b1 = await storage.events.create(runB.runId, {
+        eventType: 'step_created',
+        correlationId: sharedCorrelationId,
+        eventData: { stepName: 'shared-step', input: [] },
+      });
+      const a2 = await storage.events.create(runA.runId, {
+        eventType: 'step_started',
+        correlationId: sharedCorrelationId,
+      });
+      const b2 = await storage.events.create(runB.runId, {
+        eventType: 'step_started',
+        correlationId: sharedCorrelationId,
+      });
+      const a3 = await storage.events.create(runA.runId, {
+        eventType: 'step_completed',
+        correlationId: sharedCorrelationId,
+        eventData: { result: 'ok' },
+      });
+      const b3 = await storage.events.create(runB.runId, {
+        eventType: 'step_completed',
+        correlationId: sharedCorrelationId,
+        eventData: { result: 'ok' },
+      });
+
+      return {
+        runA: runA.runId,
+        runB: runB.runId,
+        a: [a1, a2, a3].map((r) => r.event!.eventId),
+        b: [b1, b2, b3].map((r) => r.event!.eventId),
+      };
+    }
+
+    it('scopes events to the requested run', async () => {
+      const seeded = await seedInterleavedRuns();
+
+      const result = await storage.events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        runId: seeded.runA,
+        pagination: {},
+      });
+
+      expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
+      expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('lists every run when runId is omitted', async () => {
+      const seeded = await seedInterleavedRuns();
+
+      const result = await storage.events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        pagination: {},
+      });
+
+      // Also pins the interleaving the scoped pagination test relies on.
+      expect(result.data.map((e) => e.eventId)).toEqual([
+        seeded.a[0],
+        seeded.b[0],
+        seeded.a[1],
+        seeded.b[1],
+        seeded.a[2],
+        seeded.b[2],
+      ]);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('paginates the scoped set without gaps or duplicates', async () => {
+      const seeded = await seedInterleavedRuns();
+
+      const page1 = await storage.events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        runId: seeded.runA,
+        pagination: { limit: 2 },
+      });
+
+      expect(page1.data.map((e) => e.eventId)).toEqual([seeded.a[0], seeded.a[1]]);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.cursor).toBe(seeded.a[1]);
+
+      const page2 = await storage.events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        runId: seeded.runA,
+        pagination: { limit: 2, cursor: page1.cursor ?? undefined },
+      });
+
+      expect(page2.data.map((e) => e.eventId)).toEqual([seeded.a[2]]);
+      expect(page2.hasMore).toBe(false);
     });
   });
 });

@@ -1840,6 +1840,14 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters.push({ name: '@runId', value: runId });
         }
 
+        // Same cursor predicate events.list uses. Without it the cursor is
+        // silently ignored and every page repeats the first one.
+        if (params?.pagination?.cursor) {
+          const op = sortOrder === 'asc' ? '>' : '<';
+          conditions.push(`c.eventId ${op} @cursor`);
+          parameters.push({ name: '@cursor', value: params.pagination.cursor });
+        }
+
         const querySpec: SqlQuerySpec = {
           query: `SELECT * FROM c WHERE ${conditions.join(' AND ')} ORDER BY c.eventId ${orderDir} OFFSET 0 LIMIT @limit`,
           parameters: [...parameters, { name: '@limit', value: limit + 1 }],
