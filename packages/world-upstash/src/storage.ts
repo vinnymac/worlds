@@ -41,7 +41,7 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from '@upstash/redis';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { compact, stringify, parse } from './util.js';
 
 interface UpstashStorageConfig {
@@ -102,7 +102,11 @@ function resolveClaimTtlSeconds(configured: number | undefined): number {
 }
 
 /** Epoch ms encoded in the trailing ULID of an entity id (`wevt_<ulid>`).
- * Mirrors core's decode, which strips through the LAST underscore. */
+ * Mirrors core's decode, which strips through the LAST underscore.
+ *
+ * This is also the event index's sort score. Core derives `stateUpdatedAt`
+ * from the LAST event the log returns, so ordering the log by anything other
+ * than the eventId would let it send a value below our marker forever. */
 function eventIdTime(eventId: string): number {
   return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
 }
@@ -475,7 +479,6 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
     runId: string,
     id: string,
     event: unknown,
-    createdAt: Date,
     correlationId: string | undefined,
     guard = '',
     markerAdvance = '',
@@ -491,7 +494,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       [
         stringify(event),
         id,
-        createdAt.getTime().toString(),
+        String(eventIdTime(id)),
         correlationId ? '1' : '0',
         guard,
         markerAdvance,
@@ -563,7 +566,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await appendEvent(runId, eventId, event, createdAt, data.correlationId);
+        await appendEvent(runId, eventId, event, data.correlationId);
 
         const parsed = EventSchema.parse(event);
         return { event: filterEventData(parsed, resolveData) };
@@ -694,7 +697,9 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             });
             await redis.zadd(runsByStatusKey('pending'), { score, member: effectiveRunId });
             // Create synthetic run_created event
-            const runCreatedEventId = `wevt_${ulid()}`;
+            // Backdate ahead of the run_started that bootstrapped it: the log
+            // sorts by eventId time, and a run is created before it starts.
+            const runCreatedEventId = `wevt_${ulidAt(eventIdTime(eventId) - 1)}`;
             const runCreatedEvent = {
               eventType: 'run_created' as const,
               eventData: {
@@ -710,7 +715,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             };
             await redis.set(eventKey(runCreatedEventId), stringify(runCreatedEvent));
             await redis.zadd(eventsIndexKey(effectiveRunId), {
-              score: now.getTime(),
+              score: eventIdTime(runCreatedEventId),
               member: runCreatedEventId,
             });
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
@@ -755,7 +760,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             specVersion: effectiveSpecVersion,
           };
           await redis.set(eventKey(eventId), stringify(event));
-          const score = createdAt.getTime();
+          const score = eventIdTime(eventId);
           await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
 
           const parsed = EventSchema.parse(event);
@@ -1337,7 +1342,6 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
               effectiveRunId,
               eventId,
               conflictEvent,
-              createdAt,
               data.correlationId,
               residualGuard,
             );
@@ -1381,7 +1385,6 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         effectiveRunId,
         eventId,
         event,
-        createdAt,
         data.correlationId,
         residualGuard,
         markerAdvanceFor(eventId),
