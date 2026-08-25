@@ -213,11 +213,9 @@ export function createQueue(config: QStashQueueConfig): Queue {
       if (opts.delaySeconds) {
         await new Promise((resolve) => setTimeout(resolve, opts.delaySeconds! * 1000));
       }
-      // Bound concurrent deliveries: an immediate `{ timeoutSeconds: 0 }`
-      // self-republish storm has no natural throttle the way real QStash
-      // network round trips do, and can otherwise fire unboundedly many
-      // concurrent requests at the harness server, saturating the storage
-      // backend and preventing the run from ever converging.
+      // Self-POSTs have no natural throttle the way real QStash round trips
+      // do, so an immediate `{ timeoutSeconds: 0 }` republish loop would
+      // otherwise fire unboundedly many concurrent requests.
       await loopbackSemaphore.acquire();
       try {
         for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {

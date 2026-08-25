@@ -78,14 +78,8 @@ export interface UpstashWorldConfig {
    * Also selectable via `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`. */
   queueMode?: 'qstash' | 'loopback';
 
-  /** Max concurrent in-flight deliveries for the `'loopback'` queue transport
-   * (ignored in `'qstash'` mode, where Upstash's hosted service throttles
-   * delivery rate through real network round trips). Loopback self-POSTs
-   * have no such limit: an immediate `{ timeoutSeconds: 0 }` retry storm can
-   * fire unboundedly many concurrent requests at the harness server,
-   * saturating the storage backend and starving the very deliveries that
-   * would let the run converge. Mirrors world-redis/world-nats-jetstream's
-   * default worker-pool concurrency.
+  /** Max concurrent in-flight deliveries for the `'loopback'` transport.
+   * Ignored in `'qstash'` mode, which the hosted service already paces.
    * @default 10 */
   loopbackConcurrency?: number;
 

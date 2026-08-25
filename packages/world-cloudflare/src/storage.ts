@@ -403,26 +403,10 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       },
 
       async listByCorrelationId(_params) {
-        // Unimplemented. Events live inside per-run Durable Objects and there
-        // is no global correlationId index in KV or D1, so an unscoped lookup
-        // would require cross-DO coordination.
-        //
-        // Not on the runtime path: core never calls this method (it reads
-        // correlation ids from the event log it already loaded). The caller is
-        // the observability dashboard, `@workflow/web`, whose
-        // `fetchEventsByCorrelationId` invokes it on whichever world the
-        // environment resolves to. So on Cloudflare that view renders empty
-        // rather than failing, while workflow execution is unaffected.
-        //
-        // World 4.5.0 added an optional `runId` here, which would make the
-        // scoped case addressable (one run == one DO). A correct version still
-        // has to filter a run's events by correlationId *before* paginating,
-        // which needs its own cursor scheme rather than the DO's eventId
-        // cursor.
-        //
-        // Returning empty is a silent fallback and should be revisited. The
-        // shared conformance suite does not cover this method for any world,
-        // so nothing would catch a regression here.
+        // Unimplemented: events live in per-run DOs with no global
+        // correlationId index. Only `@workflow/web` calls this, never core, so
+        // the dashboard view renders empty while execution is unaffected.
+        // Returning empty is a silent fallback and should be revisited.
         return {
           data: [],
           cursor: null,

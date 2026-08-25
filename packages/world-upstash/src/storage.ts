@@ -1473,12 +1473,9 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           : await redis.zrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
         : 0;
 
-      // A correlation id is unique within its run, not across runs, so the
-      // global correlation index can hold same-id events from sibling runs.
-      // When core supplies `runId` (world 4.5.0 and newer) the lookup is
-      // scoped to that run; older cores omit it and keep the unscoped
-      // behaviour. The filter has to run before the `limit` slice below, or
-      // `hasMore` and the cursor would describe the unfiltered set.
+      // A correlation id is unique within its run, so the global index can
+      // hold same-id events from sibling runs. Filter before the `limit`
+      // slice, or `hasMore` and the cursor describe the unfiltered set.
       const runId = params.runId;
       const events: Event[] = [];
       let offset = start;
