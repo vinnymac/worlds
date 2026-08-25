@@ -1382,12 +1382,18 @@ export function createEventsStorage(
         sortOrder === 'desc'
           ? { by: desc(events.eventId), compare: lt }
           : { by: events.eventId, compare: gt };
+      // A correlation id is only unique within its run, so an unscoped lookup
+      // can return another run's events. Scope to the run when the caller
+      // supplies one; older callers omit it and keep the previous behavior.
+      // The predicate lives in the WHERE clause so it applies before the
+      // limit + 1 window, otherwise the cursor and hasMore would be wrong.
       const all = await drizzle
         .select()
         .from(events)
         .where(
           and(
             eq(events.correlationId, params.correlationId),
+            params.runId !== undefined ? eq(events.runId, params.runId) : undefined,
             map(params.pagination?.cursor, (c) => order.compare(events.eventId, c)),
           ),
         )

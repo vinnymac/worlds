@@ -778,6 +778,53 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     return events;
   }
 
+  // Helper: Read a page of events out of an index, optionally scoped to one
+  // run. A correlation id is only unique within its run, so the correlation
+  // index can hold events belonging to several runs; when the caller scopes
+  // the lookup we walk the index in pages and keep only the matching run's
+  // events, so `limit` and `hasMore` describe the filtered set rather than the
+  // raw index page. Returns at most `limit + 1` events: the extra one is the
+  // caller's `hasMore` probe. Unscoped lookups still cost a single index read
+  // plus a single pipeline.
+  async function fetchEventPage(
+    indexKey: string,
+    start: number,
+    limit: number,
+    sortOrder: 'asc' | 'desc',
+    runId: string | undefined,
+  ): Promise<Event[]> {
+    const matched: Event[] = [];
+    let offset = start;
+
+    for (;;) {
+      const eventIds = await fetchEventIds(indexKey, offset, limit, sortOrder);
+      if (eventIds.length === 0) {
+        break;
+      }
+      offset += eventIds.length;
+
+      const eventPipeline = redis.pipeline();
+      for (const eid of eventIds) {
+        eventPipeline.get(eventKey(eid));
+      }
+      const results = await eventPipeline.exec();
+
+      for (const event of parseEventsFromPipeline(results)) {
+        if (runId === undefined || event.runId === runId) {
+          matched.push(event);
+        }
+      }
+
+      // An unscoped read is complete after one page. A scoped read stops once
+      // it has the hasMore probe, or once the index runs short of a full page.
+      if (runId === undefined || matched.length > limit || eventIds.length <= limit) {
+        break;
+      }
+    }
+
+    return matched;
+  }
+
   /** Apply a run status transition, evaluating the `stateUpdatedAt` guard in the
    * same Lua execution so a stale lifecycle event can never move the run. */
   async function updateRunStatus(
@@ -1852,16 +1899,11 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
       const indexKey = eventsByCorrelationKey(params.correlationId);
       const start = await calculateEventStartPosition(indexKey, fromCursor, sortOrder);
-      const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
-      // Fetch events via pipeline
-      const eventPipeline = redis.pipeline();
-      for (const eid of eventIds) {
-        eventPipeline.get(eventKey(eid));
-      }
-      const results = await eventPipeline.exec();
-
-      const events = parseEventsFromPipeline(results);
+      // `params.runId` scopes the lookup to a single run's event log. It is
+      // optional for backward compatibility, so an absent runId keeps the
+      // historical unscoped behavior.
+      const events = await fetchEventPage(indexKey, start, limit, sortOrder, params.runId);
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
 

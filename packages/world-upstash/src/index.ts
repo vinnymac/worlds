@@ -56,6 +56,7 @@ export function createWorld(config: UpstashWorldConfig = {}): World {
     enableDeduplication: config.enableDeduplication,
     retries: config.qstashRetries,
     queueMode: config.queueMode,
+    loopbackConcurrency: config.loopbackConcurrency,
   });
 
   const storage = createStorage(

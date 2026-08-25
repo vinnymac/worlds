@@ -6,11 +6,11 @@ catalog:
   '@testcontainers/postgresql': ^12.1.0
   '@testcontainers/redis': ^12.1.0
   '@types/node': ^24.13.3
-  '@workflow/core': 4.8.4
+  '@workflow/core': 4.8.5
   '@workflow/errors': 4.2.1
   '@workflow/utils': 4.1.4
-  '@workflow/world': 4.4.0
-  '@workflow/world-testing': 4.1.19
+  '@workflow/world': 4.5.0
+  '@workflow/world-testing': 4.1.20
   cbor-x: ^1.6.0
   drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2
@@ -111,3 +111,20 @@ minimumReleaseAgeExclude:
   - oxlint@1.79.0
   - turbo@2.10.11
   - vitest@4.1.11
+  - '@workflow/astro@4.0.20'
+  - '@workflow/builders@4.1.10'
+  - '@workflow/cli@4.3.9'
+  - '@workflow/core@4.8.5'
+  - '@workflow/nest@4.0.21'
+  - '@workflow/next@4.1.9'
+  - '@workflow/nitro@4.1.11'
+  - '@workflow/nuxt@4.0.21'
+  - '@workflow/rollup@4.0.20'
+  - '@workflow/sveltekit@4.0.20'
+  - '@workflow/vite@4.0.20'
+  - '@workflow/web@4.1.21'
+  - '@workflow/world-local@4.4.0'
+  - '@workflow/world-testing@4.1.20'
+  - '@workflow/world-vercel@4.7.1'
+  - '@workflow/world@4.5.0'
+  - workflow@4.8.5

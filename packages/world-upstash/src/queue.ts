@@ -54,6 +54,12 @@ interface QStashQueueConfig {
    * `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`.
    */
   queueMode?: 'qstash' | 'loopback';
+  /**
+   * Max concurrent in-flight deliveries for the `'loopback'` transport.
+   * @see {@link UpstashWorldConfig.loopbackConcurrency} for the rationale.
+   * @default 10
+   */
+  loopbackConcurrency?: number;
 }
 
 /**
@@ -119,6 +125,36 @@ const DEFAULT_QSTASH_RETRIES = 47;
  */
 const MAX_SOFT_REPUBLISHES = 256;
 
+/** @see {@link UpstashWorldConfig.loopbackConcurrency} */
+const DEFAULT_LOOPBACK_CONCURRENCY = 10;
+
+/** Simple counting semaphore bounding concurrent loopback deliveries. */
+class Semaphore {
+  private available: number;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(concurrency: number) {
+    this.available = concurrency;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.available > 0) {
+      this.available--;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+  }
+
+  release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      next();
+    } else {
+      this.available++;
+    }
+  }
+}
+
 export function createQueue(config: QStashQueueConfig): Queue {
   const queueMode =
     config.queueMode ??
@@ -160,6 +196,11 @@ export function createQueue(config: QStashQueueConfig): Queue {
   const LOOPBACK_MAX_DELIVERIES = 5;
   const LOOPBACK_RETRY_DELAY_MS = 1_000;
 
+  /** Bounds concurrent loopback deliveries; see {@link QStashQueueConfig.loopbackConcurrency}. */
+  const loopbackSemaphore = new Semaphore(
+    config.loopbackConcurrency ?? DEFAULT_LOOPBACK_CONCURRENCY,
+  );
+
   /** Fire-and-forget delivery of the QStash wire body to the target app,
    * honouring the publish delay and reporting the redelivery count via the
    * `upstash-retried` header exactly as QStash would. */
@@ -172,36 +213,46 @@ export function createQueue(config: QStashQueueConfig): Queue {
       if (opts.delaySeconds) {
         await new Promise((resolve) => setTimeout(resolve, opts.delaySeconds! * 1000));
       }
-      for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {
-        try {
-          const res = await fetch(loopbackUrl(body.queueName), {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'upstash-retried': String(attempt),
-              ...opts.headers,
-            },
-            body: payload,
-          });
-          if (res.ok) return;
-          debug(`loopback delivery got ${res.status} for ${body.messageId}`);
-        } catch (err) {
-          debug('loopback delivery failed', err);
+      // Bound concurrent deliveries: an immediate `{ timeoutSeconds: 0 }`
+      // self-republish storm has no natural throttle the way real QStash
+      // network round trips do, and can otherwise fire unboundedly many
+      // concurrent requests at the harness server, saturating the storage
+      // backend and preventing the run from ever converging.
+      await loopbackSemaphore.acquire();
+      try {
+        for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {
+          try {
+            const res = await fetch(loopbackUrl(body.queueName), {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'upstash-retried': String(attempt),
+                ...opts.headers,
+              },
+              body: payload,
+            });
+            if (res.ok) return;
+            debug(`loopback delivery got ${res.status} for ${body.messageId}`);
+          } catch (err) {
+            debug('loopback delivery failed', err);
+          }
+          await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
         }
-        await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
+        // Release the dedup reservation before giving up. The pump has
+        // dropped this message for good, so leaving the key in place would
+        // silently swallow core's next re-enqueue of the same step and wedge
+        // the run forever (world-redis releases its reservation on final
+        // drop for the same reason).
+        if (opts.deduplicationId) {
+          loopbackDeliveredDedupIds.delete(opts.deduplicationId);
+        }
+        // Crash loudly in logs rather than stranding the run silently.
+        console.error(
+          `[world-upstash] loopback delivery permanently failed for message ${body.messageId}`,
+        );
+      } finally {
+        loopbackSemaphore.release();
       }
-      // Release the dedup reservation before giving up. The pump has dropped
-      // this message for good, so leaving the key in place would silently
-      // swallow core's next re-enqueue of the same step and wedge the run
-      // forever (world-redis releases its reservation on final drop for the
-      // same reason).
-      if (opts.deduplicationId) {
-        loopbackDeliveredDedupIds.delete(opts.deduplicationId);
-      }
-      // Crash loudly in logs rather than stranding the run silently.
-      console.error(
-        `[world-upstash] loopback delivery permanently failed for message ${body.messageId}`,
-      );
     })();
   }
 

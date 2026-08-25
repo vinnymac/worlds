@@ -1772,13 +1772,27 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
       const events: Event[] = [];
 
-      // correlationIds are not indexed; scan live entries (one per event)
-      for await (const entry of listLiveEntries(eventsBucket)) {
-        const data = kvValueToString(entry.value);
-        const event = parse<Event>(data);
+      if (params.runId !== undefined) {
+        // A correlationId is only unique within its run, so an unscoped
+        // lookup can return a sibling run's events under the same id. Core
+        // sends runId from 4.5.0 on; it stays optional for older callers.
+        // The events-by-run index makes the scoped read targeted instead of
+        // a full bucket scan, and filtering here (before the cursor and
+        // limit are applied) keeps cursor and hasMore honest.
+        for (const event of await loadEventsForRun(params.runId)) {
+          if (event.correlationId === params.correlationId) {
+            events.push(event);
+          }
+        }
+      } else {
+        // correlationIds are not indexed; scan live entries (one per event)
+        for await (const entry of listLiveEntries(eventsBucket)) {
+          const data = kvValueToString(entry.value);
+          const event = parse<Event>(data);
 
-        if (event.correlationId === params.correlationId) {
-          events.push(event);
+          if (event.correlationId === params.correlationId) {
+            events.push(event);
+          }
         }
       }
 

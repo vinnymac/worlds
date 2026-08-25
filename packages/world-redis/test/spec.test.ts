@@ -1,6 +1,6 @@
 import { RedisContainer } from '@testcontainers/redis';
 import { createTestSuite } from '@workflow/world-testing';
-// Opt-in suite: `createTestSuite` does not include it in 4.1.19, so it has to
+// Opt-in suite: `createTestSuite` does not include it in 4.1.20, so it has to
 // be deep-imported. It asserts the world honours WORKFLOW_MAX_EVENTS via
 // EventResult.maxEvents.
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';

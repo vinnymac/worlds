@@ -403,8 +403,18 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       },
 
       async listByCorrelationId(_params) {
-        // For Cloudflare, we'd need a global index in KV or D1
-        // For now, return empty as this requires cross-DO coordination
+        // Unimplemented. Events live inside per-run Durable Objects and there
+        // is no global correlationId index in KV or D1, so an unscoped lookup
+        // would require cross-DO coordination.
+        //
+        // World 4.5.0 added an optional `runId` to these params and core 4.8.5
+        // sends it. Scoping matters because a correlationId is only unique
+        // within its run, and it also makes the scoped case addressable here
+        // (one run == one DO). Still not implemented: a correct version has to
+        // filter a run's events by correlationId *before* paginating, which
+        // needs its own cursor scheme rather than the DO's eventId cursor.
+        //
+        // Returning empty is a silent fallback and should be revisited.
         return {
           data: [],
           cursor: null,

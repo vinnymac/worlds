@@ -1495,7 +1495,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       },
 
       async listByCorrelationId(params) {
-        const { correlationId } = params;
+        const { correlationId, runId } = params;
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
 
@@ -1503,9 +1503,21 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         // paginated by the monotonic eventId (see events.list).
         let query: Query = firestore
           .collectionGroup('events')
-          .where('correlationId', '==', correlationId)
-          .orderBy('eventId', sortOrder)
-          .limit(limit + 1);
+          .where('correlationId', '==', correlationId);
+
+        // A correlationId is only unique within its run, so an unscoped
+        // lookup can return a sibling run's events under the same id. Core
+        // sends runId from 4.5.0 on; it stays optional for older callers.
+        // Filtering here (server-side, before the limit) rather than after
+        // slicing keeps cursor and hasMore honest.
+        // Requires the composite index
+        // `correlationId ASC, runId ASC, eventId ASC|DESC` declared in
+        // firestore.indexes.json.
+        if (runId !== undefined) {
+          query = query.where('runId', '==', runId);
+        }
+
+        query = query.orderBy('eventId', sortOrder).limit(limit + 1);
 
         if (params?.pagination?.cursor) {
           query = query.startAfter(params.pagination.cursor);

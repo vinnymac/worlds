@@ -1339,6 +1339,12 @@ export function createEventsStorage(
         .where(
           and(
             eq(events.correlationId, params.correlationId),
+            // A correlation id is unique within its run, not across runs, so a
+            // caller that supplies a run id gets the lookup scoped to that run.
+            // Older cores omit it and keep the previous unscoped behavior. The
+            // predicate belongs in the WHERE clause: filtering after the query
+            // would break LIMIT and the cursor.
+            map(params.runId, (id: string) => eq(events.runId, id)),
             map(params.pagination?.cursor, (c: string) => order.compare(events.eventId, c)),
           ),
         )

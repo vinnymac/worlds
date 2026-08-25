@@ -82,6 +82,13 @@ Composite indexes required:
 
 - `workflowName ASC, createdAt DESC`
 - `status ASC, createdAt DESC`
+- `workflowName ASC, status ASC, createdAt DESC`
+- events (collection group): `correlationId ASC, eventId ASC|DESC`
+- events (collection group): `correlationId ASC, runId ASC, eventId ASC|DESC`
+- hooks (collection group): `hookId ASC`
+
+The full set lives in `firestore.indexes.json`; deploy it with
+`firebase deploy --only firestore:indexes`.
 
 ## Real-Time Streaming
 

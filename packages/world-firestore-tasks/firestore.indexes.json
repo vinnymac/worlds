@@ -42,6 +42,24 @@
       ]
     },
     {
+      "collectionGroup": "events",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "correlationId", "order": "ASCENDING" },
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "eventId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "events",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "correlationId", "order": "ASCENDING" },
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "eventId", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "hooks",
       "queryScope": "COLLECTION_GROUP",
       "fields": [{ "fieldPath": "hookId", "order": "ASCENDING" }]

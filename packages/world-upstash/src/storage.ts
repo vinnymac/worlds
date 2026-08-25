@@ -415,6 +415,17 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
   const hooksByTokenKey = (token: string) => `${keyPrefix}hooks:by_token:${token}`;
   const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
 
+  /** Batch-fetch events by id in one MGET instead of N sequential GETs. This is
+   * the dominant cost of every replay's event-log read under load, since
+   * Upstash bills (and rate-limits) per HTTP request. */
+  async function getManyEvents(eventIds: string[]): Promise<Event[]> {
+    if (eventIds.length === 0) {
+      return [];
+    }
+    const rows = await redis.mget<string[]>(...eventIds.map(eventKey));
+    return rows.filter((data) => data != null).map((data) => parse<Event>(data));
+  }
+
   /**
    * Probe the event log for an existing hook_created event for this
    * (runId, hookId). Used by the legacy-claim recovery path to detect
@@ -1384,15 +1395,10 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType === 'run_started' && run) {
         const allEventIds = await redis.zrange<string[]>(eventsIndexKey(effectiveRunId), 0, -1);
         if (allEventIds.length > 0) {
-          const eventsList: Event[] = [];
-          for (const eid of allEventIds) {
-            const eData = await redis.get<string>(eventKey(eid));
-            if (eData) {
-              const e = parse<Event>(eData);
-              const p = EventSchema.parse(compact(e));
-              eventsList.push(filterEventData(p, resolveData));
-            }
-          }
+          const eventsList = (await getManyEvents(allEventIds)).map((e) => {
+            const p = EventSchema.parse(compact(e));
+            return filterEventData(p, resolveData);
+          });
           allEvents = eventsList;
         } else {
           allEvents = [];
@@ -1437,14 +1443,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         rev: sortOrder === 'desc',
       });
 
-      const events: Event[] = [];
-      for (const eid of eventIds) {
-        const data = await redis.get<string>(eventKey(eid));
-        if (data) {
-          const event = parse<Event>(data);
-          events.push(event);
-        }
-      }
+      const events = await getManyEvents(eventIds);
 
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
@@ -1474,16 +1473,31 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           : await redis.zrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
         : 0;
 
-      const eventIds = await redis.zrange<string[]>(indexKey, start, start + limit, {
-        rev: sortOrder === 'desc',
-      });
-
+      // A correlation id is unique within its run, not across runs, so the
+      // global correlation index can hold same-id events from sibling runs.
+      // When core supplies `runId` (world 4.5.0 and newer) the lookup is
+      // scoped to that run; older cores omit it and keep the unscoped
+      // behaviour. The filter has to run before the `limit` slice below, or
+      // `hasMore` and the cursor would describe the unfiltered set.
+      const runId = params.runId;
       const events: Event[] = [];
-      for (const eid of eventIds) {
-        const data = await redis.get<string>(eventKey(eid));
-        if (data) {
-          const event = parse<Event>(data);
-          events.push(event);
+      let offset = start;
+      let exhausted = false;
+      while (events.length <= limit && !exhausted) {
+        const eventIds = await redis.zrange<string[]>(indexKey, offset, offset + limit, {
+          rev: sortOrder === 'desc',
+        });
+        if (eventIds.length === 0) {
+          break;
+        }
+        offset += eventIds.length;
+        exhausted = eventIds.length <= limit;
+        const page = await getManyEvents(eventIds);
+        events.push(...(runId === undefined ? page : page.filter((e) => e.runId === runId)));
+        // Unscoped reads keep their original single round trip: the first page
+        // already holds `limit + 1` candidates, none of which are filtered out.
+        if (runId === undefined) {
+          break;
         }
       }
 

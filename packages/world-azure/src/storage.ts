@@ -1,4 +1,10 @@
-import type { Container, JSONObject, OperationInput, SqlQuerySpec } from '@azure/cosmos';
+import type {
+  Container,
+  FeedOptions,
+  JSONObject,
+  OperationInput,
+  SqlQuerySpec,
+} from '@azure/cosmos';
 import { BulkOperationType, PatchOperationType } from '@azure/cosmos';
 import {
   EntityConflictError,
@@ -1811,7 +1817,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       },
 
       async listByCorrelationId(params) {
-        const { correlationId } = params;
+        const { correlationId, runId } = params;
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
@@ -1822,10 +1828,16 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           { name: '@correlationId', value: correlationId },
         ];
 
-        if (params?.pagination?.cursor) {
-          const op = sortOrder === 'asc' ? '>' : '<';
-          conditions.push(`c.eventId ${op} @cursor`);
-          parameters.push({ name: '@cursor', value: params.pagination.cursor });
+        // A correlation id is only unique within its run, so an unscoped lookup
+        // can return another run's events. When the caller supplies a run, push
+        // the predicate into the query and into the partition key (the events
+        // container is partitioned on /runId), which also turns the fan-out
+        // into a single-partition read. Filtering after the limit + 1 fetch
+        // would corrupt the cursor and hasMore, so it has to happen here.
+        // Older callers omit runId and keep the previous cross-partition path.
+        if (runId !== undefined) {
+          conditions.push('c.runId = @runId');
+          parameters.push({ name: '@runId', value: runId });
         }
 
         const querySpec: SqlQuerySpec = {
@@ -1833,9 +1845,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters: [...parameters, { name: '@limit', value: limit + 1 }],
         };
 
-        // Cross-partition query for correlationId lookups
+        const feedOptions: FeedOptions =
+          runId !== undefined
+            ? { maxItemCount: limit + 1, partitionKey: runId }
+            : { maxItemCount: limit + 1 };
+
         const { resources } = await withCosmosRetry(() =>
-          container.items.query(querySpec, { maxItemCount: limit + 1 }).fetchAll(),
+          container.items.query(querySpec, feedOptions).fetchAll(),
         );
 
         const values = resources.slice(0, limit);
