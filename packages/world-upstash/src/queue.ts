@@ -66,13 +66,29 @@ interface QueueMessageBody {
   message: unknown;
   messageId: MessageId;
   /**
-   * Number of completed deliveries carried across self-republishes.
+   * Number of *failed* deliveries carried across self-republishes.
    * QStash's `upstash-retried` header resets to 0 on every republish, so the
    * running total lives in the body. The handler reports
    * `deliveryCount + retried + 1` as the 1-based `attempt`, which core caps
    * at MAX_QUEUE_DELIVERIES (48).
+   *
+   * Only hard failures (non-2xx responses, which QStash redelivers) count
+   * here. A `{ timeoutSeconds }` republish deliberately does not increment
+   * it; see {@link QueueMessageBody.republishCount}.
    */
   deliveryCount?: number;
+  /**
+   * Number of `{ timeoutSeconds }` self-republishes performed so far.
+   *
+   * These are core's *control-flow* re-invocations, not failed deliveries:
+   * `sleep()`, step retry backoff, `TooEarlyError`, and `{ timeoutSeconds: 0 }`
+   * ("re-invoke me with a fresh replay", which core returns whenever the
+   * `stateUpdatedAt` precondition guard exhausts its reloads). Counting them
+   * against `deliveryCount` would let a run that merely suspends often exhaust
+   * core's MAX_QUEUE_DELIVERIES budget and be killed as a runaway, so they are
+   * tracked separately and bounded only by {@link MAX_SOFT_REPUBLISHES}.
+   */
+  republishCount?: number;
 }
 
 /**
@@ -89,6 +105,19 @@ const MAX_REDELIVERY_DELAY_SECONDS = 7 * 24 * 60 * 60;
  * (but not past) the point where core gives up on the run.
  */
 const DEFAULT_QSTASH_RETRIES = 47;
+
+/**
+ * Safety ceiling on consecutive `{ timeoutSeconds }` self-republishes for a
+ * single message, mirroring world-local's `MAX_LOCAL_SAFETY_LIMIT`.
+ *
+ * Soft republishes are legitimate control flow and must not consume core's
+ * delivery budget, but an unbounded soft loop would spin a run forever. Set
+ * comfortably above MAX_QUEUE_DELIVERIES (48) so it only trips on a genuine
+ * runaway; exceeding it fails the delivery loudly (500) rather than silently
+ * stranding the message, which hands the run back to the hard-failure path
+ * where core's own cap applies.
+ */
+const MAX_SOFT_REPUBLISHES = 256;
 
 export function createQueue(config: QStashQueueConfig): Queue {
   const queueMode =
@@ -136,7 +165,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
    * `upstash-retried` header exactly as QStash would. */
   function scheduleLoopbackDelivery(
     body: QueueMessageBody,
-    opts: { delaySeconds?: number; headers?: Record<string, string> },
+    opts: { delaySeconds?: number; headers?: Record<string, string>; deduplicationId?: string },
   ): void {
     const payload = stringify(body);
     void (async () => {
@@ -160,6 +189,14 @@ export function createQueue(config: QStashQueueConfig): Queue {
           debug('loopback delivery failed', err);
         }
         await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
+      }
+      // Release the dedup reservation before giving up. The pump has dropped
+      // this message for good, so leaving the key in place would silently
+      // swallow core's next re-enqueue of the same step and wedge the run
+      // forever (world-redis releases its reservation on final drop for the
+      // same reason).
+      if (opts.deduplicationId) {
+        loopbackDeliveredDedupIds.delete(opts.deduplicationId);
       }
       // Crash loudly in logs rather than stranding the run silently.
       console.error(
@@ -275,9 +312,8 @@ export function createQueue(config: QStashQueueConfig): Queue {
             }
           }
 
-          const { queueName, message, messageId, deliveryCount } = parse<QueueMessageBody>(
-            await req.text(),
-          );
+          const { queueName, message, messageId, deliveryCount, republishCount } =
+            parse<QueueMessageBody>(await req.text());
 
           const retried = Number.parseInt(req.headers.get('upstash-retried') || '0', 10);
           // 1-based delivery counter (matches world-local's
@@ -306,8 +342,27 @@ export function createQueue(config: QStashQueueConfig): Queue {
               Math.max(0, Math.ceil(result.timeoutSeconds)),
               MAX_REDELIVERY_DELAY_SECONDS,
             );
+            const republishes = (republishCount ?? 0) + 1;
+            if (republishes > MAX_SOFT_REPUBLISHES) {
+              // Refuse to keep the soft loop going. Throwing lands on the 500
+              // below, which QStash redelivers as a hard failure, so core's
+              // own MAX_QUEUE_DELIVERIES cap ends the run with a real error
+              // instead of this message spinning silently forever.
+              throw new Error(
+                `[world-upstash] message ${messageId} exceeded ${MAX_SOFT_REPUBLISHES} timeoutSeconds republishes on ${queueName}`,
+              );
+            }
             await publishBody(
-              { queueName, message, messageId, deliveryCount: attempt },
+              {
+                queueName,
+                message,
+                messageId,
+                // Carry only the failed-delivery total. A soft republish is
+                // core asking to be re-invoked, not a delivery that failed,
+                // so it must not push `attempt` toward MAX_QUEUE_DELIVERIES.
+                deliveryCount: (deliveryCount ?? 0) + retried,
+                republishCount: republishes,
+              },
               { delaySeconds: timeoutSeconds },
             );
           }

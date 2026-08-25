@@ -6,11 +6,11 @@ catalog:
   '@testcontainers/postgresql': ^12.1.0
   '@testcontainers/redis': ^12.1.0
   '@types/node': ^24.13.3
-  '@workflow/core': 4.8.3
+  '@workflow/core': 4.8.4
   '@workflow/errors': 4.2.1
   '@workflow/utils': 4.1.4
-  '@workflow/world': 4.3.1
-  '@workflow/world-testing': 4.1.18
+  '@workflow/world': 4.4.0
+  '@workflow/world-testing': 4.1.19
   cbor-x: ^1.6.0
   drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2

@@ -388,7 +388,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
       );
     });
 
-    it('should signal redelivery instead of acking when the handler returns timeoutSeconds', async () => {
+    it('should re-send a delayed copy and ack when the handler returns timeoutSeconds', async () => {
       const handler = vi.fn().mockResolvedValue({ timeoutSeconds: 30 });
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
@@ -400,11 +400,53 @@ describe('Queue (Cloudflare Queues integration)', () => {
         }),
       );
 
-      // Retryable non-2xx: the consumer maps this onto message.retry()
-      expect(response.status).toBe(503);
-      expect(response.headers.get('Retry-After')).toBe('30');
-      const body = (await response.json()) as { timeoutSeconds?: number };
-      expect(body.timeoutSeconds).toBe(30);
+      // A suspension must NOT map onto message.retry(): Cloudflare Queues has
+      // no retry that skips an attempt, and max_retries (3 by default) would
+      // dead-letter a run that merely slept a few times.
+      expect(response.status).toBe(200);
+      expect(mockQueue.send).toHaveBeenCalledOnce();
+      const [payload, opts] = mockQueue.send.mock.calls[0];
+      expect(opts).toMatchObject({ delaySeconds: 30 });
+      const resent = JSON.parse(payload as string) as {
+        messageId: string;
+        deliveryFailures: number;
+        suspensionCount: number;
+      };
+      // Same logical message, no failure recorded, suspension tallied.
+      expect(resent.messageId).toBe('msg_retrying');
+      expect(resent.deliveryFailures).toBe(0);
+      expect(resent.suspensionCount).toBe(1);
+    });
+
+    it('should keep attempt flat across suspensions but count real failures', async () => {
+      const handler = vi.fn().mockResolvedValue({ timeoutSeconds: 0 });
+      const queueHandler = queue.createQueueHandler('workflow:', handler);
+
+      // 60 suspensions in a row, each re-sending the envelope it produced.
+      let envelope: Record<string, unknown> = {
+        messageId: 'msg_suspending',
+        queueName: 'workflow:test-queue',
+        message: { data: 'test' },
+      };
+      for (let i = 0; i < 60; i++) {
+        mockQueue.send.mockClear();
+        await queueHandler(envelopeRequest(envelope));
+        envelope = JSON.parse(mockQueue.send.mock.calls[0][0] as string);
+      }
+
+      // Every delivery reported attempt 1: nothing actually failed, so core's
+      // MAX_QUEUE_DELIVERIES budget is untouched. Before the fix this reached 61.
+      for (const [, meta] of handler.mock.calls) {
+        expect((meta as { attempt: number }).attempt).toBe(1);
+      }
+
+      // A Cloudflare retry on top of the accumulated suspensions still counts.
+      handler.mockClear();
+      await queueHandler(envelopeRequest(envelope, { 'CF-Queue-Retry-Count': '2' }));
+      expect(handler).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ attempt: 3 }),
+      );
     });
 
     it('should claim the idempotency key before invoking and release it after success', async () => {
@@ -433,7 +475,8 @@ describe('Queue (Cloudflare Queues integration)', () => {
       const handler = vi.fn().mockResolvedValue({ timeoutSeconds: 60 });
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
-      // First delivery claims the key and stays inflight (503, no release).
+      // First delivery claims the key and suspends. It acks (the delayed copy
+      // carries the work forward) but deliberately does NOT release the claim.
       const first = await queueHandler(
         envelopeRequest({
           messageId: 'msg_dup_a',
@@ -442,7 +485,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
           idempotencyKey: 'step-dup',
         }),
       );
-      expect(first.status).toBe(503);
+      expect(first.status).toBe(200);
       expect(handler).toHaveBeenCalledTimes(1);
 
       // A DIFFERENT message with the same idempotencyKey is a duplicate.
@@ -459,16 +502,20 @@ describe('Queue (Cloudflare Queues integration)', () => {
       expect(body.duplicate).toBe(true);
       expect(handler).toHaveBeenCalledTimes(1);
 
-      // Redelivery of the SAME message re-enters its own claim.
+      // The delayed copy of the SAME message re-enters its own claim. It is a
+      // new Cloudflare message, so the claim has to key off the envelope id.
       const redelivery = await queueHandler(
-        envelopeRequest({
-          messageId: 'msg_dup_a',
-          queueName: 'workflow:test-queue',
-          message: { data: 'test' },
-          idempotencyKey: 'step-dup',
-        }),
+        envelopeRequest(
+          {
+            messageId: 'msg_dup_a',
+            queueName: 'workflow:test-queue',
+            message: { data: 'test' },
+            idempotencyKey: 'step-dup',
+          },
+          { 'CF-Queue-Message-Id': 'cf_a_second_delivery' },
+        ),
       );
-      expect(redelivery.status).toBe(503);
+      expect(redelivery.status).toBe(200);
       expect(handler).toHaveBeenCalledTimes(2);
     });
 

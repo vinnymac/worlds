@@ -44,6 +44,19 @@ function computeBackoff(attempt: number): number {
  */
 const DEDUP_CLAIM_STALE_MS = 15 * 60 * 1000;
 
+/**
+ * Safety ceiling on consecutive `{ timeoutSeconds }` suspension re-sends for a
+ * single message, mirroring world-upstash's MAX_SOFT_REPUBLISHES.
+ *
+ * Suspensions are legitimate control flow and must not consume core's delivery
+ * budget, but an unbounded soft loop would keep re-sending forever. Set
+ * comfortably above MAX_QUEUE_DELIVERIES (48) so it only trips on a genuine
+ * runaway; exceeding it fails the delivery loudly rather than silently
+ * stranding the message, which hands the run back to the retry path where
+ * core's own cap applies.
+ */
+const MAX_SOFT_RESENDS = 256;
+
 export interface CloudflareQueueConfig {
   env: {
     WORKFLOW_QUEUE: CloudflareQueue;
@@ -99,6 +112,27 @@ interface QueueEnvelope {
   message: QueuePayload;
   idempotencyKey?: string;
   timestamp: number;
+  /**
+   * Number of *failed* deliveries accumulated across suspension re-sends.
+   *
+   * A suspension re-send produces a brand new Cloudflare message whose
+   * `CF-Queue-Retry-Count` restarts at 0, so the running total of real
+   * failures lives in the envelope. The handler reports
+   * `deliveryFailures + retryCount + 1` as the 1-based `attempt`, which core
+   * caps at MAX_QUEUE_DELIVERIES (48).
+   */
+  deliveryFailures?: number;
+  /**
+   * Number of `{ timeoutSeconds }` suspension re-sends performed so far.
+   *
+   * These are core's *control-flow* re-invocations, not failed deliveries:
+   * `sleep()`, step retry backoff, `TooEarlyError`, and `{ timeoutSeconds: 0 }`
+   * ("re-invoke me with a fresh replay", which core returns whenever the
+   * `stateUpdatedAt` precondition guard exhausts its reloads). They are tracked
+   * separately from {@link QueueEnvelope.deliveryFailures} and bounded only by
+   * {@link MAX_SOFT_RESENDS}.
+   */
+  suspensionCount?: number;
 }
 
 interface PumpEnvelope {
@@ -350,8 +384,13 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
       // Worker forwards each queue message body (the tagged-JSON envelope) to
       // this handler and maps the response onto message.ack() / .retry():
       // - 2xx  -> ack
-      // - 503 with Retry-After -> retry({ delaySeconds: retryAfter })
-      // - other non-2xx -> retry (with Retry-After backoff when present)
+      // - non-2xx -> retry (with Retry-After backoff when present)
+      //
+      // Suspensions deliberately do NOT use retry(). Cloudflare Queues has no
+      // way to redeliver without consuming an attempt, and `max_retries`
+      // (3 by default) would dead-letter a run that merely slept a few times.
+      // Instead the handler re-sends a delayed copy and acks, so only genuine
+      // failures advance the counter core reads as `attempt`.
       return async (req: Request) => {
         const retryCount = Number.parseInt(req.headers.get('CF-Queue-Retry-Count') || '0', 10);
 
@@ -378,12 +417,22 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
             return new Response('Invalid queue', { status: 400 });
           }
 
-          const attempt = retryCount + 1;
+          // Only failed deliveries count. `deliveryFailures` carries the total
+          // across suspension re-sends, each of which resets Cloudflare's own
+          // retry count to 0.
+          const deliveryFailures = envelope.deliveryFailures ?? 0;
+          const attempt = deliveryFailures + retryCount + 1;
 
           const messageIdStr =
             req.headers.get('CF-Queue-Message-Id') ||
             envelope.messageId ||
             `msg_${idempotencyKey || Date.now()}`;
+
+          // The claim has to survive a suspension re-send, which mints a new
+          // Cloudflare message (and so a new CF-Queue-Message-Id) for what is
+          // logically the same delivery. The envelope's own id is stable across
+          // both re-sends and Cloudflare retries, so it keys the claim.
+          const claimIdentity = envelope.messageId || messageIdStr;
 
           // Consumer-side dedup: claim the idempotencyKey before invoking the
           // handler. A redelivery of the SAME message re-enters its own
@@ -392,7 +441,7 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
           if (idempotencyKey) {
             claimStub = getClaimStub(queueName, idempotencyKey);
             const { claimed } = await claimStub.claimInflight({
-              messageId: messageIdStr,
+              messageId: claimIdentity,
               staleMs: DEDUP_CLAIM_STALE_MS,
             });
             if (!claimed) {
@@ -411,17 +460,46 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
             messageId: MessageId.parse(messageIdStr),
           });
 
-          // { timeoutSeconds } means "do NOT ack; redeliver after N seconds"
-          // (retryable step errors, ThrottleError deferral). The claim stays
-          // held so duplicates are still fenced during the wait.
+          // { timeoutSeconds } means "re-invoke me after N seconds": sleep(),
+          // step retry backoff, TooEarlyError, or a fresh replay. Re-send a
+          // delayed copy carrying the SAME messageId and the accumulated
+          // failure total, then ack. The claim stays held (the copy re-enters
+          // it via claimIdentity) so duplicates are still fenced during the
+          // wait, and Cloudflare's retry budget is left untouched.
           if (result && typeof result.timeoutSeconds === 'number') {
+            const suspensions = (envelope.suspensionCount ?? 0) + 1;
+            if (suspensions > MAX_SOFT_RESENDS) {
+              // Refuse to keep the soft loop going. Returning 500 makes the
+              // consumer retry this as a real failure, so the attempt climbs
+              // and core ends the run with a recorded error instead of the
+              // message re-sending itself forever.
+              debug('[Cloudflare Queue Handler] Suspension ceiling exceeded:', {
+                messageId: messageIdStr,
+                suspensions,
+              });
+              return new Response(
+                JSON.stringify({
+                  error: `message ${messageIdStr} exceeded ${MAX_SOFT_RESENDS} timeoutSeconds re-sends`,
+                }),
+                { status: 500, headers: { 'Retry-After': String(computeBackoff(retryCount)) } },
+              );
+            }
+
             debug('[Cloudflare Queue Handler] Handler requested redelivery:', {
               timeoutSeconds: result.timeoutSeconds,
             });
-            return new Response(JSON.stringify({ timeoutSeconds: result.timeoutSeconds }), {
-              status: 503,
-              headers: { 'Retry-After': String(result.timeoutSeconds) },
-            });
+            await env.WORKFLOW_QUEUE.send(
+              stringify({
+                ...envelope,
+                deliveryFailures: deliveryFailures + retryCount,
+                suspensionCount: suspensions,
+              }),
+              {
+                contentType: 'text',
+                delaySeconds: Math.max(0, Math.ceil(result.timeoutSeconds)),
+              },
+            );
+            return new Response(JSON.stringify({ ok: true, suspended: true }), { status: 200 });
           }
 
           // Release the claim ONLY on successful completion.
