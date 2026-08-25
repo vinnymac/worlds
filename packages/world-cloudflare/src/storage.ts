@@ -18,6 +18,7 @@ import type {
   GetStepParams,
   GetWorkflowRunParams,
   Hook,
+  ListEventsByCorrelationIdParams,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
@@ -89,6 +90,11 @@ export interface CloudflareStorageConfig {
 
 /** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/** Minimum page size when scanning a run's log for correlationId matches.
+ * Matches are sparse, so scanning in `limit`-sized pages would cost a DO round
+ * trip per few matches for small limits. */
+const CORRELATION_SCAN_PAGE_SIZE = 100;
 
 /** Resolve the per-run event ceiling: explicit config, then
  * `WORKFLOW_MAX_EVENTS`, then the default. An explicit value must be a
@@ -402,15 +408,49 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         };
       },
 
-      async listByCorrelationId(_params) {
-        // Unimplemented: events live in per-run DOs with no global
-        // correlationId index. Only `@workflow/web` calls this, never core, so
-        // the dashboard view renders empty while execution is unaffected.
-        // Returning empty is a silent fallback and should be revisited.
+      async listByCorrelationId(
+        params: ListEventsByCorrelationIdParams,
+      ): Promise<PaginatedResponse<Event>> {
+        const { correlationId, runId } = params;
+        if (!runId) {
+          // No global correlationId index exists: events live in per-run DOs,
+          // so an unscoped lookup would have to fan out over every run.
+          throw new WorkflowWorldError(
+            'Unscoped correlationId lookup is not supported on the Cloudflare world; pass runId to scope the lookup to a single run',
+            { status: 400 },
+          );
+        }
+
+        const limit = params.pagination?.limit ?? 100;
+        const sortOrder = params.pagination?.sortOrder || 'asc';
+        const stub = getRunDO(runId);
+
+        // Page the run's log until `limit + 1` matches are in hand. Filtering
+        // after a `limit` slice would make hasMore and the cursor describe the
+        // unfiltered log, silently dropping matches at page boundaries.
+        const matches: Event[] = [];
+        let cursor = params.pagination?.cursor || undefined;
+        for (;;) {
+          const page = await stub.listEvents({
+            limit: Math.max(limit, CORRELATION_SCAN_PAGE_SIZE),
+            cursor,
+            sortOrder,
+          });
+          for (const event of page.data) {
+            if (event.correlationId === correlationId) matches.push(event);
+          }
+          // listByPrefix only yields a cursor while more entries remain.
+          if (matches.length > limit || !page.hasMore || page.cursor === null) break;
+          cursor = page.cursor;
+        }
+
+        const data = matches.slice(0, limit);
+        const hasMore = matches.length > limit;
+
         return {
-          data: [],
-          cursor: null,
-          hasMore: false,
+          data: data.map(parseEvent),
+          cursor: hasMore ? (data.at(-1)?.eventId ?? null) : null,
+          hasMore,
         };
       },
     },

@@ -6,6 +6,7 @@ import {
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
+  WorkflowWorldError,
 } from '@workflow/errors';
 import { asEventRequest, expectEventType } from '@fantasticfour/testing';
 import { ulidToDate } from '@workflow/world';
@@ -486,6 +487,155 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         // run_created event + run_started + step_started = 3 events
         expect(result.data.length).toBeGreaterThanOrEqual(2);
+      });
+    });
+
+    describe('listByCorrelationId', () => {
+      /** Interleave two correlation ids in one run: step_created plus
+       * `cycles` x (step_started, step_retrying) per id. */
+      async function seedInterleaved(runId: string, ids: string[], cycles: number) {
+        for (const correlationId of ids) {
+          await storage.events.create(runId, {
+            eventType: 'step_created',
+            correlationId,
+            eventData: { stepName: correlationId, input: [] },
+          });
+        }
+        for (let i = 0; i < cycles; i++) {
+          for (const correlationId of ids) {
+            await storage.events.create(runId, { eventType: 'step_started', correlationId });
+          }
+          for (const correlationId of ids) {
+            await storage.events.create(runId, {
+              eventType: 'step_retrying',
+              correlationId,
+              eventData: { error: `retry ${i}` },
+            });
+          }
+        }
+      }
+
+      it('returns only the scoped run events carrying the correlation id', async () => {
+        const other = await createRun({
+          deploymentId: 'deployment-123',
+          workflowName: 'test-workflow',
+          input: [],
+        });
+        await seedInterleaved(testRunId, ['corr-a', 'corr-b'], 3);
+        await seedInterleaved(other.runId, ['corr-a'], 3);
+
+        const result = await storage.events.listByCorrelationId({
+          correlationId: 'corr-a',
+          runId: testRunId,
+        });
+
+        // step_created + 3 x (step_started, step_retrying)
+        expect(result.data).toHaveLength(7);
+        expect(result.hasMore).toBe(false);
+        expect(result.cursor).toBeNull();
+        expect(result.data.every((e) => e.runId === testRunId)).toBe(true);
+        expect(result.data.every((e) => e.correlationId === 'corr-a')).toBe(true);
+      });
+
+      it('paginates over the filtered set without dropping matches', async () => {
+        await seedInterleaved(testRunId, ['corr-a', 'corr-b'], 3);
+
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let pages = 0;
+        for (;;) {
+          const page = await storage.events.listByCorrelationId({
+            correlationId: 'corr-a',
+            runId: testRunId,
+            pagination: { limit: 2, cursor, sortOrder: 'asc' },
+          });
+          expect(page.data.every((e) => e.correlationId === 'corr-a')).toBe(true);
+          seen.push(...page.data.map((e) => e.eventId));
+          pages++;
+          if (!page.hasMore) break;
+          cursor = page.cursor ?? undefined;
+        }
+
+        // 7 matches over pages of 2 -> 4 pages, none dropped at a boundary
+        expect(pages).toBe(4);
+        expect(seen).toHaveLength(7);
+        expect(new Set(seen).size).toBe(7);
+        expect([...seen].sort()).toEqual(seen);
+      });
+
+      it('reports hasMore against the filtered set, not the run log', async () => {
+        await seedInterleaved(testRunId, ['corr-a', 'corr-b'], 3);
+
+        const exact = await storage.events.listByCorrelationId({
+          correlationId: 'corr-a',
+          runId: testRunId,
+          pagination: { limit: 7 },
+        });
+        expect(exact.data).toHaveLength(7);
+        expect(exact.hasMore).toBe(false);
+
+        const short = await storage.events.listByCorrelationId({
+          correlationId: 'corr-a',
+          runId: testRunId,
+          pagination: { limit: 6 },
+        });
+        expect(short.data).toHaveLength(6);
+        expect(short.hasMore).toBe(true);
+        expect(short.cursor).toBe(short.data.at(-1)?.eventId);
+      });
+
+      it('keeps scanning past internal page boundaries to find sparse matches', async () => {
+        // 110 non-matching events force more than one DO listEvents round trip
+        // before the first match is reached.
+        for (let i = 0; i < 110; i++) {
+          await storage.events.create(testRunId, {
+            eventType: 'step_created',
+            correlationId: `noise-${i}`,
+            eventData: { stepName: `noise-${i}`, input: [] },
+          });
+        }
+        await seedInterleaved(testRunId, ['corr-late'], 1);
+
+        const result = await storage.events.listByCorrelationId({
+          correlationId: 'corr-late',
+          runId: testRunId,
+          pagination: { limit: 2 },
+        });
+
+        // step_created + step_started + step_retrying = 3 matches
+        expect(result.data).toHaveLength(2);
+        expect(result.hasMore).toBe(true);
+
+        const next = await storage.events.listByCorrelationId({
+          correlationId: 'corr-late',
+          runId: testRunId,
+          pagination: { limit: 2, cursor: result.cursor ?? undefined },
+        });
+        expect(next.data).toHaveLength(1);
+        expect(next.hasMore).toBe(false);
+      });
+
+      it('returns matches in descending order when requested', async () => {
+        await seedInterleaved(testRunId, ['corr-a', 'corr-b'], 3);
+
+        const result = await storage.events.listByCorrelationId({
+          correlationId: 'corr-a',
+          runId: testRunId,
+          pagination: { limit: 3, sortOrder: 'desc' },
+        });
+
+        const ids = result.data.map((e) => e.eventId);
+        expect(ids).toHaveLength(3);
+        expect(result.hasMore).toBe(true);
+        expect([...ids].sort().reverse()).toEqual(ids);
+      });
+
+      it('throws when no runId scopes the lookup', async () => {
+        await seedInterleaved(testRunId, ['corr-a'], 1);
+
+        await expect(
+          storage.events.listByCorrelationId({ correlationId: 'corr-a' }),
+        ).rejects.toSatisfy((error) => WorkflowWorldError.is(error) && error.status === 400);
       });
     });
   });
