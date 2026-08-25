@@ -172,6 +172,25 @@ const LUA_APPEND_EVENT = `${luaStateGuard(4, 5)}
   return {1, ''}
 `;
 
+/** Rank to resume a page from. A cursor missing from the index is a caller
+ * error, not a reason to restart: `(rank ?? 0) + 1` silently skipped the
+ * index's first entry. Mirrors world-redis, which rejects the same way. */
+async function resolveCursorRank(
+  redis: Redis,
+  indexKey: string,
+  cursor: string,
+  direction: 'asc' | 'desc' = 'desc',
+): Promise<number> {
+  const rank =
+    direction === 'desc'
+      ? await redis.zrevrank(indexKey, cursor)
+      : await redis.zrank(indexKey, cursor);
+  if (rank === null || rank === undefined) {
+    throw new WorkflowWorldError(`Invalid pagination cursor "${cursor}"`, { status: 400 });
+  }
+  return rank + 1;
+}
+
 /** Throw the typed 412 core matches by error name. */
 function throwPreconditionFailed(runId: string, stateUpdatedAt: number, marker: string): never {
   throw new PreconditionFailedError(
@@ -307,11 +326,7 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
     indexKey: string,
     cursor: string | undefined,
   ): Promise<number> {
-    if (!cursor) {
-      return 0;
-    }
-    const rank = await redis.zrevrank(indexKey, cursor);
-    return (rank ?? 0) + 1;
+    return cursor ? await resolveCursorRank(redis, indexKey, cursor) : 0;
   }
 
   return {
@@ -1437,9 +1452,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
       const indexKey = eventsIndexKey(params.runId);
       const start = fromCursor
-        ? sortOrder === 'desc'
-          ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-          : await redis.zrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
+        ? await resolveCursorRank(redis, indexKey, fromCursor, sortOrder)
         : 0;
 
       const eventIds = await redis.zrange<string[]>(indexKey, start, start + limit, {
@@ -1471,9 +1484,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
       const indexKey = eventsByCorrelationKey(params.correlationId);
       const start = fromCursor
-        ? sortOrder === 'desc'
-          ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-          : await redis.zrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
+        ? await resolveCursorRank(redis, indexKey, fromCursor, sortOrder)
         : 0;
 
       // A correlation id is unique within its run, so the global index can
@@ -1569,9 +1580,7 @@ export function createStepsStorage(config: UpstashStorageConfig): Storage['steps
 
       const indexKey = stepsIndexKey(params.runId);
 
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-        : 0;
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor) : 0;
 
       const stepIds = await redis.zrange<string[]>(indexKey, start, start + limit, { rev: true });
 
@@ -1640,9 +1649,7 @@ export function createHooksStorage(config: UpstashStorageConfig): Storage['hooks
 
       const indexKey = hooksIndexKey(params.runId);
 
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-        : 0;
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor) : 0;
 
       const hookIds = await redis.zrange<string[]>(indexKey, start, start + limit, { rev: true });
 
