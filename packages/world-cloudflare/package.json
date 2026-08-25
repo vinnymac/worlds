@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-cloudflare",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "Cloudflare Durable Objects World implementation with edge-native SQLite storage and global <10ms latency",
   "keywords": [
     "cloudflare",
