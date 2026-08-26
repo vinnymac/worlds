@@ -989,4 +989,82 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(page2.hasMore).toBe(false);
     });
   });
+
+  describe('events.list eventId ordering', () => {
+    const rapidPairCount = 16;
+
+    /**
+     * Core derives `stateUpdatedAt` from the LAST event the log returns rather
+     * than the maximum, so the log has to sort by eventId. Race two event types
+     * that need a different number of round trips to reach their append: the
+     * cheaper ones land ahead of events minted before them, which an index
+     * scored by append time would preserve.
+     */
+    async function seedRapidEvents(runId: string) {
+      const created = await Promise.all(
+        Array.from({ length: rapidPairCount }, (_, index) =>
+          events.create(runId, {
+            eventType: 'step_created',
+            correlationId: `step-ordering-${index}`,
+            eventData: { stepName: 'ordering-step', input: [index] },
+          }),
+        ),
+      );
+
+      const raced = await Promise.all(
+        created.flatMap((result, index) => [
+          events.create(runId, {
+            eventType: 'step_started',
+            correlationId: result.step!.stepId,
+          }),
+          events.create(runId, {
+            eventType: 'wait_created',
+            correlationId: `wait-ordering-${index}`,
+            eventData: { resumeAt: new Date(Date.now() + 60_000) },
+          }),
+        ]),
+      );
+
+      return [...created, ...raced].map((r) => r.event!.eventId);
+    }
+
+    it('returns rapid appends in ascending eventId order, newest last', async () => {
+      const run = await createRun();
+      const seeded = await seedRapidEvents(run.runId);
+
+      const page = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+
+      expect(page.hasMore).toBe(false);
+      const eventIds = page.data.map((e) => e.eventId);
+      // The seeded events plus the run_created that opened the run.
+      expect(eventIds).toHaveLength(seeded.length + 1);
+      expect(new Set(eventIds).size).toBe(eventIds.length);
+
+      const ascending = [...eventIds].sort();
+      expect(eventIds).toEqual(ascending);
+      // Stated on its own because this is the element core actually reads.
+      expect(eventIds.at(-1)).toBe(ascending.at(-1));
+    });
+
+    it('returns the descending log as the exact reverse', async () => {
+      const run = await createRun();
+      await seedRapidEvents(run.runId);
+
+      const ascending = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      const descending = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'desc' },
+      });
+
+      expect(descending.data.map((e) => e.eventId)).toEqual(
+        ascending.data.map((e) => e.eventId).reverse(),
+      );
+    });
+  });
 });
