@@ -38,10 +38,11 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from 'ioredis';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { compact, parse, stringify } from './util.js';
 
 interface RedisStorageConfig {
@@ -190,14 +191,6 @@ function filterRunData(
   return run;
 }
 
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
-}
-
 // ============================================================
 // Lua Scripts for Atomic Multi-Key Writes
 // ============================================================
@@ -208,6 +201,25 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
 // entity-creating event writes its entity and its creation event in ONE
 // script, so no probe-then-append window exists (same design as
 // world-redis).
+
+/** Rank to resume a page from. A cursor missing from the index is a caller
+ * error, not a reason to restart: returning 0 silently repeated the first
+ * page. Mirrors world-redis, which rejects the same way. */
+async function resolveCursorRank(
+  redis: Redis,
+  indexKey: string,
+  cursor: string,
+  direction: 'asc' | 'desc',
+): Promise<number> {
+  const rank =
+    direction === 'desc'
+      ? await redis.zrevrank(indexKey, cursor)
+      : await redis.zrank(indexKey, cursor);
+  if (rank === null) {
+    throw new WorkflowWorldError(`Invalid pagination cursor "${cursor}"`, { status: 400 });
+  }
+  return rank + 1;
+}
 
 /**
  * Atomically create a run entity with all its indexes AND its creation
@@ -231,6 +243,7 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
  * ARGV[5] = event JSON
  * ARGV[6] = event ID
  * ARGV[7] = has correlation ("1" or "0")
+ * ARGV[8] = event score (eventId time)
  * Returns: [1, ''] when created (the caller already holds the run; echoing it
  *          back shipped the whole payload for nothing), [0, runJson] on replay.
  */
@@ -240,14 +253,17 @@ const LUA_CREATE_RUN_WITH_EVENT = `
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the run indexes by wall clock, so
+  -- the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[8])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('ZADD', KEYS[4], score, ARGV[2])
   redis.call('SET', KEYS[5], ARGV[4])
   redis.call('SET', KEYS[6], ARGV[5])
-  redis.call('ZADD', KEYS[7], score, ARGV[6])
+  redis.call('ZADD', KEYS[7], eventScore, ARGV[6])
   if ARGV[7] == '1' then
-    redis.call('ZADD', KEYS[8], score, ARGV[6])
+    redis.call('ZADD', KEYS[8], eventScore, ARGV[6])
   end
   return {1, ''}
 `;
@@ -306,6 +322,7 @@ const LUA_UPDATE_RUN_STATUS = `${luaStateGuard(4, 4)}
  * ARGV[4] = stateUpdatedAt guard ('' to disable)
  * ARGV[5] = event JSON
  * ARGV[6] = event ID
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created (the caller already holds the step),
  *          [0, stepJson] on replay, or [-9, marker] when the guard rejects
  */
@@ -315,10 +332,13 @@ const LUA_CREATE_STEP_WITH_EVENT = `${luaStateGuard(3, 4)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('SET', KEYS[4], ARGV[5])
-  redis.call('ZADD', KEYS[5], score, ARGV[6])
-  redis.call('ZADD', KEYS[6], score, ARGV[6])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[6])
+  redis.call('ZADD', KEYS[6], eventScore, ARGV[6])
   return {1, ''}
 `;
 
@@ -348,6 +368,7 @@ const LUA_CREATE_STEP_WITH_EVENT = `${luaStateGuard(3, 4)}
  *           drop token lookups without reading every hook body
  * ARGV[6] = event JSON
  * ARGV[7] = event ID
+ * ARGV[8] = event score (eventId time)
  * Returns: [2, owningHookId] on token conflict,
  *          [0, hookJson] when the hook already exists,
  *          [1, ''] on success,
@@ -366,11 +387,14 @@ const LUA_CREATE_HOOK_WITH_EVENT = `${luaStateGuard(4, 4)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[8])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('HSET', KEYS[5], ARGV[2], ARGV[5])
   redis.call('SET', KEYS[6], ARGV[6])
-  redis.call('ZADD', KEYS[7], score, ARGV[7])
-  redis.call('ZADD', KEYS[8], score, ARGV[7])
+  redis.call('ZADD', KEYS[7], eventScore, ARGV[7])
+  redis.call('ZADD', KEYS[8], eventScore, ARGV[7])
   return {1, ''}
 `;
 
@@ -576,13 +600,7 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
     indexKey: string,
     cursor: string | undefined,
   ): Promise<number> {
-    if (!cursor) {
-      return 0;
-    }
-    const rank = await redis.zrevrank(indexKey, cursor);
-    // If the cursor vanished from the index, restart from the beginning
-    // (duplicates are preferable to silently skipping the first item).
-    return rank === null ? 0 : rank + 1;
+    return cursor ? resolveCursorRank(redis, indexKey, cursor, 'desc') : 0;
   }
 
   // Helper: Fetch and parse runs from pipeline results
@@ -743,14 +761,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     cursor: string | undefined,
     sortOrder: 'asc' | 'desc',
   ): Promise<number> {
-    if (!cursor) {
-      return 0;
-    }
-    const rankFn = sortOrder === 'desc' ? 'zrevrank' : 'zrank';
-    const rank = await redis[rankFn](indexKey, cursor);
-    // If the cursor vanished from the index, restart from the beginning
-    // (duplicates are preferable to silently skipping the first item).
-    return rank === null ? 0 : rank + 1;
+    return cursor ? resolveCursorRank(redis, indexKey, cursor, sortOrder) : 0;
   }
 
   // Helper: Fetch event IDs with proper sort order
@@ -776,6 +787,53 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     }
 
     return events;
+  }
+
+  // Helper: Read a page of events out of an index, optionally scoped to one
+  // run. A correlation id is only unique within its run, so the correlation
+  // index can hold events belonging to several runs; when the caller scopes
+  // the lookup we walk the index in pages and keep only the matching run's
+  // events, so `limit` and `hasMore` describe the filtered set rather than the
+  // raw index page. Returns at most `limit + 1` events: the extra one is the
+  // caller's `hasMore` probe. Unscoped lookups still cost a single index read
+  // plus a single pipeline.
+  async function fetchEventPage(
+    indexKey: string,
+    start: number,
+    limit: number,
+    sortOrder: 'asc' | 'desc',
+    runId: string | undefined,
+  ): Promise<Event[]> {
+    const matched: Event[] = [];
+    let offset = start;
+
+    for (;;) {
+      const eventIds = await fetchEventIds(indexKey, offset, limit, sortOrder);
+      if (eventIds.length === 0) {
+        break;
+      }
+      offset += eventIds.length;
+
+      const eventPipeline = redis.pipeline();
+      for (const eid of eventIds) {
+        eventPipeline.get(eventKey(eid));
+      }
+      const results = await eventPipeline.exec();
+
+      for (const event of parseEventsFromPipeline(results)) {
+        if (runId === undefined || event.runId === runId) {
+          matched.push(event);
+        }
+      }
+
+      // An unscoped read is complete after one page. A scoped read stops once
+      // it has the hasMore probe, or once the index runs short of a full page.
+      if (runId === undefined || matched.length > limit || eventIds.length <= limit) {
+        break;
+      }
+    }
+
+    return matched;
   }
 
   /** Apply a run status transition, evaluating the `stateUpdatedAt` guard in the
@@ -858,7 +916,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        const score = createdAt.getTime();
+        const score = eventIdTime(eventId);
         await scripts.wfStoreEvent(
           eventKey(eventId),
           eventsIndexKey(runId),
@@ -876,7 +934,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         );
 
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -1019,7 +1077,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           // atomic execution, so a crash cannot leave one without the other
           // and concurrent bootstraps cannot double-append the event.
           const score = now.getTime();
-          const runCreatedEventId = `wevt_${ulid()}`;
+          // Backdate ahead of the run_started that bootstrapped it: the log
+          // sorts by eventId time, and a run is created before it starts.
+          const runCreatedEventId = `wevt_${ulidAt(eventIdTime(eventId) - 1)}`;
           const runCreatedEvent = {
             eventType: 'run_created' as const,
             eventData: {
@@ -1049,6 +1109,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             stringifyWithUint8Array(runCreatedEvent),
             runCreatedEventId,
             '0',
+            eventIdTime(runCreatedEventId).toString(),
           )) as [number, string];
           if (result[0] === 1) {
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
@@ -1091,7 +1152,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          const score = createdAt.getTime();
+          const score = eventIdTime(eventId);
           const stored = (await scripts.wfStoreEvent(
             eventKey(eventId),
             eventsIndexKey(effectiveRunId),
@@ -1114,7 +1175,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             // Lifecycle event: validation already loaded the body.
             run: existingRun ?? undefined,
           };
@@ -1248,6 +1309,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           '0',
+          eventIdTime(eventId).toString(),
         )) as [number, string];
 
         if (result[0] === 0) {
@@ -1258,7 +1320,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         const parsed = EventSchema.parse(event);
         const resolveData = params?.resolveData ?? 'all';
         return {
-          event: filterEventData(parsed, resolveData),
+          event: stripEventDataRefs(parsed, resolveData),
           run,
           maxEvents: maxEventsPerRun,
         };
@@ -1428,6 +1490,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           guard,
           stringifyWithUint8Array(event),
           eventId,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         if (result[0] === LUA_PRECONDITION_FAILED) {
@@ -1440,7 +1503,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         step = StepSchema.parse(compact(newStep));
         const parsed = EventSchema.parse(event);
         const resolveData = params?.resolveData ?? 'all';
-        return { event: filterEventData(parsed, resolveData), step };
+        return { event: stripEventDataRefs(parsed, resolveData), step };
       }
 
       // wait_created has no entity in this world; the event log is the only
@@ -1638,6 +1701,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           eventData.token,
           stringifyWithUint8Array(event),
           eventId,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         if (result[0] === LUA_PRECONDITION_FAILED) {
@@ -1678,7 +1742,8 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             '__unused__',
             stringifyWithUint8Array(conflictEvent),
             eventId,
-            score.toString(),
+            // The event log sorts by eventId time, not wall clock.
+            String(eventIdTime(eventId)),
             data.correlationId ? '1' : '0',
             // The guard already passed inside the fused script above.
             '',
@@ -1690,7 +1755,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const parsedConflict = EventSchema.parse(conflictEvent);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsedConflict, resolveData),
+            event: stripEventDataRefs(parsedConflict, resolveData),
             run,
             step,
             hook: undefined,
@@ -1708,7 +1773,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         hook = HookSchema.parse(compact(newHook));
         const parsed = EventSchema.parse(event);
         const resolveData = params?.resolveData ?? 'all';
-        return { event: filterEventData(parsed, resolveData), hook };
+        return { event: stripEventDataRefs(parsed, resolveData), hook };
       }
 
       // Handle hook_disposed event: delete hook entity atomically via Lua
@@ -1745,7 +1810,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         delete (event as any).eventData;
       }
 
-      const score = createdAt.getTime();
+      const score = eventIdTime(eventId);
       const stored = (await scripts.wfStoreEvent(
         eventKey(eventId),
         eventsIndexKey(effectiveRunId),
@@ -1783,7 +1848,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const pipelineResults = await eventPipeline.exec();
           allEvents = parseEventsFromPipeline(pipelineResults).map((e) => {
             const p = EventSchema.parse(compact(e));
-            return filterEventData(p, resolveData);
+            return stripEventDataRefs(p, resolveData);
           });
         } else {
           allEvents = [];
@@ -1791,7 +1856,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1836,7 +1901,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1852,16 +1917,11 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
       const indexKey = eventsByCorrelationKey(params.correlationId);
       const start = await calculateEventStartPosition(indexKey, fromCursor, sortOrder);
-      const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
-      // Fetch events via pipeline
-      const eventPipeline = redis.pipeline();
-      for (const eid of eventIds) {
-        eventPipeline.get(eventKey(eid));
-      }
-      const results = await eventPipeline.exec();
-
-      const events = parseEventsFromPipeline(results);
+      // `params.runId` scopes the lookup to a single run's event log. It is
+      // optional for backward compatibility, so an absent runId keeps the
+      // historical unscoped behavior.
+      const events = await fetchEventPage(indexKey, start, limit, sortOrder, params.runId);
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
 
@@ -1869,7 +1929,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1950,11 +2010,8 @@ export function createStepsStorage(config: RedisStorageConfig): Storage['steps']
 
       const indexKey = stepsIndexKey(params.runId);
 
-      // ZREVRANGE for descending order. A vanished cursor restarts from the
-      // beginning rather than silently skipping the first item.
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank === null ? 0 : rank + 1))
-        : 0;
+      // ZREVRANGE for descending order.
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor, 'desc') : 0;
 
       const stepIds = await redis.zrevrange(indexKey, start, start + limit);
 
@@ -2027,11 +2084,8 @@ export function createHooksStorage(config: RedisStorageConfig): Storage['hooks']
 
       const indexKey = hooksIndexKey(params.runId);
 
-      // ZREVRANGE for descending order. A vanished cursor restarts from the
-      // beginning rather than silently skipping the first item.
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank === null ? 0 : rank + 1))
-        : 0;
+      // ZREVRANGE for descending order.
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor, 'desc') : 0;
 
       const hookIds = await redis.zrevrange(indexKey, start, start + limit);
 

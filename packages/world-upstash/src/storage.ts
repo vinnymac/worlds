@@ -37,11 +37,12 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   ulidToDate,
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from '@upstash/redis';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { compact, stringify, parse } from './util.js';
 
 interface UpstashStorageConfig {
@@ -102,7 +103,11 @@ function resolveClaimTtlSeconds(configured: number | undefined): number {
 }
 
 /** Epoch ms encoded in the trailing ULID of an entity id (`wevt_<ulid>`).
- * Mirrors core's decode, which strips through the LAST underscore. */
+ * Mirrors core's decode, which strips through the LAST underscore.
+ *
+ * This is also the event index's sort score. Core derives `stateUpdatedAt`
+ * from the LAST event the log returns, so ordering the log by anything other
+ * than the eventId would let it send a value below our marker forever. */
 function eventIdTime(eventId: string): number {
   return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
 }
@@ -168,6 +173,25 @@ const LUA_APPEND_EVENT = `${luaStateGuard(4, 5)}
   return {1, ''}
 `;
 
+/** Rank to resume a page from. A cursor missing from the index is a caller
+ * error, not a reason to restart: `(rank ?? 0) + 1` silently skipped the
+ * index's first entry. Mirrors world-redis, which rejects the same way. */
+async function resolveCursorRank(
+  redis: Redis,
+  indexKey: string,
+  cursor: string,
+  direction: 'asc' | 'desc' = 'desc',
+): Promise<number> {
+  const rank =
+    direction === 'desc'
+      ? await redis.zrevrank(indexKey, cursor)
+      : await redis.zrank(indexKey, cursor);
+  if (rank === null || rank === undefined) {
+    throw new WorkflowWorldError(`Invalid pagination cursor "${cursor}"`, { status: 400 });
+  }
+  return rank + 1;
+}
+
 /** Throw the typed 412 core matches by error name. */
 function throwPreconditionFailed(runId: string, stateUpdatedAt: number, marker: string): never {
   throw new PreconditionFailedError(
@@ -213,14 +237,6 @@ function filterRunData(
     return { input: undefined, output: undefined, ...rest };
   }
   return run;
-}
-
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 /**
@@ -303,11 +319,7 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
     indexKey: string,
     cursor: string | undefined,
   ): Promise<number> {
-    if (!cursor) {
-      return 0;
-    }
-    const rank = await redis.zrevrank(indexKey, cursor);
-    return (rank ?? 0) + 1;
+    return cursor ? await resolveCursorRank(redis, indexKey, cursor) : 0;
   }
 
   return {
@@ -415,6 +427,28 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
   const hooksByTokenKey = (token: string) => `${keyPrefix}hooks:by_token:${token}`;
   const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
 
+  /** Batch-fetch events by id in MGETs instead of N sequential GETs. This is
+   * the dominant cost of every replay's event-log read under load, since
+   * Upstash bills (and rate-limits) per HTTP request. Chunked so a long run
+   * (up to maxEvents ids) cannot exceed Upstash's per-request size cap. */
+  const MGET_CHUNK_SIZE = 500;
+  async function getManyEvents(eventIds: string[]): Promise<Event[]> {
+    if (eventIds.length === 0) {
+      return [];
+    }
+    const chunks: string[][] = [];
+    for (let i = 0; i < eventIds.length; i += MGET_CHUNK_SIZE) {
+      chunks.push(eventIds.slice(i, i + MGET_CHUNK_SIZE));
+    }
+    const results = await Promise.all(
+      chunks.map((chunk) => redis.mget<string[]>(...chunk.map(eventKey))),
+    );
+    return results
+      .flat()
+      .filter((data) => data != null)
+      .map((data) => parse<Event>(data));
+  }
+
   /**
    * Probe the event log for an existing hook_created event for this
    * (runId, hookId). Used by the legacy-claim recovery path to detect
@@ -464,7 +498,6 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
     runId: string,
     id: string,
     event: unknown,
-    createdAt: Date,
     correlationId: string | undefined,
     guard = '',
     markerAdvance = '',
@@ -480,7 +513,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       [
         stringify(event),
         id,
-        createdAt.getTime().toString(),
+        String(eventIdTime(id)),
         correlationId ? '1' : '0',
         guard,
         markerAdvance,
@@ -552,10 +585,10 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        await appendEvent(runId, eventId, event, createdAt, data.correlationId);
+        await appendEvent(runId, eventId, event, data.correlationId);
 
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -683,7 +716,9 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             });
             await redis.zadd(runsByStatusKey('pending'), { score, member: effectiveRunId });
             // Create synthetic run_created event
-            const runCreatedEventId = `wevt_${ulid()}`;
+            // Backdate ahead of the run_started that bootstrapped it: the log
+            // sorts by eventId time, and a run is created before it starts.
+            const runCreatedEventId = `wevt_${ulidAt(eventIdTime(eventId) - 1)}`;
             const runCreatedEvent = {
               eventType: 'run_created' as const,
               eventData: {
@@ -699,7 +734,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             };
             await redis.set(eventKey(runCreatedEventId), stringify(runCreatedEvent));
             await redis.zadd(eventsIndexKey(effectiveRunId), {
-              score: now.getTime(),
+              score: eventIdTime(runCreatedEventId),
               member: runCreatedEventId,
             });
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
@@ -744,13 +779,13 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             specVersion: effectiveSpecVersion,
           };
           await redis.set(eventKey(eventId), stringify(event));
-          const score = createdAt.getTime();
+          const score = eventIdTime(eventId);
           await redis.zadd(eventsIndexKey(effectiveRunId), { score, member: eventId });
 
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             run: fullRunData ? (parse<WorkflowRun>(fullRunData) as WorkflowRun) : undefined,
           };
         }
@@ -1326,7 +1361,6 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
               effectiveRunId,
               eventId,
               conflictEvent,
-              createdAt,
               data.correlationId,
               residualGuard,
             );
@@ -1334,7 +1368,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             const parsedConflict = EventSchema.parse(conflictEvent);
             const resolveData = params?.resolveData ?? 'all';
             return {
-              event: filterEventData(parsedConflict, resolveData),
+              event: stripEventDataRefs(parsedConflict, resolveData),
               run,
               step,
               hook: undefined,
@@ -1370,7 +1404,6 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         effectiveRunId,
         eventId,
         event,
-        createdAt,
         data.correlationId,
         residualGuard,
         markerAdvanceFor(eventId),
@@ -1384,15 +1417,10 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       if (data.eventType === 'run_started' && run) {
         const allEventIds = await redis.zrange<string[]>(eventsIndexKey(effectiveRunId), 0, -1);
         if (allEventIds.length > 0) {
-          const eventsList: Event[] = [];
-          for (const eid of allEventIds) {
-            const eData = await redis.get<string>(eventKey(eid));
-            if (eData) {
-              const e = parse<Event>(eData);
-              const p = EventSchema.parse(compact(e));
-              eventsList.push(filterEventData(p, resolveData));
-            }
-          }
+          const eventsList = (await getManyEvents(allEventIds)).map((e) => {
+            const p = EventSchema.parse(compact(e));
+            return stripEventDataRefs(p, resolveData);
+          });
           allEvents = eventsList;
         } else {
           allEvents = [];
@@ -1400,7 +1428,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1428,23 +1456,14 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
       const indexKey = eventsIndexKey(params.runId);
       const start = fromCursor
-        ? sortOrder === 'desc'
-          ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-          : await redis.zrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
+        ? await resolveCursorRank(redis, indexKey, fromCursor, sortOrder)
         : 0;
 
       const eventIds = await redis.zrange<string[]>(indexKey, start, start + limit, {
         rev: sortOrder === 'desc',
       });
 
-      const events: Event[] = [];
-      for (const eid of eventIds) {
-        const data = await redis.get<string>(eventKey(eid));
-        if (data) {
-          const event = parse<Event>(data);
-          events.push(event);
-        }
-      }
+      const events = await getManyEvents(eventIds);
 
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
@@ -1453,7 +1472,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1469,21 +1488,31 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
 
       const indexKey = eventsByCorrelationKey(params.correlationId);
       const start = fromCursor
-        ? sortOrder === 'desc'
-          ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-          : await redis.zrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
+        ? await resolveCursorRank(redis, indexKey, fromCursor, sortOrder)
         : 0;
 
-      const eventIds = await redis.zrange<string[]>(indexKey, start, start + limit, {
-        rev: sortOrder === 'desc',
-      });
-
+      // A correlation id is unique within its run, so the global index can
+      // hold same-id events from sibling runs. Filter before the `limit`
+      // slice, or `hasMore` and the cursor describe the unfiltered set.
+      const runId = params.runId;
       const events: Event[] = [];
-      for (const eid of eventIds) {
-        const data = await redis.get<string>(eventKey(eid));
-        if (data) {
-          const event = parse<Event>(data);
-          events.push(event);
+      let offset = start;
+      for (;;) {
+        const eventIds = await redis.zrange<string[]>(indexKey, offset, offset + limit, {
+          rev: sortOrder === 'desc',
+        });
+        if (eventIds.length === 0) {
+          break;
+        }
+        offset += eventIds.length;
+        const page = await getManyEvents(eventIds);
+        events.push(...(runId === undefined ? page : page.filter((e) => e.runId === runId)));
+        // Unscoped reads keep their original single round trip: the first page
+        // already holds `limit + 1` candidates, none of which are filtered
+        // out. A short page means the index is exhausted (mirrors the redis
+        // family's fetchEventPage termination).
+        if (runId === undefined || events.length > limit || eventIds.length <= limit) {
+          break;
         }
       }
 
@@ -1494,7 +1523,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1555,9 +1584,7 @@ export function createStepsStorage(config: UpstashStorageConfig): Storage['steps
 
       const indexKey = stepsIndexKey(params.runId);
 
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-        : 0;
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor) : 0;
 
       const stepIds = await redis.zrange<string[]>(indexKey, start, start + limit, { rev: true });
 
@@ -1626,9 +1653,7 @@ export function createHooksStorage(config: UpstashStorageConfig): Storage['hooks
 
       const indexKey = hooksIndexKey(params.runId);
 
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank ?? 0) + 1)
-        : 0;
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor) : 0;
 
       const hookIds = await redis.zrange<string[]>(indexKey, start, start + limit, { rev: true });
 

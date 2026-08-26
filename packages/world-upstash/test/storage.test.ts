@@ -882,4 +882,221 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(current.status).toBe('running');
     });
   });
+
+  describe('events.listByCorrelationId run scoping', () => {
+    const sharedCorrelationId = 'hook-shared-correlation';
+
+    // A hook is addressable from any run, so two runs can emit events under
+    // one correlation id. Interleave them three apiece so an unscoped lookup
+    // alternates between the runs.
+    async function seedInterleavedRuns() {
+      const runA = await createRun({ workflowName: 'scoping-workflow-a' });
+      const runB = await createRun({ workflowName: 'scoping-workflow-b' });
+
+      const a1 = await events.create(runA.runId, {
+        eventType: 'hook_created',
+        correlationId: sharedCorrelationId,
+        eventData: { token: 'token-shared-correlation' },
+      });
+      const b1 = await events.create(runB.runId, {
+        eventType: 'hook_received',
+        correlationId: sharedCorrelationId,
+        eventData: { payload: { request: 1 } },
+      });
+      const a2 = await events.create(runA.runId, {
+        eventType: 'hook_received',
+        correlationId: sharedCorrelationId,
+        eventData: { payload: { request: 2 } },
+      });
+      const b2 = await events.create(runB.runId, {
+        eventType: 'hook_received',
+        correlationId: sharedCorrelationId,
+        eventData: { payload: { request: 3 } },
+      });
+      const a3 = await events.create(runA.runId, {
+        eventType: 'hook_received',
+        correlationId: sharedCorrelationId,
+        eventData: { payload: { request: 4 } },
+      });
+      const b3 = await events.create(runB.runId, {
+        eventType: 'hook_received',
+        correlationId: sharedCorrelationId,
+        eventData: { payload: { request: 5 } },
+      });
+
+      return {
+        runA: runA.runId,
+        runB: runB.runId,
+        a: [a1, a2, a3].map((r) => r.event!.eventId),
+        b: [b1, b2, b3].map((r) => r.event!.eventId),
+      };
+    }
+
+    it('scopes events to the requested run', async () => {
+      const seeded = await seedInterleavedRuns();
+
+      const result = await events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        runId: seeded.runA,
+        pagination: {},
+      });
+
+      expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
+      expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('lists every run when runId is omitted', async () => {
+      const seeded = await seedInterleavedRuns();
+
+      const result = await events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        pagination: {},
+      });
+
+      // Also pins the interleaving the scoped pagination test relies on.
+      expect(result.data.map((e) => e.eventId)).toEqual([
+        seeded.a[0],
+        seeded.b[0],
+        seeded.a[1],
+        seeded.b[1],
+        seeded.a[2],
+        seeded.b[2],
+      ]);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('paginates the scoped set without gaps or duplicates', async () => {
+      const seeded = await seedInterleavedRuns();
+
+      const page1 = await events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        runId: seeded.runA,
+        pagination: { limit: 2 },
+      });
+
+      expect(page1.data.map((e) => e.eventId)).toEqual([seeded.a[0], seeded.a[1]]);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.cursor).toBe(seeded.a[1]);
+
+      const page2 = await events.listByCorrelationId({
+        correlationId: sharedCorrelationId,
+        runId: seeded.runA,
+        pagination: { limit: 2, cursor: page1.cursor ?? undefined },
+      });
+
+      expect(page2.data.map((e) => e.eventId)).toEqual([seeded.a[2]]);
+      expect(page2.hasMore).toBe(false);
+    });
+  });
+
+  describe('events.list eventId ordering', () => {
+    const rapidPairCount = 16;
+
+    /**
+     * Core derives `stateUpdatedAt` from the LAST event the log returns rather
+     * than the maximum, so the log has to sort by eventId. Race two event types
+     * that need a different number of round trips to reach their append: the
+     * cheaper ones land ahead of events minted before them, which an index
+     * scored by append time would preserve.
+     */
+    async function seedRapidEvents(runId: string) {
+      const created = await Promise.all(
+        Array.from({ length: rapidPairCount }, (_, index) =>
+          events.create(runId, {
+            eventType: 'step_created',
+            correlationId: `step-ordering-${index}`,
+            eventData: { stepName: 'ordering-step', input: [index] },
+          }),
+        ),
+      );
+
+      const raced = await Promise.all(
+        created.flatMap((result, index) => [
+          events.create(runId, {
+            eventType: 'step_started',
+            correlationId: result.step!.stepId,
+          }),
+          events.create(runId, {
+            eventType: 'wait_created',
+            correlationId: `wait-ordering-${index}`,
+            eventData: { resumeAt: new Date(Date.now() + 60_000) },
+          }),
+        ]),
+      );
+
+      return [...created, ...raced].map((r) => r.event!.eventId);
+    }
+
+    it('returns rapid appends in ascending eventId order, newest last', async () => {
+      const run = await createRun();
+      const seeded = await seedRapidEvents(run.runId);
+
+      const page = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+
+      expect(page.hasMore).toBe(false);
+      const eventIds = page.data.map((e) => e.eventId);
+      // The seeded events plus the run_created that opened the run.
+      expect(eventIds).toHaveLength(seeded.length + 1);
+      expect(new Set(eventIds).size).toBe(eventIds.length);
+
+      const ascending = [...eventIds].sort();
+      expect(eventIds).toEqual(ascending);
+      // Stated on its own because this is the element core actually reads.
+      expect(eventIds.at(-1)).toBe(ascending.at(-1));
+    });
+
+    it('returns the descending log as the exact reverse', async () => {
+      const run = await createRun();
+      await seedRapidEvents(run.runId);
+
+      const ascending = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      const descending = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'desc' },
+      });
+
+      expect(descending.data.map((e) => e.eventId)).toEqual(
+        ascending.data.map((e) => e.eventId).reverse(),
+      );
+    });
+  });
+
+  describe("resolveData: 'none' event data", () => {
+    // `step_created` carries both a ref field (`input`) and display metadata
+    // (`stepName`), so it distinguishes stripping refs from dropping eventData
+    // wholesale. Event types outside the ref map are a no-op and prove nothing.
+    it('strips only the ref field and keeps sibling metadata', async () => {
+      const run = await createRun();
+      await events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'step-strip-refs',
+        eventData: { stepName: 'chargeCard', input: ['card-1'] },
+      });
+
+      const lean = await events.list({
+        runId: run.runId,
+        pagination: {},
+        resolveData: 'none',
+      });
+      const leanEvent = expectEventType(
+        lean.data.find((e) => e.eventType === 'step_created'),
+        'step_created',
+      );
+      expect(leanEvent.eventData).toEqual({ stepName: 'chargeCard' });
+
+      const full = await events.list({ runId: run.runId, pagination: {} });
+      const fullEvent = expectEventType(
+        full.data.find((e) => e.eventType === 'step_created'),
+        'step_created',
+      );
+      expect(fullEvent.eventData).toEqual({ stepName: 'chargeCard', input: ['card-1'] });
+    });
+  });
 });

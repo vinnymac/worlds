@@ -41,12 +41,13 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { createHash } from 'node:crypto';
 import type { Redis } from 'ioredis';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { compact, debug, parseWithUint8Array, stringifyWithUint8Array } from './util.js';
 
 interface RedisStorageConfig {
@@ -182,14 +183,6 @@ function filterRunData(
   return run;
 }
 
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
-}
-
 // ============================================================
 // Lua Scripts for Atomic Multi-Key Writes
 // ============================================================
@@ -218,6 +211,7 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = has correlation ("1" or "0")
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created, [0, runJson] on replay
  */
 const LUA_CREATE_RUN_WITH_EVENT = `
@@ -226,13 +220,16 @@ const LUA_CREATE_RUN_WITH_EVENT = `
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the run indexes by wall clock, so
+  -- the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('ZADD', KEYS[4], score, ARGV[2])
   redis.call('SET', KEYS[5], ARGV[4])
-  redis.call('ZADD', KEYS[6], score, ARGV[5])
+  redis.call('ZADD', KEYS[6], eventScore, ARGV[5])
   if ARGV[6] == '1' then
-    redis.call('ZADD', KEYS[7], score, ARGV[5])
+    redis.call('ZADD', KEYS[7], eventScore, ARGV[5])
   end
   return {1, ''}
 `;
@@ -291,6 +288,7 @@ const LUA_CAS_UPDATE_RUN = `${luaStateGuard(4, 5)}
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created, [0, stepJson] on replay, or [-9, marker]
  *          when the guard rejects
  */
@@ -300,10 +298,13 @@ const LUA_CREATE_STEP_WITH_EVENT = `${luaStateGuard(6, 6)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('SET', KEYS[3], ARGV[4])
-  redis.call('ZADD', KEYS[4], score, ARGV[5])
-  redis.call('ZADD', KEYS[5], score, ARGV[5])
+  redis.call('ZADD', KEYS[4], eventScore, ARGV[5])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[5])
   return {1, ''}
 `;
 
@@ -351,6 +352,7 @@ const LUA_CAS_UPDATE_STEP = `
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * ARGV[7] = event score (eventId time)
  * Returns: [2, owningHookId] on token conflict,
  *          [0, hookJson] when the hook already exists,
  *          [1, ''] on success,
@@ -369,10 +371,13 @@ const LUA_CREATE_HOOK_WITH_EVENT = `${luaStateGuard(7, 6)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('SET', KEYS[4], ARGV[4])
-  redis.call('ZADD', KEYS[5], score, ARGV[5])
-  redis.call('ZADD', KEYS[6], score, ARGV[5])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[5])
+  redis.call('ZADD', KEYS[6], eventScore, ARGV[5])
   return {1, ''}
 `;
 
@@ -414,6 +419,7 @@ const LUA_DISPOSE_HOOK = `
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created, [0, waitJson] on replay, or [-9, marker]
  *          when the guard rejects
  */
@@ -423,10 +429,13 @@ const LUA_CREATE_WAIT_WITH_EVENT = `${luaStateGuard(6, 6)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('SET', KEYS[3], ARGV[4])
-  redis.call('ZADD', KEYS[4], score, ARGV[5])
-  redis.call('ZADD', KEYS[5], score, ARGV[5])
+  redis.call('ZADD', KEYS[4], eventScore, ARGV[5])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[5])
   return {1, ''}
 `;
 
@@ -443,7 +452,7 @@ const LUA_CREATE_WAIT_WITH_EVENT = `${luaStateGuard(6, 6)}
  * KEYS[5] = run state marker key
  * ARGV[1] = SHA-1 of the expected current wait JSON
  * ARGV[2] = updated wait JSON
- * ARGV[3] = score (timestamp)
+ * ARGV[3] = event score (eventId time; only the event indexes use it)
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
@@ -774,6 +783,53 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     return events;
   }
 
+  // Helper: Read a page of events out of an index, optionally scoped to one
+  // run. A correlation id is only unique within its run, so the correlation
+  // index can hold events belonging to several runs; when the caller scopes
+  // the lookup we walk the index in pages and keep only the matching run's
+  // events, so `limit` and `hasMore` describe the filtered set rather than the
+  // raw index page. Returns at most `limit + 1` events: the extra one is the
+  // caller's `hasMore` probe. Unscoped lookups still cost a single index read
+  // plus a single pipeline.
+  async function fetchEventPage(
+    indexKey: string,
+    start: number,
+    limit: number,
+    sortOrder: 'asc' | 'desc',
+    runId: string | undefined,
+  ): Promise<Event[]> {
+    const matched: Event[] = [];
+    let offset = start;
+
+    for (;;) {
+      const eventIds = await fetchEventIds(indexKey, offset, limit, sortOrder);
+      if (eventIds.length === 0) {
+        break;
+      }
+      offset += eventIds.length;
+
+      const eventPipeline = redis.pipeline();
+      for (const eid of eventIds) {
+        eventPipeline.get(eventKey(eid));
+      }
+      const results = await eventPipeline.exec();
+
+      for (const event of parseEventsFromPipeline(results)) {
+        if (runId === undefined || event.runId === runId) {
+          matched.push(event);
+        }
+      }
+
+      // An unscoped read is complete after one page. A scoped read stops once
+      // it has the hasMore probe, or once the index runs short of a full page.
+      if (runId === undefined || matched.length > limit || eventIds.length <= limit) {
+        break;
+      }
+    }
+
+    return matched;
+  }
+
   /** An event object as persisted (before schema validation). */
   interface StoredEventShape {
     eventType: string;
@@ -814,7 +870,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     guard = '',
     markerAdvance = '',
   ): Promise<void> {
-    const score = event.createdAt.getTime();
+    const score = eventIdTime(event.eventId);
     const result = (await scripts.wfStoreEvent(
       eventKey(event.eventId),
       eventsIndexKey(event.runId),
@@ -1024,7 +1080,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
         // Legacy runs (specVersion < 2) predate the optimistic-concurrency
         // guard, so neither the guard nor the state marker applies here.
-        const score = createdAt.getTime();
+        const score = eventIdTime(eventId);
         await scripts.wfStoreEvent(
           eventKey(eventId),
           eventsIndexKey(runId),
@@ -1039,7 +1095,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         );
 
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -1152,7 +1208,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           // Synthetic run_created event, written atomically with the run
           // entity: exactly one run_created event lands regardless of how
           // the run_created/run_started race resolves.
-          const runCreatedEventId = `wevt_${ulid()}`;
+          // Backdate ahead of the run_started that bootstrapped it: the log
+          // sorts by eventId time, and a run is created before it starts.
+          const runCreatedEventId = `wevt_${ulidAt(eventIdTime(eventId) - 1)}`;
           const runCreatedEvent = {
             eventType: 'run_created' as const,
             eventData: {
@@ -1181,6 +1239,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             stringifyWithUint8Array(runCreatedEvent),
             runCreatedEventId,
             '0',
+            eventIdTime(runCreatedEventId).toString(),
           )) as [number, string];
           if (result[0] === 1) {
             await mirrorEventToStream(runCreatedEvent);
@@ -1231,7 +1290,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
           const parsed = EventSchema.parse(event);
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             run: fullRunData
               ? (filterRunData(
                   WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(fullRunData))),
@@ -1359,6 +1418,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           data.correlationId ? '1' : '0',
+          eventIdTime(eventId).toString(),
         )) as [number, string];
 
         debug('run_created lua result', { wasCreated: result[0], runId: effectiveRunId });
@@ -1370,7 +1430,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         run = WorkflowRunSchema.parse(compact(newRun));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), run, maxEvents: maxEventsPerRun };
+        return { event: stripEventDataRefs(parsed, resolveData), run, maxEvents: maxEventsPerRun };
       }
 
       // Handle step_created event: create step entity + event atomically
@@ -1410,6 +1470,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           guard,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         debug('step_created lua result', { wasCreated: result[0], stepId: data.correlationId });
@@ -1425,7 +1486,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         step = StepSchema.parse(compact(newStep));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), step };
+        return { event: stripEventDataRefs(parsed, resolveData), step };
       }
 
       // Handle hook_created event: claim token + create hook entity + event
@@ -1467,6 +1528,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           guard,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         debug('hook_created lua result', { result: result[0], hookId: data.correlationId });
@@ -1503,7 +1565,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
           const parsedConflict = EventSchema.parse(conflictEvent);
           return {
-            event: filterEventData(parsedConflict, resolveData),
+            event: stripEventDataRefs(parsedConflict, resolveData),
             hook: undefined,
           };
         }
@@ -1518,7 +1580,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         hook = HookSchema.parse(compact(newHook));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), hook };
+        return { event: stripEventDataRefs(parsed, resolveData), hook };
       }
 
       // Handle wait_created event: create wait entity + event atomically
@@ -1558,6 +1620,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           guard,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         debug('wait_created lua result', { wasCreated: result[0], waitId: data.correlationId });
@@ -1573,7 +1636,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         wait = WaitSchema.parse(compact(newWait));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), wait };
+        return { event: stripEventDataRefs(parsed, resolveData), wait };
       }
 
       // Handle wait_completed event: transition wait + event atomically,
@@ -1606,7 +1669,8 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             specVersion: effectiveSpecVersion,
           };
 
-          const score = now.getTime();
+          // Only the event indexes take this score, so it uses eventId time.
+          const score = eventIdTime(eventId);
           const result = (await scripts.wfCasCompleteWaitWithEvent(
             waitKey(effectiveRunId, data.correlationId),
             eventKey(eventId),
@@ -1629,7 +1693,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             wait = WaitSchema.parse(compact(updatedWait));
             await mirrorEventToStream(event);
             const parsed = EventSchema.parse(event);
-            return { event: filterEventData(parsed, resolveData), wait };
+            return { event: stripEventDataRefs(parsed, resolveData), wait };
           }
           if (result[0] === -1) {
             throw new WorkflowWorldError(`Wait "${data.correlationId}" not found`, {
@@ -1896,7 +1960,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const pipelineResults = await eventPipeline.exec();
           allEvents = parseEventsFromPipeline(pipelineResults).map((e) => {
             const p = EventSchema.parse(compact(e));
-            return filterEventData(p, resolveData);
+            return stripEventDataRefs(p, resolveData);
           });
         } else {
           allEvents = [];
@@ -1904,7 +1968,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1924,7 +1988,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         });
       }
       const parsed = EventSchema.parse(compact(parseWithUint8Array<Event>(data)));
-      return filterEventData(parsed, params?.resolveData ?? 'all');
+      return stripEventDataRefs(parsed, params?.resolveData ?? 'all');
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -1953,7 +2017,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1971,16 +2035,11 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       const start = fromCursor
         ? await resolveCursorRank(redis, indexKey, fromCursor, sortOrder)
         : 0;
-      const eventIds = await fetchEventIds(indexKey, start, limit, sortOrder);
 
-      // Fetch events via pipeline
-      const eventPipeline = redis.pipeline();
-      for (const eid of eventIds) {
-        eventPipeline.get(eventKey(eid));
-      }
-      const results = await eventPipeline.exec();
-
-      const events = parseEventsFromPipeline(results);
+      // `params.runId` scopes the lookup to a single run's event log. It is
+      // optional for backward compatibility, so an absent runId keeps the
+      // historical unscoped behavior.
+      const events = await fetchEventPage(indexKey, start, limit, sortOrder, params.runId);
       const values = events.slice(0, limit);
       const hasMore = events.length > limit;
 
@@ -1988,7 +2047,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,

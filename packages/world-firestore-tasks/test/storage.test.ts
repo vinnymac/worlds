@@ -3,6 +3,7 @@ import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { PreconditionFailedError } from '@workflow/errors';
+import type { Event } from '@workflow/world';
 import { ulidToDate } from '@workflow/world';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
@@ -849,6 +850,313 @@ describe('Storage (Firestore integration)', () => {
         expect(result.data[0].createdAt.getTime()).toBeGreaterThanOrEqual(
           result.data[1].createdAt.getTime(),
         );
+      });
+
+      const sharedCorrelationId = 'hook-shared-correlation';
+
+      // A hook is addressable from any run, so two runs can emit events under
+      // one correlation id. Interleave them three apiece so an unscoped lookup
+      // alternates between the runs.
+      async function seedInterleavedRuns() {
+        const runA = await createRun({
+          deploymentId: 'deployment-a',
+          workflowName: 'scoping-workflow-a',
+          input: [],
+        });
+        const runB = await createRun({
+          deploymentId: 'deployment-b',
+          workflowName: 'scoping-workflow-b',
+          input: [],
+        });
+
+        const a1 = await storage.events.create(runA.runId, {
+          eventType: 'hook_created',
+          correlationId: sharedCorrelationId,
+          eventData: { token: 'token-shared-correlation' },
+        });
+        const b1 = await storage.events.create(runB.runId, {
+          eventType: 'hook_received',
+          correlationId: sharedCorrelationId,
+          eventData: { payload: { request: 1 } },
+        });
+        await setTimeout(5);
+        const a2 = await storage.events.create(runA.runId, {
+          eventType: 'hook_received',
+          correlationId: sharedCorrelationId,
+          eventData: { payload: { request: 2 } },
+        });
+        const b2 = await storage.events.create(runB.runId, {
+          eventType: 'hook_received',
+          correlationId: sharedCorrelationId,
+          eventData: { payload: { request: 3 } },
+        });
+        await setTimeout(5);
+        const a3 = await storage.events.create(runA.runId, {
+          eventType: 'hook_received',
+          correlationId: sharedCorrelationId,
+          eventData: { payload: { request: 4 } },
+        });
+        const b3 = await storage.events.create(runB.runId, {
+          eventType: 'hook_received',
+          correlationId: sharedCorrelationId,
+          eventData: { payload: { request: 5 } },
+        });
+
+        return {
+          runA: runA.runId,
+          runB: runB.runId,
+          a: [a1, a2, a3].map((r) => r.event!.eventId),
+          b: [b1, b2, b3].map((r) => r.event!.eventId),
+        };
+      }
+
+      it('should scope events to the requested run', async () => {
+        const seeded = await seedInterleavedRuns();
+
+        const result = await storage.events.listByCorrelationId({
+          correlationId: sharedCorrelationId,
+          runId: seeded.runA,
+          pagination: {},
+        });
+
+        expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
+        expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('should list every run when runId is omitted', async () => {
+        const seeded = await seedInterleavedRuns();
+
+        const result = await storage.events.listByCorrelationId({
+          correlationId: sharedCorrelationId,
+          pagination: {},
+        });
+
+        // Also pins the interleaving the scoped pagination test relies on.
+        expect(result.data.map((e) => e.eventId)).toEqual([
+          seeded.a[0],
+          seeded.b[0],
+          seeded.a[1],
+          seeded.b[1],
+          seeded.a[2],
+          seeded.b[2],
+        ]);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('should paginate the scoped set without gaps or duplicates', async () => {
+        const seeded = await seedInterleavedRuns();
+
+        const page1 = await storage.events.listByCorrelationId({
+          correlationId: sharedCorrelationId,
+          runId: seeded.runA,
+          pagination: { limit: 2 },
+        });
+
+        expect(page1.data.map((e) => e.eventId)).toEqual([seeded.a[0], seeded.a[1]]);
+        expect(page1.hasMore).toBe(true);
+        expect(page1.cursor).toBe(seeded.a[1]);
+
+        const page2 = await storage.events.listByCorrelationId({
+          correlationId: sharedCorrelationId,
+          runId: seeded.runA,
+          pagination: { limit: 2, cursor: page1.cursor ?? undefined },
+        });
+
+        expect(page2.data.map((e) => e.eventId)).toEqual([seeded.a[2]]);
+        expect(page2.hasMore).toBe(false);
+      });
+    });
+
+    describe('resolveData', () => {
+      const resolveCorrelationId = 'resolve-data-step';
+
+      // step_created is one of the ref-bearing event types: `input` is a ref
+      // field, `stepName` is display metadata the dashboard renders. It is the
+      // cheapest probe for whether a reader strips refs without losing metadata.
+      async function seedEventWithData() {
+        const created = await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: resolveCorrelationId,
+          eventData: { stepName: 'resolve-data-step', input: [] },
+        });
+        return created.event!.eventId;
+      }
+
+      /** Narrow an event to step_created so its eventData is typed. */
+      function expectStepCreated(event: Event | undefined) {
+        if (event?.eventType !== 'step_created') {
+          throw new Error(`expected step_created, received ${event?.eventType ?? 'undefined'}`);
+        }
+        return event;
+      }
+
+      describe('create', () => {
+        it("should strip only the input ref from the returned event when resolveData is 'none'", async () => {
+          const result = await storage.events.create(
+            testRunId,
+            {
+              eventType: 'step_created',
+              correlationId: 'resolve-data-create-none',
+              eventData: { stepName: 'resolve-data-create-none', input: [] },
+            },
+            { resolveData: 'none' },
+          );
+
+          expect(result.event).toBeDefined();
+          const eventData = expectStepCreated(result.event).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-create-none');
+          expect(result.step).toBeDefined();
+        });
+
+        it('should return eventData by default', async () => {
+          const result = await storage.events.create(testRunId, {
+            eventType: 'step_created',
+            correlationId: 'resolve-data-create-default',
+            eventData: { stepName: 'resolve-data-create-default', input: [] },
+          });
+
+          const eventData = expectStepCreated(result.event).eventData;
+          expect(eventData.stepName).toBe('resolve-data-create-default');
+          expect(eventData.input).toEqual([]);
+        });
+
+        it("should strip refs from run_started preloaded events when resolveData is 'none'", async () => {
+          const seededId = await seedEventWithData();
+
+          const result = await storage.events.create(
+            testRunId,
+            { eventType: 'run_started' },
+            { resolveData: 'none' },
+          );
+
+          expect(result.events?.length).toBeGreaterThan(0);
+          const eventData = expectStepCreated(
+            result.events?.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
+        });
+
+        it('should return eventData on run_started preloaded events by default', async () => {
+          const seededId = await seedEventWithData();
+
+          const result = await storage.events.create(testRunId, { eventType: 'run_started' });
+
+          const eventData = expectStepCreated(
+            result.events?.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect(eventData.input).toEqual([]);
+        });
+
+        it("should leave event types without ref fields untouched when resolveData is 'none'", async () => {
+          await seedEventWithData();
+
+          // step_started is absent from the ref-field map, so 'none' is a no-op
+          // and every eventData key must survive the round trip.
+          const result = await storage.events.create(
+            testRunId,
+            {
+              eventType: 'step_started',
+              correlationId: resolveCorrelationId,
+              eventData: { stepName: 'resolve-data-step', attempt: 1 },
+            },
+            { resolveData: 'none' },
+          );
+
+          expect(result.event?.eventType).toBe('step_started');
+          expect(
+            result.event && 'eventData' in result.event ? result.event.eventData : undefined,
+          ).toEqual({ stepName: 'resolve-data-step', attempt: 1 });
+        });
+      });
+
+      describe('get', () => {
+        it("should strip only the input ref when resolveData is 'none'", async () => {
+          const eventId = await seedEventWithData();
+
+          const event = await storage.events.get(testRunId, eventId, {
+            resolveData: 'none',
+          });
+
+          expect(event.eventId).toBe(eventId);
+          const eventData = expectStepCreated(event).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
+        });
+
+        it('should return eventData by default', async () => {
+          const eventId = await seedEventWithData();
+
+          const event = await storage.events.get(testRunId, eventId);
+
+          const eventData = expectStepCreated(event).eventData;
+          expect(eventData.stepName).toBe('resolve-data-step');
+          expect(eventData.input).toEqual([]);
+        });
+      });
+
+      describe('list', () => {
+        it("should strip refs from every event when resolveData is 'none'", async () => {
+          const seededId = await seedEventWithData();
+
+          const result = await storage.events.list({
+            runId: testRunId,
+            resolveData: 'none',
+          });
+
+          expect(result.data.length).toBeGreaterThan(0);
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
+        });
+
+        it('should return eventData by default', async () => {
+          const seededId = await seedEventWithData();
+
+          const result = await storage.events.list({ runId: testRunId });
+
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect(eventData.input).toEqual([]);
+        });
+      });
+
+      describe('listByCorrelationId', () => {
+        it("should strip refs from every event when resolveData is 'none'", async () => {
+          const seededId = await seedEventWithData();
+
+          const result = await storage.events.listByCorrelationId({
+            correlationId: resolveCorrelationId,
+            runId: testRunId,
+            resolveData: 'none',
+          });
+
+          expect(result.data.length).toBeGreaterThan(0);
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
+        });
+
+        it('should return eventData by default', async () => {
+          const seededId = await seedEventWithData();
+
+          const result = await storage.events.listByCorrelationId({
+            correlationId: resolveCorrelationId,
+            runId: testRunId,
+          });
+
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect(eventData.input).toEqual([]);
+        });
       });
     });
   });

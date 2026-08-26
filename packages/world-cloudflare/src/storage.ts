@@ -18,6 +18,7 @@ import type {
   GetStepParams,
   GetWorkflowRunParams,
   Hook,
+  ListEventsByCorrelationIdParams,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
@@ -36,6 +37,7 @@ import {
   HookSchema,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { parse, stringify } from '@fantasticfour/shared';
@@ -89,6 +91,11 @@ export interface CloudflareStorageConfig {
 
 /** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
+
+/** Minimum page size when scanning a run's log for correlationId matches.
+ * Matches are sparse, so scanning in `limit`-sized pages would cost a DO round
+ * trip per few matches for small limits. */
+const CORRELATION_SCAN_PAGE_SIZE = 100;
 
 /** Resolve the per-run event ceiling: explicit config, then
  * `WORKFLOW_MAX_EVENTS`, then the default. An explicit value must be a
@@ -356,12 +363,15 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           await Promise.all(kvWrites);
         }
 
+        // Honour resolveData on the create return path, matching the read
+        // paths and every sibling world.
+        const resolveData = params?.resolveData ?? 'all';
         return {
-          event: outcome.event,
+          event: outcome.event && stripEventDataRefs(outcome.event, resolveData),
           run: outcome.run,
           step: outcome.step,
           hook: outcome.hook,
-          events: outcome.events,
+          events: outcome.events?.map((e) => stripEventDataRefs(e, resolveData)),
           // The runtime reads the ceiling from the run_started response only,
           // so it must also be present on the idempotent already-running
           // replay path -- keying off the request type covers both.
@@ -371,7 +381,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         };
       },
 
-      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
+      async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {
         const stub = getRunDO(runId);
         const event = await stub.getEvent(eventId);
 
@@ -381,12 +391,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
 
-        return parseEvent(event);
+        return stripEventDataRefs(parseEvent(event), params?.resolveData ?? 'all');
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 100;
+        const resolveData = params?.resolveData ?? 'all';
 
         const stub = getRunDO(runId);
         const result = await stub.listEvents({
@@ -396,19 +407,57 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         });
 
         return {
-          data: result.data.map(parseEvent),
+          data: result.data.map((e) => stripEventDataRefs(parseEvent(e), resolveData)),
           cursor: result.cursor,
           hasMore: result.hasMore,
         };
       },
 
-      async listByCorrelationId(_params) {
-        // For Cloudflare, we'd need a global index in KV or D1
-        // For now, return empty as this requires cross-DO coordination
+      async listByCorrelationId(
+        params: ListEventsByCorrelationIdParams,
+      ): Promise<PaginatedResponse<Event>> {
+        const { correlationId, runId } = params;
+        if (!runId) {
+          // No global correlationId index exists: events live in per-run DOs,
+          // so an unscoped lookup would have to fan out over every run.
+          throw new WorkflowWorldError(
+            'Unscoped correlationId lookup is not supported on the Cloudflare world; pass runId to scope the lookup to a single run',
+            { status: 400 },
+          );
+        }
+
+        const limit = params.pagination?.limit ?? 100;
+        const sortOrder = params.pagination?.sortOrder || 'asc';
+        const resolveData = params.resolveData ?? 'all';
+        const stub = getRunDO(runId);
+
+        // Page the run's log until `limit + 1` matches are in hand. Filtering
+        // after a `limit` slice would make hasMore and the cursor describe the
+        // unfiltered log, silently dropping matches at page boundaries.
+        const matches: Event[] = [];
+        let cursor = params.pagination?.cursor || undefined;
+        for (;;) {
+          const page = await stub.listEvents({
+            limit: Math.max(limit, CORRELATION_SCAN_PAGE_SIZE),
+            cursor,
+            sortOrder,
+          });
+          for (const event of page.data) {
+            if (event.correlationId === correlationId) matches.push(event);
+          }
+          // listByPrefix only yields a cursor while more entries remain, so a
+          // null cursor is the exhaustion signal.
+          if (matches.length > limit || page.cursor === null) break;
+          cursor = page.cursor;
+        }
+
+        const data = matches.slice(0, limit);
+        const hasMore = matches.length > limit;
+
         return {
-          data: [],
-          cursor: null,
-          hasMore: false,
+          data: data.map((e) => stripEventDataRefs(parseEvent(e), resolveData)),
+          cursor: hasMore ? (data.at(-1)?.eventId ?? null) : null,
+          hasMore,
         };
       },
     },

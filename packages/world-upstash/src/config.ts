@@ -78,6 +78,11 @@ export interface UpstashWorldConfig {
    * Also selectable via `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`. */
   queueMode?: 'qstash' | 'loopback';
 
+  /** Max concurrent in-flight deliveries for the `'loopback'` transport.
+   * Ignored in `'qstash'` mode, which the hosted service already paces.
+   * @default 10 */
+  loopbackConcurrency?: number;
+
   /** TTL (seconds) on creation-event claim keys, the SETNX arbiters that
    * dedup entity-creating events. Claims are pure overhead once a run is
    * terminal, and nothing else deletes them, so the TTL bounds billable

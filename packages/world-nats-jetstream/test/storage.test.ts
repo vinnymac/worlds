@@ -890,4 +890,143 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(streams).toContain(name);
     });
   });
+
+  describe('events.listByCorrelationId run scoping', () => {
+    // A hook is addressable from any run, so two runs can emit events under
+    // one correlation id. Interleave them three apiece so an unscoped lookup
+    // alternates between the runs. The buckets are never cleared between
+    // tests, so each case seeds its own correlation id and token.
+    async function seedInterleavedRuns(correlationId: string) {
+      const runA = await createRun('scoping-workflow-a');
+      const runB = await createRun('scoping-workflow-b');
+
+      const a1 = await world.events.create(runA.runId, {
+        eventType: 'hook_created',
+        correlationId,
+        eventData: { token: `token-${correlationId}` },
+      });
+      const b1 = await world.events.create(runB.runId, {
+        eventType: 'hook_received',
+        correlationId,
+        eventData: { payload: { request: 1 } },
+      });
+      const a2 = await world.events.create(runA.runId, {
+        eventType: 'hook_received',
+        correlationId,
+        eventData: { payload: { request: 2 } },
+      });
+      const b2 = await world.events.create(runB.runId, {
+        eventType: 'hook_received',
+        correlationId,
+        eventData: { payload: { request: 3 } },
+      });
+      const a3 = await world.events.create(runA.runId, {
+        eventType: 'hook_received',
+        correlationId,
+        eventData: { payload: { request: 4 } },
+      });
+      const b3 = await world.events.create(runB.runId, {
+        eventType: 'hook_received',
+        correlationId,
+        eventData: { payload: { request: 5 } },
+      });
+
+      return {
+        runA: runA.runId,
+        runB: runB.runId,
+        a: [a1, a2, a3].map((r) => r.event!.eventId),
+        b: [b1, b2, b3].map((r) => r.event!.eventId),
+      };
+    }
+
+    it('scopes events to the requested run', async () => {
+      const correlationId = 'hook-scoping-scoped';
+      const seeded = await seedInterleavedRuns(correlationId);
+
+      const result = await world.events.listByCorrelationId({
+        correlationId,
+        runId: seeded.runA,
+        pagination: {},
+      });
+
+      expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
+      expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('lists every run when runId is omitted', async () => {
+      const correlationId = 'hook-scoping-unscoped';
+      const seeded = await seedInterleavedRuns(correlationId);
+
+      const result = await world.events.listByCorrelationId({
+        correlationId,
+        pagination: {},
+      });
+
+      // Also pins the interleaving the scoped pagination test relies on.
+      expect(result.data.map((e) => e.eventId)).toEqual([
+        seeded.a[0],
+        seeded.b[0],
+        seeded.a[1],
+        seeded.b[1],
+        seeded.a[2],
+        seeded.b[2],
+      ]);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('paginates the scoped set without gaps or duplicates', async () => {
+      const correlationId = 'hook-scoping-paginated';
+      const seeded = await seedInterleavedRuns(correlationId);
+
+      const page1 = await world.events.listByCorrelationId({
+        correlationId,
+        runId: seeded.runA,
+        pagination: { limit: 2 },
+      });
+
+      expect(page1.data.map((e) => e.eventId)).toEqual([seeded.a[0], seeded.a[1]]);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.cursor).toBe(seeded.a[1]);
+
+      const page2 = await world.events.listByCorrelationId({
+        correlationId,
+        runId: seeded.runA,
+        pagination: { limit: 2, cursor: page1.cursor ?? undefined },
+      });
+
+      expect(page2.data.map((e) => e.eventId)).toEqual([seeded.a[2]]);
+      expect(page2.hasMore).toBe(false);
+    });
+  });
+
+  describe("resolveData: 'none' event data", () => {
+    // `step_created` carries both a ref field (`input`) and display metadata
+    // (`stepName`), so it distinguishes stripping refs from dropping eventData
+    // wholesale. Event types outside the ref map are a no-op and prove nothing.
+    it('strips only the ref field and keeps sibling metadata', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      const stepId = `step-strip-refs-${ulid()}`;
+      await createStep(run.runId, stepId);
+
+      const lean = await world.events.list({
+        runId: run.runId,
+        pagination: {},
+        resolveData: 'none',
+      });
+      const leanEvent = expectEventType(
+        lean.data.find((e) => e.eventType === 'step_created' && e.correlationId === stepId),
+        'step_created',
+      );
+      expect(leanEvent.eventData).toEqual({ stepName: 'test-step' });
+
+      const full = await world.events.list({ runId: run.runId, pagination: {} });
+      const fullEvent = expectEventType(
+        full.data.find((e) => e.eventType === 'step_created' && e.correlationId === stepId),
+        'step_created',
+      );
+      expect(fullEvent.eventData).toEqual({ stepName: 'test-step', input: ['input1'] });
+    });
+  });
 });
