@@ -427,15 +427,26 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
   const hooksByTokenKey = (token: string) => `${keyPrefix}hooks:by_token:${token}`;
   const hooksIndexKey = (runId: string) => `${keyPrefix}hooks:by_run:${runId}`;
 
-  /** Batch-fetch events by id in one MGET instead of N sequential GETs. This is
+  /** Batch-fetch events by id in MGETs instead of N sequential GETs. This is
    * the dominant cost of every replay's event-log read under load, since
-   * Upstash bills (and rate-limits) per HTTP request. */
+   * Upstash bills (and rate-limits) per HTTP request. Chunked so a long run
+   * (up to maxEvents ids) cannot exceed Upstash's per-request size cap. */
+  const MGET_CHUNK_SIZE = 500;
   async function getManyEvents(eventIds: string[]): Promise<Event[]> {
     if (eventIds.length === 0) {
       return [];
     }
-    const rows = await redis.mget<string[]>(...eventIds.map(eventKey));
-    return rows.filter((data) => data != null).map((data) => parse<Event>(data));
+    const chunks: string[][] = [];
+    for (let i = 0; i < eventIds.length; i += MGET_CHUNK_SIZE) {
+      chunks.push(eventIds.slice(i, i + MGET_CHUNK_SIZE));
+    }
+    const results = await Promise.all(
+      chunks.map((chunk) => redis.mget<string[]>(...chunk.map(eventKey))),
+    );
+    return results
+      .flat()
+      .filter((data) => data != null)
+      .map((data) => parse<Event>(data));
   }
 
   /**
@@ -1486,8 +1497,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       const runId = params.runId;
       const events: Event[] = [];
       let offset = start;
-      let exhausted = false;
-      while (events.length <= limit && !exhausted) {
+      for (;;) {
         const eventIds = await redis.zrange<string[]>(indexKey, offset, offset + limit, {
           rev: sortOrder === 'desc',
         });
@@ -1495,12 +1505,13 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           break;
         }
         offset += eventIds.length;
-        exhausted = eventIds.length <= limit;
         const page = await getManyEvents(eventIds);
         events.push(...(runId === undefined ? page : page.filter((e) => e.runId === runId)));
         // Unscoped reads keep their original single round trip: the first page
-        // already holds `limit + 1` candidates, none of which are filtered out.
-        if (runId === undefined) {
+        // already holds `limit + 1` candidates, none of which are filtered
+        // out. A short page means the index is exhausted (mirrors the redis
+        // family's fetchEventPage termination).
+        if (runId === undefined || events.length > limit || eventIds.length <= limit) {
           break;
         }
       }

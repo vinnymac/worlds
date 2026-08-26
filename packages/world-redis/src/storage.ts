@@ -211,6 +211,7 @@ function filterRunData(
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = has correlation ("1" or "0")
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created, [0, runJson] on replay
  */
 const LUA_CREATE_RUN_WITH_EVENT = `
@@ -287,6 +288,7 @@ const LUA_CAS_UPDATE_RUN = `${luaStateGuard(4, 5)}
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created, [0, stepJson] on replay, or [-9, marker]
  *          when the guard rejects
  */
@@ -296,10 +298,13 @@ const LUA_CREATE_STEP_WITH_EVENT = `${luaStateGuard(6, 6)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('SET', KEYS[3], ARGV[4])
-  redis.call('ZADD', KEYS[4], score, ARGV[5])
-  redis.call('ZADD', KEYS[5], score, ARGV[5])
+  redis.call('ZADD', KEYS[4], eventScore, ARGV[5])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[5])
   return {1, ''}
 `;
 
@@ -347,6 +352,7 @@ const LUA_CAS_UPDATE_STEP = `
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * ARGV[7] = event score (eventId time)
  * Returns: [2, owningHookId] on token conflict,
  *          [0, hookJson] when the hook already exists,
  *          [1, ''] on success,
@@ -365,10 +371,13 @@ const LUA_CREATE_HOOK_WITH_EVENT = `${luaStateGuard(7, 6)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('SET', KEYS[4], ARGV[4])
-  redis.call('ZADD', KEYS[5], score, ARGV[5])
-  redis.call('ZADD', KEYS[6], score, ARGV[5])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[5])
+  redis.call('ZADD', KEYS[6], eventScore, ARGV[5])
   return {1, ''}
 `;
 
@@ -410,6 +419,7 @@ const LUA_DISPOSE_HOOK = `
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
+ * ARGV[7] = event score (eventId time)
  * Returns: [1, ''] when created, [0, waitJson] on replay, or [-9, marker]
  *          when the guard rejects
  */
@@ -419,10 +429,13 @@ const LUA_CREATE_WAIT_WITH_EVENT = `${luaStateGuard(6, 6)}
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the entity indexes by wall clock,
+  -- so the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('SET', KEYS[3], ARGV[4])
-  redis.call('ZADD', KEYS[4], score, ARGV[5])
-  redis.call('ZADD', KEYS[5], score, ARGV[5])
+  redis.call('ZADD', KEYS[4], eventScore, ARGV[5])
+  redis.call('ZADD', KEYS[5], eventScore, ARGV[5])
   return {1, ''}
 `;
 
@@ -439,7 +452,7 @@ const LUA_CREATE_WAIT_WITH_EVENT = `${luaStateGuard(6, 6)}
  * KEYS[5] = run state marker key
  * ARGV[1] = SHA-1 of the expected current wait JSON
  * ARGV[2] = updated wait JSON
- * ARGV[3] = score (timestamp)
+ * ARGV[3] = event score (eventId time; only the event indexes use it)
  * ARGV[4] = event JSON
  * ARGV[5] = event ID
  * ARGV[6] = stateUpdatedAt guard ('' to disable)
@@ -1457,6 +1470,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           guard,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         debug('step_created lua result', { wasCreated: result[0], stepId: data.correlationId });
@@ -1514,6 +1528,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           guard,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         debug('hook_created lua result', { result: result[0], hookId: data.correlationId });
@@ -1605,6 +1620,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           guard,
+          String(eventIdTime(eventId)),
         )) as [number, string];
 
         debug('wait_created lua result', { wasCreated: result[0], waitId: data.correlationId });
@@ -1653,7 +1669,8 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             specVersion: effectiveSpecVersion,
           };
 
-          const score = now.getTime();
+          // Only the event indexes take this score, so it uses eventId time.
+          const score = eventIdTime(eventId);
           const result = (await scripts.wfCasCompleteWaitWithEvent(
             waitKey(effectiveRunId, data.correlationId),
             eventKey(eventId),

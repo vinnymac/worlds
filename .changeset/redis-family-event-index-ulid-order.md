@@ -17,12 +17,15 @@ where it reproduced as a hung run roughly once in five. These two worlds never
 hit it in practice only because their round-trip latency is far lower, so the
 window between the ULID and the append is narrower. It was latent, not absent.
 
-The event index and the by-correlation index now score by `eventIdTime`. The run
-indexes still score by wall clock, so `wfCreateRunWithEvent` takes the event
-score as a separate argument rather than reusing one value for both. The
-synthesized `run_created` on the resilient-start path is backdated one
-millisecond ahead of the `run_started` that bootstraps it, since ordering now
-follows the id rather than append time.
+The event index and the by-correlation index now score by `eventIdTime`. The
+entity indexes still score by wall clock, so every fused script that writes
+both takes the event score as a separate argument rather than reusing one
+value: `wfCreateRunWithEvent`, and the step, hook, and wait creation scripts
+(plus the bullmq `hook_conflict` fallback append), which had been left on the
+wall-clock score and kept the mixed-order livelock reachable through the
+step/hook/wait paths. The synthesized `run_created` on the resilient-start
+path is backdated one millisecond ahead of the `run_started` that bootstraps
+it, since ordering now follows the id rather than append time.
 
 Separately, an unresolvable pagination cursor in world-redis-bullmq restarted
 the page at rank 0, silently repeating entries a caller had already seen. It now

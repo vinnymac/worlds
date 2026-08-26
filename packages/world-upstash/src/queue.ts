@@ -215,42 +215,43 @@ export function createQueue(config: QStashQueueConfig): Queue {
       }
       // Self-POSTs have no natural throttle the way real QStash round trips
       // do, so an immediate `{ timeoutSeconds: 0 }` republish loop would
-      // otherwise fire unboundedly many concurrent requests.
-      await loopbackSemaphore.acquire();
-      try {
-        for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {
-          try {
-            const res = await fetch(loopbackUrl(body.queueName), {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'upstash-retried': String(attempt),
-                ...opts.headers,
-              },
-              body: payload,
-            });
-            if (res.ok) return;
-            debug(`loopback delivery got ${res.status} for ${body.messageId}`);
-          } catch (err) {
-            debug('loopback delivery failed', err);
-          }
-          await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
+      // otherwise fire unboundedly many concurrent requests. The slot is held
+      // only while a request is in flight; a retry sleeping through its
+      // backoff releases it so a slow or down target cannot head-of-line
+      // block healthy deliveries.
+      for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {
+        await loopbackSemaphore.acquire();
+        try {
+          const res = await fetch(loopbackUrl(body.queueName), {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'upstash-retried': String(attempt),
+              ...opts.headers,
+            },
+            body: payload,
+          });
+          if (res.ok) return;
+          debug(`loopback delivery got ${res.status} for ${body.messageId}`);
+        } catch (err) {
+          debug('loopback delivery failed', err);
+        } finally {
+          loopbackSemaphore.release();
         }
-        // Release the dedup reservation before giving up. The pump has
-        // dropped this message for good, so leaving the key in place would
-        // silently swallow core's next re-enqueue of the same step and wedge
-        // the run forever (world-redis releases its reservation on final
-        // drop for the same reason).
-        if (opts.deduplicationId) {
-          loopbackDeliveredDedupIds.delete(opts.deduplicationId);
-        }
-        // Crash loudly in logs rather than stranding the run silently.
-        console.error(
-          `[world-upstash] loopback delivery permanently failed for message ${body.messageId}`,
-        );
-      } finally {
-        loopbackSemaphore.release();
+        await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
       }
+      // Release the dedup reservation before giving up. The pump has
+      // dropped this message for good, so leaving the key in place would
+      // silently swallow core's next re-enqueue of the same step and wedge
+      // the run forever (world-redis releases its reservation on final
+      // drop for the same reason).
+      if (opts.deduplicationId) {
+        loopbackDeliveredDedupIds.delete(opts.deduplicationId);
+      }
+      // Crash loudly in logs rather than stranding the run silently.
+      console.error(
+        `[world-upstash] loopback delivery permanently failed for message ${body.messageId}`,
+      );
     })();
   }
 

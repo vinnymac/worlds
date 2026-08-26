@@ -44,7 +44,7 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { JetStreamClient, KV, KvEntry } from 'nats';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 import { compact, debug } from './util.js';
 
@@ -615,8 +615,11 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     const events: Event[] = [];
     const eventIds = await collectIndexKeys(eventsByRunBucket, `${runId}.`);
     if (eventIds.length > 0) {
-      for (const eventId of eventIds) {
-        const entry = await getLiveEntry(eventsBucket, eventId);
+      // Batched: a serial per-event loop cost N sequential KV round trips.
+      const entries = await Promise.all(
+        eventIds.map((eventId) => getLiveEntry(eventsBucket, eventId)),
+      );
+      for (const entry of entries) {
         if (!entry) continue;
         events.push(parse<Event>(kvValueToString(entry.value)));
       }
@@ -852,8 +855,10 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             .catch(() => false);
           if (created) {
             await indexRunStatus(effectiveRunId, 'pending');
-            // Create synthetic run_created event
-            const runCreatedEventId = `wevt_${ulid()}`;
+            // Synthetic run_created event, backdated one tick below the
+            // run_started that bootstrapped it so the eventId-ordered log
+            // keeps the creation event first (mirrors the redis family).
+            const runCreatedEventId = `wevt_${ulidAt(idTime(eventId) - 1)}`;
             const runCreatedEvent = {
               eventType: 'run_created' as const,
               eventData: {

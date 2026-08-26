@@ -363,12 +363,15 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           await Promise.all(kvWrites);
         }
 
+        // Honour resolveData on the create return path, matching the read
+        // paths and every sibling world.
+        const resolveData = params?.resolveData ?? 'all';
         return {
-          event: outcome.event,
+          event: outcome.event && stripEventDataRefs(outcome.event, resolveData),
           run: outcome.run,
           step: outcome.step,
           hook: outcome.hook,
-          events: outcome.events,
+          events: outcome.events?.map((e) => stripEventDataRefs(e, resolveData)),
           // The runtime reads the ceiling from the run_started response only,
           // so it must also be present on the idempotent already-running
           // replay path -- keying off the request type covers both.
@@ -442,8 +445,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           for (const event of page.data) {
             if (event.correlationId === correlationId) matches.push(event);
           }
-          // listByPrefix only yields a cursor while more entries remain.
-          if (matches.length > limit || !page.hasMore || page.cursor === null) break;
+          // listByPrefix only yields a cursor while more entries remain, so a
+          // null cursor is the exhaustion signal.
+          if (matches.length > limit || page.cursor === null) break;
           cursor = page.cursor;
         }
 
