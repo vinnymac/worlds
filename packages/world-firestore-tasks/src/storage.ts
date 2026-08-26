@@ -649,6 +649,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           return { eventId, eventRef: eventsCol.doc(eventId), record };
         }
 
+        /** Applied to every event this call returns, including preloads. */
+        const resolveData = params?.resolveData ?? 'all';
+
         // The marker read happens inside the same transaction as the event write, so
         // it is a transaction precondition: an externally-originated event landing
         // in between aborts and retries against the newer marker.
@@ -758,7 +761,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 createdAt: now,
                 updatedAt: now,
               };
-              return { event: EventSchema.parse(record), run };
+              return { event: filterEventData(EventSchema.parse(record), resolveData), run };
             });
             break;
           }
@@ -951,7 +954,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               result = { run: txResult.unchangedRun };
             } else {
               result = {
-                event: EventSchema.parse(txResult.record),
+                event: filterEventData(EventSchema.parse(txResult.record), resolveData),
                 run:
                   txResult.bootstrappedRun ??
                   txResult.unchangedRun ??
@@ -1023,7 +1026,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 createdAt: now,
                 updatedAt: now,
               };
-              return { event: EventSchema.parse(record), step };
+              return { event: filterEventData(EventSchema.parse(record), resolveData), step };
             });
             break;
           }
@@ -1150,7 +1153,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             });
 
             result = {
-              event: EventSchema.parse(record),
+              event: filterEventData(EventSchema.parse(record), resolveData),
               step: await getStep(effectiveRunId, correlationId),
             };
             break;
@@ -1222,7 +1225,10 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                   // it with this retry's payload.
                   const { eventRef, record } = allocateEvent();
                   tx.set(eventRef, record);
-                  return { event: EventSchema.parse(record), hook: hookFromDoc(existing) };
+                  return {
+                    event: filterEventData(EventSchema.parse(record), resolveData),
+                    hook: hookFromDoc(existing),
+                  };
                 }
 
                 // Cross-hook / cross-run conflict: a different (runId, hookId)
@@ -1233,7 +1239,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                   eventData: { token: hookData.token, conflictingRunId: existing.runId },
                 });
                 tx.set(eventRef, record);
-                return { event: EventSchema.parse(record) };
+                return { event: filterEventData(EventSchema.parse(record), resolveData) };
               }
 
               const now = new Date();
@@ -1254,7 +1260,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               tx.set(tokenRef, hookDoc);
 
               return {
-                event: EventSchema.parse(record),
+                event: filterEventData(EventSchema.parse(record), resolveData),
                 hook: HookSchema.parse(compact({ ...hookDoc, metadata: hookData.metadata })),
               };
             });
@@ -1290,7 +1296,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               if (typeof hookDoc.token === 'string' && hookDoc.token.length > 0) {
                 tx.delete(firestore.collection('hooks_by_token').doc(hookDoc.token));
               }
-              return { event: EventSchema.parse(record) };
+              return { event: filterEventData(EventSchema.parse(record), resolveData) };
             });
             break;
           }
@@ -1319,7 +1325,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               const { eventId, eventRef, record } = allocateEvent();
               tx.set(eventRef, record);
               advanceStateMarker(tx, eventId, marker);
-              return { event: EventSchema.parse(record) };
+              return { event: filterEventData(EventSchema.parse(record), resolveData) };
             });
             break;
           }
@@ -1374,7 +1380,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               tx.set(waitRef, waitDoc);
 
               return {
-                event: EventSchema.parse(record),
+                event: filterEventData(EventSchema.parse(record), resolveData),
                 wait: WaitSchema.parse(compact(waitDoc)),
               };
             });
@@ -1414,7 +1420,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               tx.update(waitRef, { status: 'completed', completedAt: now, updatedAt: now });
 
               return {
-                event: EventSchema.parse(record),
+                event: filterEventData(EventSchema.parse(record), resolveData),
                 wait: waitFromDoc({
                   ...waitDoc,
                   status: 'completed',
@@ -1434,7 +1440,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               await readStateMarker(tx);
               const { eventRef, record } = allocateEvent();
               tx.set(eventRef, record);
-              return { event: EventSchema.parse(record) };
+              return { event: filterEventData(EventSchema.parse(record), resolveData) };
             });
             break;
           }
@@ -1443,7 +1449,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         // Preload all events for run_started to reduce TTFB
         if (data.eventType === 'run_started' && result.run && result.event) {
           const eventsSnapshot = await eventsCol.orderBy('eventId', 'asc').get();
-          result.events = eventsSnapshot.docs.map((doc) => eventFromDoc(doc.data()));
+          result.events = eventsSnapshot.docs.map((doc) =>
+            filterEventData(eventFromDoc(doc.data()), resolveData),
+          );
           result.cursor = result.events.at(-1)?.eventId ?? null;
           result.hasMore = false;
         }

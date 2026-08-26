@@ -981,6 +981,55 @@ describe('Storage (Firestore integration)', () => {
         return created.event!.eventId;
       }
 
+      describe('create', () => {
+        it("should strip eventData from the returned event when resolveData is 'none'", async () => {
+          const result = await storage.events.create(
+            testRunId,
+            {
+              eventType: 'step_created',
+              correlationId: 'resolve-data-create-none',
+              eventData: { stepName: 'resolve-data-create-none', input: [] },
+            },
+            { resolveData: 'none' },
+          );
+
+          expect(result.event).toBeDefined();
+          expect('eventData' in result.event!).toBe(false);
+          expect(result.step).toBeDefined();
+        });
+
+        it('should return eventData by default', async () => {
+          const result = await storage.events.create(testRunId, {
+            eventType: 'step_created',
+            correlationId: 'resolve-data-create-default',
+            eventData: { stepName: 'resolve-data-create-default', input: [] },
+          });
+
+          expect('eventData' in result.event!).toBe(true);
+        });
+
+        it("should strip eventData from run_started preloaded events when resolveData is 'none'", async () => {
+          await seedEventWithData();
+
+          const result = await storage.events.create(
+            testRunId,
+            { eventType: 'run_started' },
+            { resolveData: 'none' },
+          );
+
+          expect(result.events?.length).toBeGreaterThan(0);
+          expect(result.events!.every((event) => !('eventData' in event))).toBe(true);
+        });
+
+        it('should return eventData on run_started preloaded events by default', async () => {
+          await seedEventWithData();
+
+          const result = await storage.events.create(testRunId, { eventType: 'run_started' });
+
+          expect(result.events?.some((event) => 'eventData' in event)).toBe(true);
+        });
+      });
+
       describe('get', () => {
         it("should strip eventData when resolveData is 'none'", async () => {
           const eventId = await seedEventWithData();
