@@ -1,5 +1,85 @@
 # @fantasticfour/world-postgres-redis
 
+## 2.4.2
+
+### Patch Changes
+
+- e61c6c1: Use the official `stripEventDataRefs` instead of dropping `eventData` wholesale.
+  
+  Every world carried its own `filterEventData`, which deleted the entire
+  `eventData` key when `resolveData` was `'none'`. The official worlds do not do
+  that. `@workflow/world-local`, `@workflow/world-postgres` and
+  `@workflow/world-vercel` all use `stripEventDataRefs`, exported from
+  `@workflow/world`, and none of them contains a wholesale delete.
+  
+  The difference is the display metadata. `stripEventDataRefs` removes only the
+  large ref field for the event type (`input` for `step_created`, `result` for
+  `step_completed`, `payload` for `hook_received`, and so on) and keeps the rest,
+  so a `step_created` read with `'none'` returns `eventData: { stepName }` rather
+  than nothing at all. Our worlds were discarding exactly the fields the
+  `@workflow/web` dashboard needs to label a row, which is what `'none'` is meant
+  to preserve while dropping the payload. Event types with no ref fields, such as
+  `step_started` and `wait_created`, are now returned untouched instead of losing
+  their `eventData`.
+  
+  `stripEventDataRefs` has been exported since world 4.4.0, so this was a
+  divergence from an available helper rather than a gap being filled. Each world
+  drops its local copy along with the `as Event` cast it required.
+  
+  world-azure additionally had no event filtering at all: `resolveData` was
+  honoured for runs, steps and hooks but ignored for every event reader and for
+  the `events.create` return path, including the `run_started` preload that
+  returns the run's entire event log. All of those now filter.
+  
+  Tests were added or rewritten per world to pin the upstream contract. They
+  assert against event types that actually carry ref fields, since a type absent
+  from the ref map makes `'none'` a no-op and would pass vacuously; several of the
+  previous assertions had that flaw.
+- 132c596: Track workflow 4.8.5, and scope correlation-id event lookups to a run.
+  
+  Move the catalog to @workflow/core 4.8.5, @workflow/world 4.5.0, and
+  @workflow/world-testing 4.1.20. @workflow/errors 4.2.1 and @workflow/utils 4.1.4
+  are unchanged; 4.8.5 still pins both.
+  
+  Verified against the tarballs rather than the version numbers. world 4.5.0
+  changes exactly two source files: `events.ts` adds an optional `runId` to
+  `ListEventsByCorrelationIdParams`, and `recovery.ts` gives `reenqueueActiveRuns`
+  an optional `namespace` that defaults to `resolveQueueNamespace()`. The
+  recovery change needs nothing from us: no world passes a namespace, and the
+  default resolves the same `__wkf_workflow_` prefix the callers hardcoded
+  before, so world-mysql and world-postgres-redis keep their existing behaviour
+  and pick up `WORKFLOW_QUEUE_NAMESPACE` support for free. world-testing 4.1.20
+  ships a byte-identical conformance suite (only its bundled test app was rebuilt
+  against the new core) and still publishes no `exports` map, so the `eventLimit`
+  deep import stays as it is. Comments naming the pinned world-testing version
+  move to 4.1.20.
+  
+  `events.listByCorrelationId` now honours `runId`. A correlation id is unique
+  within its run, not across runs, so a global correlation index can return
+  same-id events belonging to sibling runs. Core 4.8.5 sends `runId`, and each
+  world now scopes on it, matching world-local and world-postgres: the predicate
+  is applied before the `limit` slice everywhere, so `hasMore` and the returned
+  cursor describe the scoped set rather than the unfiltered one. Omitting `runId`
+  keeps the previous unscoped behaviour, so older cores are unaffected.
+  
+  How each world scopes depends on its engine. world-mysql, world-mysql-redis and
+  world-postgres-redis push a `run_id` equality into the existing drizzle `WHERE`
+  clause. world-azure adds a `c.runId` condition and sets the Cosmos partition key
+  to the run, turning a cross-partition fan-out into a single-partition read.
+  world-firestore-tasks adds a server-side `where('runId', '==', ...)` ahead of
+  its `orderBy`, which requires two new composite indexes (both sort directions);
+  they are declared in `firestore.indexes.json` and deployers must apply them with
+  `firebase deploy --only firestore:indexes`. world-nats-jetstream routes the
+  scoped case through its existing `events_by_run` KV index, making it
+  O(events in run) instead of a full-bucket scan. world-redis, world-redis-bullmq
+  and world-upstash page their correlation index and filter, accumulating until
+  `limit + 1` matches are found so pagination stays exact; the unscoped path still
+  costs a single round trip.
+  
+  world-cloudflare is unchanged: its `listByCorrelationId` is a stub that returns
+  an empty page, so there is nothing to scope. Its stale comment now records why
+  it is unimplemented and that returning empty is a silent fallback.
+
 ## 2.4.1
 
 ### Patch Changes

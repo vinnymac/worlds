@@ -1,6 +1,6 @@
 {
   "name": "@fantasticfour/world-mysql",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "World implementation using pure MySQL for storage, queueing, and streaming - no external dependencies (no Redis, no QStash)",
   "keywords": [
     "aiven",
