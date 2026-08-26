@@ -1,5 +1,176 @@
 # @fantasticfour/world-upstash
 
+## 1.5.2
+
+### Patch Changes
+
+- 71f9bf5: Order the event log by eventId, fixing a permanent `stateUpdatedAt` livelock.
+  
+  The event index scored entries by `createdAt.getTime()`, a wall clock read at
+  append time, while the run's state marker and core's `stateUpdatedAt` both come
+  from the ULID minted at the start of `events.create`. Those two clocks are
+  separated by every intervening Redis round trip, so an event with an older ULID
+  could sort last.
+  
+  That is fatal because `latestEventStateUpdatedAt` in core takes the ULID time of
+  the LAST event the log returns, not the maximum. Once an older-ULID event sorted
+  last, core sent a snapshot below the marker on every replay, the guard rejected
+  it as stale, and core answered each rejection with `{ timeoutSeconds: 0 }` -
+  re-invoke with a fresh replay. The fresh replay read the same ordering and
+  computed the same value, so the run could never converge. A captured failure
+  logged 58,725 rejections, every one exactly 1 ms short, with the flow message
+  self-republishing up to 3,093 times while `deliveryCount` stayed 0.
+  
+  Core documents this guard as best-effort and states that it "fails open rather
+  than livelocking"; ordering the log by a different quantity than the marker
+  broke that contract. The event index now scores by `eventIdTime(eventId)`, so
+  log order matches eventId order and the last event is always the newest, exactly
+  as upstream world-postgres does with `orderBy(events.eventId)`. The synthesized
+  `run_created` on the resilient-start path is backdated one millisecond ahead of
+  the `run_started` that bootstraps it, preserving its position now that ordering
+  follows the id rather than append time.
+  
+  Measured, not assumed: 36 consecutive `idempotency` runs with no failure, where
+  the same build without this change still failed 1 run in 12, and roughly 1 in 5
+  across all prior samples. All 66 package tests pass, including the six
+  `stateUpdatedAt` guard tests, which are unchanged because the marker's
+  representation is untouched.
+  
+  world-redis and world-redis-bullmq score their event indexes the same way and
+  carry the identical latent defect. They are not fixed here.
+- 44d6bf9: Reject an unresolvable pagination cursor instead of silently skipping an entry.
+  
+  Every paginated list resolved its cursor with `(rank ?? 0) + 1`. When `ZRANK`
+  could not find the cursor in the index it returns null, so the expression
+  produced `1` and the page started at rank 1, dropping the index's first entry
+  without any signal. Callers got a page that looked complete and quietly lost an
+  event, step, hook, or run.
+  
+  The six call sites now share one `resolveCursorRank` helper that throws
+  `WorkflowWorldError` with status 400 for a cursor that is not in the index,
+  matching world-redis. This is a behaviour change: a caller that previously
+  passed a stale or fabricated cursor got a silently shifted page and now gets a
+  400. That is the intent, since the previous result was wrong data rather than a
+  smaller page.
+  
+  Noticed while adding correlation-id pagination coverage, which surfaced that the
+  three Redis-family worlds disagreed here: world-redis threw, world-redis-bullmq
+  restarts at rank 0 and repeats entries, and this world skipped one.
+- 132c596: Batch event-log reads into a single `MGET`, and bound loopback delivery
+  concurrency.
+  
+  `events.list`, `events.listByCorrelationId`, and the `run_started` event-log
+  preload each read their events with one `GET` per event id. On this transport
+  every command is a billed, rate-limited HTTP request, so an N-event replay cost
+  N round trips. They now issue `MGET`s in parallel chunks of 500 keys, which is
+  the dominant per-replay saving under load while keeping a long run (the
+  `run_started` preload reads the whole log, up to `maxEvents` ids) under
+  Upstash's per-request size cap.
+  
+  The `'loopback'` queue transport (tests and local development, where hosted
+  QStash cannot reach the app) now bounds in-flight deliveries with a semaphore,
+  configurable via `loopbackConcurrency` and defaulting to 10, mirroring
+  world-redis and world-nats-jetstream's default worker-pool concurrency. Real
+  QStash paces redelivery through network round trips; loopback self-POSTs have
+  no such throttle, so an immediate `{ timeoutSeconds: 0 }` republish loop could
+  otherwise fire unboundedly many concurrent requests at the harness server. A
+  slot is held only while a request is in flight; a retry sleeping through its
+  backoff releases it, so a down target cannot head-of-line block healthy
+  deliveries. `'qstash'` mode is untouched.
+  
+  Note on the flaky `idempotency` conformance test: neither change fixes it, and
+  this was measured rather than assumed. It still reproduces roughly 1 run in 3
+  to 1 in 6 both with and without these changes, and on 4.8.4 and 4.8.5 alike.
+  The failure is a `stateUpdatedAt` livelock, not a delivery-concurrency problem:
+  in a captured failure the run logged 58,725 `PreconditionFailedError`
+  rejections, every one of them with the run's state marker exactly 1 ms ahead of
+  the `stateUpdatedAt` the replay reported, so core re-invoked with
+  `{ timeoutSeconds: 0 }` forever. The flow message self-republished up to 3,093
+  times and pinned `republishCount` at the `MAX_SOFT_REPUBLISHES` ceiling of 256
+  while `deliveryCount` stayed 0, confirming the delivery-budget fix from the
+  previous release is working and that the remaining stall is upstream of it. The
+  marker is advanced by `step_completed` events under
+  `EXTERNALLY_ORIGINATED_EVENT_TYPES`, and in the captured failure two of them
+  shared a single millisecond. Adding one extra round trip to the read path made
+  the failure disappear across 14 consecutive runs, so the race is tight and
+  timing-sensitive. Diagnosing the last step is tracked separately; this release
+  does not claim to fix it.
+- e61c6c1: Use the official `stripEventDataRefs` instead of dropping `eventData` wholesale.
+  
+  Every world carried its own `filterEventData`, which deleted the entire
+  `eventData` key when `resolveData` was `'none'`. The official worlds do not do
+  that. `@workflow/world-local`, `@workflow/world-postgres` and
+  `@workflow/world-vercel` all use `stripEventDataRefs`, exported from
+  `@workflow/world`, and none of them contains a wholesale delete.
+  
+  The difference is the display metadata. `stripEventDataRefs` removes only the
+  large ref field for the event type (`input` for `step_created`, `result` for
+  `step_completed`, `payload` for `hook_received`, and so on) and keeps the rest,
+  so a `step_created` read with `'none'` returns `eventData: { stepName }` rather
+  than nothing at all. Our worlds were discarding exactly the fields the
+  `@workflow/web` dashboard needs to label a row, which is what `'none'` is meant
+  to preserve while dropping the payload. Event types with no ref fields, such as
+  `step_started` and `wait_created`, are now returned untouched instead of losing
+  their `eventData`.
+  
+  `stripEventDataRefs` has been exported since world 4.4.0, so this was a
+  divergence from an available helper rather than a gap being filled. Each world
+  drops its local copy along with the `as Event` cast it required.
+  
+  world-azure additionally had no event filtering at all: `resolveData` was
+  honoured for runs, steps and hooks but ignored for every event reader and for
+  the `events.create` return path, including the `run_started` preload that
+  returns the run's entire event log. All of those now filter.
+  
+  Tests were added or rewritten per world to pin the upstream contract. They
+  assert against event types that actually carry ref fields, since a type absent
+  from the ref map makes `'none'` a no-op and would pass vacuously; several of the
+  previous assertions had that flaw.
+- 132c596: Track workflow 4.8.5, and scope correlation-id event lookups to a run.
+  
+  Move the catalog to @workflow/core 4.8.5, @workflow/world 4.5.0, and
+  @workflow/world-testing 4.1.20. @workflow/errors 4.2.1 and @workflow/utils 4.1.4
+  are unchanged; 4.8.5 still pins both.
+  
+  Verified against the tarballs rather than the version numbers. world 4.5.0
+  changes exactly two source files: `events.ts` adds an optional `runId` to
+  `ListEventsByCorrelationIdParams`, and `recovery.ts` gives `reenqueueActiveRuns`
+  an optional `namespace` that defaults to `resolveQueueNamespace()`. The
+  recovery change needs nothing from us: no world passes a namespace, and the
+  default resolves the same `__wkf_workflow_` prefix the callers hardcoded
+  before, so world-mysql and world-postgres-redis keep their existing behaviour
+  and pick up `WORKFLOW_QUEUE_NAMESPACE` support for free. world-testing 4.1.20
+  ships a byte-identical conformance suite (only its bundled test app was rebuilt
+  against the new core) and still publishes no `exports` map, so the `eventLimit`
+  deep import stays as it is. Comments naming the pinned world-testing version
+  move to 4.1.20.
+  
+  `events.listByCorrelationId` now honours `runId`. A correlation id is unique
+  within its run, not across runs, so a global correlation index can return
+  same-id events belonging to sibling runs. Core 4.8.5 sends `runId`, and each
+  world now scopes on it, matching world-local and world-postgres: the predicate
+  is applied before the `limit` slice everywhere, so `hasMore` and the returned
+  cursor describe the scoped set rather than the unfiltered one. Omitting `runId`
+  keeps the previous unscoped behaviour, so older cores are unaffected.
+  
+  How each world scopes depends on its engine. world-mysql, world-mysql-redis and
+  world-postgres-redis push a `run_id` equality into the existing drizzle `WHERE`
+  clause. world-azure adds a `c.runId` condition and sets the Cosmos partition key
+  to the run, turning a cross-partition fan-out into a single-partition read.
+  world-firestore-tasks adds a server-side `where('runId', '==', ...)` ahead of
+  its `orderBy`, which requires two new composite indexes (both sort directions);
+  they are declared in `firestore.indexes.json` and deployers must apply them with
+  `firebase deploy --only firestore:indexes`. world-nats-jetstream routes the
+  scoped case through its existing `events_by_run` KV index, making it
+  O(events in run) instead of a full-bucket scan. world-redis, world-redis-bullmq
+  and world-upstash page their correlation index and filter, accumulating until
+  `limit + 1` matches are found so pagination stays exact; the unscoped path still
+  costs a single round trip.
+  
+  world-cloudflare is unchanged: its `listByCorrelationId` is a stub that returns
+  an empty page, so there is nothing to scope. Its stale comment now records why
+  it is unimplemented and that returning empty is a silent fallback.
+
 ## 1.5.1
 
 ### Patch Changes
