@@ -158,6 +158,17 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 }
 
 /**
+ * Filter event data based on resolveData parameter
+ */
+function filterEventData(event: Event, resolveData: ResolveData): Event {
+  if (resolveData === 'none' && 'eventData' in event) {
+    const { eventData: _, ...rest } = event;
+    return rest as Event;
+  }
+  return event;
+}
+
+/**
  * Convert a structured applyEvent failure back into the typed error the
  * runtime matches on (via error-name based `.is()` checks). Typed errors
  * cannot cross the DO RPC boundary intact, which is why the DO returns
@@ -377,7 +388,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         };
       },
 
-      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
+      async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {
         const stub = getRunDO(runId);
         const event = await stub.getEvent(eventId);
 
@@ -387,12 +398,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
 
-        return parseEvent(event);
+        return filterEventData(parseEvent(event), params?.resolveData ?? 'all');
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 100;
+        const resolveData = params?.resolveData ?? 'all';
 
         const stub = getRunDO(runId);
         const result = await stub.listEvents({
@@ -402,7 +414,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         });
 
         return {
-          data: result.data.map(parseEvent),
+          data: result.data.map((e) => filterEventData(parseEvent(e), resolveData)),
           cursor: result.cursor,
           hasMore: result.hasMore,
         };
@@ -423,6 +435,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         const limit = params.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
+        const resolveData = params.resolveData ?? 'all';
         const stub = getRunDO(runId);
 
         // Page the run's log until `limit + 1` matches are in hand. Filtering
@@ -448,7 +461,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const hasMore = matches.length > limit;
 
         return {
-          data: data.map(parseEvent),
+          data: data.map((e) => filterEventData(parseEvent(e), resolveData)),
           cursor: hasMore ? (data.at(-1)?.eventId ?? null) : null,
           hasMore,
         };

@@ -638,6 +638,92 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         ).rejects.toSatisfy((error) => WorkflowWorldError.is(error) && error.status === 400);
       });
     });
+
+    describe('resolveData', () => {
+      /** Seed one event that carries eventData and return its id. */
+      async function seedEventWithData(correlationId: string) {
+        const result = await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId,
+          eventData: { stepName: 'data-step', input: [{ big: 'payload' }] },
+        });
+        return result.event!.eventId;
+      }
+
+      it('get strips eventData when resolveData is none', async () => {
+        const eventId = await seedEventWithData('corr-resolve-get');
+
+        const event = await storage.events.get(testRunId, eventId, { resolveData: 'none' });
+
+        expect(event.eventId).toBe(eventId);
+        expect('eventData' in event).toBe(false);
+      });
+
+      it('get returns eventData by default', async () => {
+        const eventId = await seedEventWithData('corr-resolve-get-all');
+
+        const omitted = await storage.events.get(testRunId, eventId);
+        const explicit = await storage.events.get(testRunId, eventId, { resolveData: 'all' });
+
+        expect(expectEventType(omitted, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+          input: [{ big: 'payload' }],
+        });
+        expect(expectEventType(explicit, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+          input: [{ big: 'payload' }],
+        });
+      });
+
+      it('list strips eventData when resolveData is none', async () => {
+        await seedEventWithData('corr-resolve-list');
+
+        const stripped = await storage.events.list({ runId: testRunId, resolveData: 'none' });
+
+        expect(stripped.data.length).toBeGreaterThan(0);
+        expect(stripped.data.every((e) => !('eventData' in e))).toBe(true);
+      });
+
+      it('list returns eventData by default', async () => {
+        const eventId = await seedEventWithData('corr-resolve-list-all');
+
+        const result = await storage.events.list({ runId: testRunId });
+
+        const found = result.data.find((e) => e.eventId === eventId);
+        expect(expectEventType(found, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+          input: [{ big: 'payload' }],
+        });
+      });
+
+      it('listByCorrelationId strips eventData when resolveData is none', async () => {
+        await seedEventWithData('corr-resolve-corr');
+
+        const stripped = await storage.events.listByCorrelationId({
+          correlationId: 'corr-resolve-corr',
+          runId: testRunId,
+          resolveData: 'none',
+        });
+
+        expect(stripped.data.length).toBeGreaterThan(0);
+        expect(stripped.data.every((e) => !('eventData' in e))).toBe(true);
+      });
+
+      it('listByCorrelationId returns eventData by default', async () => {
+        const eventId = await seedEventWithData('corr-resolve-corr-all');
+
+        const result = await storage.events.listByCorrelationId({
+          correlationId: 'corr-resolve-corr-all',
+          runId: testRunId,
+        });
+
+        const found = result.data.find((e) => e.eventId === eventId);
+        expect(expectEventType(found, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+          input: [{ big: 'payload' }],
+        });
+      });
+    });
   });
 
   describe('hooks', () => {

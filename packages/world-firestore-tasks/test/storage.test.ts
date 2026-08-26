@@ -966,6 +966,90 @@ describe('Storage (Firestore integration)', () => {
         expect(page2.hasMore).toBe(false);
       });
     });
+
+    describe('resolveData', () => {
+      const resolveCorrelationId = 'resolve-data-step';
+
+      // A step_created always carries eventData, so it is the cheapest probe
+      // for whether a reader honours resolveData.
+      async function seedEventWithData() {
+        const created = await storage.events.create(testRunId, {
+          eventType: 'step_created',
+          correlationId: resolveCorrelationId,
+          eventData: { stepName: 'resolve-data-step', input: [] },
+        });
+        return created.event!.eventId;
+      }
+
+      describe('get', () => {
+        it("should strip eventData when resolveData is 'none'", async () => {
+          const eventId = await seedEventWithData();
+
+          const event = await storage.events.get(testRunId, eventId, {
+            resolveData: 'none',
+          });
+
+          expect('eventData' in event).toBe(false);
+          expect(event.eventId).toBe(eventId);
+        });
+
+        it('should return eventData by default', async () => {
+          const eventId = await seedEventWithData();
+
+          const event = await storage.events.get(testRunId, eventId);
+
+          expect('eventData' in event).toBe(true);
+        });
+      });
+
+      describe('list', () => {
+        it("should strip eventData from every event when resolveData is 'none'", async () => {
+          await seedEventWithData();
+
+          const result = await storage.events.list({
+            runId: testRunId,
+            resolveData: 'none',
+          });
+
+          expect(result.data.length).toBeGreaterThan(0);
+          expect(result.data.every((event) => !('eventData' in event))).toBe(true);
+        });
+
+        it('should return eventData by default', async () => {
+          await seedEventWithData();
+
+          const result = await storage.events.list({ runId: testRunId });
+
+          expect(result.data.some((event) => 'eventData' in event)).toBe(true);
+        });
+      });
+
+      describe('listByCorrelationId', () => {
+        it("should strip eventData from every event when resolveData is 'none'", async () => {
+          await seedEventWithData();
+
+          const result = await storage.events.listByCorrelationId({
+            correlationId: resolveCorrelationId,
+            runId: testRunId,
+            resolveData: 'none',
+          });
+
+          expect(result.data.length).toBeGreaterThan(0);
+          expect(result.data.every((event) => !('eventData' in event))).toBe(true);
+        });
+
+        it('should return eventData by default', async () => {
+          await seedEventWithData();
+
+          const result = await storage.events.listByCorrelationId({
+            correlationId: resolveCorrelationId,
+            runId: testRunId,
+          });
+
+          expect(result.data.some((event) => 'eventData' in event)).toBe(true);
+        });
+      });
+    });
   });
 
   describe('hooks', () => {

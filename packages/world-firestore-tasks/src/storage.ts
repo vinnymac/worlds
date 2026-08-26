@@ -359,6 +359,18 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 }
 
 /**
+ * Filter event data based on resolveData parameter.
+ * The cast is needed because destructuring widens the Event union.
+ */
+function filterEventData(event: Event, resolveData: ResolveData): Event {
+  if (resolveData === 'none' && 'eventData' in event) {
+    const { eventData: _, ...rest } = event;
+    return rest as Event;
+  }
+  return event;
+}
+
+/**
  * Serialize an error object for Firestore storage.
  */
 /** `overrides.code` carries `eventData.errorCode`, naming a run_failed reason
@@ -1446,7 +1458,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         return result;
       },
 
-      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
+      async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {
         const doc = await firestore
           .collection('workflow_runs')
           .doc(runId)
@@ -1460,13 +1472,15 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
           });
         }
 
-        return eventFromDoc(doc.data() as FirebaseFirestore.DocumentData);
+        const event = eventFromDoc(doc.data() as FirebaseFirestore.DocumentData);
+        return filterEventData(event, params?.resolveData ?? 'all');
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
         const { runId } = params;
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
+        const resolveData = params?.resolveData ?? 'all';
 
         // Order and paginate by the monotonic eventId (ULID), never
         // createdAt, whose millisecond ties and out-of-commit-order writes
@@ -1488,7 +1502,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const hasMore = all.length > limit;
 
         return {
-          data: values.map((doc) => eventFromDoc(doc.data())),
+          data: values.map((doc) => filterEventData(eventFromDoc(doc.data()), resolveData)),
           cursor: values.at(-1)?.id ?? null,
           hasMore,
         };
@@ -1498,6 +1512,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const { correlationId, runId } = params;
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
+        const resolveData = params?.resolveData ?? 'all';
 
         // Query across all runs for this correlationId, ordered and
         // paginated by the monotonic eventId (see events.list).
@@ -1530,7 +1545,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const lastEventId = values.at(-1)?.data().eventId;
 
         return {
-          data: values.map((doc) => eventFromDoc(doc.data())),
+          data: values.map((doc) => filterEventData(eventFromDoc(doc.data()), resolveData)),
           cursor: typeof lastEventId === 'string' ? lastEventId : null,
           hasMore,
         };
