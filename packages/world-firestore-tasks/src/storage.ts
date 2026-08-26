@@ -40,6 +40,7 @@ import {
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
+  stripEventDataRefs,
   ulidToDate,
   validateUlidTimestamp,
   WaitSchema,
@@ -356,18 +357,6 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
     return { metadata: undefined, ...rest };
   }
   return hook;
-}
-
-/**
- * Filter event data based on resolveData parameter.
- * The cast is needed because destructuring widens the Event union.
- */
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 /**
@@ -761,7 +750,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 createdAt: now,
                 updatedAt: now,
               };
-              return { event: filterEventData(EventSchema.parse(record), resolveData), run };
+              return { event: stripEventDataRefs(EventSchema.parse(record), resolveData), run };
             });
             break;
           }
@@ -954,7 +943,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               result = { run: txResult.unchangedRun };
             } else {
               result = {
-                event: filterEventData(EventSchema.parse(txResult.record), resolveData),
+                event: stripEventDataRefs(EventSchema.parse(txResult.record), resolveData),
                 run:
                   txResult.bootstrappedRun ??
                   txResult.unchangedRun ??
@@ -1026,7 +1015,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                 createdAt: now,
                 updatedAt: now,
               };
-              return { event: filterEventData(EventSchema.parse(record), resolveData), step };
+              return { event: stripEventDataRefs(EventSchema.parse(record), resolveData), step };
             });
             break;
           }
@@ -1153,7 +1142,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             });
 
             result = {
-              event: filterEventData(EventSchema.parse(record), resolveData),
+              event: stripEventDataRefs(EventSchema.parse(record), resolveData),
               step: await getStep(effectiveRunId, correlationId),
             };
             break;
@@ -1226,7 +1215,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                   const { eventRef, record } = allocateEvent();
                   tx.set(eventRef, record);
                   return {
-                    event: filterEventData(EventSchema.parse(record), resolveData),
+                    event: stripEventDataRefs(EventSchema.parse(record), resolveData),
                     hook: hookFromDoc(existing),
                   };
                 }
@@ -1239,7 +1228,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
                   eventData: { token: hookData.token, conflictingRunId: existing.runId },
                 });
                 tx.set(eventRef, record);
-                return { event: filterEventData(EventSchema.parse(record), resolveData) };
+                return { event: stripEventDataRefs(EventSchema.parse(record), resolveData) };
               }
 
               const now = new Date();
@@ -1260,7 +1249,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               tx.set(tokenRef, hookDoc);
 
               return {
-                event: filterEventData(EventSchema.parse(record), resolveData),
+                event: stripEventDataRefs(EventSchema.parse(record), resolveData),
                 hook: HookSchema.parse(compact({ ...hookDoc, metadata: hookData.metadata })),
               };
             });
@@ -1296,7 +1285,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               if (typeof hookDoc.token === 'string' && hookDoc.token.length > 0) {
                 tx.delete(firestore.collection('hooks_by_token').doc(hookDoc.token));
               }
-              return { event: filterEventData(EventSchema.parse(record), resolveData) };
+              return { event: stripEventDataRefs(EventSchema.parse(record), resolveData) };
             });
             break;
           }
@@ -1325,7 +1314,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               const { eventId, eventRef, record } = allocateEvent();
               tx.set(eventRef, record);
               advanceStateMarker(tx, eventId, marker);
-              return { event: filterEventData(EventSchema.parse(record), resolveData) };
+              return { event: stripEventDataRefs(EventSchema.parse(record), resolveData) };
             });
             break;
           }
@@ -1380,7 +1369,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               tx.set(waitRef, waitDoc);
 
               return {
-                event: filterEventData(EventSchema.parse(record), resolveData),
+                event: stripEventDataRefs(EventSchema.parse(record), resolveData),
                 wait: WaitSchema.parse(compact(waitDoc)),
               };
             });
@@ -1420,7 +1409,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               tx.update(waitRef, { status: 'completed', completedAt: now, updatedAt: now });
 
               return {
-                event: filterEventData(EventSchema.parse(record), resolveData),
+                event: stripEventDataRefs(EventSchema.parse(record), resolveData),
                 wait: waitFromDoc({
                   ...waitDoc,
                   status: 'completed',
@@ -1440,7 +1429,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               await readStateMarker(tx);
               const { eventRef, record } = allocateEvent();
               tx.set(eventRef, record);
-              return { event: filterEventData(EventSchema.parse(record), resolveData) };
+              return { event: stripEventDataRefs(EventSchema.parse(record), resolveData) };
             });
             break;
           }
@@ -1450,7 +1439,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         if (data.eventType === 'run_started' && result.run && result.event) {
           const eventsSnapshot = await eventsCol.orderBy('eventId', 'asc').get();
           result.events = eventsSnapshot.docs.map((doc) =>
-            filterEventData(eventFromDoc(doc.data()), resolveData),
+            stripEventDataRefs(eventFromDoc(doc.data()), resolveData),
           );
           result.cursor = result.events.at(-1)?.eventId ?? null;
           result.hasMore = false;
@@ -1481,7 +1470,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         }
 
         const event = eventFromDoc(doc.data() as FirebaseFirestore.DocumentData);
-        return filterEventData(event, params?.resolveData ?? 'all');
+        return stripEventDataRefs(event, params?.resolveData ?? 'all');
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -1510,7 +1499,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const hasMore = all.length > limit;
 
         return {
-          data: values.map((doc) => filterEventData(eventFromDoc(doc.data()), resolveData)),
+          data: values.map((doc) => stripEventDataRefs(eventFromDoc(doc.data()), resolveData)),
           cursor: values.at(-1)?.id ?? null,
           hasMore,
         };
@@ -1553,7 +1542,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
         const lastEventId = values.at(-1)?.data().eventId;
 
         return {
-          data: values.map((doc) => filterEventData(eventFromDoc(doc.data()), resolveData)),
+          data: values.map((doc) => stripEventDataRefs(eventFromDoc(doc.data()), resolveData)),
           cursor: typeof lastEventId === 'string' ? lastEventId : null,
           hasMore,
         };

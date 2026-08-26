@@ -37,6 +37,7 @@ import {
   HookSchema,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { parse, stringify } from '@fantasticfour/shared';
@@ -155,17 +156,6 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
     return { metadata: undefined, ...rest };
   }
   return hook;
-}
-
-/**
- * Filter event data based on resolveData parameter
- */
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 /**
@@ -398,7 +388,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
 
-        return filterEventData(parseEvent(event), params?.resolveData ?? 'all');
+        return stripEventDataRefs(parseEvent(event), params?.resolveData ?? 'all');
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -414,7 +404,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         });
 
         return {
-          data: result.data.map((e) => filterEventData(parseEvent(e), resolveData)),
+          data: result.data.map((e) => stripEventDataRefs(parseEvent(e), resolveData)),
           cursor: result.cursor,
           hasMore: result.hasMore,
         };
@@ -461,7 +451,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const hasMore = matches.length > limit;
 
         return {
-          data: data.map((e) => filterEventData(parseEvent(e), resolveData)),
+          data: data.map((e) => stripEventDataRefs(parseEvent(e), resolveData)),
           cursor: hasMore ? (data.at(-1)?.eventId ?? null) : null,
           hasMore,
         };

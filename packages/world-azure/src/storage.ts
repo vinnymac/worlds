@@ -45,6 +45,7 @@ import {
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
+  stripEventDataRefs,
   ulidToDate,
   WaitSchema,
 } from '@workflow/world';
@@ -1323,6 +1324,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         params?: CreateEventParams,
       ): Promise<EventResult> {
         const now = new Date();
+        // Resolved once so every return site below strips the same way.
+        const resolveData = params?.resolveData ?? 'all';
 
         // For run_created events, generate a runId if null
         const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
@@ -1444,7 +1447,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           delete parsedInput.eventData;
         }
         const parsed = EventSchema.parse(parsedInput);
-        const result: EventResult = { event: parsed };
+        const result: EventResult = { event: stripEventDataRefs(parsed, resolveData) };
 
         // Cosmos has no serializable read, so the guard is a conditional Patch on the
         // marker inside the same transactional batch as the event write. Strictly
@@ -1655,7 +1658,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               guard,
             );
             if (conflictEvent) {
-              result.event = conflictEvent;
+              result.event = stripEventDataRefs(conflictEvent, resolveData);
             } else {
               result.hook = hook;
             }
@@ -1747,7 +1750,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           const { resources: eventDocs } = await withCosmosRetry(() =>
             container.items.query(eventsQuery, { partitionKey: effectiveRunId }).fetchAll(),
           );
-          result.events = eventDocs.map((doc: Record<string, unknown>) => deserializeEvent(doc));
+          result.events = eventDocs.map((doc: Record<string, unknown>) =>
+            stripEventDataRefs(deserializeEvent(doc), resolveData),
+          );
           result.cursor = result.events.at(-1)?.eventId ?? null;
           result.hasMore = false;
         }
@@ -1762,7 +1767,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         return result;
       },
 
-      async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
+      async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {
         const doc = await readRunPartitionDoc(runId, `event:${runId}:${eventId}`);
         if (!doc) {
           throw new WorkflowWorldError(`Event not found: ${eventId}`, {
@@ -1770,11 +1775,12 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           });
         }
 
-        return deserializeEvent(doc);
+        return stripEventDataRefs(deserializeEvent(doc), params?.resolveData ?? 'all');
       },
 
       async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
         const { runId } = params;
+        const resolveData = params?.resolveData ?? 'all';
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
@@ -1807,7 +1813,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const hasMore = resources.length > limit;
 
         return {
-          data: values.map((doc: Record<string, unknown>) => deserializeEvent(doc)),
+          data: values.map((doc: Record<string, unknown>) =>
+            stripEventDataRefs(deserializeEvent(doc), resolveData),
+          ),
           cursor:
             values.length > 0
               ? ((values[values.length - 1] as Record<string, unknown>).eventId as string)
@@ -1818,6 +1826,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
       async listByCorrelationId(params) {
         const { correlationId, runId } = params;
+        const resolveData = params?.resolveData ?? 'all';
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
@@ -1866,7 +1875,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         const hasMore = resources.length > limit;
 
         return {
-          data: values.map((doc: Record<string, unknown>) => deserializeEvent(doc)),
+          data: values.map((doc: Record<string, unknown>) =>
+            stripEventDataRefs(deserializeEvent(doc), resolveData),
+          ),
           cursor:
             values.length > 0
               ? ((values[values.length - 1] as Record<string, unknown>).eventId as string)

@@ -39,6 +39,7 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
@@ -223,14 +224,6 @@ function filterRunData(
     return { input: undefined, output: undefined, ...rest };
   }
   return run;
-}
-
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +729,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
 
         await putEvent(runId, eventId, event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -923,7 +916,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             run: fullRunEntry
               ? (parse<WorkflowRun>(kvValueToString(fullRunEntry.value)) as WorkflowRun)
               : undefined,
@@ -1508,7 +1501,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
           const parsedConflict = EventSchema.parse(conflictEvent);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsedConflict, resolveData),
+            event: stripEventDataRefs(parsedConflict, resolveData),
             run,
             step,
             hook: undefined,
@@ -1684,12 +1677,12 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         // Sort by eventId ascending (monotonic ULIDs, the log order)
         eventsList.sort((a, b) => compareIds(a.eventId, b.eventId));
         allEvents = eventsList.map((e) =>
-          filterEventData(EventSchema.parse(compact(e)), resolveData),
+          stripEventDataRefs(EventSchema.parse(compact(e)), resolveData),
         );
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1722,7 +1715,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
         });
       }
       const parsed = EventSchema.parse(compact(event));
-      return filterEventData(parsed, params?.resolveData ?? 'all');
+      return stripEventDataRefs(parsed, params?.resolveData ?? 'all');
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -1755,7 +1748,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1818,7 +1811,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,

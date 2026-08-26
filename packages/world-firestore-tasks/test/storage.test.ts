@@ -3,6 +3,7 @@ import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { PreconditionFailedError } from '@workflow/errors';
+import type { Event } from '@workflow/world';
 import { ulidToDate } from '@workflow/world';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
@@ -970,8 +971,9 @@ describe('Storage (Firestore integration)', () => {
     describe('resolveData', () => {
       const resolveCorrelationId = 'resolve-data-step';
 
-      // A step_created always carries eventData, so it is the cheapest probe
-      // for whether a reader honours resolveData.
+      // step_created is one of the ref-bearing event types: `input` is a ref
+      // field, `stepName` is display metadata the dashboard renders. It is the
+      // cheapest probe for whether a reader strips refs without losing metadata.
       async function seedEventWithData() {
         const created = await storage.events.create(testRunId, {
           eventType: 'step_created',
@@ -981,8 +983,16 @@ describe('Storage (Firestore integration)', () => {
         return created.event!.eventId;
       }
 
+      /** Narrow an event to step_created so its eventData is typed. */
+      function expectStepCreated(event: Event | undefined) {
+        if (event?.eventType !== 'step_created') {
+          throw new Error(`expected step_created, received ${event?.eventType ?? 'undefined'}`);
+        }
+        return event;
+      }
+
       describe('create', () => {
-        it("should strip eventData from the returned event when resolveData is 'none'", async () => {
+        it("should strip only the input ref from the returned event when resolveData is 'none'", async () => {
           const result = await storage.events.create(
             testRunId,
             {
@@ -994,7 +1004,9 @@ describe('Storage (Firestore integration)', () => {
           );
 
           expect(result.event).toBeDefined();
-          expect('eventData' in result.event!).toBe(false);
+          const eventData = expectStepCreated(result.event).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-create-none');
           expect(result.step).toBeDefined();
         });
 
@@ -1005,11 +1017,13 @@ describe('Storage (Firestore integration)', () => {
             eventData: { stepName: 'resolve-data-create-default', input: [] },
           });
 
-          expect('eventData' in result.event!).toBe(true);
+          const eventData = expectStepCreated(result.event).eventData;
+          expect(eventData.stepName).toBe('resolve-data-create-default');
+          expect(eventData.input).toEqual([]);
         });
 
-        it("should strip eventData from run_started preloaded events when resolveData is 'none'", async () => {
-          await seedEventWithData();
+        it("should strip refs from run_started preloaded events when resolveData is 'none'", async () => {
+          const seededId = await seedEventWithData();
 
           const result = await storage.events.create(
             testRunId,
@@ -1018,28 +1032,58 @@ describe('Storage (Firestore integration)', () => {
           );
 
           expect(result.events?.length).toBeGreaterThan(0);
-          expect(result.events!.every((event) => !('eventData' in event))).toBe(true);
+          const eventData = expectStepCreated(
+            result.events?.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
         });
 
         it('should return eventData on run_started preloaded events by default', async () => {
-          await seedEventWithData();
+          const seededId = await seedEventWithData();
 
           const result = await storage.events.create(testRunId, { eventType: 'run_started' });
 
-          expect(result.events?.some((event) => 'eventData' in event)).toBe(true);
+          const eventData = expectStepCreated(
+            result.events?.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect(eventData.input).toEqual([]);
+        });
+
+        it("should leave event types without ref fields untouched when resolveData is 'none'", async () => {
+          await seedEventWithData();
+
+          // step_started is absent from the ref-field map, so 'none' is a no-op
+          // and every eventData key must survive the round trip.
+          const result = await storage.events.create(
+            testRunId,
+            {
+              eventType: 'step_started',
+              correlationId: resolveCorrelationId,
+              eventData: { stepName: 'resolve-data-step', attempt: 1 },
+            },
+            { resolveData: 'none' },
+          );
+
+          expect(result.event?.eventType).toBe('step_started');
+          expect(
+            result.event && 'eventData' in result.event ? result.event.eventData : undefined,
+          ).toEqual({ stepName: 'resolve-data-step', attempt: 1 });
         });
       });
 
       describe('get', () => {
-        it("should strip eventData when resolveData is 'none'", async () => {
+        it("should strip only the input ref when resolveData is 'none'", async () => {
           const eventId = await seedEventWithData();
 
           const event = await storage.events.get(testRunId, eventId, {
             resolveData: 'none',
           });
 
-          expect('eventData' in event).toBe(false);
           expect(event.eventId).toBe(eventId);
+          const eventData = expectStepCreated(event).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
         });
 
         it('should return eventData by default', async () => {
@@ -1047,13 +1091,15 @@ describe('Storage (Firestore integration)', () => {
 
           const event = await storage.events.get(testRunId, eventId);
 
-          expect('eventData' in event).toBe(true);
+          const eventData = expectStepCreated(event).eventData;
+          expect(eventData.stepName).toBe('resolve-data-step');
+          expect(eventData.input).toEqual([]);
         });
       });
 
       describe('list', () => {
-        it("should strip eventData from every event when resolveData is 'none'", async () => {
-          await seedEventWithData();
+        it("should strip refs from every event when resolveData is 'none'", async () => {
+          const seededId = await seedEventWithData();
 
           const result = await storage.events.list({
             runId: testRunId,
@@ -1061,21 +1107,28 @@ describe('Storage (Firestore integration)', () => {
           });
 
           expect(result.data.length).toBeGreaterThan(0);
-          expect(result.data.every((event) => !('eventData' in event))).toBe(true);
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
         });
 
         it('should return eventData by default', async () => {
-          await seedEventWithData();
+          const seededId = await seedEventWithData();
 
           const result = await storage.events.list({ runId: testRunId });
 
-          expect(result.data.some((event) => 'eventData' in event)).toBe(true);
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect(eventData.input).toEqual([]);
         });
       });
 
       describe('listByCorrelationId', () => {
-        it("should strip eventData from every event when resolveData is 'none'", async () => {
-          await seedEventWithData();
+        it("should strip refs from every event when resolveData is 'none'", async () => {
+          const seededId = await seedEventWithData();
 
           const result = await storage.events.listByCorrelationId({
             correlationId: resolveCorrelationId,
@@ -1084,18 +1137,25 @@ describe('Storage (Firestore integration)', () => {
           });
 
           expect(result.data.length).toBeGreaterThan(0);
-          expect(result.data.every((event) => !('eventData' in event))).toBe(true);
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect('input' in eventData).toBe(false);
+          expect(eventData.stepName).toBe('resolve-data-step');
         });
 
         it('should return eventData by default', async () => {
-          await seedEventWithData();
+          const seededId = await seedEventWithData();
 
           const result = await storage.events.listByCorrelationId({
             correlationId: resolveCorrelationId,
             runId: testRunId,
           });
 
-          expect(result.data.some((event) => 'eventData' in event)).toBe(true);
+          const eventData = expectStepCreated(
+            result.data.find((event) => event.eventId === seededId),
+          ).eventData;
+          expect(eventData.input).toEqual([]);
         });
       });
     });

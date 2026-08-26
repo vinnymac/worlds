@@ -37,6 +37,7 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   ulidToDate,
   WorkflowRunSchema,
 } from '@workflow/world';
@@ -236,14 +237,6 @@ function filterRunData(
     return { input: undefined, output: undefined, ...rest };
   }
   return run;
-}
-
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 /**
@@ -584,7 +577,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         await appendEvent(runId, eventId, event, data.correlationId);
 
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -781,7 +774,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             run: fullRunData ? (parse<WorkflowRun>(fullRunData) as WorkflowRun) : undefined,
           };
         }
@@ -1364,7 +1357,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
             const parsedConflict = EventSchema.parse(conflictEvent);
             const resolveData = params?.resolveData ?? 'all';
             return {
-              event: filterEventData(parsedConflict, resolveData),
+              event: stripEventDataRefs(parsedConflict, resolveData),
               run,
               step,
               hook: undefined,
@@ -1415,7 +1408,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
         if (allEventIds.length > 0) {
           const eventsList = (await getManyEvents(allEventIds)).map((e) => {
             const p = EventSchema.parse(compact(e));
-            return filterEventData(p, resolveData);
+            return stripEventDataRefs(p, resolveData);
           });
           allEvents = eventsList;
         } else {
@@ -1424,7 +1417,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1468,7 +1461,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1519,7 +1512,7 @@ export function createEventsStorage(config: UpstashStorageConfig): Storage['even
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,

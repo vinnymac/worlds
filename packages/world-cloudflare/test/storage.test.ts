@@ -640,6 +640,8 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
     });
 
     describe('resolveData', () => {
+      // step_created is a ref-bearing type: `input` is the ref field, `stepName`
+      // is display metadata that must survive a 'none' read.
       /** Seed one event that carries eventData and return its id. */
       async function seedEventWithData(correlationId: string) {
         const result = await storage.events.create(testRunId, {
@@ -650,13 +652,34 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         return result.event!.eventId;
       }
 
-      it('get strips eventData when resolveData is none', async () => {
+      it('get strips only the input ref when resolveData is none', async () => {
         const eventId = await seedEventWithData('corr-resolve-get');
 
         const event = await storage.events.get(testRunId, eventId, { resolveData: 'none' });
 
         expect(event.eventId).toBe(eventId);
-        expect('eventData' in event).toBe(false);
+        expect(expectEventType(event, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+        });
+      });
+
+      it('get leaves event types without ref fields untouched when resolveData is none', async () => {
+        // step_started is absent from the ref-field map, so 'none' is a no-op.
+        await seedEventWithData('corr-resolve-noop');
+        const created = await storage.events.create(testRunId, {
+          eventType: 'step_started',
+          correlationId: 'corr-resolve-noop',
+          eventData: { stepName: 'noop-step', attempt: 1 },
+        });
+
+        const event = await storage.events.get(testRunId, created.event!.eventId, {
+          resolveData: 'none',
+        });
+
+        expect(expectEventType(event, 'step_started').eventData).toEqual({
+          stepName: 'noop-step',
+          attempt: 1,
+        });
       });
 
       it('get returns eventData by default', async () => {
@@ -675,13 +698,16 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         });
       });
 
-      it('list strips eventData when resolveData is none', async () => {
-        await seedEventWithData('corr-resolve-list');
+      it('list strips only the input ref when resolveData is none', async () => {
+        const eventId = await seedEventWithData('corr-resolve-list');
 
         const stripped = await storage.events.list({ runId: testRunId, resolveData: 'none' });
 
         expect(stripped.data.length).toBeGreaterThan(0);
-        expect(stripped.data.every((e) => !('eventData' in e))).toBe(true);
+        const found = stripped.data.find((e) => e.eventId === eventId);
+        expect(expectEventType(found, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+        });
       });
 
       it('list returns eventData by default', async () => {
@@ -696,8 +722,8 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         });
       });
 
-      it('listByCorrelationId strips eventData when resolveData is none', async () => {
-        await seedEventWithData('corr-resolve-corr');
+      it('listByCorrelationId strips only the input ref when resolveData is none', async () => {
+        const eventId = await seedEventWithData('corr-resolve-corr');
 
         const stripped = await storage.events.listByCorrelationId({
           correlationId: 'corr-resolve-corr',
@@ -706,7 +732,10 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         });
 
         expect(stripped.data.length).toBeGreaterThan(0);
-        expect(stripped.data.every((e) => !('eventData' in e))).toBe(true);
+        const found = stripped.data.find((e) => e.eventId === eventId);
+        expect(expectEventType(found, 'step_created').eventData).toEqual({
+          stepName: 'data-step',
+        });
       });
 
       it('listByCorrelationId returns eventData by default', async () => {

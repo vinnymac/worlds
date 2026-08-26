@@ -999,4 +999,34 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(page2.hasMore).toBe(false);
     });
   });
+
+  describe("resolveData: 'none' event data", () => {
+    // `step_created` carries both a ref field (`input`) and display metadata
+    // (`stepName`), so it distinguishes stripping refs from dropping eventData
+    // wholesale. Event types outside the ref map are a no-op and prove nothing.
+    it('strips only the ref field and keeps sibling metadata', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      const stepId = `step-strip-refs-${ulid()}`;
+      await createStep(run.runId, stepId);
+
+      const lean = await world.events.list({
+        runId: run.runId,
+        pagination: {},
+        resolveData: 'none',
+      });
+      const leanEvent = expectEventType(
+        lean.data.find((e) => e.eventType === 'step_created' && e.correlationId === stepId),
+        'step_created',
+      );
+      expect(leanEvent.eventData).toEqual({ stepName: 'test-step' });
+
+      const full = await world.events.list({ runId: run.runId, pagination: {} });
+      const fullEvent = expectEventType(
+        full.data.find((e) => e.eventType === 'step_created' && e.correlationId === stepId),
+        'step_created',
+      );
+      expect(fullEvent.eventData).toEqual({ stepName: 'test-step', input: ['input1'] });
+    });
+  });
 });

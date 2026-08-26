@@ -2,6 +2,7 @@ import { setTimeout } from 'node:timers/promises';
 import { expectRejectedWith } from '@fantasticfour/testing';
 import { RedisContainer } from '@testcontainers/redis';
 import { PreconditionFailedError } from '@workflow/errors';
+import type { Event } from '@workflow/world';
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
@@ -1505,6 +1506,109 @@ describe('Storage (Redis integration)', () => {
       expect(descending.data.map((e) => e.eventId)).toEqual(
         ascending.data.map((e) => e.eventId).reverse(),
       );
+    });
+  });
+
+  describe("resolveData: 'none' strips refs, not metadata", () => {
+    /** Read `eventData` without pinning a concrete event type. */
+    function dataOf(event: Event | undefined): unknown {
+      return event && 'eventData' in event ? event.eventData : undefined;
+    }
+
+    /** Whether the event still carries an `eventData` key at all. */
+    function carriesData(event: Event | undefined): boolean {
+      return event !== undefined && 'eventData' in event;
+    }
+
+    it('drops the step_created input ref and keeps the display metadata', async () => {
+      const run = await createRun();
+      const created = await events.create(
+        run.runId,
+        {
+          eventType: 'step_created',
+          correlationId: 'strip-step',
+          eventData: { stepName: 'chargeCard', input: [{ amount: 100 }] },
+        },
+        { resolveData: 'none' },
+      );
+
+      expect(dataOf(created.event)).toEqual({ stepName: 'chargeCard' });
+
+      const full = await events.list({ runId: run.runId });
+      const fullEvent = full.data.find((e) => e.eventId === created.event!.eventId);
+      expect(dataOf(fullEvent)).toEqual({ stepName: 'chargeCard', input: [{ amount: 100 }] });
+    });
+
+    it('drops the run_created input ref and keeps deploymentId and workflowName', async () => {
+      const created = await events.create(
+        null,
+        {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'deployment-strip',
+            workflowName: 'strip-workflow',
+            input: [{ big: 'payload' }],
+          },
+        },
+        { resolveData: 'none' },
+      );
+
+      expect(dataOf(created.event)).toEqual({
+        deploymentId: 'deployment-strip',
+        workflowName: 'strip-workflow',
+      });
+    });
+
+    it('omits eventData entirely when the ref was its only field', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started', eventData: {} });
+      const created = await events.create(
+        run.runId,
+        { eventType: 'run_completed', eventData: { output: ['done'] } },
+        { resolveData: 'none' },
+      );
+
+      expect(carriesData(created.event)).toBe(false);
+    });
+
+    it('leaves wait_created untouched because it declares no ref fields', async () => {
+      const run = await createRun();
+      const resumeAt = new Date(Date.now() + 60_000);
+      await events.create(run.runId, {
+        eventType: 'wait_created',
+        correlationId: 'strip-wait',
+        eventData: { resumeAt },
+      });
+
+      const lean = await events.listByCorrelationId({
+        correlationId: 'strip-wait',
+        runId: run.runId,
+        resolveData: 'none',
+      });
+
+      expect(lean.data).toHaveLength(1);
+      expect(dataOf(lean.data[0])).toEqual({ resumeAt });
+    });
+
+    it('applies the same stripping to list and listByCorrelationId', async () => {
+      const run = await createRun();
+      const created = await events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'strip-surfaces',
+        eventData: { stepName: 'sendEmail', input: [{ to: 'a@b.c' }] },
+      });
+
+      const listed = await events.list({ runId: run.runId, resolveData: 'none' });
+      const fromList = listed.data.find((e) => e.eventId === created.event!.eventId);
+      expect(dataOf(fromList)).toEqual({ stepName: 'sendEmail' });
+
+      const byCorrelation = await events.listByCorrelationId({
+        correlationId: 'strip-surfaces',
+        runId: run.runId,
+        resolveData: 'none',
+      });
+      expect(byCorrelation.data).toHaveLength(1);
+      expect(dataOf(byCorrelation.data[0])).toEqual({ stepName: 'sendEmail' });
     });
   });
 });

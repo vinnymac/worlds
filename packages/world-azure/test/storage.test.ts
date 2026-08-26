@@ -5,7 +5,7 @@ import {
   PreconditionFailedError,
   WorkflowRunNotFoundError,
 } from '@workflow/errors';
-import type { WorkflowRun, Step } from '@workflow/world';
+import type { Event, WorkflowRun, Step } from '@workflow/world';
 import { ulidToDate } from '@workflow/world';
 import type { Mock } from 'vitest';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -943,6 +943,167 @@ describe('Storage (Azure Cosmos DB integration)', () => {
 
       expect(page2.data.map((e) => e.eventId)).toEqual([seeded.a[2]]);
       expect(page2.hasMore).toBe(false);
+    });
+  });
+
+  describe('events resolveData filtering', () => {
+    // Events are a discriminated union and only some members carry eventData,
+    // so `in` narrows without a cast. An event that legitimately has none
+    // yields undefined and fails the caller's toEqual.
+    function eventDataOf(event: Event | undefined): unknown {
+      if (!event) throw new Error('expected an event');
+      return 'eventData' in event ? event.eventData : undefined;
+    }
+
+    // step_created carries `input` as its only ref field, so `stepName`
+    // survives stripping and proves the filter is field-scoped rather than a
+    // wholesale eventData delete.
+    async function seedStepCreated(workflowName: string, stepId: string) {
+      const run = await createRun(workflowName);
+      const created = await storage.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: stepId,
+        eventData: { stepName: 'chargeCard', input: [{ amount: 42 }] },
+      });
+      return { runId: run.runId, eventId: created.event!.eventId, created };
+    }
+
+    it('events.create strips the ref field under resolveData none', async () => {
+      const run = await createRun('create-strip-workflow');
+      const created = await storage.events.create(
+        run.runId,
+        {
+          eventType: 'step_created',
+          correlationId: 'step-create-strip',
+          eventData: { stepName: 'chargeCard', input: [{ amount: 42 }] },
+        },
+        { resolveData: 'none' },
+      );
+
+      expect(eventDataOf(created.event)).toEqual({ stepName: 'chargeCard' });
+    });
+
+    it('events.create returns full eventData by default', async () => {
+      const { created } = await seedStepCreated('create-default-workflow', 'step-create-default');
+
+      expect(eventDataOf(created.event)).toEqual({
+        stepName: 'chargeCard',
+        input: [{ amount: 42 }],
+      });
+    });
+
+    it('events.create strips hook_created metadata under resolveData none', async () => {
+      const run = await createRun('create-hook-strip-workflow');
+      const created = await storage.events.create(
+        run.runId,
+        {
+          eventType: 'hook_created',
+          correlationId: 'hook-strip',
+          eventData: { token: 'token-strip', metadata: { secret: 'shh' } },
+        },
+        { resolveData: 'none' },
+      );
+
+      expect(eventDataOf(created.event)).toEqual({ token: 'token-strip' });
+    });
+
+    it('events.get strips the ref field under resolveData none', async () => {
+      const { runId, eventId } = await seedStepCreated('get-strip-workflow', 'step-get-strip');
+
+      const event = await storage.events.get(runId, eventId, { resolveData: 'none' });
+
+      expect(eventDataOf(event)).toEqual({ stepName: 'chargeCard' });
+    });
+
+    it('events.get returns full eventData by default', async () => {
+      const { runId, eventId } = await seedStepCreated('get-default-workflow', 'step-get-default');
+
+      const event = await storage.events.get(runId, eventId);
+
+      expect(eventDataOf(event)).toEqual({ stepName: 'chargeCard', input: [{ amount: 42 }] });
+    });
+
+    it('events.list strips the ref field under resolveData none', async () => {
+      const { runId, eventId } = await seedStepCreated('list-strip-workflow', 'step-list-strip');
+
+      const result = await storage.events.list({ runId, resolveData: 'none', pagination: {} });
+      const stepCreated = result.data.find((e) => e.eventId === eventId);
+
+      expect(eventDataOf(stepCreated)).toEqual({ stepName: 'chargeCard' });
+      // run_created keeps its non-ref siblings while losing `input`.
+      const runCreated = result.data.find((e) => e.eventType === 'run_created');
+      expect(eventDataOf(runCreated)).toEqual({
+        deploymentId: 'test-deployment',
+        workflowName: 'list-strip-workflow',
+      });
+    });
+
+    it('events.list returns full eventData by default', async () => {
+      const { runId, eventId } = await seedStepCreated(
+        'list-default-workflow',
+        'step-list-default',
+      );
+
+      const result = await storage.events.list({ runId, pagination: {} });
+      const stepCreated = result.data.find((e) => e.eventId === eventId);
+
+      expect(eventDataOf(stepCreated)).toEqual({ stepName: 'chargeCard', input: [{ amount: 42 }] });
+    });
+
+    it('events.listByCorrelationId strips the ref field under resolveData none', async () => {
+      const { runId } = await seedStepCreated('corr-strip-workflow', 'step-corr-strip');
+
+      const result = await storage.events.listByCorrelationId({
+        correlationId: 'step-corr-strip',
+        runId,
+        resolveData: 'none',
+        pagination: {},
+      });
+
+      expect(result.data).toHaveLength(1);
+      expect(eventDataOf(result.data[0])).toEqual({ stepName: 'chargeCard' });
+    });
+
+    it('events.listByCorrelationId returns full eventData by default', async () => {
+      const { runId } = await seedStepCreated('corr-default-workflow', 'step-corr-default');
+
+      const result = await storage.events.listByCorrelationId({
+        correlationId: 'step-corr-default',
+        runId,
+        pagination: {},
+      });
+
+      expect(eventDataOf(result.data[0])).toEqual({
+        stepName: 'chargeCard',
+        input: [{ amount: 42 }],
+      });
+    });
+
+    it('the run_started event-log preload strips ref fields under resolveData none', async () => {
+      const { runId } = await seedStepCreated('preload-strip-workflow', 'step-preload-strip');
+
+      const started = await storage.events.create(
+        runId,
+        { eventType: 'run_started' },
+        { resolveData: 'none' },
+      );
+
+      const runCreated = started.events!.find((e) => e.eventType === 'run_created');
+      expect(eventDataOf(runCreated)).toEqual({
+        deploymentId: 'test-deployment',
+        workflowName: 'preload-strip-workflow',
+      });
+      const stepCreated = started.events!.find((e) => e.eventType === 'step_created');
+      expect(eventDataOf(stepCreated)).toEqual({ stepName: 'chargeCard' });
+    });
+
+    it('the run_started event-log preload returns full eventData by default', async () => {
+      const { runId } = await seedStepCreated('preload-default-workflow', 'step-preload-default');
+
+      const started = await storage.events.create(runId, { eventType: 'run_started' });
+
+      const stepCreated = started.events!.find((e) => e.eventType === 'step_created');
+      expect(eventDataOf(stepCreated)).toEqual({ stepName: 'chargeCard', input: [{ amount: 42 }] });
     });
   });
 });

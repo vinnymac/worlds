@@ -27,6 +27,7 @@ import {
   HookSchema,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { and, desc, eq, gt, lt, notInArray, sql } from 'drizzle-orm';
@@ -500,7 +501,7 @@ export function createEventsStorage(
           const parsed = EventSchema.parse(result);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             run: fullRun
               ? (() => {
                   fullRun.output ||= fullRun.outputJson;
@@ -1136,7 +1137,7 @@ export function createEventsStorage(
           const parsedConflict = EventSchema.parse(conflictResult);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsedConflict, resolveData),
+            event: stripEventDataRefs(parsedConflict, resolveData),
             run,
             step,
             hook: undefined,
@@ -1314,12 +1315,12 @@ export function createEventsStorage(
         allEvents = eventRows.map((e) => {
           e.eventData ||= e.eventDataJson;
           const p = EventSchema.parse(compact(e));
-          return filterEventData(p, resolveData);
+          return stripEventDataRefs(p, resolveData);
         });
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1341,7 +1342,7 @@ export function createEventsStorage(
       value.eventData ||= value.eventDataJson;
       const parsed = EventSchema.parse(compact(value));
       const resolveData = params?.resolveData ?? 'all';
-      return filterEventData(parsed, resolveData);
+      return stripEventDataRefs(parsed, resolveData);
     },
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
       const limit = params?.pagination?.limit ?? 100;
@@ -1369,7 +1370,7 @@ export function createEventsStorage(
         data: values.map((v) => {
           v.eventData ||= v.eventDataJson;
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore: all.length > limit,
@@ -1407,7 +1408,7 @@ export function createEventsStorage(
         data: values.map((v) => {
           v.eventData ||= v.eventDataJson;
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore: all.length > limit,
@@ -1572,13 +1573,4 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
     return { metadata: undefined, ...rest };
   }
   return hook;
-}
-
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-
-    return rest as Event;
-  }
-  return event;
 }

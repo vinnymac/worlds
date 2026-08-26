@@ -41,6 +41,7 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
@@ -180,14 +181,6 @@ function filterRunData(
     return { input: undefined, output: undefined, ...rest };
   }
   return run;
-}
-
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 // ============================================================
@@ -1089,7 +1082,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         );
 
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -1284,7 +1277,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
           const parsed = EventSchema.parse(event);
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             run: fullRunData
               ? (filterRunData(
                   WorkflowRunSchema.parse(compact(parseWithUint8Array<WorkflowRun>(fullRunData))),
@@ -1424,7 +1417,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         run = WorkflowRunSchema.parse(compact(newRun));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), run, maxEvents: maxEventsPerRun };
+        return { event: stripEventDataRefs(parsed, resolveData), run, maxEvents: maxEventsPerRun };
       }
 
       // Handle step_created event: create step entity + event atomically
@@ -1479,7 +1472,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         step = StepSchema.parse(compact(newStep));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), step };
+        return { event: stripEventDataRefs(parsed, resolveData), step };
       }
 
       // Handle hook_created event: claim token + create hook entity + event
@@ -1557,7 +1550,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
           const parsedConflict = EventSchema.parse(conflictEvent);
           return {
-            event: filterEventData(parsedConflict, resolveData),
+            event: stripEventDataRefs(parsedConflict, resolveData),
             hook: undefined,
           };
         }
@@ -1572,7 +1565,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         hook = HookSchema.parse(compact(newHook));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), hook };
+        return { event: stripEventDataRefs(parsed, resolveData), hook };
       }
 
       // Handle wait_created event: create wait entity + event atomically
@@ -1627,7 +1620,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         wait = WaitSchema.parse(compact(newWait));
         await mirrorEventToStream(event);
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData), wait };
+        return { event: stripEventDataRefs(parsed, resolveData), wait };
       }
 
       // Handle wait_completed event: transition wait + event atomically,
@@ -1683,7 +1676,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             wait = WaitSchema.parse(compact(updatedWait));
             await mirrorEventToStream(event);
             const parsed = EventSchema.parse(event);
-            return { event: filterEventData(parsed, resolveData), wait };
+            return { event: stripEventDataRefs(parsed, resolveData), wait };
           }
           if (result[0] === -1) {
             throw new WorkflowWorldError(`Wait "${data.correlationId}" not found`, {
@@ -1950,7 +1943,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const pipelineResults = await eventPipeline.exec();
           allEvents = parseEventsFromPipeline(pipelineResults).map((e) => {
             const p = EventSchema.parse(compact(e));
-            return filterEventData(p, resolveData);
+            return stripEventDataRefs(p, resolveData);
           });
         } else {
           allEvents = [];
@@ -1958,7 +1951,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1978,7 +1971,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         });
       }
       const parsed = EventSchema.parse(compact(parseWithUint8Array<Event>(data)));
-      return filterEventData(parsed, params?.resolveData ?? 'all');
+      return stripEventDataRefs(parsed, params?.resolveData ?? 'all');
     },
 
     async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
@@ -2007,7 +2000,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -2037,7 +2030,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,

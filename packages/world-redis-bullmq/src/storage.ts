@@ -38,6 +38,7 @@ import {
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  stripEventDataRefs,
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from 'ioredis';
@@ -188,14 +189,6 @@ function filterRunData(
     return { input: undefined, output: undefined, ...rest };
   }
   return run;
-}
-
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-  if (resolveData === 'none' && 'eventData' in event) {
-    const { eventData: _, ...rest } = event;
-    return rest as Event;
-  }
-  return event;
 }
 
 // ============================================================
@@ -939,7 +932,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         );
 
         const parsed = EventSchema.parse(event);
-        return { event: filterEventData(parsed, resolveData) };
+        return { event: stripEventDataRefs(parsed, resolveData) };
       }
 
       default:
@@ -1180,7 +1173,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const parsed = EventSchema.parse(event);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsed, resolveData),
+            event: stripEventDataRefs(parsed, resolveData),
             // Lifecycle event: validation already loaded the body.
             run: existingRun ?? undefined,
           };
@@ -1325,7 +1318,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         const parsed = EventSchema.parse(event);
         const resolveData = params?.resolveData ?? 'all';
         return {
-          event: filterEventData(parsed, resolveData),
+          event: stripEventDataRefs(parsed, resolveData),
           run,
           maxEvents: maxEventsPerRun,
         };
@@ -1507,7 +1500,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         step = StepSchema.parse(compact(newStep));
         const parsed = EventSchema.parse(event);
         const resolveData = params?.resolveData ?? 'all';
-        return { event: filterEventData(parsed, resolveData), step };
+        return { event: stripEventDataRefs(parsed, resolveData), step };
       }
 
       // wait_created has no entity in this world; the event log is the only
@@ -1757,7 +1750,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const parsedConflict = EventSchema.parse(conflictEvent);
           const resolveData = params?.resolveData ?? 'all';
           return {
-            event: filterEventData(parsedConflict, resolveData),
+            event: stripEventDataRefs(parsedConflict, resolveData),
             run,
             step,
             hook: undefined,
@@ -1775,7 +1768,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         hook = HookSchema.parse(compact(newHook));
         const parsed = EventSchema.parse(event);
         const resolveData = params?.resolveData ?? 'all';
-        return { event: filterEventData(parsed, resolveData), hook };
+        return { event: stripEventDataRefs(parsed, resolveData), hook };
       }
 
       // Handle hook_disposed event: delete hook entity atomically via Lua
@@ -1850,7 +1843,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           const pipelineResults = await eventPipeline.exec();
           allEvents = parseEventsFromPipeline(pipelineResults).map((e) => {
             const p = EventSchema.parse(compact(e));
-            return filterEventData(p, resolveData);
+            return stripEventDataRefs(p, resolveData);
           });
         } else {
           allEvents = [];
@@ -1858,7 +1851,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       }
 
       return {
-        event: filterEventData(parsed, resolveData),
+        event: stripEventDataRefs(parsed, resolveData),
         run,
         step,
         hook,
@@ -1903,7 +1896,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,
@@ -1931,7 +1924,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       return {
         data: values.map((v) => {
           const parsed = EventSchema.parse(compact(v));
-          return filterEventData(parsed, resolveData);
+          return stripEventDataRefs(parsed, resolveData);
         }),
         cursor: values.at(-1)?.eventId ?? null,
         hasMore,

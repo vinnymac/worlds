@@ -1067,4 +1067,36 @@ describe('Storage (Upstash Redis integration)', () => {
       );
     });
   });
+
+  describe("resolveData: 'none' event data", () => {
+    // `step_created` carries both a ref field (`input`) and display metadata
+    // (`stepName`), so it distinguishes stripping refs from dropping eventData
+    // wholesale. Event types outside the ref map are a no-op and prove nothing.
+    it('strips only the ref field and keeps sibling metadata', async () => {
+      const run = await createRun();
+      await events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: 'step-strip-refs',
+        eventData: { stepName: 'chargeCard', input: ['card-1'] },
+      });
+
+      const lean = await events.list({
+        runId: run.runId,
+        pagination: {},
+        resolveData: 'none',
+      });
+      const leanEvent = expectEventType(
+        lean.data.find((e) => e.eventType === 'step_created'),
+        'step_created',
+      );
+      expect(leanEvent.eventData).toEqual({ stepName: 'chargeCard' });
+
+      const full = await events.list({ runId: run.runId, pagination: {} });
+      const fullEvent = expectEventType(
+        full.data.find((e) => e.eventType === 'step_created'),
+        'step_created',
+      );
+      expect(fullEvent.eventData).toEqual({ stepName: 'chargeCard', input: ['card-1'] });
+    });
+  });
 });
