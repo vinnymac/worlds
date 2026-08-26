@@ -46,7 +46,7 @@ import {
 } from '@workflow/world';
 import { createHash } from 'node:crypto';
 import type { Redis } from 'ioredis';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { compact, debug, parseWithUint8Array, stringifyWithUint8Array } from './util.js';
 
 interface RedisStorageConfig {
@@ -226,13 +226,16 @@ const LUA_CREATE_RUN_WITH_EVENT = `
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the run indexes by wall clock, so
+  -- the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[7])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('ZADD', KEYS[4], score, ARGV[2])
   redis.call('SET', KEYS[5], ARGV[4])
-  redis.call('ZADD', KEYS[6], score, ARGV[5])
+  redis.call('ZADD', KEYS[6], eventScore, ARGV[5])
   if ARGV[6] == '1' then
-    redis.call('ZADD', KEYS[7], score, ARGV[5])
+    redis.call('ZADD', KEYS[7], eventScore, ARGV[5])
   end
   return {1, ''}
 `;
@@ -861,7 +864,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     guard = '',
     markerAdvance = '',
   ): Promise<void> {
-    const score = event.createdAt.getTime();
+    const score = eventIdTime(event.eventId);
     const result = (await scripts.wfStoreEvent(
       eventKey(event.eventId),
       eventsIndexKey(event.runId),
@@ -1071,7 +1074,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
         // Legacy runs (specVersion < 2) predate the optimistic-concurrency
         // guard, so neither the guard nor the state marker applies here.
-        const score = createdAt.getTime();
+        const score = eventIdTime(eventId);
         await scripts.wfStoreEvent(
           eventKey(eventId),
           eventsIndexKey(runId),
@@ -1199,7 +1202,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           // Synthetic run_created event, written atomically with the run
           // entity: exactly one run_created event lands regardless of how
           // the run_created/run_started race resolves.
-          const runCreatedEventId = `wevt_${ulid()}`;
+          // Backdate ahead of the run_started that bootstrapped it: the log
+          // sorts by eventId time, and a run is created before it starts.
+          const runCreatedEventId = `wevt_${ulidAt(eventIdTime(eventId) - 1)}`;
           const runCreatedEvent = {
             eventType: 'run_created' as const,
             eventData: {
@@ -1228,6 +1233,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             stringifyWithUint8Array(runCreatedEvent),
             runCreatedEventId,
             '0',
+            eventIdTime(runCreatedEventId).toString(),
           )) as [number, string];
           if (result[0] === 1) {
             await mirrorEventToStream(runCreatedEvent);
@@ -1406,6 +1412,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           data.correlationId ? '1' : '0',
+          eventIdTime(eventId).toString(),
         )) as [number, string];
 
         debug('run_created lua result', { wasCreated: result[0], runId: effectiveRunId });

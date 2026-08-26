@@ -41,7 +41,7 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import type { Redis } from 'ioredis';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { compact, parse, stringify } from './util.js';
 
 interface RedisStorageConfig {
@@ -234,20 +234,34 @@ function filterEventData(event: Event, resolveData: ResolveData): Event {
  * Returns: [1, ''] when created (the caller already holds the run; echoing it
  *          back shipped the whole payload for nothing), [0, runJson] on replay.
  */
+/** Rank to resume a page from. A cursor missing from the index is a caller
+ * error, not a reason to restart: returning 0 silently repeated the first
+ * page. Mirrors world-redis, which rejects the same way. */
+async function resolveCursorRank(redis: Redis, indexKey: string, cursor: string): Promise<number> {
+  const rank = await redis.zrevrank(indexKey, cursor);
+  if (rank === null) {
+    throw new WorkflowWorldError(`Invalid pagination cursor "${cursor}"`, { status: 400 });
+  }
+  return rank + 1;
+}
+
 const LUA_CREATE_RUN_WITH_EVENT = `
   local wasCreated = redis.call('SETNX', KEYS[1], ARGV[1])
   if wasCreated == 0 then
     return {0, redis.call('GET', KEYS[1])}
   end
   local score = tonumber(ARGV[3])
+  -- The event log sorts by eventId time, the run indexes by wall clock, so
+  -- the two scores are not interchangeable. See eventIdTime.
+  local eventScore = tonumber(ARGV[8])
   redis.call('ZADD', KEYS[2], score, ARGV[2])
   redis.call('ZADD', KEYS[3], score, ARGV[2])
   redis.call('ZADD', KEYS[4], score, ARGV[2])
   redis.call('SET', KEYS[5], ARGV[4])
   redis.call('SET', KEYS[6], ARGV[5])
-  redis.call('ZADD', KEYS[7], score, ARGV[6])
+  redis.call('ZADD', KEYS[7], eventScore, ARGV[6])
   if ARGV[7] == '1' then
-    redis.call('ZADD', KEYS[8], score, ARGV[6])
+    redis.call('ZADD', KEYS[8], eventScore, ARGV[6])
   end
   return {1, ''}
 `;
@@ -580,9 +594,10 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
       return 0;
     }
     const rank = await redis.zrevrank(indexKey, cursor);
-    // If the cursor vanished from the index, restart from the beginning
-    // (duplicates are preferable to silently skipping the first item).
-    return rank === null ? 0 : rank + 1;
+    if (rank === null) {
+      throw new WorkflowWorldError(`Invalid pagination cursor "${cursor}"`, { status: 400 });
+    }
+    return rank + 1;
   }
 
   // Helper: Fetch and parse runs from pipeline results
@@ -748,9 +763,10 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     }
     const rankFn = sortOrder === 'desc' ? 'zrevrank' : 'zrank';
     const rank = await redis[rankFn](indexKey, cursor);
-    // If the cursor vanished from the index, restart from the beginning
-    // (duplicates are preferable to silently skipping the first item).
-    return rank === null ? 0 : rank + 1;
+    if (rank === null) {
+      throw new WorkflowWorldError(`Invalid pagination cursor "${cursor}"`, { status: 400 });
+    }
+    return rank + 1;
   }
 
   // Helper: Fetch event IDs with proper sort order
@@ -905,7 +921,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           specVersion: SPEC_VERSION_CURRENT,
         };
 
-        const score = createdAt.getTime();
+        const score = eventIdTime(eventId);
         await scripts.wfStoreEvent(
           eventKey(eventId),
           eventsIndexKey(runId),
@@ -1066,7 +1082,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           // atomic execution, so a crash cannot leave one without the other
           // and concurrent bootstraps cannot double-append the event.
           const score = now.getTime();
-          const runCreatedEventId = `wevt_${ulid()}`;
+          // Backdate ahead of the run_started that bootstrapped it: the log
+          // sorts by eventId time, and a run is created before it starts.
+          const runCreatedEventId = `wevt_${ulidAt(eventIdTime(eventId) - 1)}`;
           const runCreatedEvent = {
             eventType: 'run_created' as const,
             eventData: {
@@ -1096,6 +1114,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             stringifyWithUint8Array(runCreatedEvent),
             runCreatedEventId,
             '0',
+            eventIdTime(runCreatedEventId).toString(),
           )) as [number, string];
           if (result[0] === 1) {
             currentRun = { status: 'pending', specVersion: effectiveSpecVersion };
@@ -1138,7 +1157,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             createdAt,
             specVersion: effectiveSpecVersion,
           };
-          const score = createdAt.getTime();
+          const score = eventIdTime(eventId);
           const stored = (await scripts.wfStoreEvent(
             eventKey(eventId),
             eventsIndexKey(effectiveRunId),
@@ -1295,6 +1314,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
           stringifyWithUint8Array(event),
           eventId,
           '0',
+          eventIdTime(eventId).toString(),
         )) as [number, string];
 
         if (result[0] === 0) {
@@ -1792,7 +1812,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         delete (event as any).eventData;
       }
 
-      const score = createdAt.getTime();
+      const score = eventIdTime(eventId);
       const stored = (await scripts.wfStoreEvent(
         eventKey(eventId),
         eventsIndexKey(effectiveRunId),
@@ -1992,11 +2012,8 @@ export function createStepsStorage(config: RedisStorageConfig): Storage['steps']
 
       const indexKey = stepsIndexKey(params.runId);
 
-      // ZREVRANGE for descending order. A vanished cursor restarts from the
-      // beginning rather than silently skipping the first item.
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank === null ? 0 : rank + 1))
-        : 0;
+      // ZREVRANGE for descending order.
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor) : 0;
 
       const stepIds = await redis.zrevrange(indexKey, start, start + limit);
 
@@ -2069,11 +2086,8 @@ export function createHooksStorage(config: RedisStorageConfig): Storage['hooks']
 
       const indexKey = hooksIndexKey(params.runId);
 
-      // ZREVRANGE for descending order. A vanished cursor restarts from the
-      // beginning rather than silently skipping the first item.
-      const start = fromCursor
-        ? await redis.zrevrank(indexKey, fromCursor).then((rank) => (rank === null ? 0 : rank + 1))
-        : 0;
+      // ZREVRANGE for descending order.
+      const start = fromCursor ? await resolveCursorRank(redis, indexKey, fromCursor) : 0;
 
       const hookIds = await redis.zrevrange(indexKey, start, start + limit);
 
