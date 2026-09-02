@@ -33,7 +33,7 @@ jobs:
           - package: '@fantasticfour/world-cloudflare'
             images: ''
           - package: '@fantasticfour/world-firestore-tasks'
-            images: 'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators'
+            images: 'gcr.io/google.com/cloudsdktool/google-cloud-cli:583.0.0-emulators'
           - package: '@fantasticfour/world-mysql'
             images: 'mysql:8.0'
           - package: '@fantasticfour/world-mysql-redis'

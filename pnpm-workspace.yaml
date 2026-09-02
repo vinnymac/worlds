@@ -14,7 +14,7 @@ catalog:
   cbor-x: ^1.6.0
   drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2
-  ioredis: ^5.10.1
+  ioredis: ^6.0.0
   mysql2: ^3.14.1
   postgres: ^3.4.9
   testcontainers: 12.1.0

@@ -48,7 +48,7 @@
     "@workflow/errors": "catalog:",
     "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
-    "bullmq": "^5.64.1",
+    "bullmq": "^6.3.4",
     "ioredis": "catalog:",
     "ulid": "catalog:"
   },

@@ -2,6 +2,7 @@ import { Firestore } from '@google-cloud/firestore';
 import type { StartedFirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { FIRESTORE_EMULATOR_IMAGE } from './emulator-image.js';
 
 describe('Firestore Container Smoke Test', () => {
   let container: StartedFirestoreEmulatorContainer;
@@ -13,9 +14,7 @@ describe('Firestore Container Smoke Test', () => {
     const startTime = Date.now();
 
     // Use official FirestoreEmulatorContainer API with Docker image
-    container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
-    ).start();
+    container = await new FirestoreEmulatorContainer(FIRESTORE_EMULATOR_IMAGE).start();
 
     startupTime = Date.now() - startTime;
     console.log(

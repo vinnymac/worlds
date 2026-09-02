@@ -1,5 +1,6 @@
 import { SPEC_VERSION_CURRENT, type Storage, type World } from '@workflow/world';
-import { connect, type NatsConnection, type JetStreamClient } from 'nats';
+import { connect, type NatsConnection } from '@nats-io/transport-node';
+import { jetstream, type JetStreamClient } from '@nats-io/jetstream';
 import type { NatsJetStreamWorldConfig } from './config.js';
 import { createQueue, type WorkerHealth } from './queue.js';
 import {
@@ -41,11 +42,11 @@ export function createWorld(
   compactTerminalRuns(): Promise<number>;
 } {
   let nc: NatsConnection | undefined;
-  let jetstream: JetStreamClient | undefined;
+  let js: JetStreamClient | undefined;
   let connectionPromise: Promise<NatsConnection> | undefined;
 
   const getJetStream = async (): Promise<JetStreamClient> => {
-    if (!jetstream) {
+    if (!js) {
       // Lazy connection - only connect on first access
       if (!connectionPromise) {
         connectionPromise =
@@ -54,9 +55,9 @@ export function createWorld(
             : connect(config.nats);
       }
       nc = await connectionPromise;
-      jetstream = nc.jetstream();
+      js = jetstream(nc);
     }
-    return jetstream;
+    return js;
   };
 
   const keyPrefix = config.keyPrefix || 'workflow_';

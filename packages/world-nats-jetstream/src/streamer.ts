@@ -5,14 +5,16 @@ import type {
   StreamInfoResponse,
   Streamer,
 } from '@workflow/world';
-import type { ConsumerMessages, JetStreamClient, JetStreamManager, KV, StoredMsg } from 'nats';
-import {
-  AckPolicy,
-  DeliverPolicy,
-  DiscardPolicy,
-  RetentionPolicy,
-  headers as createHeaders,
-} from 'nats';
+import type {
+  ConsumerMessages,
+  JetStreamClient,
+  JetStreamManager,
+  StoredMsg,
+} from '@nats-io/jetstream';
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from '@nats-io/jetstream';
+import type { KV } from '@nats-io/kv';
+import { Kvm } from '@nats-io/kv';
+import { headers as createHeaders } from '@nats-io/transport-node';
 
 interface StreamerConfig {
   getJetStream: () => Promise<JetStreamClient>;
@@ -22,13 +24,6 @@ interface StreamerConfig {
 /** Pagination bounds for getStreamChunks (contract: default 100, max 1000). */
 const DEFAULT_CHUNK_LIMIT = 100;
 const MAX_CHUNK_LIMIT = 1000;
-
-/** True when a JetStream API error means "no message at that sequence". */
-function isNoMessageFound(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const apiError = (err as Error & { api_error?: { err_code?: number } }).api_error;
-  return apiError?.err_code === 10037 || err.message.includes('no message found');
-}
 
 function isEofMessage(msg: StoredMsg): boolean {
   return msg.header.get('X-EOF') === 'true';
@@ -83,7 +78,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
   async function getStreamsByRunBucket(): Promise<KV> {
     if (!streamsByRunBucket) {
       const jetstream = await getJetStream();
-      streamsByRunBucket = await jetstream.views.kv(`${keyPrefix}streams_by_run`, {
+      streamsByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}streams_by_run`, {
         history: 1,
       });
     }
@@ -170,6 +165,10 @@ export function createStreamer(config: StreamerConfig): Streamer {
     const last = await jsm.streams.getMessage(streamName, {
       last_by_subj: `${streamName}.data`,
     });
+    if (!last) {
+      // messages > 0 guarantees a message on `.data`, so null means inconsistent stream state.
+      throw new Error(`Stream "${streamName}" reports ${messages} messages but has none`);
+    }
     const done = isEofMessage(last);
     return { dataCount: done ? messages - 1 : messages, done };
   }
@@ -264,13 +263,8 @@ export function createStreamer(config: StreamerConfig): Streamer {
       // collecting up to `limit` data chunks, then peek one further message
       // to distinguish "more chunks" from "EOF" from "end of written data".
       for (let index = startIndex; ; index++) {
-        let msg: StoredMsg;
-        try {
-          msg = await jsm.streams.getMessage(streamName, { seq: index + 1 });
-        } catch (err) {
-          if (isNoMessageFound(err)) break;
-          throw err;
-        }
+        const msg = await jsm.streams.getMessage(streamName, { seq: index + 1 });
+        if (!msg) break;
 
         if (isEofMessage(msg)) {
           done = true;

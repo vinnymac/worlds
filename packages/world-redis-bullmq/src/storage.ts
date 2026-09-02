@@ -771,8 +771,9 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     limit: number,
     sortOrder: 'asc' | 'desc',
   ): Promise<string[]> {
-    const rangeFn = sortOrder === 'desc' ? 'zrevrange' : 'zrange';
-    return redis[rangeFn](indexKey, start, start + limit);
+    return sortOrder === 'desc'
+      ? redis.zrevrange(indexKey, start, start + limit)
+      : redis.zrange(indexKey, start, String(start + limit));
   }
 
   // Helper: Parse events from pipeline results
@@ -1839,7 +1840,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       // Preload all events for run_started to reduce TTFB
       let allEvents: Event[] | undefined;
       if (data.eventType === 'run_started' && run) {
-        const allEventIds = await redis.zrange(eventsIndexKey(effectiveRunId), 0, -1);
+        const allEventIds = await redis.zrange(eventsIndexKey(effectiveRunId), 0, '-1');
         if (allEventIds.length > 0) {
           const eventPipeline = redis.pipeline();
           for (const eid of allEventIds) {

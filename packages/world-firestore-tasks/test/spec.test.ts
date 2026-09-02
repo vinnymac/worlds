@@ -6,6 +6,7 @@ import { createTestSuite } from '@workflow/world-testing';
 // exports map, so the deep import is the only way in.
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, describe, test } from 'vitest';
+import { FIRESTORE_EMULATOR_IMAGE } from './emulator-image.js';
 
 // Skip these tests on Windows since it relies on a docker container
 if (process.platform === 'win32') {
@@ -16,9 +17,7 @@ if (process.platform === 'win32') {
 
   beforeAll(async () => {
     // Use official FirestoreEmulatorContainer API
-    container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
-    ).start();
+    container = await new FirestoreEmulatorContainer(FIRESTORE_EMULATOR_IMAGE).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
     process.env.FIRESTORE_EMULATOR_HOST = emulatorHost;

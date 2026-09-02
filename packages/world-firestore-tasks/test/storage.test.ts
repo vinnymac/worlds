@@ -7,6 +7,7 @@ import type { Event } from '@workflow/world';
 import { ulidToDate } from '@workflow/world';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
+import { FIRESTORE_EMULATOR_IMAGE } from './emulator-image.js';
 
 describe('Storage (Firestore integration)', () => {
   // Skip these tests on Windows since it relies on a docker container
@@ -89,9 +90,7 @@ describe('Storage (Firestore integration)', () => {
 
   beforeAll(async () => {
     // Start Firestore emulator container
-    container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
-    ).start();
+    container = await new FirestoreEmulatorContainer(FIRESTORE_EMULATOR_IMAGE).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
 

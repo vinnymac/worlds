@@ -8,8 +8,10 @@ import {
   type ValidQueueName,
   WorkflowInvokePayloadSchema,
 } from '@workflow/world';
-import type { JetStreamClient, JsMsg, KV } from 'nats';
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from 'nats';
+import type { JetStreamClient, JsMsg } from '@nats-io/jetstream';
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from '@nats-io/jetstream';
+import type { KV } from '@nats-io/kv';
+import { Kvm } from '@nats-io/kv';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 import { createWorkflowUrl } from '@workflow/utils';
@@ -192,7 +194,7 @@ export function createQueue(
   const getSoftNakBucket = async (): Promise<KV> => {
     if (!softNakBucket) {
       const jetstream = await getJetStream();
-      softNakBucket = await jetstream.views.kv(`${prefix}queue_soft_naks`, {
+      softNakBucket = await new Kvm(jetstream).create(`${prefix}queue_soft_naks`, {
         history: 1,
         ttl: SOFT_NAK_TTL_MS,
       });
