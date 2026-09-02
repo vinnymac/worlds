@@ -1,5 +1,11 @@
 # @fantasticfour/world-mysql-redis
 
+## 1.5.4
+
+### Patch Changes
+
+- 82b4d5d: Bump `ioredis` to v6. It defaults to RESP3 now, but keeps legacy RESP2-shaped replies unless you opt into `replyMapping: "resp3"`, so the queue's Lua scripts, list/zset commands, multi/exec, and brpoplpush calls all still work as-is. The Node 20+ floor is already met.
+
 ## 1.5.3
 
 ### Patch Changes
