@@ -5,6 +5,7 @@ import { FirestoreEmulatorContainer } from '@testcontainers/gcloud';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createStorage } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
+import { FIRESTORE_EMULATOR_IMAGE } from './emulator-image.js';
 
 describe('Firestore Real-time Listeners', () => {
   // Skip these tests on Windows since it relies on a docker container
@@ -66,9 +67,7 @@ describe('Firestore Real-time Listeners', () => {
 
   beforeAll(async () => {
     // Start Firestore emulator container
-    container = await new FirestoreEmulatorContainer(
-      'gcr.io/google.com/cloudsdktool/google-cloud-cli:441.0.0-emulators',
-    ).start();
+    container = await new FirestoreEmulatorContainer(FIRESTORE_EMULATOR_IMAGE).start();
 
     const emulatorHost = container.getEmulatorEndpoint();
 
