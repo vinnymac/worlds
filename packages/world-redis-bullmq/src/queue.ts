@@ -8,7 +8,7 @@ import {
   type ValidQueueName,
 } from '@workflow/world';
 import { createWorkflowUrl } from '@workflow/utils';
-import { DelayedError, type Job, Queue, Worker } from 'bullmq';
+import { DelayedError, type ConnectionOptions, type Job, Queue, Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import type { RedisWorldConfig } from './config.js';
@@ -130,16 +130,18 @@ export function createQueue(
     enableAutoPipelining: _storageOnly,
     ...redisOptions
   } = redis.options;
+  // Cast: bullmq's ConnectionOptions type doesn't allow retryStrategy: null,
+  // though ioredis accepts it fine at runtime.
   const connectionOptions = {
     ...redisOptions,
     maxRetriesPerRequest: null,
-  };
+  } as ConnectionOptions;
 
   const bullQueues = new Map<QueueKind, Queue<QueueJobData>>();
   const workers = new Map<QueueKind, Worker<QueueJobData>>();
 
   for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
-    bullQueues.set(kind, new Queue<QueueJobData>(jobName, { connection: connectionOptions }));
+    bullQueues.set(kind, new Queue(jobName, { connection: connectionOptions }));
   }
 
   const queue: QueueInterface['queue'] = async (queueName, message, opts) => {

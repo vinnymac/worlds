@@ -43,7 +43,9 @@ import {
   WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
-import type { JetStreamClient, KV, KvEntry } from 'nats';
+import type { JetStreamClient } from '@nats-io/jetstream';
+import type { KV, KvEntry } from '@nats-io/kv';
+import { Kvm } from '@nats-io/kv';
 import { decodeTime, monotonicFactory, ulid as ulidAt } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 import { compact, debug } from './util.js';
@@ -268,10 +270,10 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
   const initBuckets = async () => {
     if (!runsBucket) {
       const jetstream = await getJetStream();
-      runsBucket = await jetstream.views.kv(`${keyPrefix}runs`, {
+      runsBucket = await new Kvm(jetstream).create(`${keyPrefix}runs`, {
         history: 10,
       });
-      runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, {
+      runsByStatusBucket = await new Kvm(jetstream).create(`${keyPrefix}runs_by_status`, {
         history: 1,
       });
     }
@@ -396,39 +398,39 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
   const initBuckets = async () => {
     if (!eventsBucket) {
       const jetstream = await getJetStream();
-      eventsBucket = await jetstream.views.kv(`${keyPrefix}events`, {
+      eventsBucket = await new Kvm(jetstream).create(`${keyPrefix}events`, {
         history: 10,
       });
-      runsBucket = await jetstream.views.kv(`${keyPrefix}runs`, {
+      runsBucket = await new Kvm(jetstream).create(`${keyPrefix}runs`, {
         history: 10,
       });
-      stepsBucket = await jetstream.views.kv(`${keyPrefix}steps`, {
+      stepsBucket = await new Kvm(jetstream).create(`${keyPrefix}steps`, {
         history: 10,
       });
-      hooksBucket = await jetstream.views.kv(`${keyPrefix}hooks`, {
+      hooksBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks`, {
         history: 10,
       });
-      hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
+      hooksTokenBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks_by_token`, {
         history: 1,
       });
-      waitsBucket = await jetstream.views.kv(`${keyPrefix}waits`, {
+      waitsBucket = await new Kvm(jetstream).create(`${keyPrefix}waits`, {
         history: 1,
       });
       // Secondary indexes
-      runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, {
+      runsByStatusBucket = await new Kvm(jetstream).create(`${keyPrefix}runs_by_status`, {
         history: 1,
       });
-      stepsByRunBucket = await jetstream.views.kv(`${keyPrefix}steps_by_run`, {
+      stepsByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}steps_by_run`, {
         history: 1,
       });
-      hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, {
+      hooksByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks_by_run`, {
         history: 1,
       });
-      eventsByRunBucket = await jetstream.views.kv(`${keyPrefix}events_by_run`, {
+      eventsByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}events_by_run`, {
         history: 1,
       });
       // Optimistic-concurrency markers (one per run); only the latest matters.
-      runStateMarkersBucket = await jetstream.views.kv(`${keyPrefix}run_state_markers`, {
+      runStateMarkersBucket = await new Kvm(jetstream).create(`${keyPrefix}run_state_markers`, {
         history: 1,
       });
       // Exactly-once arbiter for entity-creating events: one canonical
@@ -437,7 +439,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
       // `workflow_events_entity_creation_unique` index. The steps/hooks
       // sub-storages below never write creation events, so only the events
       // storage (and compaction) opens this bucket.
-      creationClaimsBucket = await jetstream.views.kv(`${keyPrefix}creation_claims`, {
+      creationClaimsBucket = await new Kvm(jetstream).create(`${keyPrefix}creation_claims`, {
         history: 1,
       });
     }
@@ -1843,10 +1845,10 @@ export function createStepsStorage(config: NatsStorageConfig): Storage['steps'] 
   const initBuckets = async () => {
     if (!stepsBucket) {
       const jetstream = await getJetStream();
-      stepsBucket = await jetstream.views.kv(`${keyPrefix}steps`, {
+      stepsBucket = await new Kvm(jetstream).create(`${keyPrefix}steps`, {
         history: 10,
       });
-      stepsByRunBucket = await jetstream.views.kv(`${keyPrefix}steps_by_run`, {
+      stepsByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}steps_by_run`, {
         history: 1,
       });
     }
@@ -1971,13 +1973,13 @@ export function createHooksStorage(config: NatsStorageConfig): Storage['hooks'] 
   const initBuckets = async () => {
     if (!hooksBucket) {
       const jetstream = await getJetStream();
-      hooksBucket = await jetstream.views.kv(`${keyPrefix}hooks`, {
+      hooksBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks`, {
         history: 10,
       });
-      hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, {
+      hooksTokenBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks_by_token`, {
         history: 1,
       });
-      hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, {
+      hooksByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks_by_run`, {
         history: 1,
       });
     }
@@ -2102,20 +2104,30 @@ export async function compactTerminalRuns(config: NatsStorageConfig): Promise<nu
   const cutoff = Date.now() - ttl;
 
   const jetstream = await getJetStream();
-  const runsBucket = await jetstream.views.kv(`${keyPrefix}runs`, { history: 10 });
-  const runsByStatusBucket = await jetstream.views.kv(`${keyPrefix}runs_by_status`, { history: 1 });
-  const stepsBucket = await jetstream.views.kv(`${keyPrefix}steps`, { history: 10 });
-  const stepsByRunBucket = await jetstream.views.kv(`${keyPrefix}steps_by_run`, { history: 1 });
-  const hooksBucket = await jetstream.views.kv(`${keyPrefix}hooks`, { history: 10 });
-  const hooksByRunBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_run`, { history: 1 });
-  const hooksTokenBucket = await jetstream.views.kv(`${keyPrefix}hooks_by_token`, { history: 1 });
-  const eventsBucket = await jetstream.views.kv(`${keyPrefix}events`, { history: 10 });
-  const eventsByRunBucket = await jetstream.views.kv(`${keyPrefix}events_by_run`, { history: 1 });
-  const waitsBucket = await jetstream.views.kv(`${keyPrefix}waits`, { history: 1 });
-  const runStateMarkersBucket = await jetstream.views.kv(`${keyPrefix}run_state_markers`, {
+  const runsBucket = await new Kvm(jetstream).create(`${keyPrefix}runs`, { history: 10 });
+  const runsByStatusBucket = await new Kvm(jetstream).create(`${keyPrefix}runs_by_status`, {
     history: 1,
   });
-  const creationClaimsBucket = await jetstream.views.kv(`${keyPrefix}creation_claims`, {
+  const stepsBucket = await new Kvm(jetstream).create(`${keyPrefix}steps`, { history: 10 });
+  const stepsByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}steps_by_run`, {
+    history: 1,
+  });
+  const hooksBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks`, { history: 10 });
+  const hooksByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks_by_run`, {
+    history: 1,
+  });
+  const hooksTokenBucket = await new Kvm(jetstream).create(`${keyPrefix}hooks_by_token`, {
+    history: 1,
+  });
+  const eventsBucket = await new Kvm(jetstream).create(`${keyPrefix}events`, { history: 10 });
+  const eventsByRunBucket = await new Kvm(jetstream).create(`${keyPrefix}events_by_run`, {
+    history: 1,
+  });
+  const waitsBucket = await new Kvm(jetstream).create(`${keyPrefix}waits`, { history: 1 });
+  const runStateMarkersBucket = await new Kvm(jetstream).create(`${keyPrefix}run_state_markers`, {
+    history: 1,
+  });
+  const creationClaimsBucket = await new Kvm(jetstream).create(`${keyPrefix}creation_claims`, {
     history: 1,
   });
 

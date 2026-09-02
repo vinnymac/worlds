@@ -38,10 +38,12 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/kv": "^3.4.0",
+    "@nats-io/transport-node": "^3.4.0",
     "@workflow/errors": "catalog:",
     "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",
-    "nats": "^2.28.2",
     "ulid": "catalog:"
   },
   "devDependencies": {

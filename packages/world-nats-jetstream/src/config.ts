@@ -1,4 +1,4 @@
-import type { ConnectionOptions } from 'nats';
+import type { ConnectionOptions } from '@nats-io/transport-node';
 
 export interface NatsJetStreamWorldConfig {
   /**

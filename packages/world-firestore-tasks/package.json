@@ -40,8 +40,8 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
-    "@google-cloud/firestore": "^7.10.0",
-    "@google-cloud/tasks": "^6.2.1",
+    "@google-cloud/firestore": "^9.0.1",
+    "@google-cloud/tasks": "^7.0.0",
     "@workflow/errors": "catalog:",
     "@workflow/utils": "catalog:",
     "@workflow/world": "catalog:",

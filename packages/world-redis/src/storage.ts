@@ -715,7 +715,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
   // run with no hooks — the common case — costs nothing beyond the index read.
   async function cleanupHooks(runId: string): Promise<void> {
     const indexKey = hooksIndexKey(runId);
-    const hookIds = await redis.zrange(indexKey, 0, -1);
+    const hookIds = await redis.zrange(indexKey, 0, '-1');
     if (hookIds.length === 0) {
       return;
     }
@@ -743,7 +743,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
   // Helper: Clean up waits when run reaches terminal status
   async function cleanupWaits(runId: string): Promise<void> {
     const indexKey = waitsIndexKey(runId);
-    const correlationIds = await redis.zrange(indexKey, 0, -1);
+    const correlationIds = await redis.zrange(indexKey, 0, '-1');
     if (correlationIds.length === 0) {
       return;
     }
@@ -763,8 +763,10 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     limit: number,
     sortOrder: 'asc' | 'desc',
   ): Promise<string[]> {
-    const rangeFn = sortOrder === 'desc' ? 'zrevrange' : 'zrange';
-    return redis[rangeFn](indexKey, start, start + limit);
+    const stop = start + limit;
+    return sortOrder === 'desc'
+      ? redis.zrevrange(indexKey, start, stop)
+      : redis.zrange(indexKey, start, stop.toString());
   }
 
   // Helper: Parse events from pipeline results
@@ -1951,7 +1953,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
       // Preload all events for run_started to reduce TTFB
       let allEvents: Event[] | undefined;
       if (data.eventType === 'run_started' && run) {
-        const allEventIds = await redis.zrange(eventsIndexKey(effectiveRunId), 0, -1);
+        const allEventIds = await redis.zrange(eventsIndexKey(effectiveRunId), 0, '-1');
         if (allEventIds.length > 0) {
           const eventPipeline = redis.pipeline();
           for (const eid of allEventIds) {

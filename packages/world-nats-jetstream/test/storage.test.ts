@@ -1,6 +1,8 @@
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import type { WorkflowRun, Step } from '@workflow/world';
-import { connect } from 'nats';
+import { connect } from '@nats-io/transport-node';
+import { jetstream } from '@nats-io/jetstream';
+import { Kvm } from '@nats-io/kv';
 import { decodeTime, ulid } from 'ulid';
 import { afterAll, beforeAll, describe, expect, it, test } from 'vitest';
 import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
@@ -485,9 +487,10 @@ describe('Storage (NATS JetStream integration)', () => {
 
       const nc = await connect({ servers: natsUrl });
       try {
-        const js = nc.jetstream();
-        const stepsBucket = await js.views.kv('test_steps', { history: 10 });
-        const claimsBucket = await js.views.kv('test_creation_claims', { history: 1 });
+        const js = jetstream(nc);
+        const kvm = new Kvm(js);
+        const stepsBucket = await kvm.create('test_steps', { history: 10 });
+        const claimsBucket = await kvm.create('test_creation_claims', { history: 1 });
         await stepsBucket.create(
           `${run.runId}.${stepId}`,
           JSON.stringify({
