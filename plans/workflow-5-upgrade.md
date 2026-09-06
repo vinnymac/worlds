@@ -81,11 +81,11 @@ on them.
       tests incl. 16 conformance, independently re-verified). Follow-up
       noted: hook_received-after-terminal TOCTOU still open, same as v4;
       world-local closes it with terminal markers plus reap
-- [ ] world-postgres-redis
+- [~] world-postgres-redis (agent running 2026-09-05)
 - [~] world-mysql (archetype for SQL family; agent running 2026-09-05)
 - [ ] world-mysql-redis
-- [ ] world-redis-bullmq
-- [ ] world-upstash
+- [~] world-redis-bullmq (agent running 2026-09-05)
+- [~] world-upstash (agent running 2026-09-05)
 - [ ] world-nats-jetstream
 - [ ] world-azure
 - [ ] world-firestore-tasks
