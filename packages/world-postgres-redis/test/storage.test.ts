@@ -1507,7 +1507,11 @@ describe('Storage (Postgres integration)', () => {
 
     it('numbers the log densely from slot 1 in canonical form', async () => {
       const run = await startRun('slots-dense');
-      await createStep(events, run.runId, { stepId: 'slot-step', stepName: 'slot-step', input: [] });
+      await createStep(events, run.runId, {
+        stepId: 'slot-step',
+        stepName: 'slot-step',
+        input: [],
+      });
 
       const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
       expect(page.data).toHaveLength(3);

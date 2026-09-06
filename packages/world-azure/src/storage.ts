@@ -1259,8 +1259,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     resolveData: ResolveData,
   ): Promise<{ events: Event[]; cursor: string | null; hasMore: false }> {
     const eventsQuery: SqlQuerySpec = {
-      query:
-        'SELECT * FROM c WHERE c.type = "event" AND c.runId = @runId ORDER BY c.eventId ASC',
+      query: 'SELECT * FROM c WHERE c.type = "event" AND c.runId = @runId ORDER BY c.eventId ASC',
       parameters: [{ name: '@runId', value: runId }],
     };
     const { resources } = await withCosmosRetry(() =>
@@ -1333,7 +1332,11 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       return result;
     }
     const committedSlot = eventIdToSlot(result.event.eventId);
-    if (committedSlot === null || askedFor < FIRST_EVENT_SLOT - 1 || committedSlot <= askedFor + 1) {
+    if (
+      committedSlot === null ||
+      askedFor < FIRST_EVENT_SLOT - 1 ||
+      committedSlot <= askedFor + 1
+    ) {
       return result;
     }
     const span = committedSlot - askedFor - 1;
@@ -1505,32 +1508,27 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         runInputData.input !== undefined
       ) {
         try {
-          await createRunWithEvent(
-            effectiveRunId,
-            runInputData,
-            effectiveSpecVersion,
-            {
-              runId: effectiveRunId,
-              eventType: 'run_created',
-              specVersion: effectiveSpecVersion,
-              createdAt: now.toISOString(),
-              eventData: encodeCbor({
-                deploymentId: runInputData.deploymentId,
-                workflowName: runInputData.workflowName,
-                input: runInputData.input,
-                executionContext: runInputData.executionContext,
-                ...(runInputData.attributes !== undefined && {
-                  attributes: runInputData.attributes,
-                }),
-                ...(runInputData.allowReservedAttributes !== undefined && {
-                  allowReservedAttributes: runInputData.allowReservedAttributes,
-                }),
-                ...(runInputData.encryptionPublicKey !== undefined && {
-                  encryptionPublicKey: runInputData.encryptionPublicKey,
-                }),
+          await createRunWithEvent(effectiveRunId, runInputData, effectiveSpecVersion, {
+            runId: effectiveRunId,
+            eventType: 'run_created',
+            specVersion: effectiveSpecVersion,
+            createdAt: now.toISOString(),
+            eventData: encodeCbor({
+              deploymentId: runInputData.deploymentId,
+              workflowName: runInputData.workflowName,
+              input: runInputData.input,
+              executionContext: runInputData.executionContext,
+              ...(runInputData.attributes !== undefined && {
+                attributes: runInputData.attributes,
               }),
-            },
-          );
+              ...(runInputData.allowReservedAttributes !== undefined && {
+                allowReservedAttributes: runInputData.allowReservedAttributes,
+              }),
+              ...(runInputData.encryptionPublicKey !== undefined && {
+                encryptionPublicKey: runInputData.encryptionPublicKey,
+              }),
+            }),
+          });
         } catch (error: unknown) {
           // A concurrent run_created won the race; the run exists, which is
           // all the bootstrap needs.
@@ -1777,9 +1775,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
               error.index === (needsClaim ? 2 : -1) &&
               error.code === 409
             ) {
-              throw new EntityConflictError(
-                `Attribute event "${correlationId}" already exists`,
-              );
+              throw new EntityConflictError(`Attribute event "${correlationId}" already exists`);
             }
             if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
               lastError = error;

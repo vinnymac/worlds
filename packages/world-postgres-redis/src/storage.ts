@@ -457,7 +457,9 @@ async function handleLegacyEvent(
         .limit(1);
       // Legacy behavior skips event storage and returns without an event.
       return {
-        run: updatedRun ? (filterRunData(rowToRun(updatedRun), resolveData) as WorkflowRun) : undefined,
+        run: updatedRun
+          ? (filterRunData(rowToRun(updatedRun), resolveData) as WorkflowRun)
+          : undefined,
       };
     }
     case 'wait_completed':
@@ -638,7 +640,12 @@ export function createEventsStorage(
       // Resilient start: run_started on a non-existent run with eventData
       // bootstraps the run, so the queue can recover a run whose creation
       // failed transiently during start().
-      if (data.eventType === 'run_started' && !currentRun && 'eventData' in data && data.eventData) {
+      if (
+        data.eventType === 'run_started' &&
+        !currentRun &&
+        'eventData' in data &&
+        data.eventData
+      ) {
         const runInputData = data.eventData;
         if (
           runInputData.deploymentId &&

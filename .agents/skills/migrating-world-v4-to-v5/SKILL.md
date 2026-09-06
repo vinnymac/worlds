@@ -51,9 +51,9 @@ Four rules bind the implementation. Check each against the code found in intake 
 - **Uniqueness.** Two concurrent appends must not both take a slot. Settle it where the store settles it: a unique constraint on `(runId, eventId)`, a conditional write, or a serializable transaction. Reading the maximum slot and adding one in process is the failure mode this rule exists for, and it survives light testing because it only breaks under concurrency.
 - **Density.** Slots run from 1 with no holes. A writer that loses a race re-derives its slot from the store and takes the next free one. Incrementing a local number after a loss leaves a permanent hole, and the runtime fails the run with `CORRUPTED_EVENT_LOG` rather than replay across one.
 - **Bump and report.** `events.create()` params carry `eventCount`: how many events the writer held in the log it replayed from, so the slot it expects is `eventCount + 1`. When that slot is taken, **do not reject the write.** Commit at the next free slot, and return the events occupying the slots you skipped on the success response, in `events` with a matching `cursor` and `hasMore`. A stale count is the normal case for a parallel fan-out; rejecting it would serialize writes the runtime deliberately issues concurrently. A create that arrives with no `eventCount` came from a caller with no loaded log (a queued step body, an out-of-band writer) and is always accepted.
-- **Allocate at the commit.** Take the slot in the same operation that appends the event, never earlier. This is what makes a reader's log a *prefix* of the run's log rather than a prefix with a hole in it: nothing can land behind a slot a reader has already passed. A World that hands out a slot in a request handler and commits later breaks the property every replay depends on.
+- **Allocate at the commit.** Take the slot in the same operation that appends the event, never earlier. This is what makes a reader's log a _prefix_ of the run's log rather than a prefix with a hole in it: nothing can land behind a slot a reader has already passed. A World that hands out a slot in a request handler and commits later breaks the property every replay depends on.
 
-The shape that satisfies all four, for a SQL store with a unique key on `(run_id, event_id)`, is to compute the ID *inside* the insert and let the constraint arbitrate:
+The shape that satisfies all four, for a SQL store with a unique key on `(run_id, event_id)`, is to compute the ID _inside_ the insert and let the constraint arbitrate:
 
 ```sql
 INSERT INTO events (run_id, event_id, event_type, data)
@@ -100,14 +100,14 @@ These are signature and module-shape changes. Apply each only where the pattern 
 
 ### Streams moved to a `streams` namespace, with `runId` first
 
-| v4 | v5 |
-| --- | --- |
-| `writeToStream(name, runId, chunk)` | `streams.write(runId, name, chunk)` |
-| `writeToStreamMulti(name, runId, chunks)` | `streams.writeMulti(runId, name, chunks)` |
-| `closeStream(name, runId)` | `streams.close(runId, name)` |
-| `readFromStream(name, startIndex?)` | `streams.get(runId, name, startIndex?)` |
-| `getStreamChunks(name, runId, options?)` | `streams.getChunks(runId, name, options?)` |
-| `listStreamsByRunId(runId)` | `streams.list(runId)` |
+| v4                                        | v5                                         |
+| ----------------------------------------- | ------------------------------------------ |
+| `writeToStream(name, runId, chunk)`       | `streams.write(runId, name, chunk)`        |
+| `writeToStreamMulti(name, runId, chunks)` | `streams.writeMulti(runId, name, chunks)`  |
+| `closeStream(name, runId)`                | `streams.close(runId, name)`               |
+| `readFromStream(name, startIndex?)`       | `streams.get(runId, name, startIndex?)`    |
+| `getStreamChunks(name, runId, options?)`  | `streams.getChunks(runId, name, options?)` |
+| `listStreamsByRunId(runId)`               | `streams.list(runId)`                      |
 
 The argument order flipped, so moving the methods without swapping arguments passes a stream name where a run ID is expected and type-checks whenever both are `string`. `readFromStream` had no `runId` at all; `streams.get` requires one, so thread the owning run through.
 
@@ -196,12 +196,19 @@ Fail the migration if any of these are true:
 
 ```md
 ## Summary
+
 ## Event ID Allocation
+
 ## Interface Changes
+
 ## Contract Changes
+
 ## Optional Surface Not Implemented
+
 ## Rollout
+
 ## Verification
+
 ## Open Questions
 ```
 

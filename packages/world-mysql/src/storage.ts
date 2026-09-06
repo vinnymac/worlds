@@ -267,7 +267,8 @@ async function insertEventRow(
           specVersion: values.specVersion,
         });
       } else {
-        const payload = values.eventData !== undefined ? Buffer.from(encode(values.eventData)) : null;
+        const payload =
+          values.eventData !== undefined ? Buffer.from(encode(values.eventData)) : null;
         const occurredAt = values.occurredAt ? toUtcSqlTimestamp(values.occurredAt) : null;
         await db.execute(
           sql`INSERT INTO ${events} (\`id\`, \`run_id\`, \`type\`, \`correlation_id\`, \`payload_cbor\`, \`occurred_at\`, \`spec_version\`) SELECT ${values.eventId}, ${values.runId}, ${values.eventType}, ${values.correlationId ?? null}, ${payload}, ${occurredAt}, ${values.specVersion}`,
@@ -305,7 +306,11 @@ async function insertEventRow(
         ? and(eq(events.runId, values.runId), eq(events.eventId, values.eventId))
         : eq(events.runId, values.runId);
     const [row] = await db
-      .select({ eventId: events.eventId, createdAt: events.createdAt, occurredAt: events.occurredAt })
+      .select({
+        eventId: events.eventId,
+        createdAt: events.createdAt,
+        occurredAt: events.occurredAt,
+      })
       .from(events)
       .where(where)
       .orderBy(desc(events.eventId))
@@ -520,9 +525,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
       const [updated] = await drizzle
         .update(runs)
         .set({ attributes: expr, updatedAt: new Date() })
-        .where(
-          and(eq(runs.runId, runId), sql`JSON_LENGTH(${expr}) <= ${ATTRIBUTE_MAX_PER_RUN}`),
-        );
+        .where(and(eq(runs.runId, runId), sql`JSON_LENGTH(${expr}) <= ${ATTRIBUTE_MAX_PER_RUN}`));
       if (updated.affectedRows === 0) {
         const [stillThere] = await drizzle
           .select({ runId: runs.runId })
@@ -783,7 +786,12 @@ export function createEventsStorage(
       // Resilient start: run_started on a non-existent run with eventData
       // creates the run, so the queue can bootstrap a run whose creation
       // failed during start().
-      if (data.eventType === 'run_started' && !currentRun && 'eventData' in data && data.eventData) {
+      if (
+        data.eventType === 'run_started' &&
+        !currentRun &&
+        'eventData' in data &&
+        data.eventData
+      ) {
         const runInputData = data.eventData;
         if (
           runInputData.deploymentId &&
@@ -1483,7 +1491,11 @@ export function createEventsStorage(
           // Answering sinceCursor on hook_conflict is required whenever it
           // is answered on hook_created: both settle the same awaiter.
           if (typeof params?.sinceCursor === 'string') {
-            const delta = await readEventsAfterCursor(effectiveRunId, params.sinceCursor, resolveData);
+            const delta = await readEventsAfterCursor(
+              effectiveRunId,
+              params.sinceCursor,
+              resolveData,
+            );
             return { ...conflictResult, ...delta };
           }
           return conflictResult;
@@ -1982,10 +1994,7 @@ export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
   const hooks = schema.hooks;
   const ownerRunIsTerminal = ownerRunIsTerminalSubquery(drizzle);
   // A hook is readable while its run lives or its retention holds its token.
-  const available = or(
-    gt(hooks.tokenRetentionUntil, sql`NOW(3)`),
-    notExists(ownerRunIsTerminal),
-  );
+  const available = or(gt(hooks.tokenRetentionUntil, sql`NOW(3)`), notExists(ownerRunIsTerminal));
 
   return {
     async get(hookId, params) {

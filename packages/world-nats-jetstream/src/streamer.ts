@@ -155,11 +155,7 @@ export function createStreamer(config: StreamerConfig): Streamer {
     return { dataCount: done ? messages - 1 : messages, done };
   }
 
-  async function publishChunk(
-    streamName: string,
-    data: Uint8Array,
-    eof: boolean,
-  ): Promise<void> {
+  async function publishChunk(streamName: string, data: Uint8Array, eof: boolean): Promise<void> {
     const h = createHeaders();
     h.set('X-Content-Type', 'application/octet-stream');
     h.set('X-EOF', eof ? 'true' : 'false');

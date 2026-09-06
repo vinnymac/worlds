@@ -18,13 +18,13 @@ from Workflow 4.x to the Workflow 5 beta line. Operational success is proven by:
 
 ## Target versions (npm `beta` dist-tags as of 2026-09-05)
 
-| Package | Current (catalog) | Target |
-|---|---|---|
-| @workflow/core | 4.8.5 | 5.0.0-beta.48 |
-| @workflow/world | 4.5.0 | 5.0.0-beta.33 |
-| @workflow/world-testing | 4.1.20 | 5.0.0-beta.48 |
-| @workflow/errors | 4.2.1 | 5.0.0-beta.20 |
-| @workflow/utils | 4.1.4 | 5.0.0-beta.10 |
+| Package                 | Current (catalog) | Target        |
+| ----------------------- | ----------------- | ------------- |
+| @workflow/core          | 4.8.5             | 5.0.0-beta.48 |
+| @workflow/world         | 4.5.0             | 5.0.0-beta.33 |
+| @workflow/world-testing | 4.1.20            | 5.0.0-beta.48 |
+| @workflow/errors        | 4.2.1             | 5.0.0-beta.20 |
+| @workflow/utils         | 4.1.4             | 5.0.0-beta.10 |
 
 Reference comparators: @workflow/world-local@5.0.0-beta.42,
 @workflow/world-postgres@5.0.0-beta.40. Beta tags are not lockstep; each
@@ -37,6 +37,7 @@ hint, not as a base; it predates 38 beta releases.
 ## Phases
 
 ### Phase 0: Research and plan
+
 - [x] Inventory repo, versions, CI, prior branches
 - [x] Contract delta research: full analysis committed as
       `plans/workflow-5-delta.md` (d.ts diffs, world-local adaptation,
@@ -47,6 +48,7 @@ hint, not as a base; it predates 38 beta releases.
       and required report shape. Every world migration follows it
 
 ### Phase 1: Dependency bump and error surface
+
 - [x] Bump catalog entries in `pnpm-workspace.yaml` to target versions
 - [x] Update `minimumReleaseAgeExclude` entries for the new beta versions
 - [x] Drop or refresh any `patches/` (none exist on this branch)
@@ -71,12 +73,15 @@ hint, not as a base; it predates 38 beta releases.
       Full log: scratchpad typecheck-v5-force.log
 
 ### Phase 2: Shared packages
+
 - [x] `packages/shared` compiles and tests green against v5 types (76/76)
 - [x] `packages/testing` compiles and tests green (6/6)
 
 ### Phase 3: World migrations (one PR-sized commit per world)
+
 Order: family archetypes first (redis, mysql), then the rest patterned
 on them.
+
 - [x] world-redis (archetype for redis family; commit 5a1c4f1, 87/87
       tests incl. 16 conformance, independently re-verified). Follow-up
       noted: hook_received-after-terminal TOCTOU still open, same as v4;
@@ -120,11 +125,13 @@ behavior checked against world-local/world-postgres beta dists rather than
 hand-rolled (see memory: match official world behavior).
 
 ### Phase 4: e2e and packaging
+
 - [ ] `test/packaging` suite updated for v5 and green (`pnpm test:packaging`)
 - [ ] CI images/config still valid (tests.yml matrix, firestore image, ghcr pulls)
 - [ ] Ruleset check: if any CI job is renamed, update ruleset 21057342
 
 ### Phase 5: Benchmarks
+
 - [x] Harness added: `bench/world-redis.bench.mjs` (commit 8abcc49). Runs
       identically against 4.x and 5.x dists; needs a redis at REDIS_URL
 - [x] world-redis 4.x vs 5.x comparison (redis:7-alpine local, node
@@ -144,6 +151,7 @@ hand-rolled (see memory: match official world behavior).
       allows
 
 ### Phase 6: Quality and ship
+
 - [ ] `pnpm lint`, `pnpm format:check` green
 - [ ] Changesets written (major bumps, prose style: no em dashes)
 - [ ] README/docs updated for v5 peer ranges

@@ -547,36 +547,37 @@ export function createRunsStorage(config: UpstashStorageConfig): Storage['runs']
     return runsIndexKey();
   }
 
-  const experimentalSetAttributes: NonNullable<Storage['runs']['experimentalSetAttributes']> =
-    async (runId, changes, options) => {
-      for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
-        const existing = await readWithDigest<WorkflowRun>(redis, runKey(runId));
-        if (!existing) {
-          throw new WorkflowRunNotFoundError(runId);
-        }
-        const currentAttributes = existing.value.attributes ?? {};
-        validateAttributeChanges(changes, {
-          existingKeys: Object.keys(currentAttributes),
-          allowReservedAttributes: options?.allowReservedAttributes === true,
-        });
-        const attributes = applyAttributeChanges(currentAttributes, changes);
-        const updated = { ...existing.value, attributes, updatedAt: new Date() };
-        const result = await redis.eval<string[], number>(
-          LUA_CAS_UPDATE_ENTITY,
-          [runKey(runId)],
-          [existing.digest, stringify(updated)],
-        );
-        if (result === -1) {
-          throw new WorkflowRunNotFoundError(runId);
-        }
-        if (result === 1) {
-          return { attributes };
-        }
+  const experimentalSetAttributes: NonNullable<
+    Storage['runs']['experimentalSetAttributes']
+  > = async (runId, changes, options) => {
+    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+      const existing = await readWithDigest<WorkflowRun>(redis, runKey(runId));
+      if (!existing) {
+        throw new WorkflowRunNotFoundError(runId);
       }
-      throw new WorkflowWorldError(`Concurrent update contention on run "${runId}"`, {
-        status: 500,
+      const currentAttributes = existing.value.attributes ?? {};
+      validateAttributeChanges(changes, {
+        existingKeys: Object.keys(currentAttributes),
+        allowReservedAttributes: options?.allowReservedAttributes === true,
       });
-    };
+      const attributes = applyAttributeChanges(currentAttributes, changes);
+      const updated = { ...existing.value, attributes, updatedAt: new Date() };
+      const result = await redis.eval<string[], number>(
+        LUA_CAS_UPDATE_ENTITY,
+        [runKey(runId)],
+        [existing.digest, stringify(updated)],
+      );
+      if (result === -1) {
+        throw new WorkflowRunNotFoundError(runId);
+      }
+      if (result === 1) {
+        return { attributes };
+      }
+    }
+    throw new WorkflowWorldError(`Concurrent update contention on run "${runId}"`, {
+      status: 500,
+    });
+  };
 
   return {
     get: (async (id: string, params?: GetWorkflowRunParams) => {
@@ -2146,7 +2147,9 @@ export function createStepsStorage(config: UpstashStorageConfig): Storage['steps
       const resolveData = params?.resolveData ?? 'all';
       const steps: (Step | StepWithoutData)[] = [];
       if (stepIds.length > 0) {
-        const bodies = await redis.mget<string[]>(...stepIds.map((sid) => stepKey(params.runId, sid)));
+        const bodies = await redis.mget<string[]>(
+          ...stepIds.map((sid) => stepKey(params.runId, sid)),
+        );
         for (const data of bodies) {
           if (data == null) continue;
           const step = parse<Step>(data);

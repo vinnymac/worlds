@@ -1794,7 +1794,10 @@ describe('Storage (Firestore integration)', () => {
         eventData: { stepName: 'slot', input: [] },
       });
 
-      const page = await storage.events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      const page = await storage.events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
       expect(page.data.length).toBe(3);
       page.data.forEach((event, index) => {
         expect(event.eventId).toBe(slotToEventId(FIRST_EVENT_SLOT + index));
@@ -1818,9 +1821,7 @@ describe('Storage (Firestore integration)', () => {
         ),
       );
 
-      const slots = results
-        .map((r) => eventIdToSlot(r.event!.eventId))
-        .toSorted((a, b) => a! - b!);
+      const slots = results.map((r) => eventIdToSlot(r.event!.eventId)).toSorted((a, b) => a! - b!);
       // run_created holds slot 1; the fan-out takes 2..17, no holes, no dups.
       expect(slots).toEqual(Array.from({ length: 16 }, (_, i) => i + 2));
     });

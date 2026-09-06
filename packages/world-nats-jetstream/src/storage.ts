@@ -315,27 +315,28 @@ export function createRunsStorage(config: NatsStorageConfig): Storage['runs'] {
       });
     })());
 
-  const experimentalSetAttributes: NonNullable<Storage['runs']['experimentalSetAttributes']> =
-    async (runId, changes, options) => {
-      await initBuckets();
-      let attributes: Record<string, string> = {};
-      const result = await casMutate<WorkflowRun>(runsBucket, runId, (existing) => {
-        const currentAttributes = existing.attributes ?? {};
-        validateAttributeChanges(changes, {
-          existingKeys: Object.keys(currentAttributes),
-          allowReservedAttributes: options?.allowReservedAttributes === true,
-        });
-        attributes = applyAttributeChanges(currentAttributes, changes);
-        return {
-          write: true,
-          value: { ...existing, attributes, updatedAt: new Date() },
-        };
+  const experimentalSetAttributes: NonNullable<
+    Storage['runs']['experimentalSetAttributes']
+  > = async (runId, changes, options) => {
+    await initBuckets();
+    let attributes: Record<string, string> = {};
+    const result = await casMutate<WorkflowRun>(runsBucket, runId, (existing) => {
+      const currentAttributes = existing.attributes ?? {};
+      validateAttributeChanges(changes, {
+        existingKeys: Object.keys(currentAttributes),
+        allowReservedAttributes: options?.allowReservedAttributes === true,
       });
-      if (result.type === 'missing') {
-        throw new WorkflowRunNotFoundError(runId);
-      }
-      return { attributes };
-    };
+      attributes = applyAttributeChanges(currentAttributes, changes);
+      return {
+        write: true,
+        value: { ...existing, attributes, updatedAt: new Date() },
+      };
+    });
+    if (result.type === 'missing') {
+      throw new WorkflowRunNotFoundError(runId);
+    }
+    return { attributes };
+  };
 
   return {
     get: (async (id: string, params?: GetWorkflowRunParams) => {
@@ -1077,9 +1078,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
     if (stepEventRequiresExistingStep && data.correlationId) {
       const stepEntry = await getLiveEntry(stepsBucket, `${effectiveRunId}.${data.correlationId}`);
       if (stepEntry) {
-        validatedStep = StepSchema.parse(
-          compact(parse<Step>(kvValueToString(stepEntry.value))),
-        );
+        validatedStep = StepSchema.parse(compact(parse<Step>(kvValueToString(stepEntry.value))));
       }
 
       if (!validatedStep && !lazyStepStart) {
@@ -1629,9 +1628,7 @@ export function createEventsStorage(config: NatsStorageConfig): Storage['events'
             'claimed',
           );
           if (!won) {
-            throw new EntityConflictError(
-              `Attribute event "${data.correlationId}" already exists`,
-            );
+            throw new EntityConflictError(`Attribute event "${data.correlationId}" already exists`);
           }
           claimed = true;
         }

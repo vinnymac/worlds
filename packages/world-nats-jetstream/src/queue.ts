@@ -235,7 +235,12 @@ export function createQueue(
   /** Record a soft redelivery and nak for `delayMs`. Returns false when the
    * soft ceiling is exhausted, in which case nothing was recorded and the
    * caller must treat the delivery as a real failure. */
-  async function softNak(msg: JsMsg, key: string, softNaks: number, delayMs: number): Promise<boolean> {
+  async function softNak(
+    msg: JsMsg,
+    key: string,
+    softNaks: number,
+    delayMs: number,
+  ): Promise<boolean> {
     const next = softNaks + 1;
     if (next > MAX_SOFT_NAKS) return false;
     // Record the suspension BEFORE nak'ing: JetStream may redeliver the

@@ -570,9 +570,7 @@ describe('Storage (NATS JetStream integration)', () => {
 
       const eventList = await world.events.list({ runId: run.runId });
       expect(
-        eventList.data.filter(
-          (e) => e.eventType === 'step_created' && e.correlationId === stepId,
-        ),
+        eventList.data.filter((e) => e.eventType === 'step_created' && e.correlationId === stepId),
       ).toHaveLength(1);
     }, 30_000);
   });
@@ -731,7 +729,10 @@ describe('Storage (NATS JetStream integration)', () => {
         eventData: { result: 1 },
       });
 
-      const events = await world.events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      const events = await world.events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
       expect(events.data.map((e) => e.eventId)).toEqual([1, 2, 3, 4, 5].map(slotToEventId));
       expect(events.data[0].eventType).toBe('run_created');
     });
@@ -750,7 +751,10 @@ describe('Storage (NATS JetStream integration)', () => {
         ),
       );
 
-      const events = await world.events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      const events = await world.events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
       // run_created + run_started + 8 step_created, dense from 1.
       expect(events.data.map((e) => e.eventId)).toEqual(
         Array.from({ length: 10 }, (_, i) => slotToEventId(i + 1)),

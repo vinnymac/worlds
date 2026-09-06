@@ -623,10 +623,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
       for (let attempt = 0; ; attempt++) {
         const baseSlot = await readMaxSlot();
         try {
-          return await firestore.runTransaction(
-            async (tx) => fn(tx, makeAllocator(baseSlot)),
-            { maxAttempts: 1 },
-          );
+          return await firestore.runTransaction(async (tx) => fn(tx, makeAllocator(baseSlot)), {
+            maxAttempts: 1,
+          });
         } catch (err) {
           if (!isSlotContentionError(err) || attempt >= MAX_CREATE_ATTEMPTS) {
             throw err;
@@ -905,7 +904,8 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             tx.create(eventRef, record);
             tx.update(runRef, updates);
             return { record };
-          });
+          },
+        );
 
         // Cleanup hooks and waits when run reaches terminal state
         if (isRunTerminalEvent && !txResult.unchangedRun) {
@@ -943,7 +943,9 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             : undefined;
 
         result = await runEventTransaction(async (tx, allocator) => {
-          const [runSnap, claimSnap] = await tx.getAll(...(claimRef ? [runRef, claimRef] : [runRef]));
+          const [runSnap, claimSnap] = await tx.getAll(
+            ...(claimRef ? [runRef, claimRef] : [runRef]),
+          );
           if (!runSnap.exists) {
             throw new WorkflowRunNotFoundError(effectiveRunId);
           }
@@ -1149,9 +1151,7 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
               // proceed (to record their completion); new work must not
               // start on a cancelled run.
               if (runSnap?.exists) {
-                const runStatus = String(
-                  (runSnap.data() as FirebaseFirestore.DocumentData).status,
-                );
+                const runStatus = String((runSnap.data() as FirebaseFirestore.DocumentData).status);
                 if (isTerminalWorkflowRunStatus(runStatus) && currentStep.status !== 'running') {
                   throw new RunExpiredError(
                     `Cannot modify non-running step on run in terminal state "${runStatus}"`,
@@ -1207,7 +1207,8 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
             tx.create(eventRef, record);
             tx.update(stepRef, updates);
             return { record };
-          });
+          },
+        );
 
         result = {
           event: stripEventDataRefs(EventSchema.parse(txOut.record), resolveData),
@@ -1543,25 +1544,28 @@ export function createStorage(config: FirestoreStorageConfig): Storage {
     return result;
   }) as Storage['events']['create'];
 
-  const experimentalSetAttributes: NonNullable<Storage['runs']['experimentalSetAttributes']> =
-    async (runId, changes, options) => {
-      const runRef = firestore.collection('workflow_runs').doc(runId);
-      return firestore.runTransaction(async (tx) => {
-        const snap = await tx.get(runRef);
-        if (!snap.exists) {
-          throw new WorkflowRunNotFoundError(runId);
-        }
-        const current = ((snap.data() as FirebaseFirestore.DocumentData).attributes ??
-          {}) as Record<string, string>;
-        validateAttributeChanges(changes, {
-          existingKeys: Object.keys(current),
-          allowReservedAttributes: options?.allowReservedAttributes === true,
-        });
-        const attributes = applyAttributeChanges(current, changes);
-        tx.update(runRef, { attributes, updatedAt: new Date() });
-        return { attributes };
+  const experimentalSetAttributes: NonNullable<
+    Storage['runs']['experimentalSetAttributes']
+  > = async (runId, changes, options) => {
+    const runRef = firestore.collection('workflow_runs').doc(runId);
+    return firestore.runTransaction(async (tx) => {
+      const snap = await tx.get(runRef);
+      if (!snap.exists) {
+        throw new WorkflowRunNotFoundError(runId);
+      }
+      const current = ((snap.data() as FirebaseFirestore.DocumentData).attributes ?? {}) as Record<
+        string,
+        string
+      >;
+      validateAttributeChanges(changes, {
+        existingKeys: Object.keys(current),
+        allowReservedAttributes: options?.allowReservedAttributes === true,
       });
-    };
+      const attributes = applyAttributeChanges(current, changes);
+      tx.update(runRef, { attributes, updatedAt: new Date() });
+      return { attributes };
+    });
+  };
 
   return {
     runs: {

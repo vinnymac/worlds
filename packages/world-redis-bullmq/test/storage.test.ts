@@ -275,7 +275,6 @@ describe('Storage (Redis integration)', () => {
       it('should throw error for non-existent step', async () => {
         await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
-
     });
 
     describe('update via events', () => {
@@ -614,7 +613,10 @@ describe('Storage (Redis integration)', () => {
       expect(listResult.data[0].stepId).toBe(stepId);
 
       // Exactly ONE step_created event in the correlation log
-      const eventList = await events.listByCorrelationId({ correlationId: stepId, runId: run.runId });
+      const eventList = await events.listByCorrelationId({
+        correlationId: stepId,
+        runId: run.runId,
+      });
       const created = eventList.data.filter((e) => e.eventType === 'step_created');
       expect(created).toHaveLength(1);
     });
@@ -1253,9 +1255,7 @@ describe('Storage (Redis integration)', () => {
         ),
       );
 
-      const slots = results
-        .map((r) => eventIdToSlot(r.event!.eventId))
-        .toSorted((a, b) => a! - b!);
+      const slots = results.map((r) => eventIdToSlot(r.event!.eventId)).toSorted((a, b) => a! - b!);
       // run_created holds slot 1; the fan-out takes 2..17, no holes, no dups.
       expect(slots).toEqual(Array.from({ length: 16 }, (_, i) => i + 2));
     });

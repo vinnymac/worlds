@@ -20,7 +20,8 @@ const APPENDS_SERIAL = 400;
 const APPENDS_CONCURRENT = 200;
 const LIST_READS = 100;
 
-const distArg = process.argv[2] ?? path.resolve(import.meta.dirname, '../packages/world-redis/dist/index.js');
+const distArg =
+  process.argv[2] ?? path.resolve(import.meta.dirname, '../packages/world-redis/dist/index.js');
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {
   console.error('REDIS_URL is required');
@@ -34,7 +35,7 @@ function percentile(sorted, p) {
 }
 
 async function timed(name, total, fn) {
-  const latencies = new Array(total);
+  const latencies = Array.from({ length: total });
   const start = performance.now();
   await fn(latencies);
   const wall = performance.now() - start;
@@ -118,17 +119,21 @@ results.push(
 const contendedRun = await createRun();
 await world.events.create(contendedRun.runId, { eventType: 'run_started' });
 results.push(
-  await timed(`events.create x${CONCURRENCY} contended one run`, APPENDS_CONCURRENT, async (lat) => {
-    await pooled(APPENDS_CONCURRENT, CONCURRENCY, async (i) => {
-      const t = performance.now();
-      await world.events.create(contendedRun.runId, {
-        eventType: 'step_created',
-        correlationId: `step-contended-${i}`,
-        eventData: { stepName: 'bench-step', input: [i] },
+  await timed(
+    `events.create x${CONCURRENCY} contended one run`,
+    APPENDS_CONCURRENT,
+    async (lat) => {
+      await pooled(APPENDS_CONCURRENT, CONCURRENCY, async (i) => {
+        const t = performance.now();
+        await world.events.create(contendedRun.runId, {
+          eventType: 'step_created',
+          correlationId: `step-contended-${i}`,
+          eventData: { stepName: 'bench-step', input: [i] },
+        });
+        lat[i] = performance.now() - t;
       });
-      lat[i] = performance.now() - t;
-    });
-  }),
+    },
+  ),
 );
 
 results.push(

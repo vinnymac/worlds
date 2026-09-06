@@ -780,9 +780,7 @@ describe('Storage (Upstash Redis integration)', () => {
       );
 
       const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
-      const slots = page.data
-        .map((e) => eventIdToSlot(e.eventId))
-        .toSorted((a, b) => a! - b!);
+      const slots = page.data.map((e) => eventIdToSlot(e.eventId)).toSorted((a, b) => a! - b!);
       // run_created holds slot 1; the fan-out takes 2..17, no holes, no dups.
       expect(slots).toEqual(Array.from({ length: 17 }, (_, i) => i + 1));
     });

@@ -560,37 +560,38 @@ export function createRunsStorage(config: RedisStorageConfig): Storage['runs'] {
     return runs;
   }
 
-  const experimentalSetAttributes: NonNullable<Storage['runs']['experimentalSetAttributes']> =
-    async (runId, changes, options) => {
-      for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
-        const existingData = await redis.get(runKey(runId));
-        if (!existingData) {
-          throw new WorkflowRunNotFoundError(runId);
-        }
-        const existing = parseWithUint8Array<WorkflowRun>(existingData);
-        const currentAttributes = existing.attributes ?? {};
-        validateAttributeChanges(changes, {
-          existingKeys: Object.keys(currentAttributes),
-          allowReservedAttributes: options?.allowReservedAttributes === true,
-        });
-        const attributes = applyAttributeChanges(currentAttributes, changes);
-        const updated = { ...existing, attributes, updatedAt: new Date() };
-        const result = await scripts.wfCasUpdateEntity(
-          runKey(runId),
-          casDigest(existingData),
-          stringifyWithUint8Array(updated),
-        );
-        if (result === null) {
-          throw new WorkflowRunNotFoundError(runId);
-        }
-        if (result === 1) {
-          return { attributes };
-        }
+  const experimentalSetAttributes: NonNullable<
+    Storage['runs']['experimentalSetAttributes']
+  > = async (runId, changes, options) => {
+    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+      const existingData = await redis.get(runKey(runId));
+      if (!existingData) {
+        throw new WorkflowRunNotFoundError(runId);
       }
-      throw new WorkflowWorldError(`Concurrent update contention on run "${runId}"`, {
-        status: 500,
+      const existing = parseWithUint8Array<WorkflowRun>(existingData);
+      const currentAttributes = existing.attributes ?? {};
+      validateAttributeChanges(changes, {
+        existingKeys: Object.keys(currentAttributes),
+        allowReservedAttributes: options?.allowReservedAttributes === true,
       });
-    };
+      const attributes = applyAttributeChanges(currentAttributes, changes);
+      const updated = { ...existing, attributes, updatedAt: new Date() };
+      const result = await scripts.wfCasUpdateEntity(
+        runKey(runId),
+        casDigest(existingData),
+        stringifyWithUint8Array(updated),
+      );
+      if (result === null) {
+        throw new WorkflowRunNotFoundError(runId);
+      }
+      if (result === 1) {
+        return { attributes };
+      }
+    }
+    throw new WorkflowWorldError(`Concurrent update contention on run "${runId}"`, {
+      status: 500,
+    });
+  };
 
   return {
     get: (async (id: string, params?: GetWorkflowRunParams) => {
@@ -893,7 +894,14 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
         updatedAt: now,
       };
       if (
-        await casRunUpdate(runId, existingData, updatedRun, existing.status, newStatus, now.getTime())
+        await casRunUpdate(
+          runId,
+          existingData,
+          updatedRun,
+          existing.status,
+          newStatus,
+          now.getTime(),
+        )
       ) {
         await cleanupHooks(runId);
         await cleanupWaits(runId);
@@ -973,7 +981,14 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             updatedAt: now,
           };
           if (
-            await casRunUpdate(runId, existingData, updatedRun, existing.status, 'cancelled', now.getTime())
+            await casRunUpdate(
+              runId,
+              existingData,
+              updatedRun,
+              existing.status,
+              'cancelled',
+              now.getTime(),
+            )
           ) {
             await cleanupHooks(runId);
             const parsed = WorkflowRunSchema.parse(compact(updatedRun));
@@ -1792,10 +1807,16 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
     // Handle run_completed event: CAS transition + cleanup hooks/waits
     if (data.eventType === 'run_completed') {
       const eventData = data.eventData;
-      run = await applyTerminalRunTransition(effectiveRunId, 'run_completed', 'completed', now, () => ({
-        output: eventData?.output,
-        error: undefined,
-      }));
+      run = await applyTerminalRunTransition(
+        effectiveRunId,
+        'run_completed',
+        'completed',
+        now,
+        () => ({
+          output: eventData?.output,
+          error: undefined,
+        }),
+      );
     }
 
     // Handle run_failed event: CAS transition + cleanup hooks/waits. The
@@ -1811,10 +1832,16 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
 
     // Handle run_cancelled event: CAS transition + cleanup hooks/waits
     if (data.eventType === 'run_cancelled') {
-      run = await applyTerminalRunTransition(effectiveRunId, 'run_cancelled', 'cancelled', now, () => ({
-        output: undefined,
-        error: undefined,
-      }));
+      run = await applyTerminalRunTransition(
+        effectiveRunId,
+        'run_cancelled',
+        'cancelled',
+        now,
+        () => ({
+          output: undefined,
+          error: undefined,
+        }),
+      );
     }
 
     // Handle attr_set event: merge the changes onto the run entity via CAS.
@@ -1846,9 +1873,7 @@ export function createEventsStorage(config: RedisStorageConfig): Storage['events
             'NX',
           );
           if (claimed === null) {
-            throw new EntityConflictError(
-              `Attribute event "${data.correlationId}" already exists`,
-            );
+            throw new EntityConflictError(`Attribute event "${data.correlationId}" already exists`);
           }
         }
         const updated = {

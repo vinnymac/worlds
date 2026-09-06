@@ -300,7 +300,11 @@ export function createStreamer(config: StreamerConfig): Streamer & {
               return false;
             };
 
-            const enqueueChunkData = (msg: { id: string; data: Uint8Array; eof: boolean }): void => {
+            const enqueueChunkData = (msg: {
+              id: string;
+              data: Uint8Array;
+              eof: boolean;
+            }): void => {
               if (msg.data.byteLength) {
                 controller.enqueue(new Uint8Array(msg.data));
               }

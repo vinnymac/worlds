@@ -9,17 +9,17 @@ Research date: 2026-09-05. Compared npm tarballs, extracted under this directory
 
 ## 1. Dist-tag table (as of 2026-09-05)
 
-| Package | latest (4.x) | beta (5.x) |
-| --- | --- | --- |
-| workflow | 4.8.5 | 5.0.0-beta.48 |
-| @workflow/world | 4.5.0 | 5.0.0-beta.33 |
-| @workflow/world-local | 4.4.0 | 5.0.0-beta.42 |
-| @workflow/world-postgres | 4.3.5 | 5.0.0-beta.40 |
-| @workflow/world-testing | 4.1.20 | 5.0.0-beta.48 |
-| @workflow/errors | 4.2.1 | 5.0.0-beta.20 |
-| @workflow/utils | 4.1.4 | 5.0.0-beta.10 |
-| @workflow/core | 4.8.5 | 5.0.0-beta.48 |
-| @workflow/cli | 4.3.9 | 5.0.0-beta.48 |
+| Package                  | latest (4.x) | beta (5.x)    |
+| ------------------------ | ------------ | ------------- |
+| workflow                 | 4.8.5        | 5.0.0-beta.48 |
+| @workflow/world          | 4.5.0        | 5.0.0-beta.33 |
+| @workflow/world-local    | 4.4.0        | 5.0.0-beta.42 |
+| @workflow/world-postgres | 4.3.5        | 5.0.0-beta.40 |
+| @workflow/world-testing  | 4.1.20       | 5.0.0-beta.48 |
+| @workflow/errors         | 4.2.1        | 5.0.0-beta.20 |
+| @workflow/utils          | 4.1.4        | 5.0.0-beta.10 |
+| @workflow/core           | 4.8.5        | 5.0.0-beta.48 |
+| @workflow/cli            | 4.3.9        | 5.0.0-beta.48 |
 
 Repo: https://github.com/vercel/workflow (release tags `workflow@5.0.0-beta.N`).
 world-testing beta.48 depends on `@workflow/world 5.0.0-beta.33`, `@workflow/core
@@ -30,24 +30,24 @@ world-testing beta.48 depends on `@workflow/world 5.0.0-beta.33`, `@workflow/cor
 v4 (`world-4/dist/spec-version.js`):
 
 ```js
-SPEC_VERSION_LEGACY = 1
-SPEC_VERSION_SUPPORTS_EVENT_SOURCING = 2
-SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT = 3
-SPEC_VERSION_CURRENT = 3
+SPEC_VERSION_LEGACY = 1;
+SPEC_VERSION_SUPPORTS_EVENT_SOURCING = 2;
+SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT = 3;
+SPEC_VERSION_CURRENT = 3;
 ```
 
 v5 (`world-5/dist/spec-version.js`):
 
 ```js
-SPEC_VERSION_LEGACY = 1
-SPEC_VERSION_SUPPORTS_EVENT_SOURCING = 2
-SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT = 3
-SPEC_VERSION_SUPPORTS_ATTRIBUTES = 4
-SPEC_VERSION_SUPPORTS_COMPRESSION = 5      // zstd/gzip payloads allowed
-SPEC_VERSION_SUPPORTS_SLOT_IDENTITY = 6    // slot-numbered event ids
-SPEC_VERSION_SUPPORTS_SEALED_LOG = 7       // noop-sealed pre-assigned slots
-SPEC_VERSION_CURRENT = 7                   // floor the runtime accepts
-SPEC_VERSION_MAX_SUPPORTED = 7             // ceiling the runtime reads
+SPEC_VERSION_LEGACY = 1;
+SPEC_VERSION_SUPPORTS_EVENT_SOURCING = 2;
+SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT = 3;
+SPEC_VERSION_SUPPORTS_ATTRIBUTES = 4;
+SPEC_VERSION_SUPPORTS_COMPRESSION = 5; // zstd/gzip payloads allowed
+SPEC_VERSION_SUPPORTS_SLOT_IDENTITY = 6; // slot-numbered event ids
+SPEC_VERSION_SUPPORTS_SEALED_LOG = 7; // noop-sealed pre-assigned slots
+SPEC_VERSION_CURRENT = 7; // floor the runtime accepts
+SPEC_VERSION_MAX_SUPPORTED = 7; // ceiling the runtime reads
 ```
 
 New exports: `mintedSpecVersion(env?)` (what a World stamps on new runs;
@@ -75,7 +75,10 @@ export interface World extends Queue, Storage, Streamer {
   clear?(): Promise<void>;
   resolveLatestDeploymentId?(): Promise<string>;
   getEncryptionKeyForRun?(run: WorkflowRun): Promise<Uint8Array | undefined>;
-  getEncryptionKeyForRun?(runId: string, context?: Record<string, unknown>): Promise<Uint8Array | undefined>;
+  getEncryptionKeyForRun?(
+    runId: string,
+    context?: Record<string, unknown>,
+  ): Promise<Uint8Array | undefined>;
 }
 ```
 
@@ -103,9 +106,9 @@ export interface World extends Queue, Streamer, Storage {
 ```ts
 export interface WorldCapabilities {
   hookRetention?: { active: boolean }; // supports experimental_minRetention on hooks
-  maxConcurrency?: boolean;            // queue supports maxConcurrency-limited consumption (per-run serialization); declarative only today
-  hookResumeDedup?: boolean;           // events.create dedups hook_received on (runId, resumeId); ALSO requires events.list to round-trip resumeId
-  deploymentAffinity?: boolean;        // deployment ids are atomic/immutable; enables misroute guard + DEPLOYMENT_MISMATCH. Leave unset for synthetic ids like dpl_local@<version>
+  maxConcurrency?: boolean; // queue supports maxConcurrency-limited consumption (per-run serialization); declarative only today
+  hookResumeDedup?: boolean; // events.create dedups hook_received on (runId, resumeId); ALSO requires events.list to round-trip resumeId
+  deploymentAffinity?: boolean; // deployment ids are atomic/immutable; enables misroute guard + DEPLOYMENT_MISMATCH. Leave unset for synthetic ids like dpl_local@<version>
 }
 ```
 
@@ -121,13 +124,17 @@ Before (methods flat on World):
 
 ```ts
 export interface Streamer {
-  streamFlushIntervalMs?: number;   // default was 10ms
+  streamFlushIntervalMs?: number; // default was 10ms
   writeToStream(name: string, runId: string, chunk: string | Uint8Array): Promise<void>;
   writeToStreamMulti?(name: string, runId: string, chunks: (string | Uint8Array)[]): Promise<void>;
   closeStream(name: string, runId: string): Promise<void>;
   readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>>;
   listStreamsByRunId(runId: string): Promise<string[]>;
-  getStreamChunks(name: string, runId: string, options?: GetChunksOptions): Promise<StreamChunksResponse>;
+  getStreamChunks(
+    name: string,
+    runId: string,
+    options?: GetChunksOptions,
+  ): Promise<StreamChunksResponse>;
   getStreamInfo(name: string, runId: string): Promise<StreamInfoResponse>;
 }
 ```
@@ -136,14 +143,18 @@ After (namespace object, runId is ALWAYS the first parameter):
 
 ```ts
 export interface Streamer {
-  streamFlushIntervalMs?: number;   // default is now 0 (first chunk flushes immediately); WORKFLOW_STREAM_FLUSH_INTERVAL_MS env overrides
+  streamFlushIntervalMs?: number; // default is now 0 (first chunk flushes immediately); WORKFLOW_STREAM_FLUSH_INTERVAL_MS env overrides
   streams: {
     write(runId: string, name: string, chunk: string | Uint8Array): Promise<void>;
     writeMulti?(runId: string, name: string, chunks: (string | Uint8Array)[]): Promise<void>;
     close(runId: string, name: string): Promise<void>;
-    get(runId: string, name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>>;  // note: now takes runId (v4 readFromStream did not)
+    get(runId: string, name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>>; // note: now takes runId (v4 readFromStream did not)
     list(runId: string): Promise<string[]>;
-    getChunks(runId: string, name: string, options?: GetChunksOptions): Promise<StreamChunksResponse>;
+    getChunks(
+      runId: string,
+      name: string,
+      options?: GetChunksOptions,
+    ): Promise<StreamChunksResponse>;
     getInfo(runId: string, name: string): Promise<StreamInfoResponse>;
   };
 }
@@ -191,6 +202,7 @@ fails the run (`Event id is not slot-numbered` / `CORRUPTED_EVENT_LOG`) if an id
 does not decode.
 
 Four binding rules (from upgrading-to-v5.mdx):
+
 1. Uniqueness: settle slot races in the STORE (unique constraint on
    `(runId, eventId)` or conditional write), never read-max-plus-one in process.
 2. Density: positions run from 1 with no holes; a losing writer re-derives its
@@ -326,12 +338,12 @@ wait_created, wait_completed`.
 - Envelope: new optional `resumeId` (top-level, must round-trip through
   events.list when hookResumeDedup declared).
 - `run_created` / `run_started`.eventData: new optional `attributes:
-  Record<string,string>`, `allowReservedAttributes: true`, `encryptionPublicKey: string`.
+Record<string,string>`, `allowReservedAttributes: true`, `encryptionPublicKey: string`.
 - `run_failed`.eventData: `error` was `z.any()`, now serialized-data union;
   `errorCode?` kept.
 - `run_cancelled`: now has optional eventData `{ cancelReason?: string }` (v4 had none).
 - NEW `attr_set` event: eventData `{ changes: {key, value: string|null}[],
-  writer: { type: 'workflow' } | { type: 'step', stepId, attempt }, allowReservedAttributes?: true }`.
+writer: { type: 'workflow' } | { type: 'step', stepId, attempt }, allowReservedAttributes?: true }`.
 - `step_completed` / `step_failed`.eventData: new optional telemetry numbers
   `ttfs, stso, stepCount, eventCount, rsfs, finalSchedulingReplay` and
   `optimizations?: string[]`; `error` -> serialized union; `stack` field REMOVED
@@ -390,11 +402,11 @@ time); callers fall back to `createdAt`. New: `workflowRunIdSchema`
   `{ correlationId, attempt }`; waits are now ordinary queue continuations with
   `delaySeconds`, the `{timeoutSeconds}` wait-return contract is gone),
   `stepId?`, `stepName?`, `hookInput?` (HookResumeInput: `{ resumeId, hookId,
-  token, payload, payloadDigest, deploymentId? }`), `stepInput?`
+token, payload, payloadDigest, deploymentId? }`), `stepInput?`
   (`{ input: Uint8Array }`, resilient step dispatch re-ensure), and
   `hookResumeTiming?` (advisory TTR telemetry `{ resumeRequestedAtMs,
-  queuePublishRequestedAtMs, strategy?, consumerStartedAtMs?,
-  replayStartedAtMs?, nextStepEncounteredAtMs?, setupSource? }`).
+queuePublishRequestedAtMs, strategy?, consumerStartedAtMs?,
+replayStartedAtMs?, nextStepEncounteredAtMs?, setupSource? }`).
   `runInput` gains `attributes?`, `allowReservedAttributes?`, `environment?`.
 - `QueuePayloadSchema` union: health check member now FIRST (ordering matters:
   probe carries optional runId and would be swallowed by the invoke member),
@@ -415,6 +427,7 @@ time); callers fall back to `createdAt`. New: `workflowRunIdSchema`
 ## 7. Runs / hooks / shared schema deltas
 
 ### runs.d.ts
+
 - `WorkflowRunSchema.error`: structured `{message, stack?, code?}` ->
   serialized-data union; new top-level `errorCode?: string`.
 - New fields on every run variant: `attributes: Record<string,string>`
@@ -430,13 +443,14 @@ time); callers fall back to `createdAt`. New: `workflowRunIdSchema`
   `BulkCancelWorkflowRunsResultSchema`.
 
 ### hooks.d.ts
+
 - `Hook` type is now purely `z.infer<typeof HookSchema>` (v4 added a manual
   intersection; gone).
 - HookSchema new fields: `isSystem?: boolean`, `tokenRetentionUntil?: Date`,
   `resumeContext?: HookResumeContext`, `resumeCapabilities?: HookResumeCapabilities`.
 - NEW `HookResumeContextSchema` `{ deploymentId, workflowName, runSpecVersion?,
-  workflowCoreVersion?, traceCarrier?, encryptionPublicKey?,
-  hookResumeInputVersion? }` (immutable slice of the owning run persisted on
+workflowCoreVersion?, traceCarrier?, encryptionPublicKey?,
+hookResumeInputVersion? }` (immutable slice of the owning run persisted on
   the hook so resume can skip runs.get).
 - NEW constants `HOOK_RESUME_INPUT_VERSION = 1`, `HOOK_RESUME_DEDUP_VERSION = 1`,
   `HookResumeCapabilitiesSchema { hookResumeDedupVersion: number }`
@@ -444,11 +458,13 @@ time); callers fall back to `createdAt`. New: `workflowRunIdSchema`
   to the static hookResumeDedup capability).
 
 ### shared.d.ts
+
 - `PaginatedResponseSchema` gains optional `pageInfo` (`PageInfoSchema`:
   `{ currentLookbackDays, maxLookbackDays, currentWindowStart, maxWindowStart,
-  upgradeAvailable }`, plan-aware lookback metadata).
+upgradeAvailable }`, plan-aware lookback metadata).
 
 ### attributes.d.ts (NEW)
+
 `AttributeKeySchema`, `AttributeValueSchema` (string|null),
 `AttributeChangeSchema`, `AttributeChangesSchema`, `AttributeValidationError`,
 `applyAttributeChanges`, `validateAttributeChanges`,
@@ -457,6 +473,7 @@ time); callers fall back to `createdAt`. New: `workflowRunIdSchema`
 `ROOT_RUN_ID_ATTRIBUTE` (`$rootRunId`), `ExperimentalSetAttributesResult`.
 
 ### analytics.d.ts (NEW, all optional via `world.analytics`)
+
 Metadata-only read namespace: `Analytics` with `runs.get/list`,
 `attributes.list`, `steps.get/list`, `events.get/getMany/list/listByCorrelationId`,
 `hooks.get/list`, `waits.get/list`; schemas `AnalyticsRunSchema` etc.; limits
@@ -522,7 +539,7 @@ runs-storage.js 140. New modules: `storage/run-status-signal.js`,
   forbidden (hook resume convergence: two writers must converge on ONE event,
   so the resume path answers the `(runId, resumeId)` sidecar claim before any
   bump; `claimHookResume` filesystem claim). `reportSkippedSlots(result,
-  eventCount, resolveData)` implements the report half when the committed slot
+eventCount, resolveData)` implements the report half when the committed slot
   exceeds `eventCount + 1`.
 - Streamer: interface renames applied at the object level (write/writeMulti/
   close/get/list/getChunks/getInfo with runId first); chunk files moved from a
@@ -543,18 +560,19 @@ runs-storage.js 140. New modules: `storage/run-status-signal.js`,
 ## 10. @workflow/errors delta (4.2.1 -> 5.0.0-beta.20)
 
 New error classes (all with `static is()`):
+
 - `WorkflowBuildError extends WorkflowError` `{ readonly hint?: string }`,
   ctor `(message, options?: WorkflowBuildErrorOptions)`.
 - `SerializationError extends WorkflowError` `{ readonly hint?: string;
-  readonly fatal = true }` (deterministic, skips step retry; recognized by
+readonly fatal = true }` (deterministic, skips step retry; recognized by
   `FatalError.is`).
 - `WorkflowDeploymentMismatchError extends WorkflowRuntimeError`
   `(runId, expectedDeploymentId, actualDeploymentId, options?: {
-  recoveryAttempts?, cause? })` with readonly fields incl. `recoveryAttempts`.
+recoveryAttempts?, cause? })` with readonly fields incl. `recoveryAttempts`.
 - `StreamError extends WorkflowWorldError` `(message, options?: { cause?,
-  url?, status? })`.
+url?, status? })`.
 - `StreamExpiredError extends WorkflowWorldError` `(message, runId?, streamId?,
-  expiredAt?)`.
+expiredAt?)`.
 
 New error codes: `STREAM_ERROR`, `DEPLOYMENT_MISMATCH`.
 `ReplayDivergenceError` signature unchanged (implementation/formatting only).
@@ -575,6 +593,7 @@ No removals. `get-port` gained a `get-port-internals` module (internal).
 ## 12. Migration notes from the official guide (upgrading-to-v5.mdx)
 
 Required, in order of effort:
+
 1. Event ID allocation (section 3.5 / 5 above). NOT visible from types.
    HARD COMPATIBILITY BREAK: ULID-numbered runs already in the store CANNOT be
    replayed by v5 code; no mixed-scheme mode, no per-run fallback. Drain
