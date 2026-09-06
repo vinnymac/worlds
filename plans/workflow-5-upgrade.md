@@ -82,16 +82,22 @@ on them.
       noted: hook_received-after-terminal TOCTOU still open, same as v4;
       world-local closes it with terminal markers plus reap
 - [~] world-postgres-redis (agent running 2026-09-05)
-- [~] world-mysql (archetype for SQL family; agent running 2026-09-05)
-- [ ] world-mysql-redis
+- [x] world-mysql (archetype for SQL family; commit 8ef2305, 47/47 tests
+      incl. conformance, independently re-verified; world-postgres port
+      with composite PK slot INSERT, workflow_event_slots legacy marker,
+      migration 0005). Watch item: InnoDB deadlock between allocation and
+      entity-row locks rolls back the create; runtime retries delivery
+- [~] world-mysql-redis (agent running 2026-09-05)
 - [x] world-redis-bullmq (commit 5f38209, 81/81 tests incl. conformance,
       independently re-verified; storage adopted verbatim from
       world-redis, extract-to-shared dedup opportunity noted for later)
 - [~] world-upstash (agent running 2026-09-05)
-- [ ] world-nats-jetstream
-- [ ] world-azure
-- [ ] world-firestore-tasks
-- [ ] world-cloudflare (also `test:workers` under workerd)
+- [~] world-nats-jetstream (agent running 2026-09-05; must fix or report
+      the suspension-as-failed-delivery conflation)
+- [~] world-azure (agent running 2026-09-05)
+- [~] world-firestore-tasks (agent running 2026-09-05)
+- [~] world-cloudflare (agent running 2026-09-05; test:workers required,
+      DO classes must stay in the published dist)
 
 Per world definition of done: build + typecheck + conformance tests green,
 behavior checked against world-local/world-postgres beta dists rather than
