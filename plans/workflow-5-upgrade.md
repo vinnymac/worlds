@@ -91,7 +91,9 @@ on them.
 - [x] world-redis-bullmq (commit 5f38209, 81/81 tests incl. conformance,
       independently re-verified; storage adopted verbatim from
       world-redis, extract-to-shared dedup opportunity noted for later)
-- [~] world-upstash (agent running 2026-09-05)
+- [x] world-upstash (commit c4fdb07, 77/77 tests incl. conformance,
+      independently re-verified; queue wire field renamed message to
+      payload, so in-flight QStash messages also need the 4.x drain)
 - [~] world-nats-jetstream (agent running 2026-09-05; must fix or report
       the suspension-as-failed-delivery conflation)
 - [~] world-azure (agent running 2026-09-05)
