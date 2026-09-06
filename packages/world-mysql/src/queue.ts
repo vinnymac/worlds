@@ -3,10 +3,10 @@ import {
   MessageId,
   parseQueueName,
   type Queue,
-  type QueueKind,
   type QueueOptions,
   type QueuePayload,
   type ValidQueueName,
+  WorkflowInvokePayloadSchema,
 } from '@workflow/world';
 import { createWorkflowUrl } from '@workflow/utils';
 import { decode, encode } from 'cbor-x';
@@ -19,15 +19,14 @@ import { debug } from './util.js';
 
 type Drizzle = MySql2Database<typeof schema>;
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
+/** The single job list. Steps ride the workflow topic in v5 (the step queue
+ * kind is retired); the payload carries stepId/stepName instead. */
+const FLOW_QUEUE = 'workflow_flows';
 
 export interface MysqlQueueConfig {
   /** Poll interval in milliseconds (default: 100) */
   pollIntervalMs?: number;
-  /** Number of concurrent workers per queue prefix (default: 10) */
+  /** Number of concurrent workers (default: 10) */
   concurrency?: number;
   /** Maximum attempts before marking as failed (default: 3) */
   maxAttempts?: number;
@@ -385,13 +384,29 @@ export function createQueue(
 
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-  const prefix = 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
-
   let running = false;
+
+  // Preserves step fan-out while preventing two workflow replays from
+  // mutating the same run's event log at the same time; a lost slot race is
+  // a bump-and-report merge either way, this just avoids paying it locally.
+  const inflightWorkflowRuns = new Map<string, Promise<void>>();
+
+  function runSerialized(key: string | undefined, task: () => Promise<void>): Promise<void> {
+    if (!key) {
+      return task();
+    }
+    const previous = inflightWorkflowRuns.get(key);
+    const execution = (previous ?? Promise.resolve())
+      .catch(() => {})
+      .then(task)
+      .finally(() => {
+        if (inflightWorkflowRuns.get(key) === execution) {
+          inflightWorkflowRuns.delete(key);
+        }
+      });
+    inflightWorkflowRuns.set(key, execution);
+    return execution;
+  }
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'mysql';
 
@@ -400,12 +415,11 @@ export function createQueue(
     message: QueuePayload,
     opts?: QueueOptions,
   ) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
-
+    // Validates the name shape; every message rides the single flow list.
+    parseQueueName(queueName);
     const envelope: JobEnvelope = { queueName, message };
 
-    return enqueueJob(db, listKey, envelope, {
+    return enqueueJob(db, FLOW_QUEUE, envelope, {
       idempotencyKey: opts?.idempotencyKey,
       delaySeconds: opts?.delaySeconds,
       maxAttempts,
@@ -449,10 +463,11 @@ export function createQueue(
     envelope: JobEnvelope,
     messageId: string,
     attempt: number,
-    pathname: 'flow' | 'step',
   ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = createWorkflowUrl(baseUrl, { type: pathname });
+    // Everything executes in the combined flow handler; the /step endpoint
+    // no longer exists in v5.
+    const url = createWorkflowUrl(baseUrl, { type: 'flow' });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -466,73 +481,83 @@ export function createQueue(
     });
   }
 
-  async function processJob(job: RawJobRow, listKey: string, kind: QueueKind): Promise<void> {
+  async function processJob(job: RawJobRow): Promise<void> {
     const startTime = Date.now();
+    let envelope: JobEnvelope;
     try {
-      const envelope = decode(job.payload) as JobEnvelope;
-      const response = await dispatch(
-        envelope,
-        job.job_id,
-        job.attempt ?? 1,
-        QUEUE_PATHNAMES[kind],
-      );
+      envelope = decode(job.payload) as JobEnvelope;
+    } catch (error) {
+      metrics.recordError(FLOW_QUEUE, false);
+      await handleJobFailure(db, job, error);
+      return;
+    }
+    // Stable across redeliveries: the message id doubles as the inline-step
+    // ownership liveness lease (ownerMessageId), so it must not be re-minted.
+    const invoke = WorkflowInvokePayloadSchema.safeParse(envelope.message);
+    const serializationKey =
+      invoke.success && !invoke.data.stepId ? `workflow:${invoke.data.runId}` : undefined;
 
-      if (response.ok) {
-        await completeJob(db, job);
-        metrics.recordProcessed(listKey, Date.now() - startTime);
-        return;
-      }
+    await runSerialized(serializationKey, async () => {
+      try {
+        const response = await dispatch(envelope, job.job_id, job.attempt ?? 1);
 
-      const text = await response.text();
-
-      if (response.status === 503) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          parsed = null;
-        }
-        if (
-          parsed &&
-          typeof parsed === 'object' &&
-          typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
-        ) {
-          const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-          // Re-schedule without consuming an attempt.
-          await db
-            .update(schema.jobs)
-            .set({
-              status: 'pending',
-              lockedAt: null,
-              lockedBy: null,
-              scheduledFor: new Date(Date.now() + timeoutMs),
-              attempt: Math.max(0, (job.attempt ?? 1) - 1),
-            })
-            .where(eq(schema.jobs.id, job.id));
+        if (response.ok) {
+          await completeJob(db, job);
+          metrics.recordProcessed(FLOW_QUEUE, Date.now() - startTime);
           return;
         }
-      }
 
-      throw new Error(`HTTP ${response.status}: ${text}`);
-    } catch (error) {
-      const isRetry = (job.attempt ?? 1) < (job.max_attempts ?? maxAttempts);
-      metrics.recordError(listKey, isRetry);
-      console.error(
-        `[world-mysql processJob] Error processing job ${job.job_id} (attempt ${job.attempt}/${job.max_attempts}):`,
-        error instanceof Error ? error.message : error,
-      );
-      await handleJobFailure(db, job, error);
-    }
+        const text = await response.text();
+
+        if (response.status === 503) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            parsed = null;
+          }
+          if (
+            parsed &&
+            typeof parsed === 'object' &&
+            typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
+          ) {
+            const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
+            // Re-schedule without consuming an attempt.
+            await db
+              .update(schema.jobs)
+              .set({
+                status: 'pending',
+                lockedAt: null,
+                lockedBy: null,
+                scheduledFor: new Date(Date.now() + timeoutMs),
+                attempt: Math.max(0, (job.attempt ?? 1) - 1),
+              })
+              .where(eq(schema.jobs.id, job.id));
+            return;
+          }
+        }
+
+        throw new Error(`HTTP ${response.status}: ${text}`);
+      } catch (error) {
+        const isRetry = (job.attempt ?? 1) < (job.max_attempts ?? maxAttempts);
+        metrics.recordError(FLOW_QUEUE, isRetry);
+        console.error(
+          `[world-mysql processJob] Error processing job ${job.job_id} (attempt ${job.attempt}/${job.max_attempts}):`,
+          error instanceof Error ? error.message : error,
+        );
+        await handleJobFailure(db, job, error);
+      }
+    });
   }
 
-  async function worker(kind: QueueKind, listKey: string, workerIdx: number) {
-    const wId = `${workerId}_${kind}_${workerIdx}`;
+  async function worker(workerIdx: number) {
+    const wId = `${workerId}_flow_${workerIdx}`;
 
     while (running) {
       try {
-        const job = await fetchJob(db, listKey, wId);
+        const job = await fetchJob(db, FLOW_QUEUE, wId);
         if (job) {
-          await processJob(job, listKey, kind);
+          await processJob(job);
         } else {
           await delay(pollIntervalMs);
         }
@@ -544,13 +569,10 @@ export function createQueue(
   }
 
   function startWorkers() {
-    const entries = Object.entries(Queues) as [QueueKind, string][];
-    for (const [kind, listKey] of entries) {
-      for (let i = 0; i < concurrency; i++) {
-        worker(kind, listKey, i).catch((error) => {
-          console.error(`[world-mysql] Worker for ${listKey} crashed:`, error);
-        });
-      }
+    for (let i = 0; i < concurrency; i++) {
+      worker(i).catch((error) => {
+        console.error(`[world-mysql] Worker for ${FLOW_QUEUE} crashed:`, error);
+      });
     }
   }
 

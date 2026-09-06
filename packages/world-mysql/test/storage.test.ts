@@ -2,11 +2,11 @@ import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { MySqlContainer } from '@testcontainers/mysql';
 import { EntityConflictError, TooEarlyError } from '@workflow/errors';
 import type { Step, WorkflowRun } from '@workflow/world';
+import { eventIdToSlot, FIRST_EVENT_SLOT, slotToEventId } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
 import type { RowDataPacket } from 'mysql2/promise';
-import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import * as schema from '../src/schema.js';
 import {
@@ -25,6 +25,7 @@ describe('Storage (MySQL integration)', () => {
 
   let container: Awaited<ReturnType<MySqlContainer['start']>>;
   let connection: mysql.Connection;
+  let pool: mysql.Pool;
   let db: MySql2Database<typeof schema>;
   let runs: ReturnType<typeof createRunsStorage>;
   let steps: ReturnType<typeof createStepsStorage>;
@@ -37,6 +38,8 @@ describe('Storage (MySQL integration)', () => {
     await connection.query('TRUNCATE TABLE `workflow`.`workflow_steps`');
     await connection.query('TRUNCATE TABLE `workflow`.`workflow_hooks`');
     await connection.query('TRUNCATE TABLE `workflow`.`workflow_runs`');
+    await connection.query('TRUNCATE TABLE `workflow`.`workflow_waits`');
+    await connection.query('TRUNCATE TABLE `workflow`.`workflow_event_slots`');
     await connection.query('TRUNCATE TABLE `workflow`.`workflow_stream_chunks`');
     await connection.query('SET FOREIGN_KEY_CHECKS = 1');
   }
@@ -79,7 +82,12 @@ describe('Storage (MySQL integration)', () => {
     // Second run must be a no-op: the ledger skips every applied file.
     await applyMigrations(connection);
 
-    db = drizzle(connection, { schema, mode: 'default' });
+    // A pool, not the single connection: concurrent drizzle transactions on
+    // one connection interleave their BEGINs (an implicit commit each time),
+    // which breaks every test that races events.create calls. Production
+    // (createMysqlWorld) always runs on a pool.
+    pool = mysql.createPool({ uri: dbUrl, connectionLimit: 20 });
+    db = drizzle(pool, { schema, mode: 'default' });
     runs = createRunsStorage(db);
     steps = createStepsStorage(db);
     hooks = createHooksStorage(db);
@@ -89,6 +97,7 @@ describe('Storage (MySQL integration)', () => {
   beforeEach(truncateTables);
 
   afterAll(async () => {
+    await pool?.end();
     await connection?.end();
     await container?.stop();
   });
@@ -293,97 +302,81 @@ describe('Storage (MySQL integration)', () => {
     });
   });
 
-  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt`: the conformance
-  // suite has no coverage for this, so pin the semantics here.
-  describe('stateUpdatedAt optimistic-concurrency guard', () => {
-    const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
-
-    async function completeStep(runId: string, stepId: string): Promise<number> {
-      await createStep(runId, stepId);
-      await events.create(runId, { eventType: 'step_started', correlationId: stepId });
-      const completed = await events.create(runId, {
-        eventType: 'step_completed',
-        correlationId: stepId,
-        eventData: { result: [] },
-      });
-      return ulidTime(completed.event!.eventId);
-    }
-
-    function stepCreated(stepId: string) {
-      return {
-        eventType: 'step_created' as const,
-        correlationId: stepId,
-        eventData: { stepName: 'guarded-step', input: [] },
-      };
-    }
-
-    it('rejects a snapshot strictly older than the marker with PreconditionFailedError', async () => {
+  // v5 slot identity: every event id is the event's dense 1-based position
+  // in its run's log, allocated at the commit and settled by the composite
+  // primary key. The conformance suite covers the happy path; these pin the
+  // MySQL-specific concurrency and bump-and-report behavior.
+  describe('slot-numbered event ids', () => {
+    it('numbers events densely from 1 in canonical form', async () => {
       const run = await createRun();
       await events.create(run.runId, { eventType: 'run_started' });
-      const marker = await completeStep(run.runId, 'step-guard-source');
+      await createStep(run.runId, 'step-slot');
 
-      await expect(
-        events.create(run.runId, stepCreated('step-guard-stale'), {
-          stateUpdatedAt: marker - 1,
-        }),
-      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
-
-      // The rejected create must leave nothing behind.
-      const stepList = await steps.list({ runId: run.runId });
-      expect(stepList.data.some((s) => s.stepId === 'step-guard-stale')).toBe(false);
+      const list = await events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(list.data.length).toBeGreaterThanOrEqual(3);
+      list.data.forEach((e, i) => {
+        expect(eventIdToSlot(e.eventId)).toBe(FIRST_EVENT_SLOT + i);
+        expect(e.eventId).toBe(slotToEventId(FIRST_EVENT_SLOT + i));
+      });
     });
 
-    it('accepts an equal snapshot and an absent snapshot, and never advances on replay creates', async () => {
+    it('settles a concurrent fan-out on unique dense slots', async () => {
       const run = await createRun();
       await events.create(run.runId, { eventType: 'run_started' });
-      const marker = await completeStep(run.runId, 'step-guard-source');
 
-      // Equal must pass; `<=` here would livelock an up-to-date client.
-      const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
-        stateUpdatedAt: marker,
-      });
-      expect(equal.step?.stepId).toBe('step-guard-equal');
+      const results = await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          events.create(run.runId, {
+            eventType: 'step_created',
+            correlationId: `step-fanout-${i}`,
+            eventData: { stepName: 'fanout', input: [] },
+          }),
+        ),
+      );
 
-      // Replay-origin creates carry a stateUpdatedAt and must not advance the
-      // marker, so the same snapshot still passes afterwards.
-      const again = await events.create(run.runId, stepCreated('step-guard-equal-2'), {
-        stateUpdatedAt: marker,
-      });
-      expect(again.step?.stepId).toBe('step-guard-equal-2');
-
-      // Absent stateUpdatedAt fails open.
-      const unguarded = await events.create(run.runId, stepCreated('step-guard-absent'));
-      expect(unguarded.step?.stepId).toBe('step-guard-absent');
+      // run_created took slot 1 and run_started slot 2; the fan-out must
+      // occupy 3..10 with no duplicates and no holes.
+      const slots = results.map((r) => eventIdToSlot(r.event!.eventId)).sort((a, b) => a! - b!);
+      expect(slots).toEqual(Array.from({ length: 8 }, (_, i) => i + 3));
     });
 
-    it('advances the marker on hook_received but not on run lifecycle events', async () => {
+    it('bumps a stale eventCount and reports the skipped span', async () => {
       const run = await createRun();
       await events.create(run.runId, { eventType: 'run_started' });
+      await createStep(run.runId, 'step-bump-taken'); // takes slot 3
 
-      // run_created / run_started omit stateUpdatedAt but are not externally
-      // originated: advancing on them would reject every replay.
-      const beforeHook = await events.create(run.runId, stepCreated('step-guard-pre-hook'), {
-        stateUpdatedAt: 1,
-      });
-      expect(beforeHook.step?.stepId).toBe('step-guard-pre-hook');
+      // Writer whose loaded log held 2 events expects slot 3; the write must
+      // commit at 4 and report the event occupying the skipped slot 3.
+      const bumped = await events.create(
+        run.runId,
+        {
+          eventType: 'step_created',
+          correlationId: 'step-bump-stale',
+          eventData: { stepName: 'bumped', input: [] },
+        },
+        { eventCount: 2 },
+      );
+      expect(eventIdToSlot(bumped.event!.eventId)).toBe(4);
+      expect(bumped.events?.map((e) => e.eventId)).toEqual([slotToEventId(3)]);
+      expect(bumped.hasMore).toBe(false);
+      // The report is a lower bound, not a page the caller finished reading.
+      expect(bumped.cursor).toBeNull();
 
-      await events.create(run.runId, {
-        eventType: 'hook_created',
-        correlationId: 'hook-guard',
-        eventData: { token: 'token-guard' },
-      });
-      const received = await events.create(run.runId, {
-        eventType: 'hook_received',
-        correlationId: 'hook-guard',
-        eventData: { payload: {} },
-      });
-      const marker = ulidTime(received.event!.eventId);
-
-      await expect(
-        events.create(run.runId, stepCreated('step-guard-post-hook'), {
-          stateUpdatedAt: marker - 1,
-        }),
-      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+      // An up-to-date count reports nothing.
+      const clean = await events.create(
+        run.runId,
+        {
+          eventType: 'step_created',
+          correlationId: 'step-bump-fresh',
+          eventData: { stepName: 'fresh', input: [] },
+        },
+        { eventCount: 4 },
+      );
+      expect(eventIdToSlot(clean.event!.eventId)).toBe(5);
+      expect(clean.events).toBeUndefined();
     });
   });
 
@@ -791,26 +784,6 @@ describe('Storage (MySQL integration)', () => {
 
       expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
       expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
-      expect(result.hasMore).toBe(false);
-    });
-
-    it('lists every run when runId is omitted', async () => {
-      const seeded = await seedInterleavedRuns();
-
-      const result = await events.listByCorrelationId({
-        correlationId: sharedCorrelationId,
-        pagination: {},
-      });
-
-      // Also pins the interleaving the scoped pagination test relies on.
-      expect(result.data.map((e) => e.eventId)).toEqual([
-        seeded.a[0],
-        seeded.b[0],
-        seeded.a[1],
-        seeded.b[1],
-        seeded.a[2],
-        seeded.b[2],
-      ]);
       expect(result.hasMore).toBe(false);
     });
 

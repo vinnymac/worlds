@@ -1,8 +1,11 @@
 import {
   type Event,
   type Hook,
+  type SerializedData,
   type Step,
   StepStatusSchema,
+  type Wait,
+  WaitStatusSchema,
   type WorkflowRun,
   WorkflowRunStatusSchema,
 } from '@workflow/world';
@@ -28,6 +31,7 @@ function mustBeMoreThanOne<T>(t: T[]) {
 
 const runStatusValues = mustBeMoreThanOne(WorkflowRunStatusSchema.options);
 const stepStatusValues = mustBeMoreThanOne(StepStatusSchema.options);
+const waitStatusValues = mustBeMoreThanOne(WaitStatusSchema.options);
 
 /**
  * A mapped type that converts all properties of T to Drizzle ORM column definitions,
@@ -62,7 +66,16 @@ export const runs = schema.table(
     /** @deprecated */
     inputJson: json('input').$type<SerializedContent>(),
     input: Cbor<SerializedContent>()('input_cbor'),
-    error: text('error'),
+    /** @deprecated legacy JSON-stringified StructuredError */
+    errorJson: text('error'),
+    /** run_failed thrown value, serialized (dehydrateRunError), CBOR-wrapped. */
+    error: Cbor<SerializedData>()('error_cbor'),
+    /** Plaintext error category (USER_ERROR, ...) from run_failed. */
+    errorCode: varchar('error_code', { length: 255 }),
+    /** Plaintext string-string run metadata (`setAttributes()`), merged SQL-side. */
+    attributes: json('attributes').$type<Record<string, string>>().default({}).notNull(),
+    /** Run's X25519 public key (base64), stamped at creation. Not secret. */
+    encryptionPublicKey: varchar('encryption_public_key', { length: 255 }),
     createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { fsp: 3 })
       .defaultNow()
@@ -72,14 +85,11 @@ export const runs = schema.table(
     startedAt: timestamp('started_at', { fsp: 3 }),
     specVersion: int('spec_version'),
     expiredAt: timestamp('expired_at', { fsp: 3 }),
-    /** Epoch-ms ULID time of the most recent externally-originated event for this
-     * run. Not part of the `WorkflowRun` contract, stripped before return. */
-    stateUpdatedAt: bigint('state_updated_at', { mode: 'number' }),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
-      'input' | 'output' | 'executionContext'
-    > & { stateUpdatedAt?: number }
+      'input' | 'output' | 'executionContext' | 'error'
+    >
   >,
   (tb) => [
     index('idx_workflow_runs_name').on(tb.workflowName),
@@ -90,7 +100,7 @@ export const runs = schema.table(
 export const events = schema.table(
   'workflow_events',
   {
-    eventId: varchar('id', { length: 255 }).primaryKey(),
+    eventId: varchar('id', { length: 255 }).notNull(),
     eventType: varchar('type', { length: 255 }).$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id', { length: 255 }),
     createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
@@ -100,12 +110,33 @@ export const events = schema.table(
     eventDataJson: json('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
     specVersion: int('spec_version'),
-  } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
+    // `resumeId` is omitted deliberately: this world does not advertise lazy
+    // hook-resume dedup, so it never persists the resume idempotency key.
+  } satisfies DrizzlishOfType<
+    Cborized<Omit<Event, 'resumeId'> & { eventData?: undefined }, 'eventData'>
+  >,
   (tb) => [
-    index('idx_workflow_events_run_id').on(tb.runId),
+    // Event ids are per-run slot positions, so `evnt_...0001` exists once per
+    // run and is only unique together with its run. Legacy runs keep
+    // globally-unique ULIDs, which this key also admits. The key leads with
+    // runId, so it also serves every by-run lookup and range scan.
+    primaryKey({ columns: [tb.runId, tb.eventId] }),
     index('idx_workflow_events_correlation_id').on(tb.correlationId),
+    // The entity-creation unique guard (step_created / hook_created /
+    // wait_created / attr_set once per (run, correlation)) lives in
+    // migrations 0004/0005 as a functional index; MySQL drizzle cannot
+    // express the NULL-exempting CASE key part.
   ],
 );
+
+/**
+ * Which runs are slot-numbered. A row exists iff the run is; its absence is
+ * the "this run predates slots, keep minting ULIDs" signal. A marker, not a
+ * counter: positions are allocated by the insert that occupies them.
+ */
+export const eventSlots = schema.table('workflow_event_slots', {
+  runId: varchar('run_id', { length: 255 }).primaryKey(),
+});
 
 export const steps = schema.table(
   'workflow_steps',
@@ -120,7 +151,10 @@ export const steps = schema.table(
     /** @deprecated we stream binary data */
     outputJson: json('output').$type<SerializedContent>(),
     output: Cbor<SerializedContent>()('output_cbor'),
-    error: text('error'),
+    /** @deprecated legacy JSON-stringified StructuredError */
+    errorJson: text('error'),
+    /** step_failed / step_retrying thrown value, serialized, CBOR-wrapped. */
+    error: Cbor<SerializedData>()('error_cbor'),
     attempt: int('attempt').notNull(),
     startedAt: timestamp('started_at', { fsp: 3 }),
     completedAt: timestamp('completed_at', { fsp: 3 }),
@@ -132,7 +166,7 @@ export const steps = schema.table(
     retryAfter: timestamp('retry_after', { fsp: 3 }),
     specVersion: int('spec_version'),
   } satisfies DrizzlishOfType<
-    Cborized<Omit<Step, 'input'> & { input?: unknown }, 'output' | 'input'>
+    Cborized<Omit<Step, 'input'> & { input?: unknown }, 'output' | 'input' | 'error'>
   >,
   (tb) => [
     index('idx_workflow_steps_run_id').on(tb.runId),
@@ -150,16 +184,41 @@ export const hooks = schema.table(
     projectId: varchar('project_id', { length: 255 }).notNull(),
     environment: varchar('environment', { length: 255 }).notNull(),
     createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    tokenRetentionUntil: timestamp('token_retention_until', { fsp: 3 }),
     /** @deprecated */
     metadataJson: json('metadata').$type<SerializedContent>(),
     metadata: Cbor<SerializedContent>()('metadata_cbor'),
     specVersion: int('spec_version'),
     isWebhook: boolean('is_webhook'),
-  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
+    isSystem: boolean('is_system').default(false),
+    // Server-synthesized resume slice. Not carried by hook_created, so this
+    // backend leaves it null; reads fall back to runs.get.
+    resumeContext: Cbor<NonNullable<Hook['resumeContext']>>()('resume_context'),
+    // `resumeCapabilities` is response-only (attested fresh per by-token
+    // lookup, never persisted), so it must not become a column.
+  } satisfies DrizzlishOfType<Cborized<Omit<Hook, 'resumeCapabilities'>, 'metadata'>>,
   (tb) => [
     index('idx_workflow_hooks_run_id').on(tb.runId),
     index('idx_workflow_hooks_token').on(tb.token),
   ],
+);
+
+export const waits = schema.table(
+  'workflow_waits',
+  {
+    waitId: varchar('wait_id', { length: 255 }).primaryKey(),
+    runId: varchar('run_id', { length: 255 }).notNull(),
+    status: mysqlEnum('status', waitStatusValues).notNull(),
+    resumeAt: timestamp('resume_at', { fsp: 3 }),
+    completedAt: timestamp('completed_at', { fsp: 3 }),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { fsp: 3 })
+      .defaultNow()
+      .$onUpdateFn(() => new Date())
+      .notNull(),
+    specVersion: int('spec_version'),
+  } satisfies DrizzlishOfType<Wait>,
+  (tb) => [index('idx_workflow_waits_run_id').on(tb.runId)],
 );
 
 const blob = customType<{ data: Buffer; notNull: false; default: false }>({

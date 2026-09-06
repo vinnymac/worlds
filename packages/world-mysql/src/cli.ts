@@ -25,8 +25,10 @@ async function setupDatabase() {
     console.log('\nCreated tables:');
     console.log('  - workflow.workflow_runs');
     console.log('  - workflow.workflow_events');
+    console.log('  - workflow.workflow_event_slots');
     console.log('  - workflow.workflow_steps');
     console.log('  - workflow.workflow_hooks');
+    console.log('  - workflow.workflow_waits');
     console.log('  - workflow.workflow_stream_chunks');
     console.log('  - workflow.workflow_jobs');
     console.log('  - workflow.workflow_job_idempotency');
