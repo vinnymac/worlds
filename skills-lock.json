@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "migrating-world-v4-to-v5": {
+      "source": "vercel/workflow",
+      "sourceType": "github",
+      "skillPath": "skills/migrating-world-v4-to-v5/SKILL.md",
+      "computedHash": "d56b3294338cd21c651d028af58121215abb39960af036fb36819d0e6e57498b"
+    }
+  }
+}

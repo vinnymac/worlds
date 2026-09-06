@@ -68,3 +68,10 @@ target
 
 # Claude local settings
 .claude/settings.local.json
+
+# Claude Code local settings and scheduler state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Pi agent state
+.pi/
