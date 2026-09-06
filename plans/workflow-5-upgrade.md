@@ -87,7 +87,9 @@ on them.
       with composite PK slot INSERT, workflow_event_slots legacy marker,
       migration 0005). Watch item: InnoDB deadlock between allocation and
       entity-row locks rolls back the create; runtime retries delivery
-- [~] world-mysql-redis (agent running 2026-09-05)
+- [x] world-mysql-redis (commit c57ee83, 48/48 tests incl. conformance,
+      independently re-verified; storage ported from world-mysql, queue
+      from world-redis, migration 0008)
 - [x] world-redis-bullmq (commit 5f38209, 81/81 tests incl. conformance,
       independently re-verified; storage adopted verbatim from
       world-redis, extract-to-shared dedup opportunity noted for later)
