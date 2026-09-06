@@ -125,10 +125,23 @@ hand-rolled (see memory: match official world behavior).
 - [ ] Ruleset check: if any CI job is renamed, update ruleset 21057342
 
 ### Phase 5: Benchmarks
-- [ ] Add a small benchmark harness (no harness exists in-repo today).
-      Baseline on 4.x (main), rerun on vt/wf-5, compare. Start with
-      world-redis + world-redis-bullmq round-trip and serde-heavy paths
-- [ ] Record before/after numbers here
+- [x] Harness added: `bench/world-redis.bench.mjs` (commit 8abcc49). Runs
+      identically against 4.x and 5.x dists; needs a redis at REDIS_URL
+- [x] world-redis 4.x vs 5.x comparison (redis:7-alpine local, node
+      24.18, main worktree baseline):
+      runs.create serial 1980 -> 2070/s (+4.5%); events.create serial
+      2352 -> 2508/s (+6.6%); events.create x16 contended one run
+      12938 -> 15131/s (+17%, p95 1.89 -> 1.25ms); events.list 400-event
+      log 7642 -> 9700/s (+27%); runs.create x16 concurrent 16-18k ->
+      12-16k/s (repeatable -15 to -20%, p95 still under 1.4ms).
+      Verdict: no regression on the per-event hot path or reads; the one
+      slower phase is run creation under 16-way concurrency, explained by
+      v5 run_created doing strictly more work (slot marker, attributes,
+      preload cursor). Accepted: once-per-workflow cost, sub-1.4ms p95.
+      Follow-up: profile the v5 run_created pipeline for a fusable
+      round trip
+- [ ] Optional: extend bench to world-redis-bullmq if publish timing
+      allows
 
 ### Phase 6: Quality and ship
 - [ ] `pnpm lint`, `pnpm format:check` green
