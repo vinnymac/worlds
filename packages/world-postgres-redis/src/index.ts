@@ -63,10 +63,9 @@ export function createWorld(
   const runUpdateSubscriber = createRunUpdateSubscriber(postgres);
 
   return {
-    // Declares support for the current spec (CBOR queue transport +
-    // resilient-start runInput bootstrap). Without this, core creates runs at
-    // the baseline spec and never sends runInput through the queue, so a
-    // transiently failed run_created can never be recovered.
+    // Event ids are slot-numbered and allocated at the commit inside the
+    // INSERT, so this World is current-spec compliant by construction (no
+    // pre-assigned positions, no noop sealing needed).
     specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,

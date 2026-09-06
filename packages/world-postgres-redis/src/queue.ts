@@ -1,12 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-  MessageId,
-  parseQueueName,
-  type Queue,
-  type QueueKind,
-  QueuePayloadSchema,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type Queue, QueuePayloadSchema, type ValidQueueName } from '@workflow/world';
 import { createWorkflowUrl } from '@workflow/utils';
 import { eq } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
@@ -24,11 +17,6 @@ interface MessageEnvelope {
   attempt: number;
   message: unknown;
 }
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
 
 /** How long an enqueue-dedup key survives if never explicitly released. */
 const DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -104,7 +92,7 @@ interface OutboxQueuePayload {
  *   outbox relay drains the row asynchronously.
  * - Workers BRPOPLPUSH to a processing list, claim the item into an in-flight
  *   sorted set (score = visibility deadline), then dispatch the payload via
- *   HTTP fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ *   HTTP fetch to `${baseUrl}/.well-known/workflow/v1/flow`.
  * - All delayed redelivery (sleep()/503 soft-retry, failure backoff) goes
  *   through a Redis sorted set scored by delivery time, so pending wake-ups
  *   survive process restarts. A poller promotes due items, and in-flight
@@ -122,11 +110,10 @@ export function createQueue(
   const visibilityMs = httpTimeoutMs + VISIBILITY_BUFFER_MS;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
-  const queueEntries = Object.entries(Queues) as [QueueKind, string][];
+  // Single workflow topic: queued steps and wait continuations travel on it
+  // too, carrying stepId / delaySeconds in the payload (v5 retired the step
+  // queue kind).
+  const workflowListKey = `${prefix}flows`;
 
   // Used to fail the run loudly when a message exhausts its delivery attempts.
   const events = createEventsStorage(drizzle);
@@ -172,8 +159,7 @@ export function createQueue(
   });
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
+    const listKey = workflowListKey;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const idempotencyKey = opts?.idempotencyKey;
     const dedupKey = idempotencyKey ? dedupKeyFor(listKey, idempotencyKey) : null;
@@ -273,9 +259,9 @@ export function createQueue(
     };
   };
 
-  async function dispatch(envelope: MessageEnvelope, pathname: 'flow' | 'step'): Promise<Response> {
+  async function dispatch(envelope: MessageEnvelope): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = createWorkflowUrl(baseUrl, { type: pathname });
+    const url = createWorkflowUrl(baseUrl, { type: 'flow' });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -314,9 +300,9 @@ export function createQueue(
     if (!parsed.success) return;
     const message = parsed.data;
     const runId =
-      'runId' in message
+      'runId' in message && typeof message.runId === 'string'
         ? message.runId
-        : 'workflowRunId' in message
+        : 'workflowRunId' in message && typeof message.workflowRunId === 'string'
           ? message.workflowRunId
           : null;
     if (!runId) return;
@@ -340,7 +326,6 @@ export function createQueue(
     listKey: string,
     item: string,
     envelope: MessageEnvelope,
-    kind: QueueKind,
   ): Promise<void> {
     const inflightKey = `${listKey}:inflight`;
     const delayedKey = `${listKey}:delayed`;
@@ -365,7 +350,7 @@ export function createQueue(
     };
 
     try {
-      const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
+      const response = await dispatch(envelope);
 
       if (response.ok) {
         if (envelope.idempotencyKey) {
@@ -422,7 +407,6 @@ export function createQueue(
     listKey: string,
     processingListKey: string,
     item: string,
-    kind: QueueKind,
   ): Promise<void> {
     // Claim the item: record a visibility deadline in the in-flight sorted
     // set, then drop it from the processing landing zone. If this worker
@@ -444,7 +428,7 @@ export function createQueue(
 
     const idempotencyKey = envelope.idempotencyKey;
     if (!idempotencyKey) {
-      await executeItem(workerRedis, listKey, item, envelope, kind);
+      await executeItem(workerRedis, listKey, item, envelope);
       return;
     }
     if (completedMessages.has(idempotencyKey)) {
@@ -463,14 +447,14 @@ export function createQueue(
       }
       return;
     }
-    const execution = executeItem(workerRedis, listKey, item, envelope, kind).finally(() => {
+    const execution = executeItem(workerRedis, listKey, item, envelope).finally(() => {
       inflightMessages.delete(idempotencyKey);
     });
     inflightMessages.set(idempotencyKey, { item, execution });
     await execution;
   }
 
-  async function worker(kind: QueueKind, listKey: string) {
+  async function worker(listKey: string) {
     // `duplicate()` copies the parent's options, and auto-pipelining is a
     // storage-side setting: batching a blocking BRPOPLPUSH with other
     // commands would stall them behind it, so it is turned off here.
@@ -490,7 +474,7 @@ export function createQueue(
           continue;
         }
         if (!item) continue;
-        await processItem(workerRedis, listKey, processingListKey, item, kind);
+        await processItem(workerRedis, listKey, processingListKey, item);
       }
     } finally {
       await workerRedis.quit().catch(() => {
@@ -528,14 +512,12 @@ export function createQueue(
 
   function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
-    for (const [kind, listKey] of queueEntries) {
-      for (let i = 0; i < concurrency; i++) {
-        workerLoops.push(
-          worker(kind, listKey).catch((error) => {
-            console.error(`[world-postgres-redis] Worker for ${listKey} crashed:`, error);
-          }),
-        );
-      }
+    for (let i = 0; i < concurrency; i++) {
+      workerLoops.push(
+        worker(workflowListKey).catch((error) => {
+          console.error(`[world-postgres-redis] Worker for ${workflowListKey} crashed:`, error);
+        }),
+      );
     }
   }
 
@@ -548,14 +530,10 @@ export function createQueue(
       if (started) return;
       started = true;
       stopOutboxRelay = outboxRelay.start();
-      for (const [, listKey] of queueEntries) {
-        await recoverProcessingList(listKey);
-      }
+      await recoverProcessingList(workflowListKey);
       startWorkers();
       promoteTimer = setInterval(() => {
-        for (const [, listKey] of queueEntries) {
-          void promoteDueMessages(listKey);
-        }
+        void promoteDueMessages(workflowListKey);
       }, PROMOTE_INTERVAL_MS);
     },
     async close() {

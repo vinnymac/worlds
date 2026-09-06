@@ -4,8 +4,8 @@ import { asEventRequest, expectEventType, expectRejectedWith } from '@fantasticf
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { EntityConflictError, TooEarlyError, WorkflowRunNotFoundError } from '@workflow/errors';
 import type { Hook, Step, WorkflowRun } from '@workflow/world';
+import { eventIdToSlot, FIRST_EVENT_SLOT, slotToEventId } from '@workflow/world';
 import postgres from 'postgres';
-import { decodeTime } from 'ulid';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import { createClient } from '../src/drizzle/index.js';
 import {
@@ -127,7 +127,7 @@ describe('Storage (Postgres integration)', () => {
   let events: ReturnType<typeof createEventsStorage>;
 
   async function truncateTables() {
-    await sql`TRUNCATE TABLE workflow.workflow_events, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_runs, workflow.workflow_stream_chunks RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE TABLE workflow.workflow_events, workflow.workflow_event_slots, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_waits, workflow.workflow_runs, workflow.workflow_stream_chunks RESTART IDENTITY CASCADE`;
   }
 
   beforeAll(async () => {
@@ -265,7 +265,8 @@ describe('Storage (Postgres integration)', () => {
         });
 
         expect(updated.status).toBe('failed');
-        expect(updated.error?.message).toBe('Something went wrong');
+        // v5 stores the serialized error payload verbatim.
+        expect(updated.error).toBe('Something went wrong');
         expect(updated.completedAt).toBeInstanceOf(Date);
       });
     });
@@ -389,18 +390,6 @@ describe('Storage (Postgres integration)', () => {
         expect(retrieved.stepId).toBe(created.stepId);
       });
 
-      it('should retrieve a step with only stepId', async () => {
-        const created = await createStep(events, testRunId, {
-          stepId: 'unique-step-123',
-          stepName: 'test-step',
-          input: ['input1'],
-        });
-
-        const retrieved = await steps.get(undefined, 'unique-step-123');
-
-        expect(retrieved.stepId).toBe(created.stepId);
-      });
-
       it('should throw error for non-existent step', async () => {
         await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
@@ -449,7 +438,8 @@ describe('Storage (Postgres integration)', () => {
         });
 
         expect(updated.status).toBe('failed');
-        expect(updated.error?.message).toBe('Step failed');
+        // v5 stores the serialized error payload verbatim.
+        expect(updated.error).toBe('Step failed');
         expect(updated.completedAt).toBeInstanceOf(Date);
       });
     });
@@ -534,7 +524,8 @@ describe('Storage (Postgres integration)', () => {
         });
 
         expect(result.event?.runId).toBe(testRunId);
-        expect(result.event?.eventId).toMatch(/^wevt_/);
+        // run_created took slot 1, step_created slot 2, so this is slot 3.
+        expect(result.event?.eventId).toBe(slotToEventId(3));
         expect(result.event?.eventType).toBe('step_started');
         expect(result.event?.correlationId).toBe('corr_123');
         expect(result.event?.createdAt).toBeInstanceOf(Date);
@@ -568,7 +559,7 @@ describe('Storage (Postgres integration)', () => {
         });
 
         expect(result.event?.runId).toBe(testRunId);
-        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(eventIdToSlot(result.event!.eventId)).not.toBeNull();
         expect(result.event?.eventType).toBe('step_failed');
         expect(result.event?.correlationId).toBe('corr_123_null');
         expect(result.event?.createdAt).toBeInstanceOf(Date);
@@ -713,6 +704,7 @@ describe('Storage (Postgres integration)', () => {
 
         const result = await events.listByCorrelationId({
           correlationId,
+          runId: testRunId,
           pagination: {},
         });
 
@@ -721,50 +713,6 @@ describe('Storage (Postgres integration)', () => {
         expect(result.data[0].eventType).toBe('step_created');
         expect(result.data[1].eventId).toBe(result1.event?.eventId);
         expect(result.data[2].eventId).toBe(result2.event?.eventId);
-      });
-
-      it('should list events across multiple runs with same correlation ID', async () => {
-        const correlationId = 'hook-xyz789';
-
-        const run2 = await createRun(events, {
-          deploymentId: 'deployment-456',
-          workflowName: 'test-workflow-2',
-          input: [],
-        });
-
-        const result1 = await events.create(testRunId, {
-          eventType: 'hook_created',
-          correlationId,
-          eventData: { token: 'test-token-1' },
-        });
-
-        await setTimeout(2);
-
-        const result2 = await events.create(run2.runId, {
-          eventType: 'hook_received',
-          correlationId,
-          eventData: { payload: { data: 'test' } },
-        });
-
-        await setTimeout(2);
-
-        const result3 = await events.create(testRunId, {
-          eventType: 'hook_disposed',
-          correlationId,
-        });
-
-        const result = await events.listByCorrelationId({
-          correlationId,
-          pagination: {},
-        });
-
-        expect(result.data).toHaveLength(3);
-        expect(result.data[0].eventId).toBe(result1.event?.eventId);
-        expect(result.data[0].runId).toBe(testRunId);
-        expect(result.data[1].eventId).toBe(result2.event?.eventId);
-        expect(result.data[1].runId).toBe(run2.runId);
-        expect(result.data[2].eventId).toBe(result3.event?.eventId);
-        expect(result.data[2].runId).toBe(testRunId);
       });
 
       it('should return empty list for non-existent correlation ID', async () => {
@@ -780,6 +728,7 @@ describe('Storage (Postgres integration)', () => {
 
         const result = await events.listByCorrelationId({
           correlationId: 'non-existent-correlation-id',
+          runId: testRunId,
           pagination: {},
         });
 
@@ -822,6 +771,7 @@ describe('Storage (Postgres integration)', () => {
 
         const result = await events.listByCorrelationId({
           correlationId: hookId,
+          runId: testRunId,
           pagination: {},
         });
 
@@ -905,26 +855,6 @@ describe('Storage (Postgres integration)', () => {
 
         expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
         expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
-        expect(result.hasMore).toBe(false);
-      });
-
-      it('should list every run when runId is omitted', async () => {
-        const seeded = await seedInterleavedRuns();
-
-        const result = await events.listByCorrelationId({
-          correlationId: sharedCorrelationId,
-          pagination: {},
-        });
-
-        // Also pins the interleaving the scoped pagination test relies on.
-        expect(result.data.map((e) => e.eventId)).toEqual([
-          seeded.a[0],
-          seeded.b[0],
-          seeded.a[1],
-          seeded.b[1],
-          seeded.a[2],
-          seeded.b[2],
-        ]);
         expect(result.hasMore).toBe(false);
       });
 
@@ -1208,7 +1138,7 @@ describe('Storage (Postgres integration)', () => {
       });
 
       expect(result.step?.status).toBe('pending');
-      expect(result.step?.error?.message).toBe('Temporary failure');
+      expect(result.step?.error).toBe('Temporary failure');
       expect(result.step?.retryAfter).toBeInstanceOf(Date);
     });
 
@@ -1564,14 +1494,10 @@ describe('Storage (Postgres integration)', () => {
     });
   });
 
-  // @workflow/world 4.3.1 `CreateEventParams.stateUpdatedAt`: the conformance
-  // suite has no coverage for this, so pin the semantics here.
-  describe('stateUpdatedAt optimistic-concurrency guard', () => {
-    const ulidTime = (eventId: string) => decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
-
+  describe('slot-numbered event ids', () => {
     async function startRun(workflowName: string): Promise<WorkflowRun> {
       const run = await createRun(events, {
-        deploymentId: 'deployment-state-guard',
+        deploymentId: 'deployment-slots',
         workflowName,
         input: [],
       });
@@ -1579,85 +1505,90 @@ describe('Storage (Postgres integration)', () => {
       return run;
     }
 
-    async function completeStep(runId: string, stepId: string): Promise<number> {
-      await createStep(events, runId, { stepId, stepName: 'guarded-step', input: [] });
-      await updateStep(events, runId, stepId, 'step_started');
-      const completed = await events.create(runId, {
-        eventType: 'step_completed',
-        correlationId: stepId,
-        eventData: { result: [] },
+    it('numbers the log densely from slot 1 in canonical form', async () => {
+      const run = await startRun('slots-dense');
+      await createStep(events, run.runId, { stepId: 'slot-step', stepName: 'slot-step', input: [] });
+
+      const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      expect(page.data).toHaveLength(3);
+      page.data.forEach((event, index) => {
+        expect(event.eventId).toBe(slotToEventId(FIRST_EVENT_SLOT + index));
+        expect(eventIdToSlot(event.eventId)).toBe(FIRST_EVENT_SLOT + index);
       });
-      return ulidTime(completed.event!.eventId);
-    }
-
-    function stepCreated(stepId: string) {
-      return {
-        eventType: 'step_created' as const,
-        correlationId: stepId,
-        eventData: { stepName: 'guarded-step', input: [] },
-      };
-    }
-
-    it('rejects a snapshot strictly older than the marker with PreconditionFailedError', async () => {
-      const run = await startRun('state-guard-stale');
-      const marker = await completeStep(run.runId, 'step-guard-source');
-
-      await expect(
-        events.create(run.runId, stepCreated('step-guard-stale'), {
-          stateUpdatedAt: marker - 1,
-        }),
-      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
-
-      // The unlocked fail-fast check runs before any entity write.
-      const stepList = await steps.list({ runId: run.runId });
-      expect(stepList.data.some((s) => s.stepId === 'step-guard-stale')).toBe(false);
     });
 
-    it('accepts an equal snapshot and an absent snapshot, and never advances on replay creates', async () => {
-      const run = await startRun('state-guard-equal');
-      const marker = await completeStep(run.runId, 'step-guard-source');
-
-      // Equal must pass; `<=` here would livelock an up-to-date client.
-      const equal = await events.create(run.runId, stepCreated('step-guard-equal'), {
-        stateUpdatedAt: marker,
+    it('bumps a stale eventCount and reports the skipped span', async () => {
+      const run = await startRun('slots-bump');
+      await createStep(events, run.runId, {
+        stepId: 'ahead-step',
+        stepName: 'ahead-step',
+        input: [],
       });
-      expect(equal.step?.stepId).toBe('step-guard-equal');
 
-      // Replay-origin creates carry a stateUpdatedAt and must not advance the
-      // marker, so the same snapshot still passes afterwards.
-      const again = await events.create(run.runId, stepCreated('step-guard-equal-2'), {
-        stateUpdatedAt: marker,
-      });
-      expect(again.step?.stepId).toBe('step-guard-equal-2');
+      // The log holds 3 events; a writer whose snapshot held 1 expects slot 2.
+      const result = await events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'stale-wait',
+          eventData: { resumeAt: new Date() },
+        },
+        { eventCount: 1 },
+      );
 
-      // Absent stateUpdatedAt fails open.
-      const unguarded = await events.create(run.runId, stepCreated('step-guard-absent'));
-      expect(unguarded.step?.stepId).toBe('step-guard-absent');
+      // Committed at the next free slot instead of rejecting.
+      expect(eventIdToSlot(result.event!.eventId)).toBe(4);
+      // The skipped span (slots 2 and 3) rides the success response, with no
+      // cursor so the caller's read position does not advance.
+      expect(result.events?.map((e) => e.eventId)).toEqual([slotToEventId(2), slotToEventId(3)]);
+      expect(result.cursor).toBeNull();
+      expect(result.hasMore).toBe(false);
     });
 
-    it('advances the marker on hook_received but not on run lifecycle events', async () => {
-      const run = await startRun('state-guard-hook');
-
-      // run_created / run_started omit stateUpdatedAt but are not externally
-      // originated: advancing on them would reject every replay.
-      const beforeHook = await events.create(run.runId, stepCreated('step-guard-pre-hook'), {
-        stateUpdatedAt: 1,
+    it('accepts a create carrying no eventCount without a report', async () => {
+      const run = await startRun('slots-no-count');
+      const result = await events.create(run.runId, {
+        eventType: 'wait_created',
+        correlationId: 'out-of-band-wait',
+        eventData: { resumeAt: new Date() },
       });
-      expect(beforeHook.step?.stepId).toBe('step-guard-pre-hook');
+      expect(eventIdToSlot(result.event!.eventId)).toBe(3);
+      expect(result.events).toBeUndefined();
+    });
 
-      await createHook(events, run.runId, { hookId: 'hook-guard', token: 'token-guard' });
-      const received = await events.create(run.runId, {
-        eventType: 'hook_received',
-        correlationId: 'hook-guard',
-        eventData: { payload: {} },
+    it('races concurrent creates for a slot without holes or duplicates', async () => {
+      const run = await startRun('slots-race');
+
+      const results = await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          events.create(run.runId, {
+            eventType: 'step_created',
+            correlationId: `race-step-${i}`,
+            eventData: { stepName: `race-step-${i}`, input: [] },
+          }),
+        ),
+      );
+
+      const slots = results.map((r) => eventIdToSlot(r.event!.eventId));
+      expect(new Set(slots).size).toBe(10);
+
+      const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      expect(page.data.map((e) => e.eventId)).toEqual(
+        Array.from({ length: 12 }, (_, i) => slotToEventId(FIRST_EVENT_SLOT + i)),
+      );
+    });
+
+    it('keeps the ULID scheme for runs that predate slots', async () => {
+      const run = await startRun('slots-legacy');
+      // Simulate a pre-slot run by removing its slot marker.
+      await sql`DELETE FROM workflow.workflow_event_slots WHERE run_id = ${run.runId}`;
+
+      const result = await events.create(run.runId, {
+        eventType: 'wait_created',
+        correlationId: 'legacy-wait',
+        eventData: { resumeAt: new Date() },
       });
-      const marker = ulidTime(received.event!.eventId);
-
-      await expect(
-        events.create(run.runId, stepCreated('step-guard-post-hook'), {
-          stateUpdatedAt: marker - 1,
-        }),
-      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
+      expect(result.event?.eventId).toMatch(/^wevt_/);
     });
   });
 
