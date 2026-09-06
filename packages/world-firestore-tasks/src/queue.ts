@@ -4,13 +4,7 @@ import type { Firestore } from '@google-cloud/firestore';
 import type { CloudTasksClient } from '@google-cloud/tasks';
 import { createWorkflowUrl } from '@workflow/utils';
 import type { Queue } from '@workflow/world';
-import {
-  MessageId,
-  parseQueueName,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
 
@@ -45,13 +39,6 @@ interface PumpEnvelope {
   /** Dedup key held while the message is inflight (queued, dispatching, or backing off). */
   idempotencyKey?: string;
 }
-
-type Pathname = 'flow' | 'step';
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, Pathname>;
 
 /**
  * How long processed-task dedup markers stay relevant. Cloud Tasks only
@@ -90,16 +77,17 @@ function resolveBaseUrl(config: CloudTasksConfig): string {
 
 /**
  * In-process test pump used when no Cloud Tasks client is configured. Replaces
- * the previous `@workflow/world-local` fallback. Two in-memory FIFOs feed an
- * HTTP dispatcher that targets `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ * the previous `@workflow/world-local` fallback. An in-memory FIFO feeds an
+ * HTTP dispatcher that targets `${baseUrl}/.well-known/workflow/v1/flow`
+ * (steps travel on the workflow topic and execute in the flow handler).
  */
 function createTestPump(config: CloudTasksConfig) {
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queue: PumpEnvelope[] = [];
+  const wakers: Array<() => void> = [];
   let running = false;
 
   /**
@@ -117,16 +105,16 @@ function createTestPump(config: CloudTasksConfig) {
     }
   }
 
-  function enqueue(pathname: Pathname, envelope: PumpEnvelope) {
-    queues[pathname].push(envelope);
-    wakers[pathname].shift()?.();
+  function enqueue(envelope: PumpEnvelope) {
+    queue.push(envelope);
+    wakers.shift()?.();
   }
 
-  async function take(pathname: Pathname): Promise<PumpEnvelope | null> {
-    const existing = queues[pathname].shift();
+  async function take(): Promise<PumpEnvelope | null> {
+    const existing = queue.shift();
     if (existing) return existing;
     return new Promise((resolve) => {
-      wakers[pathname].push(() => resolve(queues[pathname].shift() ?? null));
+      wakers.push(() => resolve(queue.shift() ?? null));
     });
   }
 
@@ -136,11 +124,11 @@ function createTestPump(config: CloudTasksConfig) {
    * timeouts) take this path too; a transient network error must not
    * permanently swallow the message.
    */
-  function retryOrDrop(envelope: PumpEnvelope, pathname: Pathname, reason: string) {
+  function retryOrDrop(envelope: PumpEnvelope, reason: string) {
     if (envelope.attempt < maxAttempts) {
       const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
       const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
-      void delay(backoff).then(() => enqueue(pathname, next));
+      void delay(backoff).then(() => enqueue(next));
     } else {
       settle(envelope);
       console.error(
@@ -149,8 +137,8 @@ function createTestPump(config: CloudTasksConfig) {
     }
   }
 
-  async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
-    const url = createWorkflowUrl(resolveBaseUrl(config), { type: pathname });
+  async function dispatch(envelope: PumpEnvelope): Promise<void> {
+    const url = createWorkflowUrl(resolveBaseUrl(config), { type: 'flow' });
     let response: Response;
     try {
       response = await fetch(url, {
@@ -167,7 +155,7 @@ function createTestPump(config: CloudTasksConfig) {
         signal: AbortSignal.timeout(httpTimeoutMs),
       });
     } catch (err) {
-      retryOrDrop(envelope, pathname, `fetch error: ${String(err)}`);
+      retryOrDrop(envelope, `fetch error: ${String(err)}`);
       return;
     }
 
@@ -187,25 +175,25 @@ function createTestPump(config: CloudTasksConfig) {
       }
       const timeoutSeconds = (parsed as { timeoutSeconds?: number } | null)?.timeoutSeconds;
       if (typeof timeoutSeconds === 'number') {
-        void delay(timeoutSeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delay(timeoutSeconds * 1000).then(() => enqueue(envelope));
         return;
       }
     }
 
-    retryOrDrop(envelope, pathname, `HTTP ${response.status}: ${text}`);
+    retryOrDrop(envelope, `HTTP ${response.status}: ${text}`);
   }
 
-  async function loop(pathname: Pathname) {
+  async function loop() {
     while (running) {
-      const envelope = await take(pathname);
+      const envelope = await take();
       if (!envelope) continue;
       try {
-        await dispatch(envelope, pathname);
+        await dispatch(envelope);
       } catch (err) {
         // dispatch handles fetch errors itself; anything reaching here is a
         // bug in the pump. Re-queue rather than silently dropping.
-        console.error(`[world-firestore-tasks test pump] dispatch error on ${pathname}:`, err);
-        retryOrDrop(envelope, pathname, `pump error: ${String(err)}`);
+        console.error('[world-firestore-tasks test pump] dispatch error:', err);
+        retryOrDrop(envelope, `pump error: ${String(err)}`);
       }
     }
   }
@@ -214,25 +202,24 @@ function createTestPump(config: CloudTasksConfig) {
     getInflight(idempotencyKey: string): string | undefined {
       return inflightMessages.get(idempotencyKey);
     },
-    push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number) {
+    push(envelope: PumpEnvelope, delaySeconds?: number) {
       if (envelope.idempotencyKey) {
         inflightMessages.set(envelope.idempotencyKey, envelope.messageId);
       }
       if (delaySeconds && delaySeconds > 0) {
-        void delay(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delay(delaySeconds * 1000).then(() => enqueue(envelope));
       } else {
-        enqueue(pathname, envelope);
+        enqueue(envelope);
       }
     },
     async start() {
       if (running) return;
       running = true;
-      void loop('flow');
-      void loop('step');
+      void loop();
     },
     stop() {
       running = false;
-      for (const list of Object.values(wakers)) for (const w of list) w();
+      for (const w of wakers) w();
     },
   };
 }
@@ -370,7 +357,6 @@ export function createQueue(config: CloudTasksConfig): Queue & {
   return {
     async queue(name, message, opts) {
       if (isTestMode()) {
-        const { kind } = parseQueueName(name);
         if (opts?.idempotencyKey) {
           const existing = testPump.getInflight(opts.idempotencyKey);
           if (existing) {
@@ -379,7 +365,6 @@ export function createQueue(config: CloudTasksConfig): Queue & {
         }
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         testPump.push(
-          QUEUE_PATHNAMES[kind],
           {
             messageId,
             queueName: name,

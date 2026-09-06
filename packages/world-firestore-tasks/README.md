@@ -31,7 +31,7 @@ pnpm add @fantasticfour/world-firestore-tasks
 ```typescript
 import { Firestore } from '@google-cloud/firestore';
 import { CloudTasksClient } from '@google-cloud/tasks';
-import { createFirestoreTasksWorld } from '@fantasticfour/world-firestore-tasks';
+import { createWorld } from '@fantasticfour/world-firestore-tasks';
 
 const firestore = new Firestore({
   projectId: 'my-project',
@@ -39,7 +39,7 @@ const firestore = new Firestore({
 
 const tasksClient = new CloudTasksClient();
 
-const world = createFirestoreTasksWorld({
+const world = createWorld({
   firestore,
   tasksClient,
   project: 'my-project',

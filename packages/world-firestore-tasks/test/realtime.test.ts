@@ -557,8 +557,8 @@ describe('Firestore Real-time Listeners', () => {
         });
 
         // Create event in same transaction. Events are ordered by eventId
-        // (monotonic ULID); use a doc ID that sorts after existing wevt_ ids.
-        const eventRef = runRef.collection('events').doc('wevt_zzzzzzzzzzzzzzzzzzzzzzzzzz');
+        // (slot ids); use a doc ID that sorts after existing slots.
+        const eventRef = runRef.collection('events').doc('evnt_99999999999999999999999999');
         transaction.set(eventRef, {
           runId: run.runId,
           eventId: eventRef.id,
@@ -626,9 +626,9 @@ describe('Firestore Real-time Listeners', () => {
       // the ordering key must not collide (previously it was the truncated
       // ULID ms-timestamp, which deadlocked/skipped same-ms chunks).
       for (let i = 0; i < 10; i++) {
-        await streamer.writeToStream(name, 'run-stream-test', `chunk-${i}`);
+        await streamer.streams.write('run-stream-test', name, `chunk-${i}`);
       }
-      await streamer.closeStream(name, 'run-stream-test');
+      await streamer.streams.close('run-stream-test', name);
     }
 
     const streamModes: Array<[string, 'listener' | 'polling']> = [
@@ -643,7 +643,7 @@ describe('Firestore Real-time Listeners', () => {
         const name = `stream-${mode}-${Date.now()}`;
         await writeStream(streamer, name);
 
-        const chunks = await collectStream(await streamer.readFromStream(name));
+        const chunks = await collectStream(await streamer.streams.get('run-stream-test', name));
         expect(chunks).toEqual(Array.from({ length: 10 }, (_, i) => `chunk-${i}`));
       },
     );
@@ -655,10 +655,14 @@ describe('Firestore Real-time Listeners', () => {
         const name = `stream-${mode}-start-${Date.now()}`;
         await writeStream(streamer, name);
 
-        const fromSeven = await collectStream(await streamer.readFromStream(name, 7));
+        const fromSeven = await collectStream(
+          await streamer.streams.get('run-stream-test', name, 7),
+        );
         expect(fromSeven).toEqual(['chunk-7', 'chunk-8', 'chunk-9']);
 
-        const lastThree = await collectStream(await streamer.readFromStream(name, -3));
+        const lastThree = await collectStream(
+          await streamer.streams.get('run-stream-test', name, -3),
+        );
         expect(lastThree).toEqual(['chunk-7', 'chunk-8', 'chunk-9']);
       },
     );
@@ -666,13 +670,13 @@ describe('Firestore Real-time Listeners', () => {
     it('should stream chunks written after the reader attached (listener)', async () => {
       const streamer = createStreamer({ firestore, mode: 'listener' });
       const name = `stream-live-${Date.now()}`;
-      await streamer.writeToStream(name, 'run-stream-test', 'early');
+      await streamer.streams.write('run-stream-test', name, 'early');
 
-      const collected = collectStream(await streamer.readFromStream(name));
+      const collected = collectStream(await streamer.streams.get('run-stream-test', name));
       await setTimeout(300);
-      await streamer.writeToStream(name, 'run-stream-test', 'late-1');
-      await streamer.writeToStream(name, 'run-stream-test', 'late-2');
-      await streamer.closeStream(name, 'run-stream-test');
+      await streamer.streams.write('run-stream-test', name, 'late-1');
+      await streamer.streams.write('run-stream-test', name, 'late-2');
+      await streamer.streams.close('run-stream-test', name);
 
       expect(await collected).toEqual(['early', 'late-1', 'late-2']);
     });
@@ -681,20 +685,20 @@ describe('Firestore Real-time Listeners', () => {
       const streamer = createStreamer({ firestore });
       const name = `stream-info-${Date.now()}`;
 
-      expect(await streamer.getStreamInfo(name, 'run-stream-test')).toEqual({
+      expect(await streamer.streams.getInfo('run-stream-test', name)).toEqual({
         tailIndex: -1,
         done: false,
       });
 
       await writeStream(streamer, name);
 
-      expect(await streamer.getStreamInfo(name, 'run-stream-test')).toEqual({
+      expect(await streamer.streams.getInfo('run-stream-test', name)).toEqual({
         tailIndex: 9,
         done: true,
       });
 
       const decoder = new TextDecoder();
-      const page1 = await streamer.getStreamChunks(name, 'run-stream-test', { limit: 4 });
+      const page1 = await streamer.streams.getChunks('run-stream-test', name, { limit: 4 });
       expect(page1.data.map((c) => decoder.decode(c.data))).toEqual([
         'chunk-0',
         'chunk-1',
@@ -705,7 +709,7 @@ describe('Firestore Real-time Listeners', () => {
       expect(page1.hasMore).toBe(true);
       expect(page1.done).toBe(false);
 
-      const page2 = await streamer.getStreamChunks(name, 'run-stream-test', {
+      const page2 = await streamer.streams.getChunks('run-stream-test', name, {
         limit: 100,
         cursor: page1.cursor ?? undefined,
       });
@@ -725,10 +729,10 @@ describe('Firestore Real-time Listeners', () => {
     it('should list streams by runId', async () => {
       const streamer = createStreamer({ firestore });
       const runId = `run-list-${Date.now()}`;
-      await streamer.writeToStream(`${runId}-stream-a`, runId, 'a');
-      await streamer.writeToStream(`${runId}-stream-b`, runId, 'b');
+      await streamer.streams.write(runId, `${runId}-stream-a`, 'a');
+      await streamer.streams.write(runId, `${runId}-stream-b`, 'b');
 
-      const streams = await streamer.listStreamsByRunId(runId);
+      const streams = await streamer.streams.list(runId);
       expect(streams.sort()).toEqual([`${runId}-stream-a`, `${runId}-stream-b`]);
     });
   });

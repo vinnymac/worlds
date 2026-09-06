@@ -18,7 +18,7 @@ export interface FirestoreTasksWorldConfig {
   targetUrl?: string;
   deploymentId?: string;
   /**
-   * Streaming strategy for readFromStream:
+   * Streaming strategy for streams.get:
    * - 'listener' (default): Firestore real-time listeners (lowest latency, higher cost)
    * - 'polling': Periodic polling (higher latency, lower cost)
    */
@@ -32,7 +32,7 @@ export interface FirestoreTasksWorldConfig {
   maxEventsPerRun?: number;
 }
 
-export function createFirestoreTasksWorld(
+export function createWorld(
   config: FirestoreTasksWorldConfig = {},
 ): World & { start(): Promise<void> } {
   // Use provided config or fall back to environment variables
@@ -98,10 +98,9 @@ export function createFirestoreTasksWorld(
     ...storage,
     ...queue,
     ...streamer,
-    // Declaring the current spec version enables resilient start: core
-    // attaches runInput to workflow queue messages so run_started can
-    // bootstrap the run when run_created lost the race. Requires the
-    // binary-safe (tagged-JSON) queue transport in queue.ts.
+    // Event ids are slot-numbered and allocated inside the committing
+    // Firestore transaction, so this World is current-spec compliant by
+    // construction (no pre-assigned positions, no noop sealing needed).
     specVersion: SPEC_VERSION_CURRENT,
     async start() {
       // Explicitly call queue.start() to ensure embedded world starts in test mode
@@ -111,6 +110,3 @@ export function createFirestoreTasksWorld(
     },
   };
 }
-
-// Export createWorld as an alias for compatibility with @workflow/world
-export { createFirestoreTasksWorld as createWorld };

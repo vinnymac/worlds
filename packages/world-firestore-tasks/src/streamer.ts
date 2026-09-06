@@ -52,22 +52,25 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
   const { firestore, mode = 'listener', pollIntervalMs = 1000 } = config;
   const ulid = monotonicFactory();
 
-  function streamRef(name: string) {
-    return firestore.collection('workflow_streams').doc(name);
+  // Stream documents are keyed by (runId, name): a stream name only
+  // identifies a stream within its owning run. Run ids are `wrun_<ULID>`,
+  // so the separator cannot occur inside the runId half.
+  function streamRef(runId: string, name: string) {
+    return firestore.collection('workflow_streams').doc(`${runId}__${name}`);
   }
 
-  function chunksCol(name: string): CollectionReference {
-    return streamRef(name).collection('chunks');
+  function chunksCol(runId: string, name: string): CollectionReference {
+    return streamRef(runId, name).collection('chunks');
   }
 
   // Streams already registered for a run in this process (avoids a parent-doc
-  // write per chunk; the parent doc powers listStreamsByRunId).
+  // write per chunk; the parent doc powers streams.list).
   const registeredStreams = new Set<string>();
 
   async function registerStreamForRun(runId: string, name: string): Promise<void> {
     const cacheKey = `${runId}:${name}`;
     if (registeredStreams.has(cacheKey)) return;
-    await streamRef(name).set({ streamId: name, runId }, { merge: true });
+    await streamRef(runId, name).set({ streamId: name, runId }, { merge: true });
     registeredStreams.add(cacheKey);
   }
 
@@ -91,11 +94,12 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
    * the resolved position.
    */
   async function readHistorical(
+    runId: string,
     name: string,
     startIndex: number,
     controller: ReadableStreamDefaultController<Uint8Array>,
   ): Promise<ReadState> {
-    const snapshot = await chunksCol(name).orderBy('chunkId', 'asc').get();
+    const snapshot = await chunksCol(runId, name).orderBy('chunkId', 'asc').get();
     const chunks = snapshot.docs.map((doc) => doc.data() as StoredChunk);
     const dataChunkCount = chunks.filter((chunk) => !chunk.eof).length;
     const resolvedStart =
@@ -155,7 +159,11 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
    * Read from stream using Firestore real-time listeners (default mode).
    * Lowest latency, but each listener incurs a read cost per document change.
    */
-  function readFromStreamListener(name: string, startIndex: number): ReadableStream<Uint8Array> {
+  function readFromStreamListener(
+    runId: string,
+    name: string,
+    startIndex: number,
+  ): ReadableStream<Uint8Array> {
     let unsubscribe: (() => void) | undefined;
     let state: ReadState | undefined;
     const pending: StoredChunk[] = [];
@@ -179,13 +187,13 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
 
     return new ReadableStream<Uint8Array>({
       async start(controller) {
-        state = await readHistorical(name, startIndex, controller);
+        state = await readHistorical(runId, name, startIndex, controller);
         if (state.closed) return;
 
         // Listen for chunks written after the historical read. The query is
         // keyed on the full chunkId so same-millisecond siblings are never
         // skipped or deadlocked.
-        let query = chunksCol(name).orderBy('chunkId', 'asc');
+        let query = chunksCol(runId, name).orderBy('chunkId', 'asc');
         if (state.lastChunkId) {
           query = query.where('chunkId', '>', state.lastChunkId);
         }
@@ -231,13 +239,17 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
    * Higher latency (configurable via pollIntervalMs) but costs scale with
    * subscriber count only, not update frequency.
    */
-  function readFromStreamPolling(name: string, startIndex: number): ReadableStream<Uint8Array> {
+  function readFromStreamPolling(
+    runId: string,
+    name: string,
+    startIndex: number,
+  ): ReadableStream<Uint8Array> {
     let state: ReadState | undefined;
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
     return new ReadableStream<Uint8Array>({
       async start(controller) {
-        state = await readHistorical(name, startIndex, controller);
+        state = await readHistorical(runId, name, startIndex, controller);
       },
 
       async pull(controller) {
@@ -249,7 +261,7 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
         // the full chunkId guarantees a chunk is only consumed once and that
         // same-millisecond siblings are not skipped.
         while (!state.closed) {
-          let query = chunksCol(name).orderBy('chunkId', 'asc');
+          let query = chunksCol(runId, name).orderBy('chunkId', 'asc');
           if (state.lastChunkId) {
             query = query.where('chunkId', '>', state.lastChunkId);
           }
@@ -286,135 +298,132 @@ export function createStreamer(config: StreamerConfig | FirestoreStreamerConfig)
   }
 
   return {
-    async writeToStream(
-      name: string,
-      _runId: string | Promise<string>,
-      chunk: string | Uint8Array,
-    ) {
-      // Generate the chunkId synchronously BEFORE any await so ULID order
-      // matches call order even when runId is a promise multiple writes
-      // are waiting on.
-      const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const runId = await _runId;
-      await registerStreamForRun(runId, name);
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array) {
+        // Generate the chunkId synchronously BEFORE any await so ULID order
+        // matches call order across concurrent writers in this process.
+        const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
+        await registerStreamForRun(runId, name);
 
-      const buffer =
-        typeof chunk === 'string'
-          ? Buffer.from(chunk)
-          : Buffer.isBuffer(chunk)
-            ? chunk
-            : Buffer.from(chunk);
+        const buffer =
+          typeof chunk === 'string'
+            ? Buffer.from(chunk)
+            : Buffer.isBuffer(chunk)
+              ? chunk
+              : Buffer.from(chunk);
 
-      await chunksCol(name)
-        .doc(chunkId)
-        .set({
+        await chunksCol(runId, name)
+          .doc(chunkId)
+          .set({
+            chunkId,
+            streamId: name,
+            chunkData: buffer.toString('base64'),
+            eof: false,
+            createdAt: new Date(),
+          });
+      },
+
+      async close(runId: string, name: string) {
+        const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
+        await registerStreamForRun(runId, name);
+
+        await chunksCol(runId, name).doc(chunkId).set({
           chunkId,
           streamId: name,
-          chunkData: buffer.toString('base64'),
-          eof: false,
+          chunkData: '',
+          eof: true,
           createdAt: new Date(),
         });
-    },
+      },
 
-    async closeStream(name: string, _runId: string | Promise<string>) {
-      const chunkId = `chnk_${ulid()}` as `chnk_${string}`;
-      const runId = await _runId;
-      await registerStreamForRun(runId, name);
+      async get(runId: string, name: string, startIndex = 0) {
+        if (mode === 'polling') {
+          return readFromStreamPolling(runId, name, startIndex);
+        }
+        return readFromStreamListener(runId, name, startIndex);
+      },
 
-      await chunksCol(name).doc(chunkId).set({
-        chunkId,
-        streamId: name,
-        chunkData: '',
-        eof: true,
-        createdAt: new Date(),
-      });
-    },
+      async list(runId: string): Promise<string[]> {
+        const snapshot = await firestore
+          .collection('workflow_streams')
+          .where('runId', '==', runId)
+          .get();
+        return snapshot.docs.map((doc) => {
+          const streamId = doc.data().streamId;
+          return typeof streamId === 'string' ? streamId : doc.id;
+        });
+      },
 
-    async readFromStream(streamName: string, startIndex = 0) {
-      if (mode === 'polling') {
-        return readFromStreamPolling(streamName, startIndex);
-      }
-      return readFromStreamListener(streamName, startIndex);
-    },
+      async getChunks(
+        runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        const limit = Math.min(Math.max(options?.limit ?? 100, 1), 1000);
 
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      const snapshot = await firestore
-        .collection('workflow_streams')
-        .where('runId', '==', runId)
-        .get();
-      return snapshot.docs.map((doc) => {
-        const streamId = doc.data().streamId;
-        return typeof streamId === 'string' ? streamId : doc.id;
-      });
-    },
-
-    async getStreamChunks(
-      name: string,
-      _runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      const limit = Math.min(Math.max(options?.limit ?? 100, 1), 1000);
-
-      let cursor: ChunkCursor = { i: 0, c: '' };
-      if (options?.cursor) {
-        try {
-          const decoded = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf-8'));
-          if (typeof decoded?.i !== 'number' || typeof decoded?.c !== 'string') {
-            throw new Error('malformed cursor payload');
+        let cursor: ChunkCursor = { i: 0, c: '' };
+        if (options?.cursor) {
+          try {
+            const decoded = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf-8'));
+            if (typeof decoded?.i !== 'number' || typeof decoded?.c !== 'string') {
+              throw new Error('malformed cursor payload');
+            }
+            cursor = decoded as ChunkCursor;
+          } catch (error) {
+            throw new WorkflowWorldError(`Invalid stream cursor: ${String(error)}`, {
+              status: 400,
+            });
           }
-          cursor = decoded as ChunkCursor;
-        } catch (error) {
-          throw new WorkflowWorldError(`Invalid stream cursor: ${String(error)}`, { status: 400 });
         }
-      }
 
-      let query = chunksCol(name).orderBy('chunkId', 'asc');
-      if (cursor.c) {
-        query = query.where('chunkId', '>', cursor.c);
-      }
-      // limit + 1 to detect whether more data (or the EOF marker) follows.
-      const snapshot = await query.limit(limit + 1).get();
-
-      const data: StreamChunk[] = [];
-      let done = false;
-      let hasMore = false;
-      let lastChunkId = cursor.c;
-      for (const doc of snapshot.docs) {
-        const chunk = doc.data() as StoredChunk;
-        if (chunk.eof) {
-          done = true;
-          break;
+        let query = chunksCol(runId, name).orderBy('chunkId', 'asc');
+        if (cursor.c) {
+          query = query.where('chunkId', '>', cursor.c);
         }
-        if (data.length >= limit) {
-          hasMore = true;
-          break;
+        // limit + 1 to detect whether more data (or the EOF marker) follows.
+        const snapshot = await query.limit(limit + 1).get();
+
+        const data: StreamChunk[] = [];
+        let done = false;
+        let hasMore = false;
+        let lastChunkId = cursor.c;
+        for (const doc of snapshot.docs) {
+          const chunk = doc.data() as StoredChunk;
+          if (chunk.eof) {
+            done = true;
+            break;
+          }
+          if (data.length >= limit) {
+            hasMore = true;
+            break;
+          }
+          data.push({ index: cursor.i + data.length, data: decodeChunkData(chunk) });
+          lastChunkId = chunk.chunkId;
         }
-        data.push({ index: cursor.i + data.length, data: decodeChunkData(chunk) });
-        lastChunkId = chunk.chunkId;
-      }
 
-      const nextCursor = hasMore
-        ? Buffer.from(
-            JSON.stringify({ i: cursor.i + data.length, c: lastChunkId } satisfies ChunkCursor),
-          ).toString('base64')
-        : null;
+        const nextCursor = hasMore
+          ? Buffer.from(
+              JSON.stringify({ i: cursor.i + data.length, c: lastChunkId } satisfies ChunkCursor),
+            ).toString('base64')
+          : null;
 
-      return { data, cursor: nextCursor, hasMore, done };
-    },
+        return { data, cursor: nextCursor, hasMore, done };
+      },
 
-    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      // Project only the eof flag; metadata never needs chunk payloads.
-      const snapshot = await chunksCol(name).select('eof').get();
-      let dataCount = 0;
-      let done = false;
-      for (const doc of snapshot.docs) {
-        if (doc.get('eof') === true) {
-          done = true;
-        } else {
-          dataCount++;
+      async getInfo(runId: string, name: string): Promise<StreamInfoResponse> {
+        // Project only the eof flag; metadata never needs chunk payloads.
+        const snapshot = await chunksCol(runId, name).select('eof').get();
+        let dataCount = 0;
+        let done = false;
+        for (const doc of snapshot.docs) {
+          if (doc.get('eof') === true) {
+            done = true;
+          } else {
+            dataCount++;
+          }
         }
-      }
-      return { tailIndex: dataCount - 1, done };
+        return { tailIndex: dataCount - 1, done };
+      },
     },
   };
 }
