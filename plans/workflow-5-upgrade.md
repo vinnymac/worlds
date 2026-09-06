@@ -44,15 +44,32 @@ hint, not as a base; it predates 38 beta releases.
 - [ ] Record migration reference in this file (see Delta notes below)
 
 ### Phase 1: Dependency bump and error surface
-- [ ] Bump catalog entries in `pnpm-workspace.yaml` to target versions
-- [ ] Update `minimumReleaseAgeExclude` entries for the new beta versions
-- [ ] Drop or refresh any `patches/` (stale branch patched world-local beta.10)
-- [ ] `pnpm install` clean
-- [ ] Capture full `pnpm typecheck` error surface, group by world, record here
+- [x] Bump catalog entries in `pnpm-workspace.yaml` to target versions
+- [x] Update `minimumReleaseAgeExclude` entries for the new beta versions
+- [x] Drop or refresh any `patches/` (none exist on this branch)
+- [x] `pnpm install` clean. Upstream packaging bug: workflow@5.0.0-beta.48
+      pins @workflow/sveltekit and @workflow/nest at .48 which were never
+      published. Both overridden to 5.0.0-beta.47 in `overrides`. Note:
+      the old `pnpm.overrides` nesting in pnpm-workspace.yaml was ignored
+      by pnpm 11; overrides now live at top level (zod moved with them)
+- [x] Capture build + typecheck surface. Build: 12/12 green (tsdown does
+      not typecheck). Typecheck with `turbo typecheck --force --continue`:
+      114 errors across ALL 10 worlds (initial run under-reported due to
+      stale turbo cache; always use --force after a dependency bump).
+      Per package: azure 16, firestore-tasks 15, postgres-redis 14,
+      mysql 13, mysql-redis 13, redis 13, nats-jetstream 11, cloudflare 9,
+      redis-bullmq 6, upstash 4. shared and testing pass.
+      Themes: Streamer lost writeToStream/readFromStream/closeStream/
+      listStreamsByRunId/getStreamChunks/getStreamInfo; Pathname is now
+      "flow" | "health" | "manifest" | "webhook" (queue pathname map lost
+      its "step" key, queue item has no `kind`); CreateEventParams lost
+      stateUpdatedAt; EventResult/run payload type shifts; error fields
+      (message/stack/code) no longer directly on event data types.
+      Full log: scratchpad typecheck-v5-force.log
 
 ### Phase 2: Shared packages
-- [ ] `packages/shared` compiles and tests green against v5 types
-- [ ] `packages/testing` compiles and tests green
+- [x] `packages/shared` compiles and tests green against v5 types (76/76)
+- [x] `packages/testing` compiles and tests green (6/6)
 
 ### Phase 3: World migrations (one PR-sized commit per world)
 Order: reference-adjacent worlds first, then the rest.
@@ -96,3 +113,8 @@ Pending.
 
 - 2026-09-05: Plan created. Inventory done. Contract delta research running.
   Stale `upgrade/workflow-v5-beta` branch reviewed and rejected as a base.
+- 2026-09-05: Catalog bumped to the beta line, install green after
+  overriding unpublished @workflow/sveltekit and @workflow/nest to .47.
+  Build 12/12 green. Forced typecheck: 114 errors across all 10 worlds
+  (see Phase 1 notes). shared and testing packages fully green.
+  world-redis conformance canary running to capture the runtime delta.
