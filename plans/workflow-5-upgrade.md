@@ -84,7 +84,9 @@ on them.
 - [~] world-postgres-redis (agent running 2026-09-05)
 - [~] world-mysql (archetype for SQL family; agent running 2026-09-05)
 - [ ] world-mysql-redis
-- [~] world-redis-bullmq (agent running 2026-09-05)
+- [x] world-redis-bullmq (commit 5f38209, 81/81 tests incl. conformance,
+      independently re-verified; storage adopted verbatim from
+      world-redis, extract-to-shared dedup opportunity noted for later)
 - [~] world-upstash (agent running 2026-09-05)
 - [ ] world-nats-jetstream
 - [ ] world-azure
