@@ -98,8 +98,10 @@ on them.
 - [x] world-upstash (commit c4fdb07, 77/77 tests incl. conformance,
       independently re-verified; queue wire field renamed message to
       payload, so in-flight QStash messages also need the 4.x drain)
-- [~] world-nats-jetstream (agent running 2026-09-05; must fix or report
-      the suspension-as-failed-delivery conflation)
+- [x] world-nats-jetstream (commit 35a2b88, 57/57 tests incl. conformance,
+      independently re-verified; suspension-as-failed-delivery conflation
+      fixed and tested; known documented edge: claim-takeover double
+      append if a winner stalls over 3s between claim and append)
 - [~] world-azure (agent running 2026-09-05)
 - [~] world-firestore-tasks (agent running 2026-09-05)
 - [x] world-cloudflare (commit 2447806, 147 node + 26 workerd tests,
