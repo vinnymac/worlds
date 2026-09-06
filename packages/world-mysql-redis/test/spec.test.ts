@@ -2,7 +2,7 @@ import { MySqlContainer } from '@testcontainers/mysql';
 import { RedisContainer } from '@testcontainers/redis';
 import { createTestSuite } from '@workflow/world-testing';
 // Not re-exported from the package entry point and not wired into
-// createTestSuite (world-testing 4.1.20); opt in via the deep import.
+// createTestSuite (world-testing 5.0.0-beta.48); opt in via the deep import.
 import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
 import { afterAll, beforeAll, test } from 'vitest';
 import mysql from 'mysql2/promise';
@@ -58,6 +58,6 @@ if (shouldSkipTests) {
   });
 
   test('smoke', () => {});
-  createTestSuite('@fantasticfour/world-mysql-redis');
-  eventLimit('@fantasticfour/world-mysql-redis');
+  createTestSuite('./dist/index.js');
+  eventLimit('./dist/index.js');
 }

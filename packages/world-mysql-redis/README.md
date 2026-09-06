@@ -95,8 +95,10 @@ The world creates the following tables:
 
 - `workflow.workflow_runs` - Workflow execution state
 - `workflow.workflow_events` - Event sourcing
+- `workflow.workflow_event_slots` - Marker for slot-numbered (v5) runs
 - `workflow.workflow_steps` - Step execution tracking
 - `workflow.workflow_hooks` - Webhook/callback management
+- `workflow.workflow_waits` - Wait entities
 - `workflow.workflow_stream_chunks` - Streaming data
 
 All tables use CBOR serialization for efficient binary storage with JSON fallback for compatibility.

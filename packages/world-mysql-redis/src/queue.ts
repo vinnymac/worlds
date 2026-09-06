@@ -1,9 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
-  parseQueueName,
   type Queue,
-  type QueueKind,
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
@@ -14,17 +12,17 @@ import { parse, stringify } from '@fantasticfour/shared';
 import type { MysqlRedisWorldConfig } from './config.js';
 
 interface MessageEnvelope {
+  /** ulid-based id for this message; stable across delivery attempts, which
+   * the runtime relies on for the inline-step ownership lease */
   messageId: string;
+  /** original idempotency key (preserved across retries) */
   idempotencyKey?: string;
   queueName: ValidQueueName;
+  /** 1-indexed attempt counter */
   attempt: number;
+  /** the workflow payload, forwarded as the HTTP fetch body */
   message: QueuePayload;
 }
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
 
 /** How long an idempotency reservation is held (seconds). */
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
@@ -137,9 +135,11 @@ function computeBackoffMs(attempt: number, config: MysqlRedisWorldConfig): numbe
 /**
  * MySQL-Redis queue.
  *
- * Two Redis lists per world (`${prefix}flows`, `${prefix}steps`) carry queued
- * envelopes. `queue()` LPUSHes; workers BRPOPLPUSH onto a processing list and
- * dispatch via HTTP fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ * One Redis list per world (`${prefix}flows`) carries queued envelopes. Steps
+ * travel on the workflow topic (v5 retired the step queue kind) and execute in
+ * the combined flow handler. `queue()` LPUSHes; workers BRPOPLPUSH onto a
+ * processing list and dispatch via HTTP fetch to
+ * `${baseUrl}/.well-known/workflow/v1/flow`.
  *
  * Durability model (at-least-once):
  * - Delayed deliveries (enqueue delaySeconds, retry backoff, 503 suspension)
@@ -157,7 +157,8 @@ function computeBackoffMs(attempt: number, config: MysqlRedisWorldConfig): numbe
  *
  * Envelopes are serialized with the shared tagged-JSON codec so Uint8Array
  * values (e.g. the CBOR-transport `runInput.input` on workflow messages)
- * survive the queue round-trip intact.
+ * survive the queue round-trip intact. A suspension dispatches its steps and
+ * waits as one parallel batch of messages; each is an independent envelope.
  */
 export function createQueue(
   redis: Redis,
@@ -169,10 +170,7 @@ export function createQueue(
   const leaseMs = httpTimeoutMs + LEASE_GRACE_MS;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const flowsList = `${prefix}flows`;
 
   let stopped = false;
 
@@ -190,8 +188,7 @@ export function createQueue(
     config.deploymentId ?? 'mysql-redis';
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const keys = keysFor(Queues[kind]);
+    const keys = keysFor(flowsList);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
 
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
@@ -252,9 +249,9 @@ export function createQueue(
     };
   };
 
-  async function dispatch(envelope: MessageEnvelope, pathname: 'flow' | 'step'): Promise<Response> {
+  async function dispatch(envelope: MessageEnvelope): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = createWorkflowUrl(baseUrl, { type: pathname });
+    const url = createWorkflowUrl(baseUrl, { type: 'flow' });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -323,12 +320,7 @@ export function createQueue(
     await multi.exec();
   }
 
-  async function processItem(
-    workerRedis: Redis,
-    listKey: string,
-    item: string,
-    kind: QueueKind,
-  ): Promise<void> {
+  async function processItem(workerRedis: Redis, listKey: string, item: string): Promise<void> {
     let envelope: MessageEnvelope;
     try {
       envelope = parse<MessageEnvelope>(item);
@@ -352,7 +344,7 @@ export function createQueue(
     };
 
     try {
-      const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
+      const response = await dispatch(envelope);
 
       if (response.ok) {
         await ack(workerRedis, listKey, item, envelope.idempotencyKey);
@@ -388,7 +380,7 @@ export function createQueue(
     }
   }
 
-  async function worker(kind: QueueKind, listKey: string) {
+  async function worker(listKey: string) {
     // `duplicate()` copies the parent's options, and auto-pipelining is a
     // storage-side setting: batching a blocking BRPOPLPUSH with other
     // commands would stall them behind it, so it is turned off here.
@@ -410,7 +402,7 @@ export function createQueue(
         // Lease the item so the reclaimer can requeue it if this process
         // dies mid-dispatch.
         await workerRedis.zadd(keys.leases, Date.now() + leaseMs, item);
-        await processItem(workerRedis, listKey, item, kind);
+        await processItem(workerRedis, listKey, item);
       }
     } finally {
       await workerRedis.quit();
@@ -467,17 +459,14 @@ export function createQueue(
 
   function startWorkers() {
     const concurrency = config.queueConcurrency || 10;
-    const entries = Object.entries(Queues) as [QueueKind, string][];
-    entries.forEach(([kind, listKey]) => {
-      maintenance(listKey).catch((error) => {
-        console.error(`[world-mysql-redis] Maintenance loop for ${listKey} crashed:`, error);
-      });
-      for (let i = 0; i < concurrency; i++) {
-        worker(kind, listKey).catch((error) => {
-          console.error(`[world-mysql-redis] Worker for ${listKey} crashed:`, error);
-        });
-      }
+    maintenance(flowsList).catch((error) => {
+      console.error(`[world-mysql-redis] Maintenance loop for ${flowsList} crashed:`, error);
     });
+    for (let i = 0; i < concurrency; i++) {
+      worker(flowsList).catch((error) => {
+        console.error(`[world-mysql-redis] Worker for ${flowsList} crashed:`, error);
+      });
+    }
   }
 
   return {

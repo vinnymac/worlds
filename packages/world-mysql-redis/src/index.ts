@@ -1,5 +1,6 @@
 import type { HealthCheckable } from '@fantasticfour/shared';
-import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
+import type { World } from '@workflow/world';
+import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { Redis } from 'ioredis';
 import mysql from 'mysql2/promise';
@@ -14,6 +15,7 @@ export type MysqlRedisWorld = World &
   HealthCheckable & {
     start(): Promise<void>;
     stop(): void;
+    close(): Promise<void>;
   };
 
 export function createWorld(
@@ -47,13 +49,12 @@ export function createWorld(
   const streamer = createStreamer(db);
 
   return {
-    // Declare the highest spec version this world supports. With spec
-    // version 3+, `start()` includes the run input in the queue message
-    // (binary-safe queue transport), which enables the resilient-start
-    // path in `events.create('run_started')`. That path is required for
-    // correctness: the runtime creates `run_created` and enqueues the
-    // workflow message in parallel, so `run_started` can win the race.
-    specVersion: SPEC_VERSION_CURRENT,
+    specVersion: mintedSpecVersion(),
+    capabilities: {
+      // tokenRetentionUntil is enforced end to end (hook create guard,
+      // terminal-run cleanup, read availability), so retained hooks work.
+      hookRetention: { active: true },
+    },
     ...storage,
     ...streamer,
     ...queue,
@@ -62,9 +63,15 @@ export function createWorld(
     },
     async start() {
       await queue.start();
+      await reenqueueActiveRuns(storage.runs, queue.queue, 'world-mysql-redis');
     },
     stop() {
       queue.stop();
+    },
+    async close() {
+      queue.stop();
+      await pool.end();
+      redis.disconnect();
     },
   };
 }
@@ -73,5 +80,4 @@ export function createWorld(
 export type { MysqlRedisWorldConfig } from './config.js';
 export type { MysqlRedisHealthResult } from './health.js';
 export { getHealth } from './health.js';
-export { withDeadlockRetry, isDeadlockError } from './util.js';
 export * from './schema.js';

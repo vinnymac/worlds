@@ -19,6 +19,7 @@ export const MIGRATION_FILES = [
   '0005_stream_chunks_run_id.sql',
   '0006_runs_state_updated_at.sql',
   '0007_events_entity_creation_unique.sql',
+  '0008_workflow_v5_slot_identity.sql',
 ];
 
 /**
@@ -32,6 +33,7 @@ const ALREADY_APPLIED_ERRNOS = new Set([
   1050, // ER_TABLE_EXISTS_ERROR
   1060, // ER_DUP_FIELDNAME
   1061, // ER_DUP_KEYNAME
+  1091, // ER_CANT_DROP_FIELD_OR_KEY: a DROP whose target is already gone
 ]);
 
 function isAlreadyAppliedError(error: unknown): boolean {
