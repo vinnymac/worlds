@@ -38,10 +38,13 @@ hint, not as a base; it predates 38 beta releases.
 
 ### Phase 0: Research and plan
 - [x] Inventory repo, versions, CI, prior branches
-- [~] Contract delta research: diff @workflow/world 4.5.0 vs 5.0.0-beta.33
-      d.ts, world-testing delta, world-local adaptation, errors/utils exports.
-      Output: scratchpad `wf5-research/DELTA.md`, summarized here when done
-- [ ] Record migration reference in this file (see Delta notes below)
+- [x] Contract delta research: full analysis committed as
+      `plans/workflow-5-delta.md` (d.ts diffs, world-local adaptation,
+      errors/utils exports, docs excerpts)
+- [x] Vercel ships an official migration skill; installed and committed at
+      `.agents/skills/migrating-world-v4-to-v5/SKILL.md`. It is the
+      authoritative per-world playbook, including a verification checklist
+      and required report shape. Every world migration follows it
 
 ### Phase 1: Dependency bump and error surface
 - [x] Bump catalog entries in `pnpm-workspace.yaml` to target versions
@@ -72,10 +75,11 @@ hint, not as a base; it predates 38 beta releases.
 - [x] `packages/testing` compiles and tests green (6/6)
 
 ### Phase 3: World migrations (one PR-sized commit per world)
-Order: reference-adjacent worlds first, then the rest.
-- [ ] world-redis
+Order: family archetypes first (redis, mysql), then the rest patterned
+on them.
+- [~] world-redis (archetype for redis family; agent running 2026-09-05)
 - [ ] world-postgres-redis
-- [ ] world-mysql
+- [~] world-mysql (archetype for SQL family; agent running 2026-09-05)
 - [ ] world-mysql-redis
 - [ ] world-redis-bullmq
 - [ ] world-upstash
@@ -105,9 +109,40 @@ hand-rolled (see memory: match official world behavior).
 - [ ] README/docs updated for v5 peer ranges
 - [ ] PR to main
 
-## Delta notes (fill from Phase 0 research)
+## Delta notes
 
-Pending.
+Full reference: `plans/workflow-5-delta.md` and the migration skill.
+Headlines for implementors (target @workflow/world@5.0.0-beta.33, spec 7):
+
+1. Event IDs are slot positions, not ULIDs: `evnt_` + dense 1-based slot,
+   zero-padded to 26 chars, minted via `slotToEventId()`. Uniqueness must
+   be settled in the store, density from 1 with no holes, "bump and
+   report" on a stale `eventCount` (commit at next free slot, return the
+   skipped events via `events`/`cursor`/`hasMore`), slot allocated in the
+   same atomic operation as the append. This is the dominant work item
+   per world and is invisible to the type checker.
+2. The `stateUpdatedAt` 412 precondition guard is gone; bump-and-report
+   supersedes it. Delete the plumbing.
+3. Streamer becomes `world.streams.*` with runId FIRST:
+   `streams.write/writeMulti/close/get/getChunks/list`. Argument order
+   flipped, so a blind move type-checks and passes name as runId.
+   Default flush interval is now 0.
+4. Step queue retired: QueueKind is 'workflow' only, steps ride the
+   workflow topic with stepId/stepName, waits are plain delaySeconds
+   continuations, suspensions dispatch steps+waits as one batch.
+5. `specVersion: SPEC_VERSION_CURRENT` is mandatory (import the constant,
+   never a literal). Factory must be exported as `createWorld()`.
+6. New event types `attr_set` and `noop`; run/step `error` fields are
+   serialized data now; runs gain attributes/errorCode/encryptionPublicKey.
+7. `steps.get` and `events.listByCorrelationId` now require runId.
+8. Optional fail-closed surface: capabilities, createBatch,
+   waitForTerminalStatus, getMany, experimentalSetAttributes (needed for
+   the lineage conformance suite), cancelMany, analytics,
+   getRuntimeDeadline, createRunId, getEnvironment, describeRun.
+9. world-testing beta.48 adds `event-ids`, `lineage`, `inline-execution`
+   suites to createTestSuite(pkgName).
+10. Rollout warning for changesets/README: ULID-era runs cannot replay on
+    v5. In-flight runs must drain on 4.x before deploying a v5 world.
 
 ## Progress log
 
@@ -117,4 +152,7 @@ Pending.
   overriding unpublished @workflow/sveltekit and @workflow/nest to .47.
   Build 12/12 green. Forced typecheck: 114 errors across all 10 worlds
   (see Phase 1 notes). shared and testing packages fully green.
-  world-redis conformance canary running to capture the runtime delta.
+- 2026-09-05: Delta research done and committed (plans/workflow-5-delta.md).
+  Official Vercel migration skill installed and committed. Archetype
+  migrations launched for world-redis and world-mysql. The 4.x-code
+  conformance canary was stopped as superseded.
