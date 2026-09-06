@@ -102,8 +102,13 @@ on them.
       the suspension-as-failed-delivery conflation)
 - [~] world-azure (agent running 2026-09-05)
 - [~] world-firestore-tasks (agent running 2026-09-05)
-- [~] world-cloudflare (agent running 2026-09-05; test:workers required,
-      DO classes must stay in the published dist)
+- [x] world-cloudflare (commit 2447806, 147 node + 26 workerd tests,
+      independently re-verified; DO exports verified in dist; shared
+      conformance seam still absent, own suites cover slot semantics).
+      Follow-ups: replace the zod v3 resolve hook in test:workers with a
+      scoped override in pnpm-workspace.yaml
+      ('@cloudflare/vitest-pool-workers>zod'); add a workerd smoke app
+      before publish
 
 Per world definition of done: build + typecheck + conformance tests green,
 behavior checked against world-local/world-postgres beta dists rather than
