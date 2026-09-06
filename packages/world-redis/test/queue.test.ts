@@ -146,7 +146,7 @@ describe('Queue (Redis integration)', () => {
 
     await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 10_000 });
     const message = received[0].body;
-    if (!('runId' in message) || !message.runInput) {
+    if (!('runInput' in message) || !message.runInput) {
       throw new Error('expected a workflow payload with runInput');
     }
     expect(message.runInput.input).toBeInstanceOf(Uint8Array);

@@ -1,8 +1,8 @@
 import { setTimeout } from 'node:timers/promises';
 import { RedisContainer } from '@testcontainers/redis';
-import { PreconditionFailedError } from '@workflow/errors';
 import { expectRejectedWith } from '@fantasticfour/testing';
 import type { Event } from '@workflow/world';
+import { eventIdToSlot, FIRST_EVENT_SLOT, slotToEventId } from '@workflow/world';
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
 import {
@@ -276,25 +276,6 @@ describe('Storage (Redis integration)', () => {
         await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
 
-      it('should find step by stepId without runId using SCAN', async () => {
-        const created = await createStep(testRunId, {
-          stepId: 'unique-step-scan-test',
-          stepName: 'test-step',
-          input: ['input1'],
-        });
-
-        // Retrieve without runId (uses SCAN instead of KEYS)
-        const retrieved = await steps.get(undefined, 'unique-step-scan-test');
-        expect(retrieved.stepId).toBe(created.stepId);
-        expect(retrieved.runId).toBe(testRunId);
-        expect(retrieved.stepName).toBe('test-step');
-      });
-
-      it('should throw 404 when step not found without runId', async () => {
-        await expect(steps.get(undefined, 'nonexistent-step-id')).rejects.toMatchObject({
-          status: 404,
-        });
-      });
     });
 
     describe('update via events', () => {
@@ -360,7 +341,7 @@ describe('Storage (Redis integration)', () => {
         });
 
         expect(result.event?.runId).toBe(testRunId);
-        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventId).toMatch(/^evnt_\d{26}$/);
         expect(result.event?.eventType).toBe('step_started');
         expect(result.event?.correlationId).toBe('corr_123');
         expect(result.event?.createdAt).toBeInstanceOf(Date);
@@ -386,7 +367,7 @@ describe('Storage (Redis integration)', () => {
         });
 
         expect(result.event?.runId).toBe(testRunId);
-        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventId).toMatch(/^evnt_\d{26}$/);
         expect(result.event?.eventType).toBe('step_failed');
         expect(result.event?.correlationId).toBe('corr_123');
         expect(result.event?.createdAt).toBeInstanceOf(Date);
@@ -438,6 +419,7 @@ describe('Storage (Redis integration)', () => {
 
         const result = await events.listByCorrelationId({
           correlationId,
+          runId: testRunId,
           pagination: {},
         });
 
@@ -483,6 +465,7 @@ describe('Storage (Redis integration)', () => {
 
         const result = await events.listByCorrelationId({
           correlationId: hookId,
+          runId: testRunId,
           pagination: {},
         });
 
@@ -500,8 +483,8 @@ describe('Storage (Redis integration)', () => {
       const sharedCorrelationId = 'hook-shared-correlation';
 
       // A hook is addressable from any run, so two runs can emit events under
-      // one correlation id. Interleave them three apiece so an unscoped lookup
-      // alternates between the runs.
+      // one correlation id. Interleave them three apiece so a scoped lookup
+      // has cross-run traffic to exclude.
       async function seedInterleavedRuns() {
         const runA = await createRun();
         const runB = await createRun();
@@ -561,23 +544,17 @@ describe('Storage (Redis integration)', () => {
         expect(result.hasMore).toBe(false);
       });
 
-      it('should list every run when runId is omitted', async () => {
+      it('should keep the other run invisible from either scope', async () => {
         const seeded = await seedInterleavedRuns();
 
         const result = await events.listByCorrelationId({
           correlationId: sharedCorrelationId,
+          runId: seeded.runB,
           pagination: {},
         });
 
-        // Also pins the interleaving the scoped pagination test relies on.
-        expect(result.data.map((e) => e.eventId)).toEqual([
-          seeded.a[0],
-          seeded.b[0],
-          seeded.a[1],
-          seeded.b[1],
-          seeded.a[2],
-          seeded.b[2],
-        ]);
+        expect(result.data.map((e) => e.eventId)).toEqual(seeded.b);
+        expect(result.data.every((e) => e.runId === seeded.runB)).toBe(true);
         expect(result.hasMore).toBe(false);
       });
 
@@ -637,7 +614,7 @@ describe('Storage (Redis integration)', () => {
       expect(listResult.data[0].stepId).toBe(stepId);
 
       // Exactly ONE step_created event in the correlation log
-      const eventList = await events.listByCorrelationId({ correlationId: stepId });
+      const eventList = await events.listByCorrelationId({ correlationId: stepId, runId: run.runId });
       const created = eventList.data.filter((e) => e.eventType === 'step_created');
       expect(created).toHaveLength(1);
     });
@@ -800,7 +777,10 @@ describe('Storage (Redis integration)', () => {
         }),
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
-      const eventList = await events.listByCorrelationId({ correlationId: 'wait-dup' });
+      const eventList = await events.listByCorrelationId({
+        correlationId: 'wait-dup',
+        runId: testRunId,
+      });
       expect(eventList.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(1);
     });
 
@@ -827,7 +807,10 @@ describe('Storage (Redis integration)', () => {
         }),
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
-      const eventList = await events.listByCorrelationId({ correlationId: 'wait-once' });
+      const eventList = await events.listByCorrelationId({
+        correlationId: 'wait-once',
+        runId: testRunId,
+      });
       expect(eventList.data.filter((e) => e.eventType === 'wait_completed')).toHaveLength(1);
     });
 
@@ -851,7 +834,10 @@ describe('Storage (Redis integration)', () => {
       expect(fulfilled).toHaveLength(1);
       expectRejectedWith(results, 'EntityConflictError');
 
-      const eventList = await events.listByCorrelationId({ correlationId: 'wait-race' });
+      const eventList = await events.listByCorrelationId({
+        correlationId: 'wait-race',
+        runId: testRunId,
+      });
       expect(eventList.data.filter((e) => e.eventType === 'wait_completed')).toHaveLength(1);
     });
 
@@ -890,7 +876,10 @@ describe('Storage (Redis integration)', () => {
         }),
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
-      const eventList = await events.listByCorrelationId({ correlationId: 'hook-same-claim' });
+      const eventList = await events.listByCorrelationId({
+        correlationId: 'hook-same-claim',
+        runId: testRunId,
+      });
       expect(eventList.data.map((e) => e.eventType)).toEqual(['hook_created']);
 
       // The token mapping still resolves to the original hook
@@ -1238,124 +1227,106 @@ describe('Storage (Redis integration)', () => {
     });
   });
 
-  describe('optimistic concurrency (stateUpdatedAt guard)', () => {
-    const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
-
-    /** Create a run that is running with one completed step, so the per-run
-     * state marker has been advanced by an externally-originated event. */
-    async function runWithMarker() {
+  describe('slot-numbered event ids', () => {
+    it('numbers the log densely from slot 1 in canonical form', async () => {
       const run = await createRun();
       await events.create(run.runId, { eventType: 'run_started' });
-      const step = await createStep(run.runId, { stepId: 'external-step' });
-      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
-      await events.create(run.runId, {
-        eventType: 'step_completed',
-        correlationId: step.stepId,
-        eventData: { result: 'ok' },
+      await createStep(run.runId, { stepId: 'slot-step' });
+
+      const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      expect(page.data.length).toBe(3);
+      page.data.forEach((event, index) => {
+        expect(event.eventId).toBe(slotToEventId(FIRST_EVENT_SLOT + index));
+        expect(eventIdToSlot(event.eventId)).toBe(FIRST_EVENT_SLOT + index);
       });
-      const raw = await redis.get(runStateKey(run.runId));
-      expect(raw).not.toBeNull();
-      return { run, marker: Number(raw) };
-    }
+    });
 
-    it('does not advance the marker on run lifecycle events', async () => {
+    it('settles a concurrent fan-out on distinct consecutive slots', async () => {
       const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      expect(await redis.get(runStateKey(run.runId))).toBeNull();
-    });
-
-    it('advances the marker on an externally-originated step_completed', async () => {
-      const { marker } = await runWithMarker();
-      expect(marker).toBeGreaterThan(0);
-    });
-
-    it('does not advance the marker for a replay-origin create', async () => {
-      const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      const step = await createStep(run.runId, { stepId: 'replay-step' });
-      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
-      await events.create(
-        run.runId,
-        {
-          eventType: 'step_completed',
-          correlationId: step.stepId,
-          eventData: { result: 'ok' },
-        },
-        { stateUpdatedAt: Date.now() },
-      );
-      expect(await redis.get(runStateKey(run.runId))).toBeNull();
-    });
-
-    it('rejects a strictly older stateUpdatedAt with PreconditionFailedError', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          {
+      const results = await Promise.all(
+        Array.from({ length: 16 }, (_, i) =>
+          events.create(run.runId, {
             eventType: 'step_created',
-            correlationId: 'stale-step',
-            eventData: { stepName: 'stale', input: [] },
-          },
-          { stateUpdatedAt: marker - 1 },
+            correlationId: `fan-${i}`,
+            eventData: { stepName: 'fan', input: [] },
+          }),
         ),
-      ).rejects.toThrow(PreconditionFailedError);
-      // The guarded write must not have landed.
-      expect(await redis.get(`${keyPrefix}step:${run.runId}:stale-step`)).toBeNull();
+      );
+
+      const slots = results
+        .map((r) => eventIdToSlot(r.event!.eventId))
+        .toSorted((a, b) => a! - b!);
+      // run_created holds slot 1; the fan-out takes 2..17, no holes, no dups.
+      expect(slots).toEqual(Array.from({ length: 16 }, (_, i) => i + 2));
     });
 
-    it('accepts an equal stateUpdatedAt (anti-livelock)', async () => {
-      const { run, marker } = await runWithMarker();
+    it('bumps a stale eventCount and reports the skipped span', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      await createStep(run.runId, { stepId: 'ahead-step' });
+
+      // The log holds 3 events; a writer whose snapshot held 1 expects slot 2.
       const result = await events.create(
         run.runId,
         {
-          eventType: 'step_created',
-          correlationId: 'equal-step',
-          eventData: { stepName: 'equal', input: [] },
+          eventType: 'wait_created',
+          correlationId: 'stale-wait',
+          eventData: { resumeAt: new Date() },
         },
-        { stateUpdatedAt: marker },
+        { eventCount: 1 },
       );
-      expect(result.step?.stepId).toBe('equal-step');
+
+      expect(result.event?.eventId).toBe(slotToEventId(4));
+      expect(result.events?.map((e) => e.eventId)).toEqual([slotToEventId(2), slotToEventId(3)]);
+      expect(result.cursor).toBeNull();
+      expect(result.hasMore).toBe(false);
     });
 
-    it('falls open when no stateUpdatedAt is supplied', async () => {
-      const { run } = await runWithMarker();
+    it('reports nothing when the expected slot was free', async () => {
+      const run = await createRun();
+      const result = await events.create(
+        run.runId,
+        { eventType: 'run_started' },
+        { eventCount: 1, skipPreload: true },
+      );
+      expect(result.event?.eventId).toBe(slotToEventId(2));
+      expect(result.events).toBeUndefined();
+    });
+
+    it('accepts a create carrying no eventCount', async () => {
+      const run = await createRun();
       const result = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: 'unguarded-step',
-        eventData: { stepName: 'unguarded', input: [] },
-      });
-      expect(result.step?.stepId).toBe('unguarded-step');
-    });
-
-    it('rejects a stale run_completed without marking the run terminal', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          { eventType: 'run_completed', eventData: { output: [] } },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toThrow(PreconditionFailedError);
-
-      const current = await runs.get(run.runId);
-      expect(current.status).toBe('running');
-    });
-
-    it('rejects a stale hook_disposed', async () => {
-      const { run, marker } = await runWithMarker();
-      await events.create(run.runId, {
         eventType: 'hook_created',
-        correlationId: 'hook-guard',
-        eventData: { token: 'token-guard' },
+        correlationId: 'hook-no-count',
+        eventData: { token: 'token-no-count' },
       });
+      expect(result.event?.eventId).toBe(slotToEventId(2));
+      expect(result.events).toBeUndefined();
+    });
 
-      await expect(
-        events.create(
-          run.runId,
-          { eventType: 'hook_disposed', correlationId: 'hook-guard' },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toThrow(PreconditionFailedError);
+    it('returns the delta after sinceCursor on the success response', async () => {
+      const run = await createRun();
+      const started = await events.create(run.runId, {
+        eventType: 'run_started',
+      });
+      const cursor = started.event!.eventId;
+      await createStep(run.runId, { stepId: 'delta-step' });
+
+      const result = await events.create(
+        run.runId,
+        {
+          eventType: 'hook_created',
+          correlationId: 'hook-delta',
+          eventData: { token: 'token-delta' },
+        },
+        { sinceCursor: cursor },
+      );
+
+      // Everything strictly after the cursor: the step_created plus the
+      // hook_created this call committed.
+      expect(result.events?.map((e) => e.eventType)).toEqual(['step_created', 'hook_created']);
+      expect(result.cursor).toBe(result.event?.eventId);
+      expect(result.hasMore).toBe(false);
     });
   });
 

@@ -62,11 +62,9 @@ export function createWorld(
     ...storage,
     ...streamer,
     ...queue,
-    // Declaring the current spec version enables resilient start: core
-    // includes runInput on the first queue delivery, and run_started
-    // bootstraps the run when it wins the race against run_created. The
-    // queue transport is binary-safe (Uint8Array round-trips), which this
-    // spec version requires.
+    // Event ids are slot-numbered and allocated at the commit inside the Lua
+    // scripts, so this World is current-spec compliant by construction (no
+    // pre-assigned positions, no noop sealing needed).
     specVersion: SPEC_VERSION_CURRENT,
     async start() {
       await queue.start();

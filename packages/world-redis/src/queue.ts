@@ -1,13 +1,6 @@
 import { hostname } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-  MessageId,
-  parseQueueName,
-  type Queue,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type Queue, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import { createWorkflowUrl } from '@workflow/utils';
 import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
@@ -19,16 +12,14 @@ import { debug, parseWithUint8Array, stringifyWithUint8Array } from './util.js';
  */
 export interface QueueStats {
   workflowsPending: number;
-  stepsPending: number;
   workflowsDelayed: number;
-  stepsDelayed: number;
   workflowsIdempotencyKeys: number;
-  stepsIdempotencyKeys: number;
   totalPending: number;
 }
 
 interface MessageEnvelope {
-  /** ulid-based id for this delivery attempt (changes on re-enqueue) */
+  /** ulid-based id for this message; stable across delivery attempts, which
+   * the runtime relies on for the inline-step ownership lease */
   messageId: string;
   /** original idempotency key (preserved across retries) */
   idempotencyKey?: string;
@@ -36,14 +27,9 @@ interface MessageEnvelope {
   queueName: ValidQueueName;
   /** 1-indexed attempt counter */
   attempt: number;
-  /** the workflow/step payload, forwarded as the HTTP fetch body */
+  /** the workflow payload, forwarded as the HTTP fetch body */
   message: QueuePayload;
 }
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
 
 /** TTL for idempotency reservations. A safety net only: reservations are
  * explicitly released on completion or final drop; the TTL guards against
@@ -202,19 +188,20 @@ function computeBackoffMs(attempt: number, config: RedisWorldConfig): number {
 }
 
 /**
- * Redis Lists queue. Two lists per world:
- * - `${prefix}flows` for workflow jobs
- * - `${prefix}steps` for step jobs
+ * Redis Lists queue. One list per world: `${prefix}flows`. Steps travel on
+ * the workflow topic (v5 retired the step queue kind) and execute in the
+ * combined flow handler.
  *
  * `queue()` atomically reserves the idempotency key and LPUSHes a JSON
  * envelope (or ZADDs it into `${list}:delayed` when delaySeconds is set).
  * Workers BLMOVE into a per-worker `${list}:processing:*` list, dispatch the
- * payload via HTTP fetch to `${baseUrl}/.well-known/workflow/v1/${flow|step}`,
+ * payload via HTTP fetch to `${baseUrl}/.well-known/workflow/v1/flow`,
  * and only then remove the entry; a crash mid-dispatch leaves the message in
  * the processing list, where the reclaimer returns it to the ready list once
  * the worker's heartbeat expires. Retries and 503-soft-retry park the message
  * in the delayed zset (never an in-process timer), so restarts cannot lose
- * deferred deliveries.
+ * deferred deliveries. A suspension dispatches its steps and waits as one
+ * parallel batch of messages; each is an independent envelope here.
  */
 export function createQueue(
   redis: Redis,
@@ -229,14 +216,11 @@ export function createQueue(
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const listKey = `${prefix}flows`;
 
-  const delayedKey = (listKey: string) => `${listKey}:delayed`;
-  const idempotencyKeyFor = (listKey: string, key: string) => `${listKey}:idempotent:${key}`;
-  const channelFor = (listKey: string) => `chan:${listKey}`;
+  const delayedKey = (list: string) => `${list}:delayed`;
+  const idempotencyKeyFor = (list: string, key: string) => `${list}:idempotent:${key}`;
+  const channelFor = (list: string) => `chan:${list}`;
 
   let started = false;
   let stopped = false;
@@ -256,8 +240,6 @@ export function createQueue(
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'redis';
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
 
     const envelope: MessageEnvelope = {
@@ -327,7 +309,6 @@ export function createQueue(
   /** Ack a delivery: drop it from the processing list and release its key. */
   async function ack(
     client: Redis,
-    listKey: string,
     processingKey: string,
     item: string,
     envelope: MessageEnvelope,
@@ -345,7 +326,6 @@ export function createQueue(
   /** Defer a delivery into the delayed zset (durable, restart-safe). */
   async function defer(
     client: Redis,
-    listKey: string,
     processingKey: string,
     item: string,
     nextPayload: string,
@@ -362,8 +342,7 @@ export function createQueue(
     );
   }
 
-  async function worker(kind: QueueKind, listKey: string) {
-    const pathname = QUEUE_PATHNAMES[kind];
+  async function worker() {
     const consumerId = `${hostname()}-${process.pid}-${generateMessageId()}`;
     const processingKey = `${listKey}:processing:${consumerId}`;
     const ownerKey = `${processingKey}:owner`;
@@ -413,7 +392,7 @@ export function createQueue(
 
         try {
           const baseUrl = resolveBaseUrl(config);
-          const url = createWorkflowUrl(baseUrl, { type: pathname });
+          const url = createWorkflowUrl(baseUrl, { type: 'flow' });
           const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -429,7 +408,7 @@ export function createQueue(
           if (response.ok) {
             // Success: ack and release the idempotency reservation so the
             // same key can be queued again later.
-            await ack(workerRedis, listKey, processingKey, item, envelope);
+            await ack(workerRedis, processingKey, item, envelope);
             continue;
           }
 
@@ -450,7 +429,7 @@ export function createQueue(
               typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
             ) {
               const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-              await defer(workerRedis, listKey, processingKey, item, item, Date.now() + timeoutMs);
+              await defer(workerRedis, processingKey, item, item, Date.now() + timeoutMs);
               continue;
             }
           }
@@ -463,7 +442,6 @@ export function createQueue(
             const next: MessageEnvelope = { ...envelope, attempt: nextAttempt };
             await defer(
               workerRedis,
-              listKey,
               processingKey,
               item,
               stringifyWithUint8Array(next),
@@ -475,7 +453,7 @@ export function createQueue(
             );
             // Final drop: ack releases the idempotency reservation so the
             // message can be re-enqueued instead of wedging the run forever.
-            await ack(workerRedis, listKey, processingKey, item, envelope);
+            await ack(workerRedis, processingKey, item, envelope);
           }
         } catch (error) {
           if (stopped) break;
@@ -487,14 +465,13 @@ export function createQueue(
               const next: MessageEnvelope = { ...envelope, attempt: nextAttempt };
               await defer(
                 workerRedis,
-                listKey,
                 processingKey,
                 item,
                 stringifyWithUint8Array(next),
                 Date.now() + backoffMs,
               );
             } else {
-              await ack(workerRedis, listKey, processingKey, item, envelope);
+              await ack(workerRedis, processingKey, item, envelope);
             }
           } catch (redisError) {
             // The message stays in the processing list and will be
@@ -512,34 +489,32 @@ export function createQueue(
     }
   }
 
-  /** Promote due delayed messages to the ready lists. */
+  /** Promote due delayed messages to the ready list. */
   async function promoterLoop() {
     while (!stopped) {
-      for (const listKey of Object.values(Queues)) {
-        try {
-          let promoted: unknown;
-          do {
-            promoted = await redis.eval(
-              LUA_PROMOTE_DUE,
-              2,
-              delayedKey(listKey),
-              listKey,
-              Date.now().toString(),
-              PROMOTE_BATCH.toString(),
-              channelFor(listKey),
-            );
-          } while (promoted === PROMOTE_BATCH);
-        } catch (error) {
-          if (stopped) return;
-          console.error(`[world-redis promoter] error on ${listKey}:`, error);
-        }
+      try {
+        let promoted: unknown;
+        do {
+          promoted = await redis.eval(
+            LUA_PROMOTE_DUE,
+            2,
+            delayedKey(listKey),
+            listKey,
+            Date.now().toString(),
+            PROMOTE_BATCH.toString(),
+            channelFor(listKey),
+          );
+        } while (promoted === PROMOTE_BATCH);
+      } catch (error) {
+        if (stopped) return;
+        console.error(`[world-redis promoter] error on ${listKey}:`, error);
       }
       await sleep(DELAYED_POLL_INTERVAL_MS);
     }
   }
 
   /** Return messages stranded in dead workers' processing lists. */
-  async function reclaimOnce(listKey: string): Promise<void> {
+  async function reclaimOnce(): Promise<void> {
     let cursor = '0';
     do {
       const [next, keys] = await redis.scan(
@@ -569,13 +544,11 @@ export function createQueue(
 
   async function reclaimerLoop() {
     while (!stopped) {
-      for (const listKey of Object.values(Queues)) {
-        try {
-          await reclaimOnce(listKey);
-        } catch (error) {
-          if (stopped) return;
-          console.error(`[world-redis reclaimer] error on ${listKey}:`, error);
-        }
+      try {
+        await reclaimOnce();
+      } catch (error) {
+        if (stopped) return;
+        console.error(`[world-redis reclaimer] error on ${listKey}:`, error);
       }
       await sleep(RECLAIM_INTERVAL_MS);
     }
@@ -593,33 +566,17 @@ export function createQueue(
   }
 
   async function getQueueStats(): Promise<QueueStats> {
-    const flowsKey = Queues.workflow;
-    const stepsKey = Queues.step;
-
-    const [
-      workflowsPending,
-      stepsPending,
-      workflowsDelayed,
-      stepsDelayed,
-      workflowsIdempotencyKeys,
-      stepsIdempotencyKeys,
-    ] = await Promise.all([
-      redis.llen(flowsKey),
-      redis.llen(stepsKey),
-      redis.zcard(delayedKey(flowsKey)),
-      redis.zcard(delayedKey(stepsKey)),
-      countKeys(`${flowsKey}:idempotent:*`),
-      countKeys(`${stepsKey}:idempotent:*`),
+    const [workflowsPending, workflowsDelayed, workflowsIdempotencyKeys] = await Promise.all([
+      redis.llen(listKey),
+      redis.zcard(delayedKey(listKey)),
+      countKeys(`${listKey}:idempotent:*`),
     ]);
 
     const stats: QueueStats = {
       workflowsPending,
-      stepsPending,
       workflowsDelayed,
-      stepsDelayed,
       workflowsIdempotencyKeys,
-      stepsIdempotencyKeys,
-      totalPending: workflowsPending + stepsPending + workflowsDelayed + stepsDelayed,
+      totalPending: workflowsPending + workflowsDelayed,
     };
 
     debug('queue stats', stats);
@@ -635,11 +592,8 @@ export function createQueue(
       if (started) return;
       started = true;
       const concurrency = config.queueConcurrency || 10;
-      const entries = Object.entries(Queues) as [QueueKind, string][];
       loopPromises.push(
-        ...entries.flatMap(([kind, listKey]) =>
-          Array.from({ length: concurrency }, () => worker(kind, listKey)),
-        ),
+        ...Array.from({ length: concurrency }, () => worker()),
         promoterLoop(),
         reclaimerLoop(),
       );
