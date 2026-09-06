@@ -1,3 +1,5 @@
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { parse, stringify } from '@fantasticfour/shared';
 import type { ValidQueueName } from '@workflow/world';
 import type { Mock } from 'vitest';
@@ -597,6 +599,61 @@ describe('Queue (Cloudflare Queues integration)', () => {
 
       expect(response.status).toBe(200);
       expect(handler).toHaveBeenCalled();
+    });
+  });
+
+  describe('test pump suspension accounting', () => {
+    let server: Server;
+
+    afterEach(async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    it('keeps the attempt header flat across timeoutSeconds suspensions and counts only real failures', async () => {
+      process.env.VITEST = 'true';
+
+      // A suspension re-enqueues the SAME envelope, so every suspended
+      // delivery must report attempt 1; only the real 500 advances it.
+      const attempts: number[] = [];
+      let deliveries = 0;
+      server = createServer((req, res) => {
+        req.resume();
+        req.on('end', () => {
+          attempts.push(Number(req.headers['x-vqs-message-attempt']));
+          deliveries += 1;
+          if (deliveries <= 3) {
+            res.writeHead(503, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ timeoutSeconds: 0 }));
+          } else if (deliveries === 4) {
+            res.writeHead(500);
+            res.end('transient failure');
+          } else {
+            res.writeHead(200);
+            res.end('ok');
+          }
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const port = (server.address() as AddressInfo).port;
+
+      queue = createQueue({
+        env: mockEnv,
+        deploymentId: 'test-deployment',
+        baseUrl: `http://localhost:${port}`,
+        backoffDelayMs: 1,
+      });
+      await queue.start();
+      await queue.queue('__wkf_workflow_pump' as ValidQueueName, asMessage({ data: 'x' }), {
+        idempotencyKey: 'pump-suspend',
+      });
+
+      await vi.waitFor(() => expect(deliveries).toBe(5), { timeout: 5_000 });
+
+      // Initial delivery + 3 suspensions stay at attempt 1; the single real
+      // failure is the only thing that advances the counter.
+      expect(attempts).toEqual([1, 1, 1, 1, 2]);
+      // Suspensions never touch the production Cloudflare queue either.
+      expect(mockQueue.send).not.toHaveBeenCalled();
     });
   });
 
