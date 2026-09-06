@@ -111,7 +111,10 @@ on them.
       independently re-verified; note: streams remain name-keyed like
       world-redis, two runs sharing a stream name would collide, same
       as v4)
-- [~] world-firestore-tasks (agent running 2026-09-05)
+- [x] world-firestore-tasks (commit 7608ecf, 117/117 tests incl.
+      conformance, independently re-verified; three emulator-verified
+      concurrency fixes, suite runtime 130s to 35s; real-GCP lock
+      behavior deserves a soak test before production rollout)
 - [x] world-cloudflare (commit 2447806, 147 node + 26 workerd tests,
       independently re-verified; DO exports verified in dist; shared
       conformance seam still absent, own suites cover slot semantics).
@@ -126,9 +129,11 @@ hand-rolled (see memory: match official world behavior).
 
 ### Phase 4: e2e and packaging
 
-- [ ] `test/packaging` suite updated for v5 and green (`pnpm test:packaging`)
-- [ ] CI images/config still valid (tests.yml matrix, firestore image, ghcr pulls)
-- [ ] Ruleset check: if any CI job is renamed, update ruleset 21057342
+- [x] `test/packaging` suite green unchanged (91/91); it is
+      version-agnostic (packs tarballs, probes exports)
+- [x] CI config reviewed: no job renamed, matrix and emulator images
+      unchanged, cloudflare test:workers script simplified (hook removed)
+- [x] Ruleset check: no CI job renamed, ruleset 21057342 untouched
 
 ### Phase 5: Benchmarks
 
@@ -152,10 +157,22 @@ hand-rolled (see memory: match official world behavior).
 
 ### Phase 6: Quality and ship
 
-- [ ] `pnpm lint`, `pnpm format:check` green
-- [ ] Changesets written (major bumps, prose style: no em dashes)
-- [ ] README/docs updated for v5 peer ranges
-- [ ] PR to main
+- [x] `pnpm lint`, `pnpm format:check` green (commit 55e1737)
+- [x] Changeset written: `.changeset/workflow-5-spec.md`, major bump for
+      all ten worlds with the rollout warning
+- [x] README/docs checked: no 4.x version references to update
+- [~] Draft PR to main (opened 2026-09-05; review before merge)
+
+Deferred follow-ups (tracked, not blockers):
+- Extract the duplicated redis storage layer shared by world-redis and
+  world-redis-bullmq into a shared module
+- hook_received-after-terminal TOCTOU in world-redis (world-local closes
+  it with terminal markers plus reap)
+- Profile v5 run_created for the 15-20% concurrent-creation cost
+- world-cloudflare workerd smoke app; conformance seam upstream ask
+  (createTestSuite world-injection)
+- Firestore real-GCP soak test
+- Extend bench to world-redis-bullmq
 
 ## Delta notes
 
@@ -204,3 +221,9 @@ Headlines for implementors (target @workflow/world@5.0.0-beta.33, spec 7):
   Official Vercel migration skill installed and committed. Archetype
   migrations launched for world-redis and world-mysql. The 4.x-code
   conformance canary was stopped as superseded.
+- 2026-09-05: All ten worlds migrated, each independently re-verified
+  (build + typecheck + full test suite re-run before commit). 739 tests
+  green across the worlds plus 91 packaging and 82 shared/testing.
+  Benchmarks: v5 beats 4.x on every hot path except concurrent run
+  creation (accepted, explained). Root gates green: build, forced
+  typecheck, lint, format, packaging. Changeset written. Draft PR opened.
