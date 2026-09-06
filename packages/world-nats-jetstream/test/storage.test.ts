@@ -1,17 +1,13 @@
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import type { WorkflowRun, Step } from '@workflow/world';
+import { eventIdToSlot, slotToEventId } from '@workflow/world';
 import { connect } from '@nats-io/transport-node';
 import { jetstream } from '@nats-io/jetstream';
 import { Kvm } from '@nats-io/kv';
-import { decodeTime, ulid } from 'ulid';
+import { ulid } from 'ulid';
 import { afterAll, beforeAll, describe, expect, it, test } from 'vitest';
 import { expectEventType, expectRejectedWith } from '@fantasticfour/testing';
 import { createWorld } from '../src/index.js';
-
-/** ULID time of a prefixed id, matching how the runtime derives stateUpdatedAt. */
-function eventTime(eventId: string): number {
-  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
-}
 
 describe('Storage (NATS JetStream integration)', () => {
   if (process.platform === 'win32') {
@@ -478,12 +474,67 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(holder.hookId).toBe(hookId);
     });
 
-    it('a delivery racing a crashed winner heals under the canonical eventId', async () => {
-      // Seed the orphan window by hand: step entity + creation claim written,
-      // event write lost (a crash between claim and putEvent).
+    it('a redelivery heals a winner that crashed before claiming its creation event', async () => {
+      // Seed the orphan window by hand: step entity written, claim and event
+      // lost (a crash right after the entity create).
       const run = await createRun();
       const stepId = 'step-orphan-heal';
-      const canonicalEventId = `wevt_${ulid()}`;
+
+      const nc = await connect({ servers: natsUrl });
+      try {
+        const js = jetstream(nc);
+        const kvm = new Kvm(js);
+        const stepsBucket = await kvm.create('test_steps', { history: 10 });
+        await stepsBucket.create(
+          `${run.runId}.${stepId}`,
+          JSON.stringify({
+            runId: run.runId,
+            stepId,
+            stepName: 'test-step',
+            input: ['input1'],
+            status: 'pending',
+            attempt: 0,
+            specVersion: run.specVersion,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } finally {
+        await nc.close();
+      }
+
+      // The redelivery loses the entity create but wins the creation claim,
+      // so it completes the crashed winner's event append.
+      const healed = await world.events.create(run.runId, {
+        eventType: 'step_created',
+        correlationId: stepId,
+        eventData: { stepName: 'test-step', input: ['input1'] },
+      });
+      expect(healed.step?.stepId).toBe(stepId);
+      expect(eventIdToSlot(healed.event!.eventId)).not.toBeNull();
+
+      const eventList = await world.events.list({ runId: run.runId });
+      const created = eventList.data.filter(
+        (e) => e.eventType === 'step_created' && e.correlationId === stepId,
+      );
+      expect(created).toHaveLength(1);
+
+      // And a further redelivery is now a true duplicate.
+      await expect(
+        world.events.create(run.runId, {
+          eventType: 'step_created',
+          correlationId: stepId,
+          eventData: { stepName: 'test-step', input: ['input1'] },
+        }),
+      ).rejects.toMatchObject({ name: 'EntityConflictError' });
+    });
+
+    it('a redelivery takes over a claim whose winner crashed before appending', async () => {
+      // Crash window two: entity + claim written, event append lost. The
+      // redelivery polls the pending claim out, takes it over via revision
+      // CAS, and appends the missing creation event.
+      const run = await createRun();
+      const stepId = 'step-claim-takeover';
 
       const nc = await connect({ servers: natsUrl });
       try {
@@ -505,37 +556,25 @@ describe('Storage (NATS JetStream integration)', () => {
             updatedAt: new Date().toISOString(),
           }),
         );
-        await claimsBucket.create(`${run.runId}.${stepId}.step_created`, canonicalEventId);
+        await claimsBucket.create(`${run.runId}.${stepId}.step_created`, 'pending');
       } finally {
         await nc.close();
       }
 
-      // The redelivery loses the claim, finds no durable event, and completes
-      // the crashed winner's write under its canonical id.
       const healed = await world.events.create(run.runId, {
         eventType: 'step_created',
         correlationId: stepId,
         eventData: { stepName: 'test-step', input: ['input1'] },
       });
       expect(healed.step?.stepId).toBe(stepId);
-      expect(healed.event?.eventId).toBe(canonicalEventId);
 
       const eventList = await world.events.list({ runId: run.runId });
-      const created = eventList.data.filter(
-        (e) => e.eventType === 'step_created' && e.correlationId === stepId,
-      );
-      expect(created).toHaveLength(1);
-      expect(created[0].eventId).toBe(canonicalEventId);
-
-      // And a further redelivery is now a true duplicate.
-      await expect(
-        world.events.create(run.runId, {
-          eventType: 'step_created',
-          correlationId: stepId,
-          eventData: { stepName: 'test-step', input: ['input1'] },
-        }),
-      ).rejects.toMatchObject({ name: 'EntityConflictError' });
-    });
+      expect(
+        eventList.data.filter(
+          (e) => e.eventType === 'step_created' && e.correlationId === stepId,
+        ),
+      ).toHaveLength(1);
+    }, 30_000);
   });
 
   describe('KV revision correctness', () => {
@@ -554,7 +593,7 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(listed.data[0].status).toBe('completed');
     });
 
-    it('steps.get without runId returns the latest revision', async () => {
+    it('steps.get returns the latest revision', async () => {
       const run = await createRun();
       await world.events.create(run.runId, { eventType: 'run_started' });
       const stepId = `step-latest-${Date.now()}`;
@@ -566,7 +605,7 @@ describe('Storage (NATS JetStream integration)', () => {
         eventData: { result: 'output-value' },
       });
 
-      const fetched = await world.steps.get(undefined, stepId);
+      const fetched = await world.steps.get(run.runId, stepId);
       expect(fetched.status).toBe('completed');
       expect(fetched.output).toBe('output-value');
     });
@@ -658,157 +697,127 @@ describe('Storage (NATS JetStream integration)', () => {
       }
     });
 
-    it('only reports the ceiling on run_started responses', async () => {
+    it('reports the ceiling only on run-lifecycle responses', async () => {
       const run = await createRun();
       await world.events.create(run.runId, { eventType: 'run_started' });
+
+      const step = await createStep(run.runId, 'step-ceiling');
+      const stepStarted = await world.events.create(run.runId, {
+        eventType: 'step_started',
+        correlationId: step.stepId,
+      });
+      expect(stepStarted.maxEvents).toBeUndefined();
 
       const completed = await world.events.create(run.runId, {
         eventType: 'run_completed',
         eventData: { output: 'done' },
       });
-      expect(completed.maxEvents).toBeUndefined();
+      expect(completed.maxEvents).toBe(25_000);
     });
   });
 
-  describe('Optimistic concurrency (stateUpdatedAt)', () => {
-    const resumeAt = () => new Date(Date.now() + 60_000);
-
-    it('rejects a create whose snapshot predates an externally-originated event', async () => {
+  describe('Slot-numbered event ids', () => {
+    it('numbers a run log densely from slot 1 in commit order', async () => {
       const run = await createRun();
-      await world.events.create(run.runId, { eventType: 'run_started' });
+      const started = await world.events.create(run.runId, { eventType: 'run_started' });
+      expect(started.event?.eventId).toBe(slotToEventId(2));
 
-      const hookId = `hook-guard-${Date.now()}`;
-      await world.events.create(run.runId, {
-        eventType: 'hook_created',
-        correlationId: hookId,
-        eventData: { token: `guard-token-${Date.now()}` },
-      });
-
-      // No stateUpdatedAt: externally originated, so it advances the marker.
-      const received = await world.events.create(run.runId, {
-        eventType: 'hook_received',
-        correlationId: hookId,
-        eventData: { payload: 'value' },
-      });
-      const marker = eventTime(received.event!.eventId);
-
-      // Strictly older snapshot -> 412.
-      await expect(
-        world.events.create(
-          run.runId,
-          {
-            eventType: 'wait_created',
-            correlationId: 'wait-stale',
-            eventData: { resumeAt: resumeAt() },
-          },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toMatchObject({ name: 'PreconditionFailedError', status: 412 });
-
-      // Equal snapshot must pass; rejecting an up-to-date client livelocks it.
-      const equal = await world.events.create(
-        run.runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-equal',
-          eventData: { resumeAt: resumeAt() },
-        },
-        { stateUpdatedAt: marker },
-      );
-      expect(equal.wait?.status).toBe('waiting');
-
-      // An absent stateUpdatedAt disables the guard entirely.
-      const unguarded = await world.events.create(run.runId, {
-        eventType: 'wait_created',
-        correlationId: 'wait-unguarded',
-        eventData: { resumeAt: resumeAt() },
-      });
-      expect(unguarded.wait?.status).toBe('waiting');
-    });
-
-    it('advances the marker on an unguarded step_completed', async () => {
-      const run = await createRun();
-      await world.events.create(run.runId, { eventType: 'run_started' });
-      const stepId = `step-marker-${Date.now()}`;
+      const stepId = 'step-slots';
       await createStep(run.runId, stepId);
       await world.events.create(run.runId, { eventType: 'step_started', correlationId: stepId });
-
-      const completed = await world.events.create(run.runId, {
+      await world.events.create(run.runId, {
         eventType: 'step_completed',
         correlationId: stepId,
-        eventData: { result: 42 },
+        eventData: { result: 1 },
       });
-      const marker = eventTime(completed.event!.eventId);
 
-      await expect(
-        world.events.create(
-          run.runId,
-          {
-            eventType: 'wait_created',
-            correlationId: 'wait-after-step',
-            eventData: { resumeAt: resumeAt() },
-          },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toMatchObject({ name: 'PreconditionFailedError' });
+      const events = await world.events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      expect(events.data.map((e) => e.eventId)).toEqual([1, 2, 3, 4, 5].map(slotToEventId));
+      expect(events.data[0].eventType).toBe('run_created');
     });
 
-    it('does not advance the marker for replay-origin creates', async () => {
+    it('concurrent appends race for slots without holes or duplicates', async () => {
       const run = await createRun();
       await world.events.create(run.runId, { eventType: 'run_started' });
-      const stepId = `step-replay-origin-${Date.now()}`;
-      await createStep(run.runId, stepId);
-      await world.events.create(run.runId, { eventType: 'step_started', correlationId: stepId });
 
-      // Carries stateUpdatedAt -> replay origin -> must not advance the marker.
-      const completed = await world.events.create(
-        run.runId,
-        { eventType: 'step_completed', correlationId: stepId, eventData: { result: 42 } },
-        { stateUpdatedAt: Date.now() },
+      await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          world.events.create(run.runId, {
+            eventType: 'step_created',
+            correlationId: `step-fanout-${i}`,
+            eventData: { stepName: 'test-step', input: [i] },
+          }),
+        ),
       );
 
-      // A far older snapshot still passes, because nothing advanced.
-      const wait = await world.events.create(
-        run.runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-no-advance',
-          eventData: { resumeAt: resumeAt() },
-        },
-        { stateUpdatedAt: eventTime(completed.event!.eventId) - 60_000 },
+      const events = await world.events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      // run_created + run_started + 8 step_created, dense from 1.
+      expect(events.data.map((e) => e.eventId)).toEqual(
+        Array.from({ length: 10 }, (_, i) => slotToEventId(i + 1)),
       );
-      expect(wait.wait?.status).toBe('waiting');
     });
 
-    it('scopes the marker to its own run', async () => {
-      const runA = await createRun();
-      const runB = await createRun();
-      await world.events.create(runA.runId, { eventType: 'run_started' });
-      await world.events.create(runB.runId, { eventType: 'run_started' });
-
-      const hookId = `hook-scope-${Date.now()}`;
-      await world.events.create(runA.runId, {
-        eventType: 'hook_created',
-        correlationId: hookId,
-        eventData: { token: `scope-token-${Date.now()}` },
-      });
-      const received = await world.events.create(runA.runId, {
-        eventType: 'hook_received',
-        correlationId: hookId,
-        eventData: { payload: 'value' },
-      });
-
-      // runB has no marker of its own, so runA's must not reject it.
-      const wait = await world.events.create(
-        runB.runId,
+    it('bumps a stale eventCount to the next free slot and reports the skipped span', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      // Log now holds slots 1..2. A writer that replayed only slot 1 sends
+      // eventCount: 1; its write must land at slot 3 (not reject) and the
+      // response must carry the slot-2 event it missed.
+      const result = await world.events.create(
+        run.runId,
         {
           eventType: 'wait_created',
-          correlationId: 'wait-other-run',
-          eventData: { resumeAt: resumeAt() },
+          correlationId: 'wait-bump',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
         },
-        { stateUpdatedAt: eventTime(received.event!.eventId) - 60_000 },
+        { eventCount: 1 },
       );
-      expect(wait.wait?.status).toBe('waiting');
+      expect(result.event?.eventId).toBe(slotToEventId(3));
+      expect(result.events?.map((e) => e.eventId)).toEqual([slotToEventId(2)]);
+      expect(result.cursor).toBeNull();
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('accepts a fresh eventCount and a create with no eventCount', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+
+      const fresh = await world.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-fresh-count',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { eventCount: 2 },
+      );
+      expect(fresh.event?.eventId).toBe(slotToEventId(3));
+      expect(fresh.events).toBeUndefined();
+
+      const uncounted = await world.events.create(run.runId, {
+        eventType: 'wait_completed',
+        correlationId: 'wait-fresh-count',
+        eventData: {},
+      });
+      expect(uncounted.event?.eventId).toBe(slotToEventId(4));
+    });
+
+    it('returns the delta after sinceCursor on the create response', async () => {
+      const run = await createRun();
+      await world.events.create(run.runId, { eventType: 'run_started' });
+      const result = await world.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-since',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { sinceCursor: slotToEventId(1) },
+      );
+      // Everything strictly after slot 1, including the created event itself.
+      expect(result.events?.map((e) => eventIdToSlot(e.eventId))).toEqual([2, 3]);
+      expect(result.cursor).toBe(slotToEventId(3));
+      expect(result.hasMore).toBe(false);
     });
   });
 
@@ -829,57 +838,70 @@ describe('Storage (NATS JetStream integration)', () => {
       const run = await createRun();
       const name = `late-reader-${Date.now()}`;
 
-      await world.writeToStream(name, run.runId, 'chunk-0');
-      await world.writeToStream(name, run.runId, 'chunk-1');
-      await world.writeToStream(name, run.runId, 'chunk-2');
-      await world.closeStream(name, run.runId);
+      await world.streams.write(run.runId, name, 'chunk-0');
+      await world.streams.write(run.runId, name, 'chunk-1');
+      await world.streams.write(run.runId, name, 'chunk-2');
+      await world.streams.close(run.runId, name);
 
       // Reader attaches only after everything (including EOF) was written.
-      const chunks = await collectStream(await world.readFromStream(name));
+      const chunks = await collectStream(await world.streams.get(run.runId, name));
       expect(chunks).toEqual(['chunk-0', 'chunk-1', 'chunk-2']);
 
       // A second reader replays the same chunks (acks must not consume them).
-      const again = await collectStream(await world.readFromStream(name));
+      const again = await collectStream(await world.streams.get(run.runId, name));
       expect(again).toEqual(['chunk-0', 'chunk-1', 'chunk-2']);
+    });
+
+    it('scopes streams to their run', async () => {
+      const runA = await createRun();
+      const runB = await createRun();
+      const name = `scoped-${Date.now()}`;
+
+      await world.streams.write(runA.runId, name, 'from-a');
+      await world.streams.close(runA.runId, name);
+      await world.streams.write(runB.runId, name, 'from-b');
+      await world.streams.close(runB.runId, name);
+
+      expect(await collectStream(await world.streams.get(runA.runId, name))).toEqual(['from-a']);
+      expect(await collectStream(await world.streams.get(runB.runId, name))).toEqual(['from-b']);
     });
 
     it('resumes from startIndex without double-skipping', async () => {
       const run = await createRun();
       const name = `resume-${Date.now()}`;
 
-      await world.writeToStream(name, run.runId, 'a');
-      await world.writeToStream(name, run.runId, 'b');
-      await world.writeToStream(name, run.runId, 'c');
-      await world.closeStream(name, run.runId);
+      await world.streams.write(run.runId, name, 'a');
+      await world.streams.writeMulti!(run.runId, name, ['b', 'c']);
+      await world.streams.close(run.runId, name);
 
-      expect(await collectStream(await world.readFromStream(name, 1))).toEqual(['b', 'c']);
-      expect(await collectStream(await world.readFromStream(name, -1))).toEqual(['c']);
+      expect(await collectStream(await world.streams.get(run.runId, name, 1))).toEqual(['b', 'c']);
+      expect(await collectStream(await world.streams.get(run.runId, name, -1))).toEqual(['c']);
     });
 
-    it('implements getStreamInfo, getStreamChunks, and listStreamsByRunId', async () => {
+    it('implements streams.getInfo, streams.getChunks, and streams.list', async () => {
       const run = await createRun();
       const name = `contract-${Date.now()}`;
 
-      await world.writeToStream(name, run.runId, 'one');
-      await world.writeToStream(name, run.runId, 'two');
+      await world.streams.write(run.runId, name, 'one');
+      await world.streams.write(run.runId, name, 'two');
 
-      const openInfo = await world.getStreamInfo(name, run.runId);
+      const openInfo = await world.streams.getInfo(run.runId, name);
       expect(openInfo).toEqual({ tailIndex: 1, done: false });
 
-      await world.closeStream(name, run.runId);
+      await world.streams.close(run.runId, name);
 
-      const info = await world.getStreamInfo(name, run.runId);
+      const info = await world.streams.getInfo(run.runId, name);
       expect(info).toEqual({ tailIndex: 1, done: true });
 
       const decoder = new TextDecoder();
-      const firstPage = await world.getStreamChunks(name, run.runId, { limit: 1 });
+      const firstPage = await world.streams.getChunks(run.runId, name, { limit: 1 });
       expect(firstPage.data.map((c) => ({ index: c.index, text: decoder.decode(c.data) }))).toEqual(
         [{ index: 0, text: 'one' }],
       );
       expect(firstPage.hasMore).toBe(true);
       expect(firstPage.cursor).not.toBeNull();
 
-      const secondPage = await world.getStreamChunks(name, run.runId, {
+      const secondPage = await world.streams.getChunks(run.runId, name, {
         limit: 1,
         cursor: firstPage.cursor!,
       });
@@ -889,7 +911,7 @@ describe('Storage (NATS JetStream integration)', () => {
       expect(secondPage.hasMore).toBe(false);
       expect(secondPage.done).toBe(true);
 
-      const streams = await world.listStreamsByRunId(run.runId);
+      const streams = await world.streams.list(run.runId);
       expect(streams).toContain(name);
     });
   });
@@ -954,27 +976,6 @@ describe('Storage (NATS JetStream integration)', () => {
 
       expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
       expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
-      expect(result.hasMore).toBe(false);
-    });
-
-    it('lists every run when runId is omitted', async () => {
-      const correlationId = 'hook-scoping-unscoped';
-      const seeded = await seedInterleavedRuns(correlationId);
-
-      const result = await world.events.listByCorrelationId({
-        correlationId,
-        pagination: {},
-      });
-
-      // Also pins the interleaving the scoped pagination test relies on.
-      expect(result.data.map((e) => e.eventId)).toEqual([
-        seeded.a[0],
-        seeded.b[0],
-        seeded.a[1],
-        seeded.b[1],
-        seeded.a[2],
-        seeded.b[2],
-      ]);
       expect(result.hasMore).toBe(false);
     });
 

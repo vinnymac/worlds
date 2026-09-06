@@ -84,7 +84,7 @@ describe('Queue suspensions vs failed deliveries (NATS JetStream integration)', 
   /** Each test needs its own queue id so deliveries never interleave. */
   function nextQueueName(): ValidQueueName {
     queueCounter += 1;
-    return ValidQueueName.parse(`__wkf_step_susp-${queueCounter}`);
+    return ValidQueueName.parse(`__wkf_workflow_susp-${queueCounter}`);
   }
 
   async function waitForDeliveries(count: number) {

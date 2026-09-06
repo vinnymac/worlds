@@ -72,13 +72,9 @@ export function createWorld(
   const queue = createQueue(getJetStream, config);
 
   return {
-    // Declare the highest spec version this world supports. With spec
-    // version 3+, `start()` includes the run input in the queue message
-    // (CBOR queue transport), which enables the resilient-start path in
-    // `events.create('run_started')`. That path is required for
-    // correctness here: the runtime creates `run_created` and enqueues
-    // the workflow message in parallel, and JetStream delivers to the
-    // in-process worker fast enough that `run_started` can win the race.
+    // Event ids are slot-numbered and allocated by the KV create() that
+    // commits each event, so this World is current-spec compliant by
+    // construction (no pre-assigned positions, no noop sealing needed).
     specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,

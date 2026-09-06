@@ -3,7 +3,6 @@ import {
   MessageId,
   parseQueueName,
   type Queue,
-  type QueueKind,
   type QueuePayload,
   type ValidQueueName,
   WorkflowInvokePayloadSchema,
@@ -19,10 +18,16 @@ import type { NatsJetStreamWorldConfig } from './config.js';
 import { debug } from './util.js';
 
 interface MessageEnvelope {
+  /** Stable across redeliveries (JetStream redelivers the same message);
+   * the runtime's inline-step ownership lease relies on that. */
   messageId: string;
   idempotencyKey?: string;
   queueName: ValidQueueName;
   message: QueuePayload;
+  /** Epoch ms before which this message must not be dispatched. Carries
+   * `QueueOptions.delaySeconds`: JetStream has no delayed publish, so an
+   * early delivery is soft-nak'd back for the remaining delay. */
+  notBefore?: number;
 }
 
 /** Health statistics for a queue worker. */
@@ -56,14 +61,15 @@ const ACK_WAIT_NANOS = 30 * 1_000_000_000; // 30 seconds
 const ACK_PROGRESS_INTERVAL_MS = 10_000;
 
 /**
- * Safety ceiling on `{ timeoutSeconds }` soft naks for a single message,
- * mirroring world-upstash's MAX_SOFT_REPUBLISHES and world-local's
+ * Safety ceiling on suspension soft naks for a single message, mirroring
+ * world-upstash's MAX_SOFT_REPUBLISHES and world-local's
  * MAX_LOCAL_SAFETY_LIMIT.
  *
- * Suspensions are legitimate control flow and must not consume core's delivery
- * budget, but an unbounded soft loop would spin a message forever. Past this
- * ceiling the delivery is nak'd as a real failure so it starts counting toward
- * core's own cap and the run ends with a recorded error.
+ * Suspensions ({ timeoutSeconds } replies) and not-yet-due delayed
+ * continuations are legitimate control flow and must not consume core's
+ * delivery budget, but an unbounded soft loop would spin a message forever.
+ * Past this ceiling the delivery is nak'd as a real failure so it starts
+ * counting toward core's own cap and the run ends with a recorded error.
  */
 const MAX_SOFT_NAKS = 256;
 
@@ -88,11 +94,6 @@ const NAK_DELAY_MS = 5_000;
  */
 const SOFT_NAK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
-
 function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
   if (config.baseUrl) return config.baseUrl;
   if (process.env.WORKFLOW_BASE_URL) return process.env.WORKFLOW_BASE_URL;
@@ -101,11 +102,14 @@ function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
 }
 
 /**
- * NATS JetStream queue. Each queue type gets its own stream + durable consumer
- * in work-queue mode. Deduplication uses `Nats-Msg-Id` (configurable window).
+ * NATS JetStream queue. One stream + durable consumer in work-queue mode:
+ * v5 retired the step topic, so queued steps travel on the workflow stream
+ * carrying `stepId`/`stepName` in the payload, and a suspension dispatches
+ * its steps and waits as one parallel batch of independent messages.
+ * Deduplication uses `Nats-Msg-Id` (configurable window).
  *
  * Worker delivery: messages are pulled from JetStream and dispatched via HTTP
- * fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`. JetStream itself
+ * fetch to `${baseUrl}/.well-known/workflow/v1/flow`. JetStream itself
  * handles redelivery via `max_deliver` and `nak()`.
  *
  * Message payloads are serialized with the shared tagged-JSON codec so that
@@ -120,10 +124,7 @@ export function createQueue(
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Streams = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const streamName = `${prefix}flows`;
 
   const dedupWindowMs = config.dedupWindowMs ?? DEFAULT_DEDUP_WINDOW_MS;
   // JetStream takes nanoseconds for its time fields.
@@ -144,18 +145,19 @@ export function createQueue(
   const inflightWorkflowRuns = new Map<string, Promise<void>>();
 
   /** Serialization key for a delivery, or `undefined` when it may run freely.
-   * Only workflow invocations are keyed; step deliveries stay parallel so
-   * fan-out is preserved. */
-  function workflowRunSerializationKey(kind: QueueKind, message: QueuePayload): string | undefined {
-    if (kind !== 'workflow') return undefined;
+   * Only replay invocations are keyed; step-execution deliveries (payloads
+   * carrying `stepId`) stay parallel so fan-out is preserved. */
+  function workflowRunSerializationKey(message: QueuePayload): string | undefined {
+    if (message && typeof message === 'object' && '__healthCheck' in message) return undefined;
     const invoke = WorkflowInvokePayloadSchema.safeParse(message);
     if (!invoke.success) return undefined;
+    if (invoke.data.stepId) return undefined;
     return `workflow:${invoke.data.runId}`;
   }
 
   /** Run `task`, serialized against every other delivery sharing `key`. Workers
-   * share one durable consumer, so two deliveries for a run would otherwise
-   * replay concurrently and corrupt its event log. Per-process only. */
+   * share one durable consumer, so two replays of a run would otherwise race
+   * each other and churn on slot bumps. Per-process only. */
   async function runSerialized(key: string | undefined, task: () => Promise<void>): Promise<void> {
     if (!key) {
       await task();
@@ -175,20 +177,20 @@ export function createQueue(
   }
 
   /**
-   * Per-message tally of `{ timeoutSeconds }` suspensions.
+   * Per-message tally of soft (non-failure) redeliveries.
    *
-   * `{ timeoutSeconds }` is core's *control-flow* signal, not a failed
-   * delivery: `sleep()`, step retry backoff, `TooEarlyError`, and
-   * `{ timeoutSeconds: 0 }` ("re-invoke me with a fresh replay", returned
-   * whenever the `stateUpdatedAt` precondition guard exhausts its reloads or
-   * `run_completed` is rejected as stale). JetStream's only durable redelivery
-   * timer is `nak(delay)`, which unavoidably increments `num_delivered`, so the
-   * suspensions are counted here and subtracted back out before the delivery is
-   * reported to core as an `attempt`.
+   * Two soft cases exist: `{ timeoutSeconds }` replies (core's control-flow
+   * suspension signal: sleep(), step retry backoff, TooEarlyError,
+   * `{ timeoutSeconds: 0 }` re-invocations) and not-yet-due delayed
+   * continuations (`QueueOptions.delaySeconds`, how v5 schedules waits).
+   * JetStream's only durable redelivery timer is `nak(delay)`, which
+   * unavoidably increments `num_delivered`, so the soft redeliveries are
+   * counted here and subtracted back out before the delivery is reported to
+   * core as an `attempt`. A world that skipped this would kill healthy runs:
+   * core hard-fails at attempt > MAX_QUEUE_DELIVERIES.
    *
-   * Kept in KV rather than in memory so the tally survives a worker restart or
-   * a consumer rebalance; losing it would silently restore the old behaviour of
-   * counting suspensions against core's budget.
+   * Kept in KV rather than in memory so the tally survives a worker restart
+   * or a consumer rebalance.
    */
   let softNakBucket: KV | undefined;
   const getSoftNakBucket = async (): Promise<KV> => {
@@ -204,8 +206,8 @@ export function createQueue(
 
   /** Stable per-message key. `streamSequence` identifies the message within its
    * stream and does not change across redeliveries, unlike `deliveryCount`. */
-  function softNakKey(kind: QueueKind, msg: JsMsg): string {
-    return `${kind}_${msg.info.streamSequence}`;
+  function softNakKey(msg: JsMsg): string {
+    return `workflow_${msg.info.streamSequence}`;
   }
 
   async function readSoftNaks(key: string): Promise<number> {
@@ -230,6 +232,20 @@ export function createQueue(
       });
   }
 
+  /** Record a soft redelivery and nak for `delayMs`. Returns false when the
+   * soft ceiling is exhausted, in which case nothing was recorded and the
+   * caller must treat the delivery as a real failure. */
+  async function softNak(msg: JsMsg, key: string, softNaks: number, delayMs: number): Promise<boolean> {
+    const next = softNaks + 1;
+    if (next > MAX_SOFT_NAKS) return false;
+    // Record the suspension BEFORE nak'ing: JetStream may redeliver the
+    // moment the delay elapses, and a redelivery that read a stale count
+    // would report an inflated attempt.
+    await writeSoftNaks(key, next);
+    msg.nak(delayMs);
+    return true;
+  }
+
   let initialized = false;
   const initStreams = async () => {
     if (initialized) return;
@@ -237,22 +253,20 @@ export function createQueue(
     const jetstream = await getJetStream();
     const jsm = await jetstream.jetstreamManager();
 
-    for (const streamName of Object.values(Streams)) {
-      try {
-        await jsm.streams.add({
-          name: streamName,
-          subjects: [`${streamName}.>`],
-          retention: RetentionPolicy.Workqueue,
-          discard: DiscardPolicy.Old,
-          max_msgs: 100000,
-          max_age: 7 * 24 * 60 * 60 * 1_000_000_000, // 7 days
-          duplicate_window: dedupWindowNanos,
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (!message.includes('already in use')) {
-          throw err;
-        }
+    try {
+      await jsm.streams.add({
+        name: streamName,
+        subjects: [`${streamName}.>`],
+        retention: RetentionPolicy.Workqueue,
+        discard: DiscardPolicy.Old,
+        max_msgs: 100000,
+        max_age: 7 * 24 * 60 * 60 * 1_000_000_000, // 7 days
+        duplicate_window: dedupWindowNanos,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes('already in use')) {
+        throw err;
       }
     }
 
@@ -262,17 +276,19 @@ export function createQueue(
   const queue: Queue['queue'] = async (queueName, message, opts) => {
     await initStreams();
 
-    const { kind, id } = parseQueueName(queueName);
-    const streamName = Streams[kind];
+    const { id } = parseQueueName(queueName);
     const subject = `${streamName}.${id}`;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
+
+    const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : 0;
 
     const envelope: MessageEnvelope = {
       messageId,
       idempotencyKey: opts?.idempotencyKey,
       queueName,
       message,
+      ...(delayMs > 0 ? { notBefore: Date.now() + delayMs } : {}),
     };
     const payload = stringify(envelope);
 
@@ -315,13 +331,9 @@ export function createQueue(
     };
   };
 
-  async function dispatch(
-    envelope: MessageEnvelope,
-    attempt: number,
-    pathname: 'flow' | 'step',
-  ): Promise<Response> {
+  async function dispatch(envelope: MessageEnvelope, attempt: number): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = createWorkflowUrl(baseUrl, { type: pathname });
+    const url = createWorkflowUrl(baseUrl, { type: 'flow' });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -337,24 +349,35 @@ export function createQueue(
 
   /** Dispatch one delivery and settle it (ack / nak). Never throws: every
    * failure is translated into a nak so JetStream owns the redelivery. */
-  async function deliver(
-    msg: JsMsg,
-    envelope: MessageEnvelope,
-    pathname: 'flow' | 'step',
-    streamName: string,
-    kind: QueueKind,
-  ): Promise<void> {
-    const key = softNakKey(kind, msg);
+  async function deliver(msg: JsMsg, envelope: MessageEnvelope): Promise<void> {
+    const key = softNakKey(msg);
     try {
       // Report only *failed* deliveries as the attempt, so core's poison-pill
       // escalation (attempt > MAX_QUEUE_DELIVERIES) still fires on a genuinely
-      // stuck message but a run that merely suspends is never killed as a
-      // runaway. The first delivery cannot have suspended yet, so the happy
-      // path skips the KV read entirely.
-      const softNaks = msg.info.deliveryCount > 1 ? await readSoftNaks(key) : 0;
+      // stuck message but a run that merely suspends (or a delayed wait
+      // continuation) is never killed as a runaway. The first delivery cannot
+      // have soft-nak'd yet unless it carries a delay, so the happy path
+      // skips the KV read entirely.
+      const mayHaveSoftNaks = msg.info.deliveryCount > 1;
+      const softNaks = mayHaveSoftNaks ? await readSoftNaks(key) : 0;
       const attempt = Math.max(1, msg.info.deliveryCount - softNaks);
 
-      const response = await dispatch(envelope, attempt, pathname);
+      // Delayed continuation not yet due: park it without consuming an
+      // attempt. delaySeconds is how v5 schedules wait continuations.
+      if (envelope.notBefore !== undefined) {
+        const remaining = envelope.notBefore - Date.now();
+        if (remaining > 0) {
+          if (await softNak(msg, key, softNaks, remaining)) return;
+          console.error(
+            `[world-nats-jetstream worker] message ${envelope.messageId} exceeded ${MAX_SOFT_NAKS} delay naks on ${streamName}`,
+          );
+          msg.nak(NAK_DELAY_MS);
+          health.totalFailed++;
+          return;
+        }
+      }
+
+      const response = await dispatch(envelope, attempt);
 
       if (response.ok) {
         msg.ack();
@@ -378,26 +401,17 @@ export function createQueue(
           typeof parsed === 'object' &&
           typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
         ) {
-          const next = softNaks + 1;
-          if (next > MAX_SOFT_NAKS) {
-            // Refuse to keep the soft loop going. Nak'ing without recording the
-            // suspension makes this delivery count as a real failure, so the
-            // attempt climbs and core ends the run with a recorded error
-            // instead of the message spinning silently until max_deliver.
-            console.error(
-              `[world-nats-jetstream worker] message ${envelope.messageId} exceeded ${MAX_SOFT_NAKS} timeoutSeconds naks on ${streamName}`,
-            );
-            msg.nak(NAK_DELAY_MS);
-            health.totalFailed++;
-            return;
-          }
-          // Record the suspension BEFORE nak'ing: JetStream may redeliver the
-          // moment the delay elapses, and a redelivery that read a stale count
-          // would report an inflated attempt.
-          await writeSoftNaks(key, next);
-          // JetStream supports a custom nak delay (in ms).
           const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-          msg.nak(timeoutMs);
+          if (await softNak(msg, key, softNaks, timeoutMs)) return;
+          // Refuse to keep the soft loop going. Nak'ing without recording the
+          // suspension makes this delivery count as a real failure, so the
+          // attempt climbs and core ends the run with a recorded error
+          // instead of the message spinning silently until max_deliver.
+          console.error(
+            `[world-nats-jetstream worker] message ${envelope.messageId} exceeded ${MAX_SOFT_NAKS} timeoutSeconds naks on ${streamName}`,
+          );
+          msg.nak(NAK_DELAY_MS);
+          health.totalFailed++;
           return;
         }
       }
@@ -414,7 +428,7 @@ export function createQueue(
     }
   }
 
-  async function worker(kind: QueueKind, streamName: string) {
+  async function worker() {
     try {
       const jetstream = await getJetStream();
       const jsm = await jetstream.jetstreamManager();
@@ -434,8 +448,8 @@ export function createQueue(
         if (!message.includes('already') && !message.includes('in use')) {
           throw err;
         }
-        // The durable already exists with an older configuration (e.g. the
-        // previous max_deliver: 3); reconcile the retry policy in place.
+        // The durable already exists with an older configuration; reconcile
+        // the retry policy in place.
         await jsm.consumers.update(streamName, consumerName, {
           max_deliver: MAX_DELIVER,
           ack_wait: ACK_WAIT_NANOS,
@@ -446,7 +460,6 @@ export function createQueue(
       const messages = await consumer.consume();
 
       health.consecutiveFailures = 0;
-      const pathname = QUEUE_PATHNAMES[kind];
 
       for await (const msg of messages) {
         let envelope: MessageEnvelope;
@@ -471,8 +484,8 @@ export function createQueue(
         }, ACK_PROGRESS_INTERVAL_MS);
 
         try {
-          await runSerialized(workflowRunSerializationKey(kind, envelope.message), () =>
-            deliver(msg, envelope, pathname, streamName, kind),
+          await runSerialized(workflowRunSerializationKey(envelope.message), () =>
+            deliver(msg, envelope),
           );
         } finally {
           clearInterval(progressTimer);
@@ -492,7 +505,7 @@ export function createQueue(
       console.error(`[world-nats-jetstream worker] Error in worker for ${streamName}:`, error);
 
       await delay(backoff);
-      void worker(kind, streamName);
+      void worker();
     }
   }
 
@@ -500,12 +513,8 @@ export function createQueue(
     await initStreams();
 
     const concurrency = config.queueConcurrency || 10;
-    const entries = Object.entries(Streams) as [QueueKind, string][];
-
-    for (const [kind, streamName] of entries) {
-      for (let i = 0; i < concurrency; i++) {
-        void worker(kind, streamName);
-      }
+    for (let i = 0; i < concurrency; i++) {
+      void worker();
     }
   }
 

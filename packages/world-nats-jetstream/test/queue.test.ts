@@ -67,7 +67,7 @@ describe('Queue (NATS JetStream integration)', () => {
   });
 
   it('derives the attempt header from JetStream delivery count and redelivers after nak backoff', async () => {
-    const queueName = ValidQueueName.parse('__wkf_step_attempt-demo');
+    const queueName = ValidQueueName.parse('__wkf_workflow_attempt-demo');
     await world.queue(queueName, asQueueMessage({ hello: 'world' }));
 
     // First delivery fails (500) -> nak with 5s backoff -> redelivery.
