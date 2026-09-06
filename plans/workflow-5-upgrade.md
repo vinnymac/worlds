@@ -81,7 +81,9 @@ on them.
       tests incl. 16 conformance, independently re-verified). Follow-up
       noted: hook_received-after-terminal TOCTOU still open, same as v4;
       world-local closes it with terminal markers plus reap
-- [~] world-postgres-redis (agent running 2026-09-05)
+- [x] world-postgres-redis (commit bba9469, 81/81 tests incl. conformance,
+      independently re-verified; hook retention and waitForTerminalStatus
+      noted as worthwhile later adoptions)
 - [x] world-mysql (archetype for SQL family; commit 8ef2305, 47/47 tests
       incl. conformance, independently re-verified; world-postgres port
       with composite PK slot INSERT, workflow_event_slots legacy marker,
