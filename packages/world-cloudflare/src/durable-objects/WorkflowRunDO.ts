@@ -1,6 +1,10 @@
 import { DurableObject } from 'cloudflare:workers';
-import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import { monotonicFactory } from 'ulid';
+import type { AttributeChange, Event, Hook, Step, WorkflowRun } from '@workflow/world';
+import {
+  applyAttributeChanges,
+  validateAttributeChanges,
+  WorkflowRunSchema,
+} from '@workflow/world';
 import {
   applyEvent,
   type ApplyEventOutcome,
@@ -11,6 +15,12 @@ import {
   listByPrefix,
   STEP_KEY_PREFIX,
 } from '../apply-event.js';
+import { compact } from '../util.js';
+
+/** Structured outcome for setAttributes; typed errors do not survive RPC. */
+export type SetAttributesOutcome =
+  | { ok: true; attributes: Record<string, string> }
+  | { ok: false; code: 'RUN_NOT_FOUND' | 'ATTRIBUTE_INVALID'; message: string };
 
 /**
  * Current schema version for DO storage.
@@ -90,11 +100,6 @@ interface InflightClaim {
  */
 export class WorkflowRunDO extends DurableObject {
   private schemaReady: Promise<void> | null = null;
-  /**
-   * Per-DO monotonic ULID factory. Event ids are allocated inside the DO so
-   * their order matches transaction commit order for the run.
-   */
-  private nextUlid = monotonicFactory();
 
   /**
    * Lazily ensure schema migrations have run.
@@ -116,12 +121,47 @@ export class WorkflowRunDO extends DurableObject {
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
     await this.ensureSchema();
     return await this.ctx.storage.transaction(async (txn) =>
-      applyEvent(storeFrom(txn), {
-        ...request,
-        nextEventId: () => `wevt_${this.nextUlid()}`,
-        now: new Date(),
-      }),
+      applyEvent(storeFrom(txn), { ...request, now: new Date() }),
     );
+  }
+
+  /**
+   * Direct attribute merge for `runs.experimentalSetAttributes`. Read,
+   * validate, merge and write in ONE storage transaction; no event is
+   * appended (this is the stopgap API the attr_set event will replace).
+   */
+  async setAttributes(
+    changes: AttributeChange[],
+    options?: { allowReservedAttributes?: boolean },
+  ): Promise<SetAttributesOutcome> {
+    await this.ensureSchema();
+    return await this.ctx.storage.transaction(async (txn) => {
+      const run = await txn.get<WorkflowRun>('run');
+      if (!run) {
+        return { ok: false as const, code: 'RUN_NOT_FOUND' as const, message: 'Run not found' };
+      }
+      try {
+        validateAttributeChanges(changes, {
+          existingKeys: Object.keys(run.attributes ?? {}),
+          allowReservedAttributes: options?.allowReservedAttributes === true,
+        });
+      } catch (error) {
+        return {
+          ok: false as const,
+          code: 'ATTRIBUTE_INVALID' as const,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      const updated = WorkflowRunSchema.parse(
+        compact({
+          ...run,
+          attributes: applyAttributeChanges(run.attributes ?? {}, changes),
+          updatedAt: new Date(),
+        }),
+      );
+      await txn.put('run', updated);
+      return { ok: true as const, attributes: updated.attributes };
+    });
   }
 
   /**

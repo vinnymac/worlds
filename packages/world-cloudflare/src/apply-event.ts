@@ -2,24 +2,28 @@
  * Transactional event-application core shared by the real WorkflowRunDO and
  * the in-memory test mocks.
  *
- * All guard checks, the event append, and the entity mutation happen against a
- * single {@link EventStore}. The Durable Object wraps a call to
- * {@link applyEvent} in `ctx.storage.transaction()`, so the whole operation is
- * atomic; the mocks run it against an in-memory store.
+ * All guard checks, the slot allocation, the event append, and the entity
+ * mutation happen against a single {@link EventStore}. The Durable Object
+ * wraps a call to {@link applyEvent} in `ctx.storage.transaction()`, so the
+ * whole operation is atomic; the mocks run it against an in-memory store.
+ *
+ * Event ids are v5 slots: `evnt_` + the event's dense 1-based position in the
+ * run's log, formatted by `slotToEventId`. The base slot is read from the
+ * store inside the same transaction that commits the append, so allocation is
+ * store-settled: no writer can take a slot without the transaction that
+ * appends its event.
  *
  * Guard semantics are ported from the upstream `@workflow/world-local` /
- * `@workflow/world-postgres` reference implementations (4.2.x contract):
+ * `@workflow/world-postgres` reference implementations (5.x contract):
  * - run_started on a terminal run -> RunExpiredError
  * - terminal transitions on a terminal run -> EntityConflictError
  * - run_cancelled is idempotent on an already-cancelled run
- * - duplicate step_created / hook_created -> EntityConflictError
+ * - duplicate step/hook/wait creation -> EntityConflictError
  * - step events on a terminal step -> EntityConflictError
  * - step_started before step.retryAfter -> TooEarlyError
- * - error/output/completedAt are cleared whenever a run re-enters a
- *   non-final status (WorkflowRunSchema is a discriminated union)
- * - a create carrying a `stateUpdatedAt` snapshot older than the run's
- *   externally-originated state marker -> PreconditionFailedError (4.3.1
- *   optimistic-concurrency guard)
+ * - attr_set on a terminal run -> EntityConflictError
+ * - a stale `eventCount` never rejects a write: the event commits at the next
+ *   free slot and the skipped span is reported (bump-and-report)
  *
  * Errors are returned as structured outcomes (never thrown) because custom
  * error classes do not survive the Durable Object RPC boundary with their
@@ -28,36 +32,41 @@
  */
 
 import type {
+  AttributeChange,
   CreateEventRequest,
   Event,
   Hook,
   RunCreatedEventRequest,
   Step,
+  Wait,
   WorkflowRun,
 } from '@workflow/world';
 import {
+  applyAttributeChanges,
   EventSchema,
+  eventIdToSlot,
+  FIRST_EVENT_SLOT,
   HookSchema,
+  isChildEntityCreationEvent,
   isLegacySpecVersion,
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
+  slotToEventId,
   StepSchema,
-  ulidToDate,
+  validateAttributeChanges,
+  WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { compact } from './util.js';
 
 /** Storage key for the run entity. */
 const RUN_KEY = 'run';
-/** Key prefixes for per-entity storage. ULID-suffixed keys list in order. */
+/** Key prefixes for per-entity storage. Slot-numbered event ids are
+ * zero-padded, so lexicographic key order equals positional order. */
 export const EVENT_KEY_PREFIX = 'event:';
 export const STEP_KEY_PREFIX = 'step:';
-// Waits have no entity in this world; the marker key exists only so a
-// redelivered wait_created conflicts instead of appending a second
-// creation event (events are keyed by eventId, so the log itself cannot
-// dedupe by correlationId).
 export const WAIT_KEY_PREFIX = 'wait:';
 export const HOOK_KEY_PREFIX = 'hook:';
 /**
@@ -67,14 +76,9 @@ export const HOOK_KEY_PREFIX = 'hook:';
  * rejected as a duplicate instead of resurrecting the hook.
  */
 const HOOK_EVENT_MARKER_PREFIX = 'hookevent:';
-/** Per-run concurrency marker: ULID time (epoch ms) of the most recent
- * externally-originated event. See {@link EXTERNAL_EVENT_TYPES}. */
-const STATE_MARKER_KEY = 'statemarker';
-
-/** Event types that advance the state marker when created outside a replay.
- * Narrow by design: core also omits `stateUpdatedAt` on `run_created` /
- * `run_started` / `run_failed`, and advancing there would reject replays. */
-const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
+/** Dedup claim for workflow-writer attr_set events, keyed by correlationId,
+ * so a replayed attr_set cannot apply (or log) twice. */
+const ATTR_EVENT_MARKER_PREFIX = 'attrevent:';
 
 export interface EventStoreListOptions {
   prefix: string;
@@ -108,20 +112,26 @@ export interface ApplyEventRequest {
    * (hook_created only). `null` means the token is unclaimed.
    */
   tokenHolder?: { runId: string; hookId: string } | null;
-  /** `CreateEventParams.stateUpdatedAt`: epoch ms of the newest event the
-   * caller had loaded. Present only on replay-context creates; absent creates
-   * are treated as externally originated and fail open. */
-  stateUpdatedAt?: number;
+  /** `CreateEventParams.eventCount`: how many events the writer held when it
+   * decided to write. A committed slot above `eventCount + 1` triggers the
+   * report half of bump-and-report. */
+  eventCount?: number;
+  /** `CreateEventParams.skipPreload`: omit the run_started event preload. */
+  skipPreload?: boolean;
+  /** `CreateEventParams.sinceCursor`: return the delta of events strictly
+   * after this cursor with the success response (events.list semantics). */
+  sinceCursor?: string;
 }
 
 export type ApplyEventErrorCode =
   | 'RUN_NOT_FOUND'
   | 'STEP_NOT_FOUND'
+  | 'WAIT_NOT_FOUND'
   | 'HOOK_NOT_FOUND'
   | 'ENTITY_CONFLICT'
   | 'RUN_EXPIRED'
   | 'TOO_EARLY'
-  | 'PRECONDITION_FAILED'
+  | 'ATTRIBUTE_INVALID'
   | 'RUN_NOT_SUPPORTED'
   | 'LEGACY_RUN_NOT_SUPPORTED';
 
@@ -135,6 +145,12 @@ export interface ApplyEventFailure {
   runSpecVersion?: number;
 }
 
+export interface EventPage {
+  events: Event[];
+  cursor: string | null;
+  hasMore: boolean;
+}
+
 export interface ApplyEventSuccess {
   ok: true;
   /** Absent for idempotent replays that record no new event. */
@@ -142,20 +158,23 @@ export interface ApplyEventSuccess {
   run?: WorkflowRun;
   step?: Step;
   hook?: Hook;
+  wait?: Wait;
+  /** Set when a lazy step_started atomically created its step: the runtime's
+   * exactly-once inline-execution ownership signal. */
+  stepCreated?: true;
   /** Hooks whose tokens must be released from the global KV index. */
   releasedHooks: Array<{ hookId: string; token: string }>;
   /** Set when a run entity was created (run_created or resilient bootstrap). */
   runCreated?: { workflowName: string; createdAt: Date };
   /** Set when the global KV hook index must be (re)written. */
   hookToIndex?: Hook;
-  /** All events (ascending), preloaded for run_started responses. */
-  events?: Event[];
+  /** run_started preload, sinceCursor delta, or the skipped-slot report. */
+  eventPage?: EventPage;
 }
 
 export type ApplyEventOutcome = ApplyEventSuccess | ApplyEventFailure;
 
 interface ApplyEventContext extends ApplyEventRequest {
-  nextEventId(): string;
   now: Date;
 }
 
@@ -165,32 +184,6 @@ function failure(
   extra?: Pick<ApplyEventFailure, 'retryAfterSeconds' | 'runSpecVersion'>,
 ): ApplyEventFailure {
   return { ok: false, code, message, ...extra };
-}
-
-function readStringProp(value: unknown, key: string): string | undefined {
-  if (value !== null && typeof value === 'object') {
-    const prop = (value as Record<string, unknown>)[key];
-    if (typeof prop === 'string') return prop;
-  }
-  return undefined;
-}
-
-/**
- * Map a failure eventData.error (which may be a string, an Error-shaped
- * object, or anything else) to the structured error stored on entities.
- * Matches upstream: string errors keep their text, errorCode is preserved.
- */
-function toStructuredError(
-  error: unknown,
-  opts?: { stack?: string; code?: string },
-): { message: string; stack?: string; code?: string } {
-  const message =
-    typeof error === 'string' ? error : (readStringProp(error, 'message') ?? 'Unknown error');
-  return {
-    message,
-    stack: opts?.stack ?? readStringProp(error, 'stack'),
-    code: opts?.code ?? readStringProp(error, 'code'),
-  };
 }
 
 /**
@@ -221,26 +214,21 @@ export async function listByPrefix<T>(
   };
 }
 
-/** Advance the per-run state marker for an externally-originated event.
- * Replay-origin creates carry a `stateUpdatedAt` and must not advance it. A
- * non-decodable event id leaves the marker untouched, failing open. */
-async function advanceStateMarker(
-  store: EventStore,
-  ctx: ApplyEventContext,
-  event: Event,
-): Promise<void> {
-  if (ctx.stateUpdatedAt !== undefined) return;
-  if (!EXTERNAL_EVENT_TYPES.has(event.eventType)) return;
+/** Read the highest committed slot inside the caller's transaction. Returns
+ * null when the log's last id is not slot-numbered (a ULID-era run). */
+async function lastCommittedSlot(store: EventStore): Promise<number | null> {
+  const entries = await store.list<Event>({ prefix: EVENT_KEY_PREFIX, limit: 1, reverse: true });
+  const last = entries.values().next().value;
+  if (last === undefined) return 0;
+  return eventIdToSlot(last.eventId);
+}
 
-  const underscore = event.eventId.lastIndexOf('_');
-  const rawUlid = underscore === -1 ? event.eventId : event.eventId.slice(underscore + 1);
-  const time = ulidToDate(rawUlid)?.getTime();
-  if (time === undefined) return;
-
-  const current = await store.get<number>(STATE_MARKER_KEY);
-  if (current === undefined || time > current) {
-    await store.put(STATE_MARKER_KEY, time);
-  }
+/** Full-log preload for run_started responses (events.list semantics with the
+ * whole log on one page). */
+async function preloadAllEvents(store: EventStore): Promise<EventPage> {
+  const entries = await store.list<Event>({ prefix: EVENT_KEY_PREFIX });
+  const events = Array.from(entries.values());
+  return { events, cursor: events.at(-1)?.eventId ?? null, hasMore: false };
 }
 
 /** Delete all hook entities for the run, returning the released tokens. */
@@ -256,19 +244,119 @@ async function releaseAllHooks(
   return released;
 }
 
+/** Delete all wait entities for the run (terminal-run cleanup). */
+async function deleteAllWaits(store: EventStore): Promise<void> {
+  const waits = await store.list<Wait>({ prefix: WAIT_KEY_PREFIX });
+  for (const key of waits.keys()) {
+    await store.delete(key);
+  }
+}
+
+/** Validate a batch of attribute changes, converting the thrown
+ * AttributeValidationError into a structured outcome for the RPC boundary. */
+function validateAttributes(
+  changes: AttributeChange[],
+  context: { existingKeys?: Iterable<string>; allowReservedAttributes?: boolean },
+): ApplyEventFailure | null {
+  try {
+    validateAttributeChanges(changes, context);
+    return null;
+  } catch (error) {
+    return failure('ATTRIBUTE_INVALID', error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Attribute changes equivalent to seeding `attributes` at run creation. */
+function seedAttributeChanges(attributes: Record<string, string> | undefined): AttributeChange[] {
+  return Object.entries(attributes ?? {}).map(([key, value]) => ({ key, value }));
+}
+
 export async function applyEvent(
+  store: EventStore,
+  ctx: ApplyEventContext,
+): Promise<ApplyEventOutcome> {
+  const outcome = await applyEventCore(store, ctx);
+  if (!outcome.ok) return outcome;
+  return decorateWithEventPage(store, ctx, outcome);
+}
+
+/**
+ * Attach the response event page, still inside the caller's transaction so
+ * every variant is computed against the exact log the write committed into.
+ * Priority mirrors world-local/world-redis: the sinceCursor delta wins (it is
+ * a strict superset of the skipped span and the only one that advances the
+ * caller's cursor), then a preload set by the core, then bump-and-report.
+ */
+async function decorateWithEventPage(
+  store: EventStore,
+  ctx: ApplyEventContext,
+  outcome: ApplyEventSuccess,
+): Promise<ApplyEventSuccess> {
+  if (typeof ctx.sinceCursor === 'string' && outcome.event) {
+    const page = await listByPrefix<Event>(
+      store,
+      EVENT_KEY_PREFIX,
+      { limit: 1000, cursor: ctx.sinceCursor, sortOrder: 'asc' },
+      (e) => e.eventId,
+    );
+    return {
+      ...outcome,
+      eventPage: { events: page.data, cursor: page.cursor, hasMore: page.hasMore },
+    };
+  }
+  if (outcome.eventPage !== undefined) return outcome;
+  if (ctx.eventCount === undefined || !outcome.event) return outcome;
+
+  // The report half of bump-and-report: the events occupying the slots
+  // between the one the writer asked for and the one its write landed on.
+  // `cursor` stays null: the report is a lower bound, not a read position.
+  const askedFor = ctx.eventCount;
+  const committedSlot = eventIdToSlot(outcome.event.eventId);
+  if (committedSlot === null || askedFor < FIRST_EVENT_SLOT || committedSlot <= askedFor + 1) {
+    return outcome;
+  }
+  const span = committedSlot - askedFor - 1;
+  const entries = await store.list<Event>({
+    prefix: EVENT_KEY_PREFIX,
+    startAfter: `${EVENT_KEY_PREFIX}${slotToEventId(askedFor)}`,
+    end: `${EVENT_KEY_PREFIX}${outcome.event.eventId}`,
+    limit: span,
+  });
+  const events = Array.from(entries.values());
+  return {
+    ...outcome,
+    eventPage: { events, cursor: null, hasMore: events.length < span },
+  };
+}
+
+async function applyEventCore(
   store: EventStore,
   ctx: ApplyEventContext,
 ): Promise<ApplyEventOutcome> {
   const { runId, data, now } = ctx;
   const specVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
 
-  /** Build and validate the stored event BEFORE anything is persisted. */
+  // Slot base for this transaction. The DO serializes applyEvent calls and
+  // the storage transaction makes the read atomic with every append below,
+  // so `baseSlot + n` is the store-settled position of the nth append.
+  const baseSlot = await lastCommittedSlot(store);
+  if (baseSlot === null) {
+    return failure(
+      'LEGACY_RUN_NOT_SUPPORTED',
+      `Run "${runId}" has ULID-numbered events and cannot be replayed by this world; drain it on the 4.x build`,
+    );
+  }
+  let allocated = 0;
+
+  /** Build and validate the stored event BEFORE anything is persisted. The
+   * slot is drawn at the append; guard failures return before any append, so
+   * the log stays dense. */
   const buildEvent = (record: Record<string, unknown>): Event => {
+    allocated += 1;
     const withMeta: Record<string, unknown> = {
       ...record,
       runId,
-      eventId: ctx.nextEventId(),
+      eventId: slotToEventId(baseSlot + allocated),
       createdAt: now,
       specVersion,
     };
@@ -281,22 +369,7 @@ export async function applyEvent(
 
   const putEvent = async (event: Event): Promise<void> => {
     await store.put(`${EVENT_KEY_PREFIX}${event.eventId}`, event);
-    await advanceStateMarker(store, ctx, event);
   };
-
-  // Runs inside the caller's storage transaction, so the marker read and the
-  // event append are atomic. Strictly older snapshots are rejected; equal
-  // passes and absent fails open.
-  if (ctx.stateUpdatedAt !== undefined) {
-    const marker = await store.get<number>(STATE_MARKER_KEY);
-    if (marker !== undefined && ctx.stateUpdatedAt < marker) {
-      return failure(
-        'PRECONDITION_FAILED',
-        `Event creation for run "${runId}" is based on a stale snapshot ` +
-          `(stateUpdatedAt ${ctx.stateUpdatedAt} < ${marker})`,
-      );
-    }
-  }
 
   // ============================================================
   // VALIDATION: current run state (skipped for run_created and for
@@ -318,8 +391,20 @@ export async function applyEvent(
   // ============================================================
   let bootstrapped: ApplyEventSuccess['runCreated'];
   if (data.eventType === 'run_started' && !currentRun && data.eventData) {
-    const { deploymentId, workflowName, input, executionContext } = data.eventData;
+    const {
+      deploymentId,
+      workflowName,
+      input,
+      executionContext,
+      attributes,
+      allowReservedAttributes,
+      encryptionPublicKey,
+    } = data.eventData;
     if (deploymentId && workflowName && input !== undefined) {
+      const invalid = validateAttributes(seedAttributeChanges(attributes), {
+        allowReservedAttributes: allowReservedAttributes === true,
+      });
+      if (invalid) return invalid;
       const createdRun = WorkflowRunSchema.parse(
         compact({
           runId,
@@ -331,15 +416,27 @@ export async function applyEvent(
           status: 'pending',
           output: undefined,
           error: undefined,
+          attributes: attributes ?? {},
+          encryptionPublicKey,
           startedAt: undefined,
           completedAt: undefined,
           createdAt: now,
           updatedAt: now,
         }),
       );
+      // Synthetic run_created event: it takes the earlier slot, so it
+      // replays first.
       const runCreatedEvent = buildEvent({
         eventType: 'run_created',
-        eventData: { deploymentId, workflowName, input, executionContext },
+        eventData: {
+          deploymentId,
+          workflowName,
+          input,
+          executionContext,
+          attributes,
+          allowReservedAttributes,
+          encryptionPublicKey,
+        },
       });
       await store.put(RUN_KEY, createdRun);
       await putEvent(runCreatedEvent);
@@ -366,6 +463,12 @@ export async function applyEvent(
       );
     }
   }
+
+  // Lazy step start: a step_started carrying step-creation data (stepName +
+  // input) may arrive with no prior step_created and creates the step on the
+  // fly, mirroring the resilient run_started path.
+  const createsChildEntity = isChildEntityCreationEvent(data);
+  const lazyStepStart = createsChildEntity && data.eventType === 'step_started';
 
   // ============================================================
   // GUARDS: terminal run state
@@ -394,14 +497,16 @@ export async function applyEvent(
         `Cannot transition run from terminal state "${currentRun.status}"`,
       );
     }
-    if (
-      data.eventType === 'step_created' ||
-      data.eventType === 'hook_created' ||
-      data.eventType === 'wait_created'
-    ) {
+    if (createsChildEntity) {
       return failure(
         'ENTITY_CONFLICT',
         `Cannot create new entities on run in terminal state "${currentRun.status}"`,
+      );
+    }
+    if (data.eventType === 'attr_set') {
+      return failure(
+        'ENTITY_CONFLICT',
+        `Cannot set attributes on run in terminal state "${currentRun.status}"`,
       );
     }
   }
@@ -417,25 +522,33 @@ export async function applyEvent(
     data.eventType === 'step_retrying'
   ) {
     validatedStep = await store.get<Step>(`${STEP_KEY_PREFIX}${data.correlationId}`);
-    if (!validatedStep) {
+    if (!validatedStep && !lazyStepStart) {
       return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
     }
-    if (isTerminalStepStatus(validatedStep.status)) {
-      return failure(
-        'ENTITY_CONFLICT',
-        `Cannot modify step in terminal state "${validatedStep.status}"`,
-      );
+    // Lazy start exactly-once gate: a lazy step_started always CREATES the
+    // step. An existing step means a concurrent handler won the create;
+    // EntityConflictError maps to `skipped` in the runtime's executeStep.
+    if (lazyStepStart && validatedStep) {
+      return failure('ENTITY_CONFLICT', `Step "${data.correlationId}" already created`);
     }
-    // On terminal runs, only in-flight steps may still record progress.
-    if (
-      currentRun &&
-      isTerminalWorkflowRunStatus(currentRun.status) &&
-      validatedStep.status !== 'running'
-    ) {
-      return failure(
-        'RUN_EXPIRED',
-        `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-      );
+    if (validatedStep) {
+      if (isTerminalStepStatus(validatedStep.status)) {
+        return failure(
+          'ENTITY_CONFLICT',
+          `Cannot modify step in terminal state "${validatedStep.status}"`,
+        );
+      }
+      // On terminal runs, only in-flight steps may still record progress.
+      if (
+        currentRun &&
+        isTerminalWorkflowRunStatus(currentRun.status) &&
+        validatedStep.status !== 'running'
+      ) {
+        return failure(
+          'RUN_EXPIRED',
+          `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
+        );
+      }
     }
   }
 
@@ -472,6 +585,10 @@ export async function applyEvent(
         // exists"), and every world now shares this contract.
         return failure('ENTITY_CONFLICT', `Workflow run "${runId}" already exists`);
       }
+      const invalid = validateAttributes(seedAttributeChanges(data.eventData.attributes), {
+        allowReservedAttributes: data.eventData.allowReservedAttributes === true,
+      });
+      if (invalid) return invalid;
       const run = WorkflowRunSchema.parse(
         compact({
           runId,
@@ -483,6 +600,8 @@ export async function applyEvent(
           status: 'pending',
           output: undefined,
           error: undefined,
+          attributes: data.eventData.attributes ?? {},
+          encryptionPublicKey: data.eventData.encryptionPublicKey,
           startedAt: undefined,
           completedAt: undefined,
           createdAt: now,
@@ -508,7 +627,12 @@ export async function applyEvent(
       // Idempotent for concurrent invocations / queue redeliveries: if the
       // run is already running this is a replay: no duplicate event.
       if (currentRun.status === 'running') {
-        return { ok: true, run: currentRun, releasedHooks: [] };
+        return {
+          ok: true,
+          run: currentRun,
+          releasedHooks: [],
+          ...(ctx.skipPreload ? {} : { eventPage: await preloadAllEvents(store) }),
+        };
       }
       const run = WorkflowRunSchema.parse(
         compact({
@@ -524,20 +648,14 @@ export async function applyEvent(
       const event = buildEvent({ ...data });
       await store.put(RUN_KEY, run);
       await putEvent(event);
-      // Preload all events so the runtime can skip the initial events.list.
-      const allEvents = await listByPrefix<Event>(
-        store,
-        EVENT_KEY_PREFIX,
-        { limit: 1000, sortOrder: 'asc' },
-        (e) => e.eventId,
-      );
       return {
         ok: true,
         event,
         run,
         releasedHooks: [],
         runCreated: bootstrapped,
-        events: allEvents.data,
+        // Preload the log so the runtime can skip the initial events.list.
+        ...(ctx.skipPreload ? {} : { eventPage: await preloadAllEvents(store) }),
       };
     }
 
@@ -559,6 +677,7 @@ export async function applyEvent(
       await store.put(RUN_KEY, run);
       await putEvent(event);
       const releasedHooks = await releaseAllHooks(store);
+      await deleteAllWaits(store);
       return { ok: true, event, run, releasedHooks };
     }
 
@@ -566,14 +685,14 @@ export async function applyEvent(
       if (!currentRun) {
         return failure('RUN_NOT_FOUND', `Workflow run "${runId}" not found`);
       }
+      // The serialized error payload is stored verbatim.
       const run = WorkflowRunSchema.parse(
         compact({
           ...currentRun,
           status: 'failed',
           output: undefined,
-          error: toStructuredError(data.eventData.error, {
-            code: data.eventData.errorCode ?? readStringProp(data.eventData.error, 'code'),
-          }),
+          error: data.eventData.error,
+          errorCode: data.eventData.errorCode,
           completedAt: now,
           updatedAt: now,
         }),
@@ -582,6 +701,7 @@ export async function applyEvent(
       await store.put(RUN_KEY, run);
       await putEvent(event);
       const releasedHooks = await releaseAllHooks(store);
+      await deleteAllWaits(store);
       return { ok: true, event, run, releasedHooks };
     }
 
@@ -603,7 +723,43 @@ export async function applyEvent(
       await store.put(RUN_KEY, run);
       await putEvent(event);
       const releasedHooks = await releaseAllHooks(store);
+      await deleteAllWaits(store);
       return { ok: true, event, run, releasedHooks };
+    }
+
+    case 'attr_set': {
+      if (!currentRun) {
+        return failure('RUN_NOT_FOUND', `Workflow run "${runId}" not found`);
+      }
+      const invalid = validateAttributes(data.eventData.changes, {
+        existingKeys: Object.keys(currentRun.attributes ?? {}),
+        allowReservedAttributes: data.eventData.allowReservedAttributes === true,
+      });
+      if (invalid) return invalid;
+      // Claim only after validation: a validation failure must leave the
+      // correlationId unclaimed so a retry is not misreported as a dup.
+      if (data.correlationId && data.eventData.writer.type === 'workflow') {
+        const claimKey = `${ATTR_EVENT_MARKER_PREFIX}${data.correlationId}`;
+        const claimed = await store.get<string>(claimKey);
+        if (claimed !== undefined) {
+          return failure(
+            'ENTITY_CONFLICT',
+            `Attribute event "${data.correlationId}" already exists`,
+          );
+        }
+        await store.put(claimKey, '1');
+      }
+      const run = WorkflowRunSchema.parse(
+        compact({
+          ...currentRun,
+          attributes: applyAttributeChanges(currentRun.attributes ?? {}, data.eventData.changes),
+          updatedAt: now,
+        }),
+      );
+      const event = buildEvent({ ...data });
+      await store.put(RUN_KEY, run);
+      await putEvent(event);
+      return { ok: true, event, run, releasedHooks: [] };
     }
 
     case 'step_created': {
@@ -639,7 +795,38 @@ export async function applyEvent(
     }
 
     case 'step_started': {
-      const step = validatedStep;
+      const stepKey = `${STEP_KEY_PREFIX}${data.correlationId}`;
+      let step = validatedStep;
+      let stepCreatedLazily = false;
+      if (!step && lazyStepStart && data.eventData) {
+        // Lazy path: create the step plus a synthetic step_created event at
+        // the prior slot, then transition it below.
+        const { stepName, input } = data.eventData;
+        if (typeof stepName !== 'string' || input === undefined) {
+          return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
+        }
+        step = StepSchema.parse(
+          compact({
+            runId,
+            stepId: data.correlationId,
+            stepName,
+            status: 'pending',
+            input,
+            attempt: 0,
+            createdAt: now,
+            updatedAt: now,
+            specVersion,
+          }),
+        );
+        const stepCreatedEvent = buildEvent({
+          eventType: 'step_created',
+          correlationId: data.correlationId,
+          eventData: { stepName, input },
+        });
+        await store.put(stepKey, step);
+        await putEvent(stepCreatedEvent);
+        stepCreatedLazily = true;
+      }
       if (!step) {
         return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
       }
@@ -664,9 +851,15 @@ export async function applyEvent(
         }),
       );
       const event = buildEvent({ ...data });
-      await store.put(`${STEP_KEY_PREFIX}${data.correlationId}`, updated);
+      await store.put(stepKey, updated);
       await putEvent(event);
-      return { ok: true, event, step: updated, releasedHooks: [] };
+      return {
+        ok: true,
+        event,
+        step: updated,
+        releasedHooks: [],
+        ...(stepCreatedLazily ? { stepCreated: true as const } : {}),
+      };
     }
 
     case 'step_completed': {
@@ -698,7 +891,7 @@ export async function applyEvent(
         compact({
           ...step,
           status: 'failed',
-          error: toStructuredError(data.eventData.error, { stack: data.eventData.stack }),
+          error: data.eventData.error,
           completedAt: now,
           updatedAt: now,
         }),
@@ -718,8 +911,8 @@ export async function applyEvent(
         compact({
           ...step,
           status: 'pending',
-          error: toStructuredError(data.eventData.error, { stack: data.eventData.stack }),
-          retryAfter: data.eventData.retryAfter ? new Date(data.eventData.retryAfter) : undefined,
+          error: data.eventData.error,
+          retryAfter: data.eventData.retryAfter,
           updatedAt: now,
         }),
       );
@@ -774,7 +967,8 @@ export async function applyEvent(
           environment: '',
           createdAt: now,
           specVersion,
-          isWebhook: data.eventData.isWebhook ?? false,
+          isWebhook: data.eventData.isWebhook,
+          isSystem: data.eventData.isSystem,
         }),
       );
       const event = buildEvent({ ...data });
@@ -803,20 +997,56 @@ export async function applyEvent(
 
     case 'wait_created': {
       const waitKey = `${WAIT_KEY_PREFIX}${data.correlationId}`;
-      const existing = await store.get<{ eventId: string }>(waitKey);
+      const existing = await store.get<Wait>(waitKey);
       if (existing) {
         // Core catches EntityConflictError for exactly this replay case
         // ("Wait already exists, continuing").
         return failure('ENTITY_CONFLICT', `Wait "${data.correlationId}" already exists`);
       }
+      const wait = WaitSchema.parse(
+        compact({
+          waitId: `${runId}-${data.correlationId}`,
+          runId,
+          status: 'waiting',
+          resumeAt: data.eventData.resumeAt,
+          completedAt: undefined,
+          createdAt: now,
+          updatedAt: now,
+          specVersion,
+        }),
+      );
       const event = buildEvent({ ...data });
-      await store.put(waitKey, { eventId: event.eventId });
+      await store.put(waitKey, wait);
       await putEvent(event);
-      return { ok: true, event, releasedHooks: [] };
+      return { ok: true, event, wait, releasedHooks: [] };
     }
 
-    // hook_received, hook_conflict, wait_completed are event-only at the
-    // storage level for this world.
+    case 'wait_completed': {
+      const waitKey = `${WAIT_KEY_PREFIX}${data.correlationId}`;
+      const existing = await store.get<Wait>(waitKey);
+      if (!existing) {
+        return failure('WAIT_NOT_FOUND', `Wait "${data.correlationId}" not found`);
+      }
+      if (existing.status === 'completed') {
+        return failure('ENTITY_CONFLICT', `Wait "${data.correlationId}" already completed`);
+      }
+      const wait = WaitSchema.parse(
+        compact({
+          ...existing,
+          status: 'completed',
+          completedAt: now,
+          updatedAt: now,
+        }),
+      );
+      const event = buildEvent({ ...data });
+      await store.put(waitKey, wait);
+      await putEvent(event);
+      return { ok: true, event, wait, releasedHooks: [] };
+    }
+
+    // hook_received and hook_conflict are event-only at the storage level for
+    // this world. `noop` never reaches here: slots are allocated at the
+    // commit, so this world has no holes to seal.
     default: {
       const event = buildEvent({ ...data });
       await putEvent(event);

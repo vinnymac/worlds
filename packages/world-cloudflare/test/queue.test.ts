@@ -210,18 +210,11 @@ describe('Queue (Cloudflare Queues integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      // Register handler for embedded world
-      queue.createQueueHandler('test:', vi.fn());
-
-      const queueName = 'test:queue' as ValidQueueName;
-      const message = asMessage({ data: 'test' });
-
-      // 'test:queue' doesn't match the __wkf_(workflow|step)_ naming
-      // convention, so parseQueueName() rejects it before the embedded
-      // world/test pump ever runs.
-      await expect(queue.queue(queueName, message)).rejects.toThrow(
-        'Invalid queue name: test:queue',
+      const result = await queue.queue(
+        '__wkf_workflow_q' as ValidQueueName,
+        asMessage({ data: 'test' }),
       );
+      expect(result.messageId).toMatch(/^msg_/);
 
       // Main assertion: Cloudflare Queue should NOT be called
       expect(mockQueue.send).not.toHaveBeenCalled();
@@ -237,11 +230,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      queue.createQueueHandler('test:', vi.fn());
-
-      await expect(
-        queue.queue('test:queue' as ValidQueueName, asMessage({ data: 'test' })),
-      ).rejects.toThrow('Invalid queue name: test:queue');
+      await queue.queue('__wkf_workflow_q' as ValidQueueName, asMessage({ data: 'test' }));
 
       // Main assertion: Cloudflare Queue should NOT be called
       expect(mockQueue.send).not.toHaveBeenCalled();
@@ -253,19 +242,25 @@ describe('Queue (Cloudflare Queues integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      const first = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 1 }), {
-        idempotencyKey: 'step-abc',
-      });
-      const second = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 1 }), {
-        idempotencyKey: 'step-abc',
-      });
+      const first = await queue.queue(
+        '__wkf_workflow_a' as ValidQueueName,
+        asMessage({ data: 1 }),
+        { idempotencyKey: 'step-abc' },
+      );
+      const second = await queue.queue(
+        '__wkf_workflow_a' as ValidQueueName,
+        asMessage({ data: 1 }),
+        { idempotencyKey: 'step-abc' },
+      );
 
       // Same inflight message: the duplicate enqueue returns the original id
       expect(second.messageId).toBe(first.messageId);
 
-      const third = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 2 }), {
-        idempotencyKey: 'step-other',
-      });
+      const third = await queue.queue(
+        '__wkf_workflow_a' as ValidQueueName,
+        asMessage({ data: 2 }),
+        { idempotencyKey: 'step-other' },
+      );
       expect(third.messageId).not.toBe(first.messageId);
     });
   });

@@ -7,8 +7,12 @@
  * storage medium (an in-memory sorted map) is mocked.
  */
 
-import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import { monotonicFactory } from 'ulid';
+import type { AttributeChange, Event, Hook, Step, WorkflowRun } from '@workflow/world';
+import {
+  applyAttributeChanges,
+  validateAttributeChanges,
+  WorkflowRunSchema,
+} from '@workflow/world';
 import {
   applyEvent,
   type ApplyEventOutcome,
@@ -20,6 +24,8 @@ import {
   listByPrefix,
   STEP_KEY_PREFIX,
 } from './apply-event.js';
+import type { SetAttributesOutcome } from './durable-objects/WorkflowRunDO.js';
+import { compact } from './util.js';
 
 // In-memory storage for mock Durable Objects
 const durableObjectData = new Map<string, Map<string, unknown>>();
@@ -85,18 +91,60 @@ interface InflightClaim {
  */
 class MockWorkflowRunDOStub {
   private store: EventStore;
-  private nextUlid = monotonicFactory();
+  /** Serializes writes per DO, mirroring the real DO's storage transaction:
+   * concurrent applyEvent calls arbitrate slots one at a time. */
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(runId: string) {
     this.store = createMemoryStore(() => getDOStorage(runId));
   }
 
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.writeChain.then(operation, operation);
+    this.writeChain = next.catch(() => undefined);
+    return next;
+  }
+
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
-    return applyEvent(this.store, {
-      ...request,
-      nextEventId: () => `wevt_${this.nextUlid()}`,
-      now: new Date(),
-    });
+    return this.serialize(() => applyEvent(this.store, { ...request, now: new Date() }));
+  }
+
+  async setAttributes(
+    changes: AttributeChange[],
+    options?: { allowReservedAttributes?: boolean },
+  ): Promise<SetAttributesOutcome> {
+    return this.serialize(() => this.setAttributesImpl(changes, options));
+  }
+
+  private async setAttributesImpl(
+    changes: AttributeChange[],
+    options?: { allowReservedAttributes?: boolean },
+  ): Promise<SetAttributesOutcome> {
+    const run = await this.store.get<WorkflowRun>('run');
+    if (!run) {
+      return { ok: false, code: 'RUN_NOT_FOUND', message: 'Run not found' };
+    }
+    try {
+      validateAttributeChanges(changes, {
+        existingKeys: Object.keys(run.attributes ?? {}),
+        allowReservedAttributes: options?.allowReservedAttributes === true,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'ATTRIBUTE_INVALID',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const updated = WorkflowRunSchema.parse(
+      compact({
+        ...run,
+        attributes: applyAttributeChanges(run.attributes ?? {}, changes),
+        updatedAt: new Date(),
+      }),
+    );
+    await this.store.put('run', updated);
+    return { ok: true, attributes: updated.attributes };
   }
 
   async getRun(): Promise<WorkflowRun | null> {

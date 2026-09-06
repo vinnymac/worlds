@@ -17,7 +17,7 @@ export interface CloudflareWorldConfig {
   maxEventsPerRun?: CloudflareStorageConfig['maxEventsPerRun'];
 }
 
-export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
+export function createWorld(config?: CloudflareWorldConfig): World {
   // Check for global test environment first (for @workflow/world-testing)
   let env = config?.env;
   if (!env) {
@@ -65,12 +65,9 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
     ...storage,
     ...queue,
     ...streamer,
-    // Enables resilient start: runs are created at the current spec version,
-    // so the queue message carries runInput and run_started can bootstrap the
-    // run when run_created has not landed yet.
+    // Event ids are slot-numbered and allocated at the commit inside the DO
+    // storage transaction, so this world is current-spec compliant by
+    // construction (no pre-assigned positions, no noop sealing needed).
     specVersion: SPEC_VERSION_CURRENT,
   };
 }
-
-// Export createWorld as an alias for compatibility with @workflow/world
-export { createCloudflareWorld as createWorld };

@@ -1,7 +1,6 @@
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   RunExpiredError,
   RunNotSupportedError,
   TooEarlyError,
@@ -9,10 +8,12 @@ import {
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
+  AttributeChange,
   CreateEventParams,
   CreateEventRequest,
   Event,
   EventResult,
+  ExperimentalSetAttributesResult,
   GetEventParams,
   GetHookParams,
   GetStepParams,
@@ -33,6 +34,7 @@ import type {
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import {
+  AttributeValidationError,
   EventSchema,
   HookSchema,
   SPEC_VERSION_CURRENT,
@@ -43,6 +45,7 @@ import {
 import { parse, stringify } from '@fantasticfour/shared';
 import { monotonicFactory } from 'ulid';
 import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
+import type { SetAttributesOutcome } from './durable-objects/WorkflowRunDO.js';
 import { compact } from './util.js';
 
 /**
@@ -51,6 +54,10 @@ import { compact } from './util.js';
  */
 export interface WorkflowRunDOStub {
   applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome>;
+  setAttributes(
+    changes: AttributeChange[],
+    options?: { allowReservedAttributes?: boolean },
+  ): Promise<SetAttributesOutcome>;
   getRun(): Promise<WorkflowRun | null>;
   getStep(stepId: string): Promise<Step | null>;
   getEvent(eventId: string): Promise<Event | null>;
@@ -180,10 +187,12 @@ function throwOutcomeError(
       throw new EntityConflictError(outcome.message);
     case 'RUN_EXPIRED':
       throw new RunExpiredError(outcome.message);
+    case 'WAIT_NOT_FOUND':
+      throw new WorkflowWorldError(outcome.message, { status: 404 });
     case 'TOO_EARLY':
       throw new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds });
-    case 'PRECONDITION_FAILED':
-      throw new PreconditionFailedError(outcome.message);
+    case 'ATTRIBUTE_INVALID':
+      throw new AttributeValidationError(outcome.message);
     case 'RUN_NOT_SUPPORTED':
       throw new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT);
     case 'LEGACY_RUN_NOT_SUPPORTED':
@@ -275,6 +284,21 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           hasMore,
         };
       },
+
+      async experimentalSetAttributes(
+        runId: string,
+        changes: AttributeChange[],
+        options?: { allowReservedAttributes?: boolean },
+      ): Promise<ExperimentalSetAttributesResult> {
+        const outcome = await getRunDO(runId).setAttributes(changes, options);
+        if (!outcome.ok) {
+          if (outcome.code === 'RUN_NOT_FOUND') {
+            throw new WorkflowRunNotFoundError(runId);
+          }
+          throw new AttributeValidationError(outcome.message);
+        }
+        return { attributes: outcome.attributes };
+      },
     } as Storage['runs'],
 
     events: {
@@ -313,15 +337,17 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           }
         }
 
-        // Guards, event append, and entity mutation run in ONE DO storage
-        // transaction (see apply-event.ts). The event is schema-validated
-        // before anything is persisted. `stateUpdatedAt` rides along so the
-        // optimistic-concurrency check is atomic with the append.
+        // Guards, slot allocation, event append, and entity mutation run in
+        // ONE DO storage transaction (see apply-event.ts). The event is
+        // schema-validated before anything is persisted. `eventCount` rides
+        // along so bump-and-report is computed atomically with the append.
         const outcome = await stub.applyEvent({
           runId: effectiveRunId,
           data,
           tokenHolder,
-          stateUpdatedAt: params?.stateUpdatedAt,
+          eventCount: params?.eventCount,
+          skipPreload: params?.skipPreload === true,
+          sinceCursor: params?.sinceCursor,
         });
 
         if (!outcome.ok) {
@@ -366,18 +392,27 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // Honour resolveData on the create return path, matching the read
         // paths and every sibling world.
         const resolveData = params?.resolveData ?? 'all';
-        return {
+        const base: EventResult = {
           event: outcome.event && stripEventDataRefs(outcome.event, resolveData),
           run: outcome.run,
           step: outcome.step,
           hook: outcome.hook,
-          events: outcome.events?.map((e) => stripEventDataRefs(e, resolveData)),
-          // The runtime reads the ceiling from the run_started response only,
-          // so it must also be present on the idempotent already-running
-          // replay path -- keying off the request type covers both.
-          ...(data.eventType === 'run_started' && outcome.run
-            ? { maxEvents: maxEventsPerRun }
-            : {}),
+          wait: outcome.wait,
+          ...(outcome.stepCreated ? { stepCreated: true as const } : {}),
+          // Server-owned per-run event ceiling; the runtime enforces it. Only
+          // meaningful on run-lifecycle responses (run entity attached).
+          ...(outcome.run ? { maxEvents: maxEventsPerRun } : {}),
+        };
+        if (!outcome.eventPage) {
+          return base;
+        }
+        // run_started preload, sinceCursor delta, or the skipped-slot report
+        // of bump-and-report; the union requires the trio together.
+        return {
+          ...base,
+          events: outcome.eventPage.events.map((e) => stripEventDataRefs(e, resolveData)),
+          cursor: outcome.eventPage.cursor,
+          hasMore: outcome.eventPage.hasMore,
         };
       },
 
@@ -463,12 +498,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     },
 
     steps: {
-      async get(runId: string | undefined, stepId: string, params?: GetStepParams) {
-        if (!runId) {
-          throw new WorkflowWorldError('runId is required for Cloudflare step lookup', {
-            status: 400,
-          });
-        }
+      async get(runId: string, stepId: string, params?: GetStepParams) {
         const stub = getRunDO(runId);
         const step = await stub.getStep(stepId);
 

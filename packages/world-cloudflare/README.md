@@ -33,7 +33,7 @@ deploy` fails with `Your Worker depends on the following Durable Objects, which
 are not exported in your entrypoint file`.
 
 ```typescript
-import { createCloudflareWorld } from '@fantasticfour/world-cloudflare';
+import { createWorld } from '@fantasticfour/world-cloudflare';
 
 // Required: wrangler binds these to the classes named in wrangler.toml.
 export { StreamDO, WorkflowRunDO } from '@fantasticfour/world-cloudflare/worker';
@@ -41,18 +41,16 @@ export { StreamDO, WorkflowRunDO } from '@fantasticfour/world-cloudflare/worker'
 // In your Cloudflare Worker
 export default {
   async fetch(request, env) {
-    const world = createCloudflareWorld({ env });
+    const world = createWorld({ env });
 
-    // Create a workflow run
-    const run = await world.runs.create({
-      runId: ulid(),
-      workflowName: 'my-workflow',
-      status: 'pending',
-      input: ['arg1', 'arg2'],
-      deploymentId: 'production',
-      executionContext: {},
-      createdAt: new Date(),
-      updatedAt: new Date(),
+    // Create a workflow run via the event-sourced API
+    const { run } = await world.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'production',
+        workflowName: 'my-workflow',
+        input: ['arg1', 'arg2'],
+      },
     });
 
     return new Response(JSON.stringify(run));
@@ -66,13 +64,13 @@ export default {
 - **Queue**: Cloudflare Queues with automatic retries
 - **Streaming**: WebSocket-based real-time events via Durable Objects
 - **Indexing**: Workers KV for global workflow lookups
-- **IDs**: ULID-based for sortable identifiers
+- **IDs**: slot-numbered event ids (`evnt_` + zero-padded position); ULID run ids
 
 ## Configuration
 
 Configure in `wrangler.toml`:
 
-All four bindings are required, and the binding names are fixed: `createCloudflareWorld`
+All four bindings are required, and the binding names are fixed: `createWorld`
 reads them off `env` by name.
 
 ```toml

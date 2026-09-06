@@ -1,14 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
 import { createWorkflowUrl } from '@workflow/utils';
-import {
-  MessageId,
-  parseQueueName,
-  type Queue,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type Queue, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import { parse, stringify } from '@fantasticfour/shared';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
@@ -126,10 +119,9 @@ interface QueueEnvelope {
    * Number of `{ timeoutSeconds }` suspension re-sends performed so far.
    *
    * These are core's *control-flow* re-invocations, not failed deliveries:
-   * `sleep()`, step retry backoff, `TooEarlyError`, and `{ timeoutSeconds: 0 }`
-   * ("re-invoke me with a fresh replay", which core returns whenever the
-   * `stateUpdatedAt` precondition guard exhausts its reloads). They are tracked
-   * separately from {@link QueueEnvelope.deliveryFailures} and bounded only by
+   * step retry backoff, `TooEarlyError`, and `{ timeoutSeconds: 0 }`
+   * ("re-invoke me with a fresh replay"). They are tracked separately from
+   * {@link QueueEnvelope.deliveryFailures} and bounded only by
    * {@link MAX_SOFT_RESENDS}.
    */
   suspensionCount?: number;
@@ -143,12 +135,8 @@ interface PumpEnvelope {
   idempotencyKey?: string;
 }
 
-type Pathname = 'flow' | 'step';
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, Pathname>;
+/** v5 retired the step queue kind: everything travels on the flow topic. */
+type Pathname = 'flow';
 
 function resolveBaseUrl(config: CloudflareQueueConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -159,8 +147,8 @@ function resolveBaseUrl(config: CloudflareQueueConfig): string {
 
 /**
  * In-process test pump. Replaces the previous `@workflow/world-local` fallback.
- * Holds two in-memory FIFOs and HTTP-dispatches envelopes to the user's server
- * at `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ * Holds an in-memory FIFO and HTTP-dispatches envelopes to the user's server
+ * at `${baseUrl}/.well-known/workflow/v1/flow`.
  *
  * Mirrors world-local's idempotency semantics: messages are deduplicated on
  * `idempotencyKey` while a message with the same key is in flight, and the
@@ -171,8 +159,8 @@ function createTestPump(config: CloudflareQueueConfig) {
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [] };
+  const wakers: Record<Pathname, Array<() => void>> = { flow: [] };
   /** Inflight messageIds by idempotencyKey (world-local queue.js semantics). */
   const inflightMessages = new Map<string, MessageId>();
   let running = false;
@@ -276,7 +264,6 @@ function createTestPump(config: CloudflareQueueConfig) {
       if (running) return;
       running = true;
       void loop('flow');
-      void loop('step');
     },
     stop() {
       running = false;
@@ -310,10 +297,9 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
         if (existing) {
           return { messageId: existing };
         }
-        const { kind } = parseQueueName(queueName);
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         testPump.push(
-          QUEUE_PATHNAMES[kind],
+          'flow',
           {
             messageId,
             queueName,

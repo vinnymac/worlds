@@ -42,26 +42,11 @@ export interface StreamDOId {
 const READ_POLL_MS = 100;
 /** Chunks fetched per DO round-trip while reading. */
 const READ_BATCH_SIZE = 32;
-/** Default / maximum page sizes for getStreamChunks. */
+/** Default / maximum page sizes for streams.getChunks. */
 const DEFAULT_CHUNK_PAGE_SIZE = 100;
 const MAX_CHUNK_PAGE_SIZE = 1000;
 
-/**
- * `Streamer` declares `runId: string`, but core hands the streamer a run id
- * that is still in flight, so every world in this repo awaits it. Widening the
- * returned type puts that contract where callers can see it instead of leaving
- * it to an untyped call site.
- */
-export type CloudflareStreamer = Streamer & {
-  writeToStream(
-    name: string,
-    runId: string | Promise<string>,
-    chunk: string | Uint8Array,
-  ): Promise<void>;
-  closeStream(name: string, runId: string | Promise<string>): Promise<void>;
-};
-
-export function createStreamer(config: CloudflareStreamerConfig): CloudflareStreamer {
+export function createStreamer(config: CloudflareStreamerConfig): Streamer {
   const { env } = config;
 
   const getStreamDO = (streamName: string): StreamDOStub => {
@@ -77,7 +62,7 @@ export function createStreamer(config: CloudflareStreamerConfig): CloudflareStre
   /** Per-isolate cache so each (runId, stream) pair registers only once. */
   const registeredStreams = new Set<string>();
 
-  async function registerStreamForRun(name: string, runId: string): Promise<void> {
+  async function registerStreamForRun(runId: string, name: string): Promise<void> {
     const cacheKey = `${runId}\u0000${name}`;
     if (registeredStreams.has(cacheKey)) return;
     await getRunRegistryDO(runId).registerStream(name);
@@ -89,95 +74,103 @@ export function createStreamer(config: CloudflareStreamerConfig): CloudflareStre
   }
 
   return {
-    async writeToStream(name: string, runId: string | Promise<string>, chunk: string | Uint8Array) {
-      const resolvedRunId = await runId;
-      await registerStreamForRun(name, resolvedRunId);
-      await getStreamDO(name).writeChunk(toBytes(chunk));
-    },
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array) {
+        await registerStreamForRun(runId, name);
+        await getStreamDO(name).writeChunk(toBytes(chunk));
+      },
 
-    async closeStream(name: string, runId: string | Promise<string>) {
-      const resolvedRunId = await runId;
-      await registerStreamForRun(name, resolvedRunId);
-      await getStreamDO(name).closeStream();
-    },
+      async writeMulti(runId: string, name: string, chunks: (string | Uint8Array)[]) {
+        await registerStreamForRun(runId, name);
+        const stub = getStreamDO(name);
+        for (const chunk of chunks) {
+          await stub.writeChunk(toBytes(chunk));
+        }
+      },
 
-    async readFromStream(name: string, startIndex = 0) {
-      const stub = getStreamDO(name);
+      async close(runId: string, name: string) {
+        await registerStreamForRun(runId, name);
+        await getStreamDO(name).closeStream();
+      },
 
-      // Negative startIndex counts back from the current end, clamped to 0.
-      let nextIndex: number;
-      if (startIndex < 0) {
-        const info = await stub.getInfo();
-        nextIndex = Math.max(0, info.tailIndex + 1 + startIndex);
-      } else {
-        nextIndex = startIndex;
-      }
+      async get(_runId: string, name: string, startIndex = 0) {
+        const stub = getStreamDO(name);
 
-      let cancelled = false;
+        // Negative startIndex counts back from the current end, clamped to 0.
+        let nextIndex: number;
+        if (startIndex < 0) {
+          const info = await stub.getInfo();
+          nextIndex = Math.max(0, info.tailIndex + 1 + startIndex);
+        } else {
+          nextIndex = startIndex;
+        }
 
-      return new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          // Loop until we can enqueue data, close, or the reader cancels.
-          // Errors from the DO propagate and error the stream; readers must
-          // never see a silently-truncated stream.
-          while (!cancelled) {
-            const { chunks, done } = await stub.getChunks({
-              startIndex: nextIndex,
-              limit: READ_BATCH_SIZE,
-            });
-            if (chunks.length > 0) {
-              for (const chunk of chunks) {
-                controller.enqueue(chunk);
+        let cancelled = false;
+
+        return new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            // Loop until we can enqueue data, close, or the reader cancels.
+            // Errors from the DO propagate and error the stream; readers must
+            // never see a silently-truncated stream.
+            while (!cancelled) {
+              const { chunks, done } = await stub.getChunks({
+                startIndex: nextIndex,
+                limit: READ_BATCH_SIZE,
+              });
+              if (chunks.length > 0) {
+                for (const chunk of chunks) {
+                  controller.enqueue(chunk);
+                }
+                nextIndex += chunks.length;
+                return;
               }
-              nextIndex += chunks.length;
-              return;
+              if (done) {
+                controller.close();
+                return;
+              }
+              await new Promise((resolve) => setTimeout(resolve, READ_POLL_MS));
             }
-            if (done) {
-              controller.close();
-              return;
-            }
-            await new Promise((resolve) => setTimeout(resolve, READ_POLL_MS));
-          }
-        },
+          },
 
-        cancel() {
-          cancelled = true;
-        },
-      });
-    },
+          cancel() {
+            cancelled = true;
+          },
+        });
+      },
 
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      return getRunRegistryDO(runId).listStreams();
-    },
+      async list(runId: string): Promise<string[]> {
+        return getRunRegistryDO(runId).listStreams();
+      },
 
-    async getStreamChunks(
-      name: string,
-      _runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      const limit = Math.min(options?.limit ?? DEFAULT_CHUNK_PAGE_SIZE, MAX_CHUNK_PAGE_SIZE);
-      const startIndex = options?.cursor ? Number.parseInt(options.cursor, 10) : 0;
-      if (Number.isNaN(startIndex) || startIndex < 0) {
-        throw new Error(`Invalid stream cursor: ${options?.cursor}`);
-      }
+      async getChunks(
+        _runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        const limit = Math.min(options?.limit ?? DEFAULT_CHUNK_PAGE_SIZE, MAX_CHUNK_PAGE_SIZE);
+        const startIndex = options?.cursor ? Number.parseInt(options.cursor, 10) : 0;
+        if (Number.isNaN(startIndex) || startIndex < 0) {
+          throw new Error(`Invalid stream cursor: ${options?.cursor}`);
+        }
 
-      const stub = getStreamDO(name);
-      const result = await stub.getChunks({ startIndex, limit: limit + 1 });
-      const hasMore = result.chunks.length > limit;
-      const data: StreamChunk[] = result.chunks
-        .slice(0, limit)
-        .map((chunk, offset) => ({ index: startIndex + offset, data: chunk }));
+        const stub = getStreamDO(name);
+        const result = await stub.getChunks({ startIndex, limit: limit + 1 });
+        const hasMore = result.chunks.length > limit;
+        const data: StreamChunk[] = result.chunks
+          .slice(0, limit)
+          .map((chunk, offset) => ({ index: startIndex + offset, data: chunk }));
 
-      return {
-        data,
-        cursor: hasMore ? String(startIndex + limit) : null,
-        hasMore,
-        done: result.done,
-      };
-    },
+        return {
+          data,
+          cursor: hasMore ? String(startIndex + limit) : null,
+          hasMore,
+          done: result.done,
+        };
+      },
 
-    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      return getStreamDO(name).getInfo();
+      async getInfo(_runId: string, name: string): Promise<StreamInfoResponse> {
+        return getStreamDO(name).getInfo();
+      },
     },
   };
 }

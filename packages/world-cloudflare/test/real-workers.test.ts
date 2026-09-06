@@ -6,6 +6,7 @@
  */
 
 import { expectEventType } from '@fantasticfour/testing';
+import { eventIdToSlot } from '@workflow/world';
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ApplyEventOutcome, ApplyEventRequest } from '../src/apply-event.js';
@@ -104,7 +105,10 @@ describe('Real Cloudflare Durable Objects', () => {
       expect(started.run?.output).toBeUndefined();
       expect(started.run?.error).toBeUndefined();
       // run_started preloads the event log
-      expect(started.events?.map((e) => e.eventType)).toEqual(['run_created', 'run_started']);
+      expect(started.eventPage?.events.map((e) => e.eventType)).toEqual([
+        'run_created',
+        'run_started',
+      ]);
 
       const completed = expectOk(
         await stub.applyEvent({
@@ -151,7 +155,7 @@ describe('Real Cloudflare Durable Objects', () => {
       expect(events.data.filter((e) => e.eventType === 'run_started')).toHaveLength(1);
     });
 
-    it('should map run_failed string errors and errorCode', async () => {
+    it('should store run_failed errors verbatim with errorCode', async () => {
       expectOk(await stub.applyEvent(runCreated()));
       expectOk(await stub.applyEvent({ runId, data: { eventType: 'run_started' } }));
 
@@ -165,7 +169,8 @@ describe('Real Cloudflare Durable Objects', () => {
         }),
       );
       expect(failed.run?.status).toBe('failed');
-      expect(failed.run?.error).toMatchObject({ message: 'boom', code: 'REPLAY_TIMEOUT' });
+      expect(failed.run?.error).toBe('boom');
+      expect(failed.run?.errorCode).toBe('REPLAY_TIMEOUT');
     });
 
     it('should return RUN_NOT_FOUND for events on a missing run', async () => {
@@ -344,7 +349,7 @@ describe('Real Cloudflare Durable Objects', () => {
           data: {
             eventType: 'step_failed',
             correlationId: 'step-001',
-            eventData: { error: 'fatal', stack: 'at test' },
+            eventData: { error: { message: 'fatal', stack: 'at test' } },
           },
         }),
       );
@@ -359,7 +364,7 @@ describe('Real Cloudflare Durable Objects', () => {
 
       const step = await stub.getStep('step-001');
       expect(step?.status).toBe('failed');
-      expect(step?.error).toMatchObject({ message: 'fatal', stack: 'at test' });
+      expect(step?.error).toEqual({ message: 'fatal', stack: 'at test' });
     });
 
     it('should return STEP_NOT_FOUND for lifecycle events on unknown steps', async () => {
@@ -551,6 +556,88 @@ describe('Real Cloudflare Durable Objects', () => {
     });
   });
 
+  describe('Slot allocation against real DO transactions', () => {
+    it('numbers events by position, dense from 1', async () => {
+      expectOk(await stub.applyEvent(runCreated()));
+      expectOk(await stub.applyEvent({ runId, data: { eventType: 'run_started' } }));
+      expectOk(
+        await stub.applyEvent({
+          runId,
+          data: {
+            eventType: 'step_created',
+            correlationId: 'step-001',
+            eventData: { stepName: 'a', input: [] },
+          },
+        }),
+      );
+
+      const events = await stub.listEvents();
+      expect(events.data.map((e) => eventIdToSlot(e.eventId))).toEqual([1, 2, 3]);
+      expect(events.data[0].eventId).toBe('evnt_00000000000000000000000001');
+    });
+
+    it('arbitrates a concurrent fan-out onto dense slots with bump-and-report', async () => {
+      expectOk(await stub.applyEvent(runCreated()));
+      expectOk(await stub.applyEvent({ runId, data: { eventType: 'run_started' } }));
+
+      // Five writers race from the same 2-event snapshot for slot 3. The DO
+      // storage transaction is the arbiter; none may reject or leave a hole.
+      const outcomes = await Promise.all(
+        Array.from({ length: 5 }, (_, i) =>
+          stub.applyEvent({
+            runId,
+            eventCount: 2,
+            data: {
+              eventType: 'step_created',
+              correlationId: `fan-step-${i}`,
+              eventData: { stepName: `fan-${i}`, input: [] },
+            },
+          }),
+        ),
+      );
+
+      const slots = outcomes
+        .map((o) => eventIdToSlot(expectOk(o).event!.eventId))
+        .sort((a, b) => (a ?? 0) - (b ?? 0));
+      expect(slots).toEqual([3, 4, 5, 6, 7]);
+
+      for (const outcome of outcomes) {
+        const ok = expectOk(outcome);
+        const slot = eventIdToSlot(ok.event!.eventId)!;
+        if (slot === 3) {
+          expect(ok.eventPage).toBeUndefined();
+        } else {
+          // The report names exactly the slots this writer skipped over.
+          expect(ok.eventPage?.events.map((e) => eventIdToSlot(e.eventId))).toEqual(
+            Array.from({ length: slot - 3 }, (_, i) => i + 3),
+          );
+          expect(ok.eventPage?.cursor).toBeNull();
+          expect(ok.eventPage?.hasMore).toBe(false);
+        }
+      }
+
+      const events = await stub.listEvents();
+      expect(events.data.map((e) => eventIdToSlot(e.eventId))).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    });
+  });
+
+  describe('WorkflowRunDO.setAttributes', () => {
+    it('merges attributes transactionally and reports failures structurally', async () => {
+      const missing = await stub.setAttributes([{ key: 'a', value: '1' }]);
+      expect(missing).toMatchObject({ ok: false, code: 'RUN_NOT_FOUND' });
+
+      expectOk(await stub.applyEvent(runCreated()));
+      const merged = await stub.setAttributes([{ key: 'a', value: '1' }]);
+      expect(merged).toEqual({ ok: true, attributes: { a: '1' } });
+
+      const reserved = await stub.setAttributes([{ key: '$secret', value: 'x' }]);
+      expect(reserved).toMatchObject({ ok: false, code: 'ATTRIBUTE_INVALID' });
+
+      const run = await stub.getRun();
+      expect(run?.attributes).toEqual({ a: '1' });
+    });
+  });
+
   describe('Streamer against the real StreamDO', () => {
     let streamer: ReturnType<typeof createStreamer>;
     let streamName: string;
@@ -563,15 +650,15 @@ describe('Real Cloudflare Durable Objects', () => {
     });
 
     it('should write and read a stream end-to-end', async () => {
-      await streamer.writeToStream(streamName, streamRunId, 'Hello, ');
-      await streamer.writeToStream(
-        streamName,
+      await streamer.streams.write(streamRunId, streamName, 'Hello, ');
+      await streamer.streams.write(
         streamRunId,
+        streamName,
         new Uint8Array([119, 111, 114, 108, 100]),
       );
-      await streamer.closeStream(streamName, streamRunId);
+      await streamer.streams.close(streamRunId, streamName);
 
-      const stream = await streamer.readFromStream(streamName);
+      const stream = await streamer.streams.get(streamRunId, streamName);
       const reader = stream.getReader();
       const chunks: Uint8Array[] = [];
       for (;;) {
@@ -586,30 +673,30 @@ describe('Real Cloudflare Durable Objects', () => {
     });
 
     it('should expose stream info and reject writes after close', async () => {
-      let info = await streamer.getStreamInfo(streamName, streamRunId);
+      let info = await streamer.streams.getInfo(streamRunId, streamName);
       expect(info).toEqual({ tailIndex: -1, done: false });
 
-      await streamer.writeToStream(streamName, streamRunId, 'data');
-      await streamer.closeStream(streamName, streamRunId);
+      await streamer.streams.write(streamRunId, streamName, 'data');
+      await streamer.streams.close(streamRunId, streamName);
 
-      info = await streamer.getStreamInfo(streamName, streamRunId);
+      info = await streamer.streams.getInfo(streamRunId, streamName);
       expect(info).toEqual({ tailIndex: 0, done: true });
 
-      await expect(streamer.writeToStream(streamName, streamRunId, 'late')).rejects.toThrow();
+      await expect(streamer.streams.write(streamRunId, streamName, 'late')).rejects.toThrow();
     });
 
-    it('should paginate stored chunks via getStreamChunks', async () => {
+    it('should paginate stored chunks via streams.getChunks', async () => {
       for (let i = 0; i < 5; i++) {
-        await streamer.writeToStream(streamName, streamRunId, `chunk-${i}`);
+        await streamer.streams.write(streamRunId, streamName, `chunk-${i}`);
       }
-      await streamer.closeStream(streamName, streamRunId);
+      await streamer.streams.close(streamRunId, streamName);
 
-      const page1 = await streamer.getStreamChunks(streamName, streamRunId, { limit: 3 });
+      const page1 = await streamer.streams.getChunks(streamRunId, streamName, { limit: 3 });
       expect(page1.data.map((c) => c.index)).toEqual([0, 1, 2]);
       expect(page1.hasMore).toBe(true);
       expect(page1.done).toBe(true);
 
-      const page2 = await streamer.getStreamChunks(streamName, streamRunId, {
+      const page2 = await streamer.streams.getChunks(streamRunId, streamName, {
         limit: 3,
         cursor: page1.cursor ?? undefined,
       });
@@ -619,13 +706,13 @@ describe('Real Cloudflare Durable Objects', () => {
     });
 
     it('should list streams by run id', async () => {
-      await streamer.writeToStream(`${streamName}-a`, streamRunId, 'a');
-      await streamer.writeToStream(`${streamName}-b`, streamRunId, 'b');
+      await streamer.streams.write(streamRunId, `${streamName}-a`, 'a');
+      await streamer.streams.write(streamRunId, `${streamName}-b`, 'b');
 
-      const streams = await streamer.listStreamsByRunId(streamRunId);
+      const streams = await streamer.streams.list(streamRunId);
       expect(streams.sort()).toEqual([`${streamName}-a`, `${streamName}-b`]);
 
-      const empty = await streamer.listStreamsByRunId(`wrun_${crypto.randomUUID()}`);
+      const empty = await streamer.streams.list(`wrun_${crypto.randomUUID()}`);
       expect(empty).toEqual([]);
     });
   });
