@@ -4,10 +4,10 @@ import { Redis } from '@upstash/redis';
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   TooEarlyError,
   WorkflowRunNotFoundError,
 } from '@workflow/errors';
+import { eventIdToSlot, slotToEventId } from '@workflow/world';
 import {
   GenericContainer,
   Network,
@@ -22,7 +22,6 @@ import {
   createStepsStorage,
 } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
-import { stringify } from '../src/util.js';
 
 describe('Storage (Upstash Redis integration)', () => {
   if (process.platform === 'win32') {
@@ -304,18 +303,7 @@ describe('Storage (Upstash Redis integration)', () => {
     });
   });
 
-  describe('Creation-claim hardening', () => {
-    it('claim keys carry the default TTL', async () => {
-      const run = await createRun();
-      const stepId = 'step-claim-ttl';
-      await createStep(run.runId, { stepId });
-
-      const claimKey = `${keyPrefix}events:creation:${run.runId}:${stepId}:step_created`;
-      const ttl = await redis.ttl(claimKey);
-      expect(ttl).toBeGreaterThan(0);
-      expect(ttl).toBeLessThanOrEqual(30 * 24 * 60 * 60);
-    });
-
+  describe('Creation dedup', () => {
     it('concurrent step_created deliveries converge on a single event row', async () => {
       const run = await createRun();
       const stepId = 'step-claim-race';
@@ -338,30 +326,11 @@ describe('Storage (Upstash Redis integration)', () => {
       ).toHaveLength(1);
     });
 
-    it('concurrent replays over a LEGACY token claim converge on one hook_created', async () => {
+    it('concurrent hook_created replays converge on one hook_created row', async () => {
       const run = await createRun();
-      const hookId = 'hook-legacy-claim';
-      const token = 'token-legacy-claim';
+      const hookId = 'hook-replay-race';
+      const token = 'token-replay-race';
 
-      // Seed pre-eventId state by hand: hook entity + legacy token claim
-      // (plain hookId, no canonical eventId) with NO hook_created event in
-      // the log (the state a crash leaves under the old claim format).
-      const legacyHook = {
-        runId: run.runId,
-        hookId,
-        token,
-        ownerId: '',
-        projectId: '',
-        environment: '',
-        isWebhook: false,
-        specVersion: run.specVersion,
-        createdAt: new Date(),
-      };
-      await redis.set(`${keyPrefix}hook:${hookId}`, stringify(legacyHook));
-      await redis.set(`${keyPrefix}hooks:by_token:${token}`, hookId);
-
-      // Two concurrent replays race the legacy-claim upgrade; the CAS lets
-      // exactly one install its eventId and the other adopts it.
       const replay = () =>
         events.create(run.runId, {
           eventType: 'hook_created',
@@ -378,10 +347,6 @@ describe('Storage (Upstash Redis integration)', () => {
         eventList.data.filter((e) => e.eventType === 'hook_created' && e.correlationId === hookId),
       ).toHaveLength(1);
       expect(eventList.data.some((e) => e.eventType === 'hook_conflict')).toBe(false);
-
-      // A further replay is a true duplicate.
-      const err: unknown = await replay().catch((e: unknown) => e);
-      expect(EntityConflictError.is(err)).toBe(true);
     });
   });
 
@@ -686,10 +651,10 @@ describe('Storage (Upstash Redis integration)', () => {
   describe('Streamer', () => {
     it('round-trips string chunks without corruption', async () => {
       const runId = 'wrun_stream_str';
-      await streamer.writeToStream('out', runId, 'hello world');
-      await streamer.closeStream('out', runId);
+      await streamer.streams.write(runId, 'out', 'hello world');
+      await streamer.streams.close(runId, 'out');
 
-      const chunks = await streamer.getStreamChunks('out', runId);
+      const chunks = await streamer.streams.getChunks(runId, 'out');
       expect(chunks.data).toHaveLength(1);
       expect(new TextDecoder().decode(chunks.data[0].data)).toBe('hello world');
       expect(chunks.done).toBe(true);
@@ -701,35 +666,45 @@ describe('Storage (Upstash Redis integration)', () => {
       // auto-deserialization would otherwise return as the number 1234.
       const tricky = new Uint8Array([0xd7, 0x6d, 0xf8]);
       const binary = new Uint8Array([0, 1, 2, 253, 254, 255]);
-      await streamer.writeToStream('out', runId, tricky);
-      await streamer.writeToStream('out', runId, binary);
-      await streamer.closeStream('out', runId);
+      await streamer.streams.write(runId, 'out', tricky);
+      await streamer.streams.write(runId, 'out', binary);
+      await streamer.streams.close(runId, 'out');
 
-      const chunks = await streamer.getStreamChunks('out', runId);
+      const chunks = await streamer.streams.getChunks(runId, 'out');
       expect(chunks.data).toHaveLength(2);
       expect(Array.from(chunks.data[0].data)).toEqual([0xd7, 0x6d, 0xf8]);
       expect(Array.from(chunks.data[1].data)).toEqual([0, 1, 2, 253, 254, 255]);
       expect(chunks.done).toBe(true);
     });
 
-    it('getStreamInfo reports done after closeStream', async () => {
+    it('writeMulti lands chunks in order in one operation', async () => {
+      const runId = 'wrun_stream_multi';
+      await streamer.streams.writeMulti!(runId, 'out', ['a', 'b', 'c']);
+      await streamer.streams.close(runId, 'out');
+
+      const chunks = await streamer.streams.getChunks(runId, 'out');
+      expect(chunks.data.map((c) => new TextDecoder().decode(c.data))).toEqual(['a', 'b', 'c']);
+      expect(await streamer.streams.list(runId)).toEqual(['out']);
+    });
+
+    it('getInfo reports done after close', async () => {
       const runId = 'wrun_stream_info';
-      await streamer.writeToStream('out', runId, 'chunk');
-      expect((await streamer.getStreamInfo('out', runId)).done).toBe(false);
-      await streamer.closeStream('out', runId);
-      const info = await streamer.getStreamInfo('out', runId);
+      await streamer.streams.write(runId, 'out', 'chunk');
+      expect((await streamer.streams.getInfo(runId, 'out')).done).toBe(false);
+      await streamer.streams.close(runId, 'out');
+      const info = await streamer.streams.getInfo(runId, 'out');
       expect(info.done).toBe(true);
       expect(info.tailIndex).toBe(0);
     });
 
-    it('readFromStream resolves negative startIndex from the tail', async () => {
+    it('streams.get resolves negative startIndex from the tail', async () => {
       const runId = 'wrun_stream_neg';
       for (const chunk of ['a', 'b', 'c', 'd']) {
-        await streamer.writeToStream('out', runId, chunk);
+        await streamer.streams.write(runId, 'out', chunk);
       }
-      await streamer.closeStream('out', runId);
+      await streamer.streams.close(runId, 'out');
 
-      const stream = await streamer.readFromStream('out', -2, runId);
+      const stream = await streamer.streams.get(runId, 'out', -2);
       const received: string[] = [];
       const reader = stream.getReader();
       for (;;) {
@@ -779,107 +754,73 @@ describe('Storage (Upstash Redis integration)', () => {
     });
   });
 
-  describe('optimistic concurrency (stateUpdatedAt guard)', () => {
-    const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
-
-    /** Create a run that is running with one completed step, so the per-run
-     * state marker has been advanced by an externally-originated event. */
-    async function runWithMarker() {
+  describe('slot-numbered event ids', () => {
+    it('numbers events by position, dense from 1', async () => {
       const run = await createRun();
       await events.create(run.runId, { eventType: 'run_started' });
-      const step = await createStep(run.runId, { stepId: 'external-step' });
+      const step = await createStep(run.runId, { stepId: 'slot-step' });
       await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
-      await events.create(run.runId, {
-        eventType: 'step_completed',
-        correlationId: step.stepId,
-        eventData: { result: 'ok' },
-      });
-      const raw = await redis.get<string>(runStateKey(run.runId));
-      expect(raw).not.toBeNull();
-      return { run, marker: Number(raw) };
-    }
 
-    it('does not advance the marker on run lifecycle events', async () => {
+      const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      const slots = page.data.map((e) => eventIdToSlot(e.eventId));
+      expect(slots).toEqual(Array.from({ length: slots.length }, (_, i) => i + 1));
+      expect(page.data[0].eventId).toBe(slotToEventId(1));
+    });
+
+    it('a concurrent fan-out takes consecutive slots with no holes or dups', async () => {
       const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      expect(await redis.get(runStateKey(run.runId))).toBeNull();
-    });
-
-    it('advances the marker on an externally-originated step_completed', async () => {
-      const { marker } = await runWithMarker();
-      expect(marker).toBeGreaterThan(0);
-    });
-
-    it('does not advance the marker for a replay-origin create', async () => {
-      const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      const step = await createStep(run.runId, { stepId: 'replay-step' });
-      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
-      await events.create(
-        run.runId,
-        {
-          eventType: 'step_completed',
-          correlationId: step.stepId,
-          eventData: { result: 'ok' },
-        },
-        { stateUpdatedAt: Date.now() },
-      );
-      expect(await redis.get(runStateKey(run.runId))).toBeNull();
-    });
-
-    it('rejects a strictly older stateUpdatedAt with PreconditionFailedError', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          {
+      await Promise.all(
+        Array.from({ length: 16 }, (_, index) =>
+          events.create(run.runId, {
             eventType: 'step_created',
-            correlationId: 'stale-step',
-            eventData: { stepName: 'stale', input: [] },
-          },
-          { stateUpdatedAt: marker - 1 },
+            correlationId: `fanout-step-${index}`,
+            eventData: { stepName: 'fanout', input: [index] },
+          }),
         ),
-      ).rejects.toThrow(PreconditionFailedError);
-      // The event must not have landed in the log.
-      expect(await redis.zcard(`${keyPrefix}events:by_correlation:stale-step`)).toBe(0);
+      );
+
+      const page = await events.list({ runId: run.runId, pagination: { sortOrder: 'asc' } });
+      const slots = page.data
+        .map((e) => eventIdToSlot(e.eventId))
+        .toSorted((a, b) => a! - b!);
+      // run_created holds slot 1; the fan-out takes 2..17, no holes, no dups.
+      expect(slots).toEqual(Array.from({ length: 17 }, (_, i) => i + 1));
     });
 
-    it('accepts an equal stateUpdatedAt (anti-livelock)', async () => {
-      const { run, marker } = await runWithMarker();
+    it('bumps a stale eventCount and reports the skipped span', async () => {
+      const run = await createRun();
+      await events.create(run.runId, { eventType: 'run_started' });
+      await createStep(run.runId, { stepId: 'bump-step' });
+      // The writer replayed a 1-event log; slots 2 and 3 are already taken.
       const result = await events.create(
         run.runId,
         {
-          eventType: 'step_created',
-          correlationId: 'equal-step',
-          eventData: { stepName: 'equal', input: [] },
+          eventType: 'wait_created',
+          correlationId: 'stale-wait',
+          eventData: { resumeAt: new Date() },
         },
-        { stateUpdatedAt: marker },
+        { eventCount: 1 },
       );
-      expect(result.step?.stepId).toBe('equal-step');
+
+      expect(result.event?.eventId).toBe(slotToEventId(4));
+      expect(result.events?.map((e) => e.eventId)).toEqual([slotToEventId(2), slotToEventId(3)]);
+      expect(result.cursor).toBeNull();
+      expect(result.hasMore).toBe(false);
     });
 
-    it('falls open when no stateUpdatedAt is supplied', async () => {
-      const { run } = await runWithMarker();
-      const result = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: 'unguarded-step',
-        eventData: { stepName: 'unguarded', input: [] },
-      });
-      expect(result.step?.stepId).toBe('unguarded-step');
-    });
-
-    it('rejects a stale run_completed without marking the run terminal', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          { eventType: 'run_completed', eventData: { output: [] } },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toThrow(PreconditionFailedError);
-
-      const current = await runs.get(run.runId);
-      expect(current.status).toBe('running');
+    it('reports nothing when the expected slot was free', async () => {
+      const run = await createRun();
+      const result = await events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'fresh-wait',
+          eventData: { resumeAt: new Date() },
+        },
+        { eventCount: 1 },
+      );
+      expect(result.event?.eventId).toBe(slotToEventId(2));
+      expect(result.events).toBeUndefined();
     });
   });
 
@@ -887,8 +828,8 @@ describe('Storage (Upstash Redis integration)', () => {
     const sharedCorrelationId = 'hook-shared-correlation';
 
     // A hook is addressable from any run, so two runs can emit events under
-    // one correlation id. Interleave them three apiece so an unscoped lookup
-    // alternates between the runs.
+    // one correlation id. Interleave them three apiece so a scoped lookup
+    // has cross-run traffic to exclude.
     async function seedInterleavedRuns() {
       const runA = await createRun({ workflowName: 'scoping-workflow-a' });
       const runB = await createRun({ workflowName: 'scoping-workflow-b' });
@@ -946,26 +887,6 @@ describe('Storage (Upstash Redis integration)', () => {
       expect(result.hasMore).toBe(false);
     });
 
-    it('lists every run when runId is omitted', async () => {
-      const seeded = await seedInterleavedRuns();
-
-      const result = await events.listByCorrelationId({
-        correlationId: sharedCorrelationId,
-        pagination: {},
-      });
-
-      // Also pins the interleaving the scoped pagination test relies on.
-      expect(result.data.map((e) => e.eventId)).toEqual([
-        seeded.a[0],
-        seeded.b[0],
-        seeded.a[1],
-        seeded.b[1],
-        seeded.a[2],
-        seeded.b[2],
-      ]);
-      expect(result.hasMore).toBe(false);
-    });
-
     it('paginates the scoped set without gaps or duplicates', async () => {
       const seeded = await seedInterleavedRuns();
 
@@ -994,11 +915,10 @@ describe('Storage (Upstash Redis integration)', () => {
     const rapidPairCount = 16;
 
     /**
-     * Core derives `stateUpdatedAt` from the LAST event the log returns rather
-     * than the maximum, so the log has to sort by eventId. Race two event types
-     * that need a different number of round trips to reach their append: the
-     * cheaper ones land ahead of events minted before them, which an index
-     * scored by append time would preserve.
+     * The log must sort by eventId (slot order). Race two event types that
+     * need a different number of round trips to reach their append: slots
+     * are allocated at the commit, so the returned ids must match commit
+     * order exactly regardless of when each create started.
      */
     async function seedRapidEvents(runId: string) {
       const created = await Promise.all(

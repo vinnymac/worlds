@@ -10,7 +10,7 @@ const TARGET_URL = 'https://example.com/api/workflow';
 
 interface PublishedBody {
   queueName: ValidQueueName;
-  message: unknown;
+  payload: unknown;
   messageId: MessageId;
   deliveryCount?: number;
   republishCount?: number;
@@ -86,7 +86,7 @@ describe('QStash queue', () => {
       } as QueuePayload);
 
       const { body } = publishedRequest(publishSpy);
-      const message = body.message as { runInput: { input: unknown[] } };
+      const message = body.payload as { runInput: { input: unknown[] } };
       expect(message.runInput.input[0]).toBeInstanceOf(Uint8Array);
       expect(Array.from(message.runInput.input[0] as Uint8Array)).toEqual([1, 2, 3, 250]);
     });
@@ -172,15 +172,14 @@ describe('QStash queue', () => {
       // Same logical message. No delivery *failed*, so the attempt counter
       // core sees stays put; only the soft-republish counter moves.
       expect(republishedBody.messageId).toBe(body.messageId);
-      expect(republishedBody.message).toEqual({ runId: 'wrun_1' });
+      expect(republishedBody.payload).toEqual({ runId: 'wrun_1' });
       expect(republishedBody.deliveryCount).toBe(0);
       expect(republishedBody.republishCount).toBe(1);
     });
 
     it('does not let timeoutSeconds republishes inflate attempt toward MAX_QUEUE_DELIVERIES', async () => {
       // Regression: core returns { timeoutSeconds: 0 } to mean "re-invoke me
-      // with a fresh replay" (e.g. when the stateUpdatedAt precondition guard
-      // exhausts its reloads under concurrent step completion). Counting those
+      // with a fresh replay". Counting those
       // as deliveries drove `attempt` past core's MAX_QUEUE_DELIVERIES (48),
       // which failed the run with "exceeded max deliveries (49/48)" even
       // though nothing had actually failed.

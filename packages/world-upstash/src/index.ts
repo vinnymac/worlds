@@ -68,10 +68,10 @@ export function createWorld(config: UpstashWorldConfig = {}): World {
   const streamer = createStreamer({ redis: streamerRedis, keyPrefix });
 
   return {
-    // Declare the supported spec version so core creates runs at the
-    // current spec (enabling resilient start: runInput rides the queue
-    // message and run_started can bootstrap the run). The queue transport
-    // uses the tagged-JSON codec, so Uint8Array payloads survive.
+    // Event ids are slot-numbered and allocated at the commit inside the Lua
+    // scripts, so this World is current-spec compliant by construction. The
+    // queue transport uses the tagged-JSON codec, so Uint8Array payloads
+    // survive.
     specVersion: SPEC_VERSION_CURRENT,
     ...storage,
     ...streamer,

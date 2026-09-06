@@ -74,7 +74,7 @@ export interface UpstashWorldConfig {
 
   /** Queue transport. `'qstash'` (default) publishes via hosted QStash;
    * `'loopback'` delivers in-process by POSTing the QStash wire body straight
-   * to the target app's flow/step routes (for tests and local development).
+   * to the target app's flow route (for tests and local development).
    * Also selectable via `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`. */
   queueMode?: 'qstash' | 'loopback';
 
@@ -83,12 +83,12 @@ export interface UpstashWorldConfig {
    * @default 10 */
   loopbackConcurrency?: number;
 
-  /** TTL (seconds) on creation-event claim keys, the SETNX arbiters that
-   * dedup entity-creating events. Claims are pure overhead once a run is
-   * terminal, and nothing else deletes them, so the TTL bounds billable
-   * growth. Duplicates race within delivery windows (seconds to minutes),
-   * making a month-long TTL a wide safety margin. `0` retains claims
-   * forever.
+  /** TTL (seconds) on attr_set dedup claim keys, the SETNX arbiters that
+   * stop a replayed workflow-writer attr_set from applying twice. Claims
+   * are pure overhead once a run is terminal, and nothing else deletes
+   * them, so the TTL bounds billable growth. Duplicates race within
+   * delivery windows (seconds to minutes), making a month-long TTL a wide
+   * safety margin. `0` retains claims forever.
    * @default process.env.WORKFLOW_UPSTASH_CLAIM_TTL_SECONDS || 2_592_000 (30 days) */
   claimTtlSeconds?: number;
 }

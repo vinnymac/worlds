@@ -6,7 +6,6 @@ import type {
   QueuePrefix,
   ValidQueueName,
 } from '@workflow/world';
-import { parseQueueName } from '@workflow/world';
 import { Client, Receiver } from '@upstash/qstash';
 import { monotonicFactory } from 'ulid';
 import { debug, parse, stringify } from './util.js';
@@ -49,8 +48,8 @@ interface QStashQueueConfig {
   /**
    * Queue transport. `'qstash'` (default) publishes via hosted QStash.
    * `'loopback'` delivers in-process by POSTing the QStash wire body straight
-   * to the target app's flow/step routes (for tests and local development,
-   * where hosted QStash cannot reach the app). Also selectable via
+   * to the target app's flow route (for tests and local development, where
+   * hosted QStash cannot reach the app). Also selectable via
    * `WORKFLOW_UPSTASH_QUEUE_MODE=loopback`.
    */
   queueMode?: 'qstash' | 'loopback';
@@ -69,7 +68,10 @@ interface QStashQueueConfig {
  */
 interface QueueMessageBody {
   queueName: ValidQueueName;
-  message: unknown;
+  /** The workflow payload. Named `payload` so `body.payload.runId` is
+   * discoverable by tooling that inspects flow deliveries (the conformance
+   * harness counts invocations per run this way). */
+  payload: unknown;
   messageId: MessageId;
   /**
    * Number of *failed* deliveries carried across self-republishes.
@@ -88,8 +90,7 @@ interface QueueMessageBody {
    *
    * These are core's *control-flow* re-invocations, not failed deliveries:
    * `sleep()`, step retry backoff, `TooEarlyError`, and `{ timeoutSeconds: 0 }`
-   * ("re-invoke me with a fresh replay", which core returns whenever the
-   * `stateUpdatedAt` precondition guard exhausts its reloads). Counting them
+   * ("re-invoke me with a fresh replay"). Counting them
    * against `deliveryCount` would let a run that merely suspends often exhaust
    * core's MAX_QUEUE_DELIVERIES budget and be killed as a runaway, so they are
    * tracked separately and bounded only by {@link MAX_SOFT_REPUBLISHES}.
@@ -180,11 +181,10 @@ export function createQueue(config: QStashQueueConfig): Queue {
   /** Loopback delivery target, resolved lazily per publish: the
    * world-testing harness binds its port (and sets `process.env.PORT`) only
    * after the server is listening, which is after the world is created. */
-  function loopbackUrl(queueName: ValidQueueName): string {
+  function loopbackUrl(): string {
     const base = targetUrl ?? `http://localhost:${process.env.PORT ?? '3000'}`;
-    const { kind } = parseQueueName(queueName);
-    const pathname = kind === 'step' ? 'step' : 'flow';
-    return `${base.replace(/\/$/, '')}/.well-known/workflow/v1/${pathname}`;
+    // v5 retired the step queue kind: everything travels on the flow route.
+    return `${base.replace(/\/$/, '')}/.well-known/workflow/v1/flow`;
   }
 
   /** deduplicationIds the loopback pump has accepted; mirrors the
@@ -222,7 +222,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
       for (let attempt = 0; attempt < LOOPBACK_MAX_DELIVERIES; attempt++) {
         await loopbackSemaphore.acquire();
         try {
-          const res = await fetch(loopbackUrl(body.queueName), {
+          const res = await fetch(loopbackUrl(), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -306,7 +306,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
       const messageId = `wmsg_${ulid()}` as MessageId;
 
       await publishBody(
-        { queueName, message, messageId },
+        { queueName, payload: message, messageId },
         {
           delaySeconds: opts.delaySeconds,
           headers: opts.headers,
@@ -362,7 +362,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
             }
           }
 
-          const { queueName, message, messageId, deliveryCount, republishCount } =
+          const { queueName, payload, messageId, deliveryCount, republishCount } =
             parse<QueueMessageBody>(await req.text());
 
           const retried = Number.parseInt(req.headers.get('upstash-retried') || '0', 10);
@@ -372,7 +372,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
           const attempt = (deliveryCount ?? 0) + retried + 1;
           const requestId = req.headers.get('x-request-id') || undefined;
 
-          const result = await handler(message, {
+          const result = await handler(payload, {
             attempt,
             queueName,
             messageId,
@@ -405,7 +405,7 @@ export function createQueue(config: QStashQueueConfig): Queue {
             await publishBody(
               {
                 queueName,
-                message,
+                payload,
                 messageId,
                 // Carry only the failed-delivery total. A soft republish is
                 // core asking to be re-invoked, not a delivery that failed,
