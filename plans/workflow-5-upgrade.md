@@ -102,7 +102,10 @@ on them.
       independently re-verified; suspension-as-failed-delivery conflation
       fixed and tested; known documented edge: claim-takeover double
       append if a winner stalls over 3s between claim and append)
-- [~] world-azure (agent running 2026-09-05)
+- [x] world-azure (commit 6b5bad1, 58/58 tests incl. 16 conformance,
+      independently re-verified; note: streams remain name-keyed like
+      world-redis, two runs sharing a stream name would collide, same
+      as v4)
 - [~] world-firestore-tasks (agent running 2026-09-05)
 - [x] world-cloudflare (commit 2447806, 147 node + 26 workerd tests,
       independently re-verified; DO exports verified in dist; shared
