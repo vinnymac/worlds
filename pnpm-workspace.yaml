@@ -47,6 +47,9 @@ allowBuilds:
 
 overrides:
   zod: 4.3.6
+  # @cloudflare/vitest-pool-workers expects zod v3 APIs; scope it out of the
+  # workspace-wide zod 4 pin so test:workers needs no resolve hook.
+  '@cloudflare/vitest-pool-workers>zod': ^3.25.0
   # workflow@5.0.0-beta.48 pins @workflow/sveltekit and @workflow/nest at
   # 5.0.0-beta.48, but neither was published (both beta lines stop at .47).
   # We use neither integration; pin the nearest published beta.

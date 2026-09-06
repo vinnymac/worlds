@@ -41,7 +41,7 @@
     "deploy": "wrangler deploy",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "test:workers": "NODE_OPTIONS=\"${NODE_OPTIONS:-} --import ./test/zod-v3-resolve-hook.mjs\" vitest run --config vitest.workers.config.ts",
+    "test:workers": "vitest run --config vitest.workers.config.ts",
     "test:all": "pnpm test && pnpm test:workers",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
