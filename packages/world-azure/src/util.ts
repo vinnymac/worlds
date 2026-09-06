@@ -30,11 +30,14 @@ const HTTP_FAILED_DEPENDENCY = 424;
  * the status `Items.batch()` would otherwise discard. */
 export class BatchOperationError extends Error {
   readonly code: number;
+  /** Position of the rejected operation in the submitted batch. */
+  readonly index: number;
 
   constructor(index: number, code: number) {
     super(`${BATCH_ERROR_PREFIX} operation ${index} failed with status ${code}`);
     this.name = 'BatchOperationError';
     this.code = code;
+    this.index = index;
   }
 }
 

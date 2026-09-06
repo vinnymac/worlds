@@ -111,7 +111,7 @@ be introspected; ensure the queue was provisioned with duplicate detection.
 
 ## Indexing
 
-The `cosmos-indexes.json` file contains the recommended indexing policy with composite indexes for common query patterns. Listings order and paginate on monotonic ULID ids (`runId`, `eventId`, `stepId`, `hookId`), never `createdAt`, whose millisecond ties can skip or duplicate rows at page boundaries:
+The `cosmos-indexes.json` file contains the recommended indexing policy with composite indexes for common query patterns. Listings order and paginate on lexicographically ordered ids (`runId`, `stepId`, `hookId` are monotonic ULIDs; `eventId` is a fixed-width slot number, so string order equals log position), never `createdAt`, whose millisecond ties can skip or duplicate rows at page boundaries:
 
 - `workflowName + runId` (run listings filtered by workflow)
 - `status + runId` (run listings filtered by status)

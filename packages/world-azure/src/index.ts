@@ -173,8 +173,9 @@ export function createAzureWorld(
   });
 
   return {
-    // Runs are created at the current spec version so resilient start
-    // (CBOR queue transport + run_started bootstrap) is enabled.
+    // Event ids are slot-numbered and allocated at the commit (the batch
+    // Create of the slot-keyed document), so this World is current-spec
+    // compliant by construction: no pre-assigned positions, no noop sealing.
     specVersion: SPEC_VERSION_CURRENT,
 
     get runs() {
@@ -209,46 +210,11 @@ export function createAzureWorld(
     createQueueHandler: queue.createQueueHandler,
     getDeploymentId: queue.getDeploymentId,
 
-    get writeToStream() {
+    get streams() {
       if (!streamerInstance) {
         throw new Error('Azure world not started. Call start() first.');
       }
-      return streamerInstance.writeToStream;
-    },
-
-    get closeStream() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.closeStream;
-    },
-
-    get readFromStream() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.readFromStream;
-    },
-
-    get listStreamsByRunId() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.listStreamsByRunId;
-    },
-
-    get getStreamChunks() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.getStreamChunks;
-    },
-
-    get getStreamInfo() {
-      if (!streamerInstance) {
-        throw new Error('Azure world not started. Call start() first.');
-      }
-      return streamerInstance.getStreamInfo;
+      return streamerInstance.streams;
     },
 
     async start() {

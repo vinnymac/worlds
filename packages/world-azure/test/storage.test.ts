@@ -2,12 +2,10 @@ import type { Container, FeedOptions, JSONValue, SqlQuerySpec } from '@azure/cos
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   WorkflowRunNotFoundError,
 } from '@workflow/errors';
 import type { Event, WorkflowRun, Step } from '@workflow/world';
-import { ulidToDate } from '@workflow/world';
-import type { Mock } from 'vitest';
+import { eventIdToSlot, FIRST_EVENT_SLOT, slotToEventId } from '@workflow/world';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage } from '../src/storage.js';
 
@@ -33,12 +31,7 @@ interface MockQueryIterator<T> {
 type MockBatchOperation =
   | { operationType: 'Create' | 'Upsert'; id?: string; resourceBody: MockDoc }
   | { operationType: 'Replace'; id: string; resourceBody: MockDoc }
-  | { operationType: 'Delete'; id: string }
-  | {
-      operationType: 'Patch';
-      id: string;
-      resourceBody: { condition?: string; operations: { path: string; value: unknown }[] };
-    };
+  | { operationType: 'Delete'; id: string };
 
 type MockBatchResult = { code: number; result: { statusCode: number }[] };
 
@@ -135,6 +128,11 @@ describe('Storage (Azure Cosmos DB integration)', () => {
                   const eventId = doc.eventId ?? '';
                   if (cursorOp === '>' ? eventId <= cursor : eventId >= cursor) continue;
                 }
+                // Inclusive eventId bounds used by the skipped-slot report.
+                const fromBound = paramMap['@from'];
+                const toBound = paramMap['@to'];
+                if (typeof fromBound === 'string' && (doc.eventId ?? '') < fromBound) continue;
+                if (typeof toBound === 'string' && (doc.eventId ?? '') > toBound) continue;
                 resources.push(doc);
               }
 
@@ -162,30 +160,6 @@ describe('Storage (Azure Cosmos DB integration)', () => {
         // partition, and a rejected operation RESOLVES with HTTP 207 carrying the
         // failing status on result[i].statusCode (siblings 424) rather than throwing.
         batch: vi.fn<MockBatchImpl>(async (operations, _partitionKey) => {
-          /** Evaluate the `from c where c.<field> <op> <number>` conditions we emit. */
-          const conditionHolds = (
-            condition: string | undefined,
-            doc: MockDoc | undefined,
-          ): boolean => {
-            if (!condition) return true;
-            const match = /from c where c\.(\w+) (<=|<|>=|>) (-?\d+)$/.exec(condition.trim());
-            if (!match) throw new Error(`mock cannot evaluate condition: ${condition}`);
-            const [, field, operator, rawValue] = match;
-            const actual = doc?.[field];
-            if (typeof actual !== 'number') return false;
-            const expected = Number(rawValue);
-            switch (operator) {
-              case '<=':
-                return actual <= expected;
-              case '<':
-                return actual < expected;
-              case '>=':
-                return actual >= expected;
-              default:
-                return actual > expected;
-            }
-          };
-
           const statuses = operations.map((op) => {
             if (op.operationType === 'Create' && mockData.has(op.resourceBody.id)) return 409;
             if (
@@ -193,10 +167,6 @@ describe('Storage (Azure Cosmos DB integration)', () => {
               !mockData.has(op.id)
             ) {
               return 404;
-            }
-            if (op.operationType === 'Patch') {
-              if (!mockData.has(op.id)) return 404;
-              return conditionHolds(op.resourceBody.condition, mockData.get(op.id)) ? 200 : 412;
             }
             return op.operationType === 'Create' ? 201 : 200;
           });
@@ -220,16 +190,6 @@ describe('Storage (Azure Cosmos DB integration)', () => {
               mockData.set(op.resourceBody.id ?? op.id, op.resourceBody);
             } else if (op.operationType === 'Delete') {
               mockData.delete(op.id);
-            } else if (op.operationType === 'Patch') {
-              const existing = mockData.get(op.id);
-              if (!existing) {
-                throw new Error(`Patch on a document the mock never stored: ${op.id}`);
-              }
-              const doc: MockDoc = { ...existing };
-              for (const patch of op.resourceBody.operations) {
-                doc[patch.path.replace(/^\//, '')] = patch.value;
-              }
-              mockData.set(op.id, doc);
             }
           }
           return { code: 200, result: statuses.map((statusCode) => ({ statusCode })) };
@@ -454,11 +414,15 @@ describe('Storage (Azure Cosmos DB integration)', () => {
     );
   });
 
-  it('should resolve steps without a runId via cross-partition lookup', async () => {
+  it('scopes step lookups to the owning run', async () => {
     const run = await createRun();
-    const step = await createStep(run.runId, 'step-no-runid');
+    const step = await createStep(run.runId, 'step-scoped');
+    const other = await createRun();
 
-    const resolved = await storage.steps.get(undefined, step.stepId);
+    // v5 requires the runId; a lookup under another run must miss.
+    await expect(storage.steps.get(other.runId, step.stepId)).rejects.toThrow(/not found/i);
+
+    const resolved = await storage.steps.get(run.runId, step.stepId);
     expect(resolved.stepId).toBe(step.stepId);
     expect(resolved.runId).toBe(run.runId);
   });
@@ -494,7 +458,7 @@ describe('Storage (Azure Cosmos DB integration)', () => {
       });
 
       expect(result.run?.status).toBe('failed');
-      expect(result.run?.error?.message).toBe('plain failure');
+      expect(result.run?.error).toEqual({ message: 'plain failure' });
     });
   });
 
@@ -628,172 +592,108 @@ describe('Storage (Azure Cosmos DB integration)', () => {
     });
   });
 
-  describe('Optimistic concurrency guard (stateUpdatedAt, world 4.3.1)', () => {
-    /** ULID time (epoch ms) of an event id, i.e. the state-marker unit. */
-    function eventTime(eventId: string): number {
-      const time = ulidToDate(eventId.slice(eventId.lastIndexOf('_') + 1))?.getTime();
-      if (time === undefined) throw new Error(`not a decodable event id: ${eventId}`);
-      return time;
-    }
-
-    /** Drive a run until an externally-originated step_completed has advanced the
-     * state marker, and report the marker value. */
-    async function runWithMarker(): Promise<{ runId: string; marker: number }> {
-      const run = await createRun('guard-workflow');
+  describe('Slot-numbered event ids (world 5)', () => {
+    it('numbers the log densely from slot 1 in canonical form', async () => {
+      const run = await createRun('slot-workflow');
       await storage.events.create(run.runId, { eventType: 'run_started' });
-      await createStep(run.runId, 'step-guard');
-      await storage.events.create(run.runId, {
-        eventType: 'step_started',
-        correlationId: 'step-guard',
-        eventData: {},
-      });
-      // No stateUpdatedAt -> externally originated -> advances the marker.
-      const completed = await storage.events.create(run.runId, {
-        eventType: 'step_completed',
-        correlationId: 'step-guard',
-        eventData: { result: 'ok' },
-      });
-      return { runId: run.runId, marker: eventTime(completed.event!.eventId) };
-    }
+      await createStep(run.runId, 'slot-step');
 
-    it('rejects a strictly older snapshot with PreconditionFailedError', async () => {
-      const { runId, marker } = await runWithMarker();
+      const events = await storage.events.list({
+        runId: run.runId,
+        pagination: { sortOrder: 'asc' },
+      });
+      expect(events.data.length).toBeGreaterThanOrEqual(3);
+      events.data.forEach((event, index) => {
+        expect(event.eventId).toMatch(/^evnt_\d{26}$/);
+        expect(event.eventId).toBe(slotToEventId(FIRST_EVENT_SLOT + index));
+        expect(eventIdToSlot(event.eventId)).toBe(FIRST_EVENT_SLOT + index);
+      });
+    });
 
-      await expect(
-        storage.events.create(
-          runId,
-          {
+    it('settles a concurrent fan-out on distinct consecutive slots', async () => {
+      const run = await createRun('slot-race-workflow');
+      const results = await Promise.all(
+        Array.from({ length: 16 }, (_, i) =>
+          storage.events.create(run.runId, {
             eventType: 'wait_created',
-            correlationId: 'wait-stale',
+            correlationId: `wait-race-${i}`,
             eventData: { resumeAt: new Date(Date.now() + 60_000) },
-          },
-          { stateUpdatedAt: marker - 1 },
+          }),
         ),
-      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
-
-      // The rejected create must not have appended anything.
-      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
-      expect(events.data.some((e) => e.eventType === 'wait_created')).toBe(false);
-    });
-
-    it('rejects inside the batch when the marker advances after the pre-check', async () => {
-      // The fast-path compare passes, so only the in-batch Patch condition can
-      // catch this -- exactly the race the guard exists for.
-      const { runId, marker } = await runWithMarker();
-      // runWithMarker() always seeds the marker doc, so this lookup can't miss.
-      const markerDoc = mockData.get(`marker:${runId}`)!;
-      expect(markerDoc.stateUpdatedAt).toBe(marker);
-
-      const batch = mockContainer.items.batch as unknown as Mock<MockBatchImpl>;
-      const original = batch.getMockImplementation()!;
-      batch.mockImplementationOnce(async (operations, partitionKey) => {
-        markerDoc.stateUpdatedAt = marker + 1000;
-        return original(operations, partitionKey);
-      });
-
-      await expect(
-        storage.events.create(
-          runId,
-          {
-            eventType: 'wait_created',
-            correlationId: 'wait-raced',
-            eventData: { resumeAt: new Date(Date.now() + 60_000) },
-          },
-          { stateUpdatedAt: marker },
-        ),
-      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
-
-      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
-      expect(events.data.some((e) => e.eventType === 'wait_created')).toBe(false);
-    });
-
-    it('accepts an equal snapshot and does not advance the marker', async () => {
-      const { runId, marker } = await runWithMarker();
-
-      // Equal passes (anti-livelock for an up-to-date client)...
-      await storage.events.create(
-        runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-a',
-          eventData: { resumeAt: new Date(Date.now() + 60_000) },
-        },
-        { stateUpdatedAt: marker },
       );
-      // ...and a replay-origin create must not move the marker forward, so the
-      // same snapshot still passes afterwards.
-      await storage.events.create(
-        runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-b',
-          eventData: { resumeAt: new Date(Date.now() + 60_000) },
-        },
-        { stateUpdatedAt: marker },
-      );
-
-      expect(mockData.get(`marker:${runId}`)!.stateUpdatedAt).toBe(marker);
-      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
-      expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(2);
+      const slots = results
+        .map((r) => eventIdToSlot(r.event!.eventId))
+        .sort((a, b) => (a ?? 0) - (b ?? 0));
+      // run_created holds slot 1; the fan-out takes 2..17, no holes, no dups.
+      expect(slots).toEqual(Array.from({ length: 16 }, (_, i) => i + 2));
     });
 
-    it('fails open when no snapshot is supplied', async () => {
-      const { runId } = await runWithMarker();
-
-      const result = await storage.events.create(runId, {
-        eventType: 'wait_created',
-        correlationId: 'wait-unguarded',
-        eventData: { resumeAt: new Date(Date.now() + 60_000) },
-      });
-      expect(result.event).toBeDefined();
-    });
-
-    it('advances the marker on an externally-originated hook_received', async () => {
-      const run = await createRun('guard-hook-workflow');
+    it('bumps a stale eventCount and reports the skipped span', async () => {
+      const run = await createRun('slot-bump-workflow');
       await storage.events.create(run.runId, { eventType: 'run_started' });
-      await storage.events.create(run.runId, {
-        eventType: 'hook_created',
-        correlationId: 'hook-guard',
-        eventData: { token: 'token-guard' },
-      });
-      const received = await storage.events.create(run.runId, {
-        eventType: 'hook_received',
-        correlationId: 'hook-guard',
-        eventData: { payload: {} },
-      });
-      const marker = eventTime(received.event!.eventId);
-      expect(mockData.get(`marker:${run.runId}`)!.stateUpdatedAt).toBe(marker);
+      await createStep(run.runId, 'bump-step');
 
-      await expect(
-        storage.events.create(
-          run.runId,
-          { eventType: 'hook_disposed', correlationId: 'hook-guard', eventData: {} },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
-    });
-
-    it('does not arm the guard from run lifecycle events', async () => {
-      // run_created / run_started are created without a snapshot but are NOT
-      // externally originated; treating them as such would 412 every replay.
-      const run = await createRun('guard-lifecycle-workflow');
-      const started = await storage.events.create(run.runId, { eventType: 'run_started' });
-      const startedAt = eventTime(started.event!.eventId);
-
+      // The log holds 3 events; a writer whose snapshot held 1 expects slot 2.
       const result = await storage.events.create(
         run.runId,
         {
           eventType: 'wait_created',
-          correlationId: 'wait-x',
+          correlationId: 'wait-bump',
           eventData: { resumeAt: new Date(Date.now() + 60_000) },
         },
-        { stateUpdatedAt: startedAt - 1000 },
+        { eventCount: 1 },
       );
-      expect(result.event).toBeDefined();
+
+      expect(result.event?.eventId).toBe(slotToEventId(4));
+      expect(result.events?.map((e) => e.eventId)).toEqual([slotToEventId(2), slotToEventId(3)]);
+      expect(result.cursor).toBeNull();
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('reports nothing when the expected slot was free', async () => {
+      const run = await createRun('slot-free-workflow');
+      const result = await storage.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-free',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { eventCount: 1 },
+      );
+      expect(result.event?.eventId).toBe(slotToEventId(2));
+      expect(result.events).toBeUndefined();
+    });
+
+    it('accepts a create carrying no eventCount', async () => {
+      const run = await createRun('slot-no-count-workflow');
+      const result = await storage.events.create(run.runId, {
+        eventType: 'wait_created',
+        correlationId: 'wait-nocount',
+        eventData: { resumeAt: new Date(Date.now() + 60_000) },
+      });
+      expect(result.event?.eventId).toBe(slotToEventId(2));
+    });
+
+    it('returns the delta after sinceCursor on the success response', async () => {
+      const run = await createRun('slot-delta-workflow');
+      await storage.events.create(run.runId, { eventType: 'run_started' });
+      const result = await storage.events.create(
+        run.runId,
+        {
+          eventType: 'wait_created',
+          correlationId: 'wait-delta',
+          eventData: { resumeAt: new Date(Date.now() + 60_000) },
+        },
+        { sinceCursor: slotToEventId(1) },
+      );
+      expect(result.events?.map((e) => e.eventId)).toEqual([slotToEventId(2), slotToEventId(3)]);
+      expect(result.cursor).toBe(slotToEventId(3));
+      expect(result.hasMore).toBe(false);
     });
   });
 
-  describe('Event ceiling (EventResult.maxEvents, world 4.3.1)', () => {
+  describe('Event ceiling (EventResult.maxEvents)', () => {
     it('reports the default ceiling on run_started and on its idempotent replay', async () => {
       const run = await createRun('max-events-workflow');
 
@@ -846,7 +746,6 @@ describe('Storage (Azure Cosmos DB integration)', () => {
 
     // Entities live in their run's partition here, so the cross-run case is
     // two runs walking the same step lifecycle under one correlation id.
-    // Interleave them so an unscoped lookup alternates between the runs.
     async function seedInterleavedRuns() {
       const runA = await createRun('scoping-workflow-a');
       const runB = await createRun('scoping-workflow-b');
@@ -899,26 +798,6 @@ describe('Storage (Azure Cosmos DB integration)', () => {
 
       expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
       expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
-      expect(result.hasMore).toBe(false);
-    });
-
-    it('lists every run when runId is omitted', async () => {
-      const seeded = await seedInterleavedRuns();
-
-      const result = await storage.events.listByCorrelationId({
-        correlationId: sharedCorrelationId,
-        pagination: {},
-      });
-
-      // Also pins the interleaving the scoped pagination test relies on.
-      expect(result.data.map((e) => e.eventId)).toEqual([
-        seeded.a[0],
-        seeded.b[0],
-        seeded.a[1],
-        seeded.b[1],
-        seeded.a[2],
-        seeded.b[2],
-      ]);
       expect(result.hasMore).toBe(false);
     });
 

@@ -1,21 +1,16 @@
-import type {
-  Container,
-  FeedOptions,
-  JSONObject,
-  OperationInput,
-  SqlQuerySpec,
-} from '@azure/cosmos';
-import { BulkOperationType, PatchOperationType } from '@azure/cosmos';
+import type { Container, JSONObject, OperationInput, SqlQuerySpec } from '@azure/cosmos';
+import { BulkOperationType } from '@azure/cosmos';
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   RunExpiredError,
+  RunNotSupportedError,
   TooEarlyError,
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
+  AttributeChange,
   CreateEventParams,
   CreateEventRequest,
   Event,
@@ -25,6 +20,7 @@ import type {
   GetStepParams,
   GetWorkflowRunParams,
   Hook,
+  ListEventsByCorrelationIdParams,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
@@ -40,19 +36,30 @@ import type {
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import {
+  applyAttributeChanges,
   EventSchema,
+  eventIdToSlot,
+  FIRST_EVENT_SLOT,
   HookSchema,
+  isChildEntityCreationEvent,
+  isHookEventRequiringExistence,
+  isLegacySpecVersion,
+  isStepEventType,
+  isTerminalRunEventType,
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
+  requiresNewerWorld,
   SPEC_VERSION_CURRENT,
+  slotToEventId,
   stripEventDataRefs,
-  ulidToDate,
+  validateAttributeChanges,
   WaitSchema,
 } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { encodeCbor, decodeCbor } from './cbor.js';
 import {
   assertBatchCommitted,
+  BatchOperationError,
   compact,
   isConflictError,
   isNotFoundError,
@@ -66,7 +73,7 @@ import {
  * All documents in `workflow_runs` container share a partition key of /runId
  * and are distinguished by their `type` field.
  */
-type DocType = 'run' | 'event' | 'step' | 'hook' | 'wait' | 'marker';
+type DocType = 'run' | 'event' | 'step' | 'hook' | 'wait' | 'attrclaim';
 
 type CosmosDoc = Record<string, unknown>;
 
@@ -75,16 +82,9 @@ type CosmosDoc = Record<string, unknown>;
  */
 const MAX_TRANSITION_ATTEMPTS = 5;
 
-/** Id of the per-run concurrency marker document. Lives in the run's own
- * partition so it can join the same transactional batch as the event. */
-function stateMarkerId(runId: string): string {
-  return `marker:${runId}`;
-}
-
-/** Event types that advance the state marker when created outside a replay.
- * Narrow by design: core also omits `stateUpdatedAt` on `run_created` /
- * `run_started` / `run_failed`, and advancing there would reject replays. */
-const EXTERNAL_EVENT_TYPES: ReadonlySet<string> = new Set(['hook_received', 'step_completed']);
+/** Maximum retries for a contended event slot. Each retry re-reads the log's
+ * tail, so this only trips under sustained same-run write pressure. */
+const MAX_SLOT_ATTEMPTS = 16;
 
 /** Default per-run event ceiling. Mirrors `@workflow/world-local`. */
 const DEFAULT_MAX_EVENTS_PER_RUN = 25_000;
@@ -100,13 +100,15 @@ interface CosmosStorageConfig {
   maxEventsPerRun?: number;
 }
 
-/** Transactional-batch operations enforcing or advancing the state marker,
- * plus the snapshot they were built from. Threaded into every batch so the
- * guard commits or rolls back with the event. */
-interface StateGuard {
-  operations: OperationInput[];
-  /** `CreateEventParams.stateUpdatedAt`, when the caller sent one. */
-  stateUpdatedAt?: number;
+/** Event document fields minus identity; the slot allocator assigns the id. */
+interface EventBody {
+  runId: string;
+  eventType: string;
+  correlationId?: string;
+  /** CBOR-encoded eventData, omitted when the event stores none. */
+  eventData?: Uint8Array;
+  specVersion: number;
+  createdAt: string;
 }
 
 /** Resolve the per-run event ceiling: explicit config, then
@@ -125,24 +127,6 @@ function resolveMaxEventsPerRun(configured: number | undefined): number {
   const raw = process.env.WORKFLOW_MAX_EVENTS;
   const parsed = raw !== undefined ? Number(raw) : Number.NaN;
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
-}
-
-/** ULID time (epoch ms) of a prefixed event id, or undefined when it is not
- * a decodable ULID. Mirrors core, which likewise fails open. */
-function eventIdTime(eventId: string): number | undefined {
-  const underscore = eventId.lastIndexOf('_');
-  const rawUlid = underscore === -1 ? eventId : eventId.slice(underscore + 1);
-  return ulidToDate(rawUlid)?.getTime();
-}
-
-/** A freshly seeded state marker: no externally-originated event yet. */
-function newStateMarkerDoc(runId: string): CosmosDoc {
-  return {
-    id: stateMarkerId(runId),
-    type: 'marker' as DocType,
-    runId,
-    stateUpdatedAt: 0,
-  };
 }
 
 interface SerializedError {
@@ -413,63 +397,109 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   const ulid = monotonicFactory();
   const maxEventsPerRun = resolveMaxEventsPerRun(config.maxEventsPerRun);
 
-  /** Read the per-run state marker, or undefined for legacy runs and runs with
-   * no externally-originated event yet. */
-  async function readStateMarker(runId: string): Promise<number | undefined> {
-    const doc = await readRunPartitionDoc(runId, stateMarkerId(runId));
-    const value = doc?.stateUpdatedAt;
-    return typeof value === 'number' ? value : undefined;
+  /** Execute a same-partition transactional batch with 429 retry. All event +
+   * entity mutations go through here. */
+  async function commitBatch(operations: OperationInput[], partitionKey: string) {
+    return withCosmosRetry(async () => {
+      // batch() resolves even when the transaction was rejected, so the
+      // per-operation statuses have to be inspected explicitly.
+      const response = await container.items.batch(operations, partitionKey);
+      assertBatchCommitted(response);
+      return response;
+    });
   }
 
-  /** Re-read the marker after a rejected batch and translate the rejection into
-   * the contract error when the guard caused it. Batch failures arrive without
-   * a usable status (see util.ts). */
-  async function throwIfStale(runId: string, stateUpdatedAt: number): Promise<void> {
-    const marker = await readStateMarker(runId);
-    if (marker !== undefined && stateUpdatedAt < marker) {
-      throw new PreconditionFailedError(
-        `Event creation for run "${runId}" is based on a stale snapshot ` +
-          `(stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
+  /** Build the full event document for a slot-numbered id. */
+  function eventDocAt(body: EventBody, eventId: string): CosmosDoc {
+    return {
+      id: `event:${body.runId}:${eventId}`,
+      type: 'event' as DocType,
+      runId: body.runId,
+      eventId,
+      eventType: body.eventType,
+      specVersion: body.specVersion,
+      createdAt: body.createdAt,
+      ...(body.correlationId !== undefined && { correlationId: body.correlationId }),
+      ...(body.eventData !== undefined && { eventData: body.eventData }),
+    };
+  }
+
+  /** Next free slot of a run's log: the stored maximum plus one. Slot ids are
+   * fixed-width decimals, so the lexicographic maximum is the positional one. */
+  async function nextEventSlot(runId: string): Promise<number> {
+    const querySpec: SqlQuerySpec = {
+      query:
+        'SELECT TOP 1 c.eventId FROM c WHERE c.type = "event" AND c.runId = @runId ' +
+        'ORDER BY c.eventId DESC',
+      parameters: [{ name: '@runId', value: runId }],
+    };
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query<{ eventId: string }>(querySpec, { partitionKey: runId }).fetchAll(),
+    );
+    const top = resources[0]?.eventId;
+    if (top === undefined) {
+      return FIRST_EVENT_SLOT;
+    }
+    const slot = eventIdToSlot(top);
+    if (slot === null) {
+      throw new WorkflowWorldError(
+        `Run "${runId}" holds a non-slot event id "${top}"; its log cannot be extended`,
+        { status: 500 },
       );
     }
+    return slot + 1;
   }
 
-  /** Execute a same-partition transactional batch with 429 retry. All event +
-   * entity mutations go through here, and `guard` appends the concurrency
-   * operations so the marker check commits atomically with the event. */
-  async function commitBatch(
-    operations: OperationInput[],
-    partitionKey: string,
-    guard?: StateGuard,
-  ) {
-    const allOperations = guard ? [...operations, ...guard.operations] : operations;
-    try {
-      return await withCosmosRetry(async () => {
-        // batch() resolves even when the transaction was rejected, so the
-        // per-operation statuses have to be inspected explicitly.
-        const response = await container.items.batch(allOperations, partitionKey);
-        assertBatchCommitted(response);
-        return response;
-      });
-    } catch (error: unknown) {
-      if (
-        guard?.stateUpdatedAt !== undefined &&
-        (isWrappedBatchError(error) || isPreconditionFailedError(error))
-      ) {
-        await throwIfStale(partitionKey, guard.stateUpdatedAt);
+  /**
+   * Commit an event (plus same-partition entity operations) at the next free
+   * slot. The slot is proposed from the store's current maximum and taken by
+   * the batch Create of the slot-keyed document: Cosmos rejects a duplicate id
+   * within the partition, so the Create is the conditional write that settles
+   * a race at the commit. A loser re-reads the maximum, which the winner has
+   * advanced, and retries at the new tail (the bump). Entity-operation
+   * failures propagate to the caller for classification; the event Create is
+   * always operation 0.
+   */
+  async function commitEventAtNextSlot(
+    body: EventBody,
+    extraOps: (eventDoc: CosmosDoc) => OperationInput[] = () => [],
+  ): Promise<CosmosDoc> {
+    for (let attempt = 0; attempt < MAX_SLOT_ATTEMPTS; attempt++) {
+      const slot = await nextEventSlot(body.runId);
+      const eventDoc = eventDocAt(body, slotToEventId(slot));
+      try {
+        await commitBatch(
+          [
+            { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
+            ...extraOps(eventDoc),
+          ],
+          body.runId,
+        );
+        return eventDoc;
+      } catch (error: unknown) {
+        if (error instanceof BatchOperationError && error.index === 0 && error.code === 409) {
+          continue;
+        }
+        if (isWrappedBatchError(error) && !(error instanceof BatchOperationError)) {
+          // Transport-wrapped batch failure with no per-operation status:
+          // an occupied slot means this writer lost the race.
+          const taken = await readRunPartitionDoc(body.runId, eventDoc.id as string);
+          if (taken) {
+            continue;
+          }
+        }
+        throw error;
       }
-      throw error;
     }
+    throw new WorkflowWorldError(
+      `Event slot contention on run "${body.runId}" exceeded ${MAX_SLOT_ATTEMPTS} attempts`,
+      { status: 500 },
+    );
   }
 
-  /** Commit an event document with no same-partition entity mutation. Still a
-   * batch, so the state guard commits atomically with the event. */
-  function commitEventDoc(eventDoc: CosmosDoc, runId: string, guard: StateGuard) {
-    return commitBatch(
-      [{ operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) }],
-      runId,
-      guard,
-    );
+  /** Parse a committed event document into the contract Event. */
+  function toEvent(eventDoc: CosmosDoc, resolveData: ResolveData): Event {
+    return stripEventDataRefs(EventSchema.parse(compact(deserializeEvent(eventDoc))), resolveData);
   }
 
   /**
@@ -526,19 +556,18 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     }
   }
 
-  /**
-   * Internal: create a run entity in Cosmos DB (called from events.create for run_created).
-   * Uses a transactional batch to atomically create the event and run documents
-   * within the same partition (runId).
-   */
-  async function createRunFromEvent(
+  /** Build a fresh run document from run_created / bootstrap event data. */
+  function buildRunDoc(
     runId: string,
     data: RunCreatedEventRequest['eventData'],
     specVersion: number,
-    eventDoc: CosmosDoc,
-  ): Promise<{ run: WorkflowRun }> {
-    const now = new Date();
-    const run: CosmosDoc = {
+    now: Date,
+  ): CosmosDoc {
+    validateAttributeChanges(
+      Object.entries(data.attributes ?? {}).map(([key, value]) => ({ key, value })),
+      { allowReservedAttributes: data.allowReservedAttributes === true },
+    );
+    return {
       id: `run:${runId}`,
       type: 'run' as DocType,
       runId,
@@ -548,29 +577,38 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       input: encodeCbor(data.input),
       executionContext: data.executionContext as Record<string, unknown> | undefined,
       deploymentId: data.deploymentId,
+      attributes: data.attributes ?? {},
+      ...(data.encryptionPublicKey !== undefined && {
+        encryptionPublicKey: data.encryptionPublicKey,
+      }),
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
+  }
 
+  /**
+   * Internal: create a run entity (called from events.create for run_created
+   * and the resilient-start bootstrap). The run_created event and the run
+   * document commit in one same-partition transactional batch, with the slot
+   * allocated at that commit.
+   */
+  async function createRunWithEvent(
+    runId: string,
+    data: RunCreatedEventRequest['eventData'],
+    specVersion: number,
+    body: EventBody,
+  ): Promise<{ run: WorkflowRun; eventDoc: CosmosDoc }> {
+    const run = buildRunDoc(runId, data, specVersion, new Date(body.createdAt));
+
+    let eventDoc: CosmosDoc;
     try {
-      await commitBatch(
-        [
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(run) },
-          // Seed the state marker with the run so later guarded creates can
-          // patch it conditionally (Patch requires the document to exist).
-          {
-            operationType: BulkOperationType.Create,
-            resourceBody: toResourceBody(newStateMarkerDoc(runId)),
-          },
-        ],
-        runId,
-      );
+      eventDoc = await commitEventAtNextSlot(body, () => [
+        { operationType: BulkOperationType.Create, resourceBody: toResourceBody(run) },
+      ]);
     } catch (error: unknown) {
-      // The Cosmos SDK wraps transactional-batch failures in a plain Error
-      // with no status code, so classify by re-reading the entity: if the
-      // run exists, this was a duplicate/concurrent run_created. The runtime
-      // swallows EntityConflictError on the raced start() path.
+      // Classify by re-reading the entity: if the run exists, this was a
+      // duplicate/concurrent run_created. The runtime swallows
+      // EntityConflictError on the raced start() path.
       if (isConflictError(error) || isWrappedBatchError(error)) {
         const existing = await getRunDoc(runId);
         if (existing) {
@@ -579,12 +617,12 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       }
       throw error;
     }
-    return { run: deserializeRun(run) };
+    return { run: deserializeRun(run), eventDoc };
   }
 
   /**
-   * Internal: transition a run entity in Cosmos DB (called from events.create
-   * for run_started/run_completed/run_failed/run_cancelled).
+   * Internal: transition a run entity (called from events.create for
+   * run_started/run_completed/run_failed/run_cancelled).
    *
    * The event document and the entity replace are committed in a single
    * same-partition transactional batch, with the replace guarded by the
@@ -597,9 +635,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     runId: string,
     eventType: string,
     eventData: Record<string, unknown> | undefined,
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<WorkflowRun> {
+    body: EventBody,
+  ): Promise<{ run: WorkflowRun; eventDoc?: CosmosDoc }> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
       const doc = await getRunDoc(runId);
@@ -618,7 +655,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         // Idempotency: run_started on an already running run is a replay.
         // Return existing run state without appending a duplicate event.
         if (status === 'running') {
-          return deserializeRun(doc);
+          return { run: deserializeRun(doc) };
         }
       } else if (runIsTerminal) {
         throw new EntityConflictError(`Cannot transition run from terminal state "${status}"`);
@@ -659,6 +696,10 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           if (eventData?.error !== undefined) {
             doc.error = serializeEventError(eventData.error, { code: eventData.errorCode });
           }
+          // WorkflowRun carries the machine-readable code top-level too.
+          if (typeof eventData?.errorCode === 'string') {
+            doc.errorCode = eventData.errorCode;
+          }
           break;
         }
         case 'run_cancelled': {
@@ -668,20 +709,16 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         }
       }
 
+      let eventDoc: CosmosDoc;
       try {
-        await commitBatch(
-          [
-            { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-            {
-              operationType: BulkOperationType.Replace,
-              id: doc.id as string,
-              ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
-              resourceBody: toResourceBody(doc),
-            },
-          ],
-          runId,
-          guard,
-        );
+        eventDoc = await commitEventAtNextSlot(body, () => [
+          {
+            operationType: BulkOperationType.Replace,
+            id: doc.id as string,
+            ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
+            resourceBody: toResourceBody(doc),
+          },
+        ]);
       } catch (error: unknown) {
         // Etag mismatch (412 inside the batch) or another wrapped failure:
         // nothing was committed (the batch is atomic), so re-read and re-run
@@ -703,25 +740,25 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         await cleanupRunScopedEntities(runId);
       }
 
-      return deserializeRun(doc);
+      return { run: deserializeRun(doc), eventDoc };
     }
 
     throw lastError ?? new WorkflowWorldError(`Failed to transition run "${runId}"`);
   }
 
   /**
-   * Internal: create a step entity in Cosmos DB (called from events.create for step_created).
-   * Uses a transactional batch to atomically create the event and step documents
-   * within the same partition (runId).
+   * Internal: create a step entity (called from events.create for
+   * step_created and the lazy step_started create). The creation event and
+   * the step document commit in one transactional batch.
    */
   async function createStepFromEvent(
     runId: string,
     stepId: string,
     data: { stepName: string; input: unknown },
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<{ step: Step }> {
-    const now = new Date();
+    specVersion: number,
+    body: EventBody,
+  ): Promise<{ step: Step; eventDoc: CosmosDoc }> {
+    const now = new Date(body.createdAt);
     const step: CosmosDoc = {
       id: `step:${runId}:${stepId}`,
       type: 'step' as DocType,
@@ -730,24 +767,22 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       stepName: data.stepName,
       status: 'pending',
       input: encodeCbor(data.input),
-      attempt: 1,
+      attempt: 0,
+      specVersion,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
 
+    let eventDoc: CosmosDoc;
     try {
-      await commitBatch(
-        [
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(step) },
-        ],
-        runId,
-        guard,
-      );
+      eventDoc = await commitEventAtNextSlot(body, () => [
+        { operationType: BulkOperationType.Create, resourceBody: toResourceBody(step) },
+      ]);
     } catch (error: unknown) {
-      // See createRunFromEvent: batch errors are opaque, so re-read to
-      // classify. Duplicate step_created -> EntityConflictError, which the
-      // runtime's concurrent-replay catch path swallows.
+      // Batch errors are opaque, so re-read to classify. Duplicate
+      // step_created -> EntityConflictError, which the runtime's
+      // concurrent-replay catch path swallows (and the owned-inline path
+      // maps to `skipped`).
       if (isConflictError(error) || isWrappedBatchError(error)) {
         const existing = await getStepDoc(runId, stepId);
         if (existing) {
@@ -758,12 +793,12 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       }
       throw error;
     }
-    return { step: deserializeStep(step) };
+    return { step: deserializeStep(step), eventDoc };
   }
 
   /**
-   * Internal: transition a step entity in Cosmos DB (called from events.create
-   * for step_started/step_completed/step_failed/step_retrying).
+   * Internal: transition a step entity (called from events.create for
+   * step_started/step_completed/step_failed/step_retrying).
    *
    * Same atomic event + etag-guarded replace pattern as updateRunFromEvent.
    */
@@ -772,9 +807,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     stepId: string,
     eventType: string,
     eventData: Record<string, unknown> | undefined,
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<Step> {
+    body: EventBody,
+  ): Promise<{ step: Step; eventDoc: CosmosDoc }> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
       const doc = await getStepDoc(runId, stepId);
@@ -813,9 +847,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           }
           // The step is running now; clear any pending retry schedule.
           delete doc.retryAfter;
-          if (eventData?.attempt !== undefined) {
-            doc.attempt = eventData.attempt;
-          }
+          doc.attempt = (typeof doc.attempt === 'number' ? doc.attempt : 0) + 1;
           break;
         }
         case 'step_completed': {
@@ -842,25 +874,20 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           if (eventData?.retryAfter !== undefined) {
             doc.retryAfter = new Date(eventData.retryAfter as string | number | Date).toISOString();
           }
-          doc.attempt = (typeof doc.attempt === 'number' ? doc.attempt : 1) + 1;
           break;
         }
       }
 
+      let eventDoc: CosmosDoc;
       try {
-        await commitBatch(
-          [
-            { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-            {
-              operationType: BulkOperationType.Replace,
-              id: doc.id as string,
-              ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
-              resourceBody: toResourceBody(doc),
-            },
-          ],
-          runId,
-          guard,
-        );
+        eventDoc = await commitEventAtNextSlot(body, () => [
+          {
+            operationType: BulkOperationType.Replace,
+            id: doc.id as string,
+            ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
+            resourceBody: toResourceBody(doc),
+          },
+        ]);
       } catch (error: unknown) {
         if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
           lastError = error;
@@ -869,7 +896,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         throw error;
       }
 
-      return deserializeStep(doc);
+      return { step: deserializeStep(doc), eventDoc };
     }
 
     throw lastError ?? new WorkflowWorldError(`Failed to transition step "${stepId}"`);
@@ -885,10 +912,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     correlationId: string,
     eventData: Record<string, unknown> | undefined,
     specVersion: number,
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<Wait> {
-    const now = new Date();
+    body: EventBody,
+  ): Promise<{ wait: Wait; eventDoc: CosmosDoc }> {
+    const now = new Date(body.createdAt);
     const waitDoc: CosmosDoc = {
       id: `wait:${runId}:${correlationId}`,
       type: 'wait' as DocType,
@@ -902,15 +928,11 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       updatedAt: now.toISOString(),
     };
 
+    let eventDoc: CosmosDoc;
     try {
-      await commitBatch(
-        [
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(waitDoc) },
-        ],
-        runId,
-        guard,
-      );
+      eventDoc = await commitEventAtNextSlot(body, () => [
+        { operationType: BulkOperationType.Create, resourceBody: toResourceBody(waitDoc) },
+      ]);
     } catch (error: unknown) {
       if (isConflictError(error) || isWrappedBatchError(error)) {
         const existing = await readRunPartitionDoc(runId, `wait:${runId}:${correlationId}`);
@@ -920,7 +942,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       }
       throw error;
     }
-    return deserializeWait(waitDoc);
+    return { wait: deserializeWait(waitDoc), eventDoc };
   }
 
   /**
@@ -931,9 +953,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
   async function completeWaitFromEvent(
     runId: string,
     correlationId: string,
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<Wait> {
+    body: EventBody,
+  ): Promise<{ wait: Wait; eventDoc: CosmosDoc }> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
       const doc = await readRunPartitionDoc(runId, `wait:${runId}:${correlationId}`);
@@ -949,20 +970,16 @@ export function createStorage(config: CosmosStorageConfig): Storage {
       doc.completedAt = now.toISOString();
       doc.updatedAt = now.toISOString();
 
+      let eventDoc: CosmosDoc;
       try {
-        await commitBatch(
-          [
-            { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-            {
-              operationType: BulkOperationType.Replace,
-              id: doc.id as string,
-              ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
-              resourceBody: toResourceBody(doc),
-            },
-          ],
-          runId,
-          guard,
-        );
+        eventDoc = await commitEventAtNextSlot(body, () => [
+          {
+            operationType: BulkOperationType.Replace,
+            id: doc.id as string,
+            ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
+            resourceBody: toResourceBody(doc),
+          },
+        ]);
       } catch (error: unknown) {
         if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
           lastError = error;
@@ -971,7 +988,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         throw error;
       }
 
-      return deserializeWait(doc);
+      return { wait: deserializeWait(doc), eventDoc };
     }
 
     throw lastError ?? new WorkflowWorldError(`Failed to complete wait "${correlationId}"`);
@@ -988,18 +1005,13 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     runId: string,
     hookId: string,
     hookDoc: CosmosDoc,
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<void> {
+    body: EventBody,
+  ): Promise<{ eventDoc: CosmosDoc }> {
+    let eventDoc: CosmosDoc;
     try {
-      await commitBatch(
-        [
-          { operationType: BulkOperationType.Create, resourceBody: toResourceBody(eventDoc) },
-          { operationType: BulkOperationType.Delete, id: hookDoc.id as string },
-        ],
-        runId,
-        guard,
-      );
+      eventDoc = await commitEventAtNextSlot(body, () => [
+        { operationType: BulkOperationType.Delete, id: hookDoc.id as string },
+      ]);
     } catch (error: unknown) {
       if (isWrappedBatchError(error) || isNotFoundError(error)) {
         const still = await readRunPartitionDoc(runId, hookDoc.id as string);
@@ -1022,6 +1034,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         }
       }
     }
+    return { eventDoc };
   }
 
   /**
@@ -1083,10 +1096,9 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     hookId: string,
     data: { token: string; metadata?: unknown; isWebhook?: boolean },
     specVersion: number,
-    eventDoc: CosmosDoc,
-    guard: StateGuard,
-  ): Promise<{ hook?: Hook; conflictEvent?: Event }> {
-    const now = new Date();
+    body: EventBody,
+  ): Promise<{ hook?: Hook; conflictEventDoc?: CosmosDoc; eventDoc?: CosmosDoc }> {
+    const now = new Date(body.createdAt);
 
     const hookDoc: CosmosDoc = {
       id: `hook:${runId}:${hookId}`,
@@ -1123,7 +1135,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
      */
     async function handleClaimedToken(
       claim: Record<string, unknown>,
-    ): Promise<{ hook?: Hook; conflictEvent?: Event }> {
+    ): Promise<{ hook?: Hook; conflictEventDoc?: CosmosDoc; eventDoc?: CosmosDoc }> {
       if (claim.runId === runId && claim.hookId === hookId) {
         if (await hasHookCreatedEvent(runId, hookId)) {
           // Real duplicate: the entity and its event are both committed.
@@ -1137,38 +1149,24 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         } catch (error: unknown) {
           if (!isConflictError(error)) throw error;
         }
-        await commitEventDoc(eventDoc, runId, guard);
-        return { hook: deserializeHook(claim) };
+        const eventDoc = await commitEventAtNextSlot(body);
+        return { hook: deserializeHook(claim), eventDoc };
       }
 
       // Cross-run conflict: a different (runId, hookId) holds this token.
       // Store a hook_conflict event instead of throwing.
-      const conflictEventData = {
-        token: data.token,
-        conflictingRunId: claim.runId as string,
-      };
-      const conflictDoc: CosmosDoc = {
-        id: eventDoc.id,
-        type: 'event' as DocType,
+      const conflictEventDoc = await commitEventAtNextSlot({
         runId,
-        eventId: eventDoc.eventId,
         eventType: 'hook_conflict',
         correlationId: hookId,
-        eventData: encodeCbor(conflictEventData),
+        eventData: encodeCbor({
+          token: data.token,
+          conflictingRunId: claim.runId as string,
+        }),
         specVersion,
-        createdAt: now.toISOString(),
-      };
-      await commitEventDoc(conflictDoc, runId, guard);
-      const conflictEvent = EventSchema.parse({
-        runId,
-        eventId: eventDoc.eventId,
-        eventType: 'hook_conflict',
-        correlationId: hookId,
-        eventData: conflictEventData,
-        specVersion,
-        createdAt: now,
+        createdAt: body.createdAt,
       });
-      return { conflictEvent };
+      return { conflictEventDoc };
     }
 
     const existingClaim = await readHookTokenDoc(data.token);
@@ -1201,7 +1199,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
 
     // Commit the hook_created event last so a crash above leaves orphaned hook
     // docs that the recovery path can complete instead of an event without entity.
-    await commitEventDoc(eventDoc, runId, guard);
+    const eventDoc = await commitEventAtNextSlot(body);
 
     const parsed = HookSchema.parse(
       compact({
@@ -1217,7 +1215,7 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         isWebhook: data.isWebhook,
       }),
     );
-    return { hook: parsed };
+    return { hook: parsed, eventDoc };
   }
 
   /**
@@ -1254,6 +1252,696 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     }
     await Promise.all(deleteOps);
   }
+
+  /** Load a run's full event log for the run_started preload, in slot order. */
+  async function preloadAllEvents(
+    runId: string,
+    resolveData: ResolveData,
+  ): Promise<{ events: Event[]; cursor: string | null; hasMore: false }> {
+    const eventsQuery: SqlQuerySpec = {
+      query:
+        'SELECT * FROM c WHERE c.type = "event" AND c.runId = @runId ORDER BY c.eventId ASC',
+      parameters: [{ name: '@runId', value: runId }],
+    };
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(eventsQuery, { partitionKey: runId }).fetchAll(),
+    );
+    const events = resources.map((doc: Record<string, unknown>) =>
+      stripEventDataRefs(deserializeEvent(doc), resolveData),
+    );
+    return { events, cursor: events.at(-1)?.eventId ?? null, hasMore: false };
+  }
+
+  /** Read one page of a run's event log, `events.list` semantics. */
+  async function listEventsImpl(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
+    const { runId } = params;
+    const resolveData = params?.resolveData ?? 'all';
+    const limit = params?.pagination?.limit ?? 100;
+    const sortOrder = params.pagination?.sortOrder || 'asc';
+    const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
+
+    // Order and paginate by eventId: slot ids are fixed-width decimals, so
+    // lexicographic order is positional order, and the cursor predicate can
+    // never skip events sharing a boundary timestamp.
+    const conditions: string[] = ['c.type = "event"', 'c.runId = @runId'];
+    const parameters: { name: string; value: string | number }[] = [
+      { name: '@runId', value: runId },
+    ];
+
+    if (params?.pagination?.cursor) {
+      const op = sortOrder === 'asc' ? '>' : '<';
+      conditions.push(`c.eventId ${op} @cursor`);
+      parameters.push({ name: '@cursor', value: params.pagination.cursor });
+    }
+
+    const querySpec: SqlQuerySpec = {
+      query: `SELECT * FROM c WHERE ${conditions.join(' AND ')} ORDER BY c.eventId ${orderDir} OFFSET 0 LIMIT @limit`,
+      parameters: [...parameters, { name: '@limit', value: limit + 1 }],
+    };
+
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
+
+    const values = resources.slice(0, limit);
+    const hasMore = resources.length > limit;
+
+    return {
+      data: values.map((doc: Record<string, unknown>) =>
+        stripEventDataRefs(deserializeEvent(doc), resolveData),
+      ),
+      cursor:
+        values.length > 0
+          ? ((values[values.length - 1] as Record<string, unknown>).eventId as string)
+          : null,
+      hasMore,
+    };
+  }
+
+  /**
+   * The report half of bump-and-report: when the committed slot exceeds
+   * `eventCount + 1`, return the events occupying the skipped span so the
+   * writer learns its snapshot was stale without the write being rejected.
+   * `cursor` stays null: the report is a lower bound, not a read position.
+   */
+  async function reportSkippedSlots(
+    result: EventResult,
+    askedFor: number,
+    resolveData: ResolveData,
+  ): Promise<EventResult> {
+    if (!result.event) {
+      return result;
+    }
+    const committedSlot = eventIdToSlot(result.event.eventId);
+    if (committedSlot === null || askedFor < FIRST_EVENT_SLOT - 1 || committedSlot <= askedFor + 1) {
+      return result;
+    }
+    const span = committedSlot - askedFor - 1;
+    const runId = result.event.runId;
+    const querySpec: SqlQuerySpec = {
+      query:
+        'SELECT * FROM c WHERE c.type = "event" AND c.runId = @runId ' +
+        'AND c.eventId >= @from AND c.eventId <= @to ORDER BY c.eventId ASC',
+      parameters: [
+        { name: '@runId', value: runId },
+        { name: '@from', value: slotToEventId(askedFor + 1) },
+        { name: '@to', value: slotToEventId(committedSlot - 1) },
+      ],
+    };
+    const { resources } = await withCosmosRetry(() =>
+      container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
+    );
+    const events = resources.map((doc: Record<string, unknown>) =>
+      stripEventDataRefs(deserializeEvent(doc), resolveData),
+    );
+    return {
+      ...result,
+      events,
+      cursor: null,
+      hasMore: events.length < span,
+    };
+  }
+
+  /**
+   * Handle events for legacy runs (pre-event-sourcing, specVersion <= 1).
+   * Legacy runs keep ULID event ids so the log's identity scheme stays
+   * uniform within one run.
+   */
+  async function handleLegacyEvent(
+    runId: string,
+    data: CreateEventRequest | RunCreatedEventRequest,
+    resolveData: ResolveData,
+  ): Promise<EventResult> {
+    switch (data.eventType) {
+      case 'run_cancelled': {
+        // Legacy: no event storage; transition the run entity directly.
+        let lastError: unknown;
+        for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
+          const doc = await getRunDoc(runId);
+          if (!doc) return {};
+          if (doc.status === 'cancelled') {
+            return { run: filterData(deserializeRun(doc), resolveData, ['input', 'output']) };
+          }
+          const now = new Date();
+          doc.status = 'cancelled';
+          doc.completedAt = now.toISOString();
+          doc.updatedAt = now.toISOString();
+          try {
+            await commitBatch(
+              [
+                {
+                  operationType: BulkOperationType.Replace,
+                  id: doc.id as string,
+                  ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
+                  resourceBody: toResourceBody(doc),
+                },
+              ],
+              runId,
+            );
+          } catch (error: unknown) {
+            if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
+              lastError = error;
+              continue;
+            }
+            throw error;
+          }
+          await cleanupRunScopedEntities(runId);
+          return { run: filterData(deserializeRun(doc), resolveData, ['input', 'output']) };
+        }
+        throw lastError ?? new WorkflowWorldError(`Failed to cancel legacy run "${runId}"`);
+      }
+
+      case 'wait_completed':
+      case 'hook_received': {
+        const eventId = `wevt_${ulid()}`;
+        const now = new Date();
+        const eventData =
+          'eventData' in data ? (data.eventData as Record<string, unknown> | undefined) : undefined;
+        const eventDoc: CosmosDoc = {
+          id: `event:${runId}:${eventId}`,
+          type: 'event' as DocType,
+          runId,
+          eventId,
+          eventType: data.eventType,
+          eventData: encodeCbor(eventData ?? {}),
+          specVersion: SPEC_VERSION_CURRENT,
+          createdAt: now.toISOString(),
+          ...('correlationId' in data &&
+            data.correlationId !== undefined && { correlationId: data.correlationId }),
+        };
+        await withCosmosRetry(() => container.items.create(eventDoc));
+        return { event: toEvent(eventDoc, resolveData) };
+      }
+
+      default:
+        throw new WorkflowWorldError(
+          `Event type '${data.eventType}' not supported for legacy runs. ` +
+            'Please upgrade @workflow packages.',
+          { status: 400 },
+        );
+    }
+  }
+
+  async function createImpl(
+    runId: string | null,
+    data: RunCreatedEventRequest | CreateEventRequest,
+    params?: CreateEventParams,
+  ): Promise<EventResult> {
+    const now = new Date();
+    const resolveData = params?.resolveData ?? 'all';
+
+    // For run_created events, generate a runId if null
+    const effectiveRunId =
+      runId && runId !== '' ? runId : data.eventType === 'run_created' ? `wrun_${ulid()}` : '';
+    if (!effectiveRunId) {
+      throw new WorkflowWorldError(`runId is required for ${data.eventType} events`, {
+        status: 400,
+      });
+    }
+
+    const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
+    const correlationId = 'correlationId' in data ? data.correlationId : undefined;
+    const eventData =
+      'eventData' in data ? (data.eventData as Record<string, unknown> | undefined) : undefined;
+
+    /** Event body for the main event of this create. */
+    const body: EventBody = {
+      runId: effectiveRunId,
+      eventType: data.eventType,
+      specVersion: effectiveSpecVersion,
+      createdAt: now.toISOString(),
+      ...(correlationId !== undefined && { correlationId }),
+      // run_started stores no eventData (its payload only bootstraps the run).
+      ...(data.eventType !== 'run_started' && { eventData: encodeCbor(eventData ?? {}) }),
+    };
+
+    // Entity creation: run_created writes the run and its creation event in
+    // one batch; a duplicate throws EntityConflictError everywhere.
+    if (data.eventType === 'run_created') {
+      const { run, eventDoc } = await createRunWithEvent(
+        effectiveRunId,
+        data.eventData,
+        effectiveSpecVersion,
+        body,
+      );
+      return {
+        event: toEvent(eventDoc, resolveData),
+        run: filterData(run, resolveData, ['input', 'output']),
+        maxEvents: maxEventsPerRun,
+      };
+    }
+
+    let runDoc = await getRunDoc(effectiveRunId);
+
+    // ============================================================
+    // RESILIENT START: Bootstrap run from run_started eventData. The
+    // synthetic run_created takes the earlier slot, so it replays first.
+    // ============================================================
+    if (data.eventType === 'run_started' && !runDoc && eventData) {
+      const runInputData = eventData as RunCreatedEventRequest['eventData'];
+      if (
+        runInputData.deploymentId &&
+        runInputData.workflowName &&
+        runInputData.input !== undefined
+      ) {
+        try {
+          await createRunWithEvent(
+            effectiveRunId,
+            runInputData,
+            effectiveSpecVersion,
+            {
+              runId: effectiveRunId,
+              eventType: 'run_created',
+              specVersion: effectiveSpecVersion,
+              createdAt: now.toISOString(),
+              eventData: encodeCbor({
+                deploymentId: runInputData.deploymentId,
+                workflowName: runInputData.workflowName,
+                input: runInputData.input,
+                executionContext: runInputData.executionContext,
+                ...(runInputData.attributes !== undefined && {
+                  attributes: runInputData.attributes,
+                }),
+                ...(runInputData.allowReservedAttributes !== undefined && {
+                  allowReservedAttributes: runInputData.allowReservedAttributes,
+                }),
+                ...(runInputData.encryptionPublicKey !== undefined && {
+                  encryptionPublicKey: runInputData.encryptionPublicKey,
+                }),
+              }),
+            },
+          );
+        } catch (error: unknown) {
+          // A concurrent run_created won the race; the run exists, which is
+          // all the bootstrap needs.
+          if (!(error instanceof EntityConflictError)) {
+            throw error;
+          }
+        }
+        runDoc = await getRunDoc(effectiveRunId);
+      }
+    }
+
+    // Match the first-party worlds: these events reject on a non-existent run
+    // rather than persisting an orphan event.
+    if (
+      !runDoc &&
+      (data.eventType === 'run_failed' ||
+        data.eventType === 'attr_set' ||
+        data.eventType === 'run_started')
+    ) {
+      throw new WorkflowRunNotFoundError(effectiveRunId);
+    }
+
+    // ============================================================
+    // VERSION COMPATIBILITY: Check run spec version
+    // ============================================================
+    if (runDoc) {
+      const runSpecVersion = runDoc.specVersion as number | undefined;
+      if (requiresNewerWorld(runSpecVersion)) {
+        throw new RunNotSupportedError(runSpecVersion as number, SPEC_VERSION_CURRENT);
+      }
+      if (isLegacySpecVersion(runSpecVersion)) {
+        return handleLegacyEvent(effectiveRunId, data, resolveData);
+      }
+    }
+
+    // Lazy step start: a step_started carrying step-creation data (stepName +
+    // input) may arrive with no prior step_created and creates the step on
+    // the fly, mirroring the resilient run_started path.
+    const createsChildEntity = isChildEntityCreationEvent(data);
+    const lazyStepStart = createsChildEntity && data.eventType === 'step_started';
+
+    // ============================================================
+    // VALIDATION: terminal-state and event-ordering guards. These run
+    // BEFORE any write so rejected duplicates can never corrupt the log:
+    // - RunExpiredError: run already terminal -> skip the message
+    // - EntityConflictError: duplicate/terminal entity -> treat as an
+    //   idempotent concurrent replay and continue
+    // - TooEarlyError: step retryAfter not reached -> defer via queue
+    // ============================================================
+    const runStatus = runDoc?.status as string | undefined;
+    const runIsTerminal = runStatus !== undefined && isTerminalWorkflowRunStatus(runStatus);
+    if (runIsTerminal && runDoc) {
+      // Idempotent operation: run_cancelled on an already cancelled run
+      // records the event without re-transitioning the run.
+      if (data.eventType === 'run_cancelled' && runStatus === 'cancelled') {
+        const eventDoc = await commitEventAtNextSlot(body);
+        return {
+          event: toEvent(eventDoc, resolveData),
+          run: filterData(deserializeRun(runDoc), resolveData, ['input', 'output']),
+          maxEvents: maxEventsPerRun,
+        };
+      }
+      // For run_started on terminal runs, use RunExpiredError so the runtime
+      // knows to exit without retrying.
+      if (data.eventType === 'run_started') {
+        throw new RunExpiredError(
+          `Workflow run "${effectiveRunId}" is already in terminal state "${runStatus}"`,
+        );
+      }
+      if (isTerminalRunEventType(data.eventType)) {
+        throw new EntityConflictError(`Cannot transition run from terminal state "${runStatus}"`);
+      }
+      if (createsChildEntity) {
+        throw new EntityConflictError(
+          `Cannot create new entities on run in terminal state "${runStatus}"`,
+        );
+      }
+      if (data.eventType === 'attr_set') {
+        throw new EntityConflictError(
+          `Cannot set attributes on run in terminal state "${runStatus}"`,
+        );
+      }
+    }
+
+    // Step-related event validation (ordering and terminal state)
+    let validatedStepDoc: CosmosDoc | undefined;
+    const stepEventNeedsStep = isStepEventType(data.eventType) && data.eventType !== 'step_created';
+    if (stepEventNeedsStep && correlationId) {
+      validatedStepDoc = await getStepDoc(effectiveRunId, correlationId);
+      if (!validatedStepDoc && !lazyStepStart) {
+        throw new WorkflowWorldError(`Step not found: ${correlationId}`, { status: 404 });
+      }
+      // Lazy start exactly-once gate: a lazy step_started always CREATES the
+      // step. An existing step means a concurrent handler won the create;
+      // EntityConflictError maps to `skipped` in the runtime's executeStep.
+      if (lazyStepStart && validatedStepDoc) {
+        throw new EntityConflictError(`Step "${correlationId}" already created`);
+      }
+      if (validatedStepDoc) {
+        const stepStatus = validatedStepDoc.status as string;
+        if (isTerminalStepStatus(stepStatus)) {
+          throw new EntityConflictError(`Cannot modify step in terminal state "${stepStatus}"`);
+        }
+        if (runIsTerminal && stepStatus !== 'running') {
+          throw new RunExpiredError(
+            `Cannot modify non-running step on run in terminal state "${runStatus}"`,
+          );
+        }
+      }
+    }
+
+    // Event ordering: hook_received/hook_disposed require an existing hook.
+    let existingHookDoc: CosmosDoc | undefined;
+    if (isHookEventRequiringExistence(data.eventType) && correlationId) {
+      existingHookDoc = await readRunPartitionDoc(
+        effectiveRunId,
+        `hook:${effectiveRunId}:${correlationId}`,
+      );
+      if (!existingHookDoc) {
+        throw new HookNotFoundError(correlationId);
+      }
+    }
+
+    // Entity side effects. All entity-bearing events commit the event
+    // document and the entity mutation in one same-partition transactional
+    // batch, with the slot taken at that commit.
+    switch (data.eventType) {
+      case 'step_created': {
+        const { step, eventDoc } = await createStepFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          data.eventData,
+          effectiveSpecVersion,
+          body,
+        );
+        return { event: toEvent(eventDoc, resolveData), step };
+      }
+      case 'hook_created': {
+        const hookEventData = eventData as {
+          token: string;
+          metadata?: unknown;
+          isWebhook?: boolean;
+        };
+
+        if (!correlationId) {
+          console.error('[hook_created] Missing correlationId');
+        }
+        if (!hookEventData.token) {
+          console.error('[hook_created] Missing token in eventData');
+        }
+
+        const { hook, conflictEventDoc, eventDoc } = await createHookFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          hookEventData,
+          effectiveSpecVersion,
+          body,
+        );
+        if (conflictEventDoc) {
+          return { event: toEvent(conflictEventDoc, resolveData) };
+        }
+        return {
+          ...(eventDoc && { event: toEvent(eventDoc, resolveData) }),
+          hook,
+        };
+      }
+      case 'hook_disposed': {
+        const { eventDoc } = await disposeHookFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          existingHookDoc as CosmosDoc,
+          body,
+        );
+        return { event: toEvent(eventDoc, resolveData) };
+      }
+      case 'wait_created': {
+        const { wait, eventDoc } = await createWaitFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          eventData,
+          effectiveSpecVersion,
+          body,
+        );
+        return { event: toEvent(eventDoc, resolveData), wait };
+      }
+      case 'wait_completed': {
+        const { wait, eventDoc } = await completeWaitFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          body,
+        );
+        return { event: toEvent(eventDoc, resolveData), wait };
+      }
+      case 'attr_set': {
+        // Merge the changes onto the run entity, committed atomically with
+        // the event. A workflow-writer attr_set with a correlationId carries
+        // a claim document in the same batch, so a replayed event cannot
+        // apply (or log) twice.
+        const changes = data.eventData.changes;
+        const needsClaim = data.eventData.writer.type === 'workflow' && correlationId !== undefined;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
+          const doc = await getRunDoc(effectiveRunId);
+          if (!doc) {
+            throw new WorkflowRunNotFoundError(effectiveRunId);
+          }
+          const existingAttributes = (doc.attributes ?? {}) as Record<string, string>;
+          validateAttributeChanges(changes, {
+            existingKeys: Object.keys(existingAttributes),
+            allowReservedAttributes: data.eventData.allowReservedAttributes === true,
+          });
+          doc.attributes = applyAttributeChanges(existingAttributes, changes);
+          doc.updatedAt = now.toISOString();
+          try {
+            const eventDoc = await commitEventAtNextSlot(body, () => [
+              {
+                operationType: BulkOperationType.Replace,
+                id: doc.id as string,
+                ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
+                resourceBody: toResourceBody(doc),
+              },
+              ...(needsClaim
+                ? [
+                    {
+                      operationType: BulkOperationType.Create,
+                      resourceBody: toResourceBody({
+                        id: `attrclaim:${effectiveRunId}:${correlationId}`,
+                        type: 'attrclaim' as DocType,
+                        runId: effectiveRunId,
+                      }),
+                    },
+                  ]
+                : []),
+            ]);
+            return {
+              event: toEvent(eventDoc, resolveData),
+              run: filterData(deserializeRun(doc), resolveData, ['input', 'output']),
+            };
+          } catch (error: unknown) {
+            // The claim Create is the batch's last operation; its 409 means
+            // this attr_set already applied on a previous delivery.
+            if (
+              error instanceof BatchOperationError &&
+              error.index === (needsClaim ? 2 : -1) &&
+              error.code === 409
+            ) {
+              throw new EntityConflictError(
+                `Attribute event "${correlationId}" already exists`,
+              );
+            }
+            if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
+              lastError = error;
+              continue;
+            }
+            throw error;
+          }
+        }
+        throw (
+          lastError ??
+          new WorkflowWorldError(`Concurrent update contention on run "${effectiveRunId}"`, {
+            status: 500,
+          })
+        );
+      }
+      case 'run_started': {
+        // Idempotency: run_started on an already running run is a replay;
+        // return the run without appending a duplicate event. Core reads the
+        // per-run event ceiling only from the run_started response, so it
+        // must be present on this path too.
+        if (runStatus === 'running' && runDoc) {
+          const run = filterData(deserializeRun(runDoc), resolveData, [
+            'input',
+            'output',
+          ]) as WorkflowRun;
+          if (params?.skipPreload) {
+            return { run, maxEvents: maxEventsPerRun };
+          }
+          const preloaded = await preloadAllEvents(effectiveRunId, resolveData);
+          return {
+            run,
+            events: preloaded.events,
+            cursor: preloaded.cursor,
+            hasMore: preloaded.hasMore,
+            maxEvents: maxEventsPerRun,
+          };
+        }
+        const { run, eventDoc } = await updateRunFromEvent(
+          effectiveRunId,
+          data.eventType,
+          eventData,
+          body,
+        );
+        const filtered = filterData(run, resolveData, ['input', 'output']) as WorkflowRun;
+        if (params?.skipPreload) {
+          return {
+            ...(eventDoc && { event: toEvent(eventDoc, resolveData) }),
+            run: filtered,
+            maxEvents: maxEventsPerRun,
+          };
+        }
+        // Preload all events for run_started to reduce TTFB, in slot order.
+        const preloaded = await preloadAllEvents(effectiveRunId, resolveData);
+        return {
+          ...(eventDoc && { event: toEvent(eventDoc, resolveData) }),
+          run: filtered,
+          events: preloaded.events,
+          cursor: preloaded.cursor,
+          hasMore: preloaded.hasMore,
+          maxEvents: maxEventsPerRun,
+        };
+      }
+      case 'run_completed':
+      case 'run_failed':
+      case 'run_cancelled': {
+        const { run, eventDoc } = await updateRunFromEvent(
+          effectiveRunId,
+          data.eventType,
+          eventData,
+          body,
+        );
+        return {
+          ...(eventDoc && { event: toEvent(eventDoc, resolveData) }),
+          run: filterData(run, resolveData, ['input', 'output']),
+          maxEvents: maxEventsPerRun,
+        };
+      }
+      case 'step_started': {
+        let stepCreatedLazily = false;
+        if (lazyStepStart && !validatedStepDoc) {
+          // The lazy path creates the step (the batch Create is the
+          // exactly-once ownership claim) plus a synthetic step_created
+          // event at the prior slot.
+          const lazyData = data.eventData as { stepName: string; input: unknown };
+          await createStepFromEvent(
+            effectiveRunId,
+            correlationId as string,
+            lazyData,
+            effectiveSpecVersion,
+            {
+              runId: effectiveRunId,
+              eventType: 'step_created',
+              correlationId: correlationId as string,
+              specVersion: effectiveSpecVersion,
+              createdAt: now.toISOString(),
+              eventData: encodeCbor({ stepName: lazyData.stepName, input: lazyData.input }),
+            },
+          );
+          stepCreatedLazily = true;
+        }
+        const { step, eventDoc } = await updateStepFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          data.eventType,
+          eventData,
+          body,
+        );
+        return {
+          event: toEvent(eventDoc, resolveData),
+          step,
+          ...(stepCreatedLazily ? { stepCreated: true as const } : {}),
+        };
+      }
+      case 'step_completed':
+      case 'step_failed':
+      case 'step_retrying': {
+        const { step, eventDoc } = await updateStepFromEvent(
+          effectiveRunId,
+          correlationId as string,
+          data.eventType,
+          eventData,
+          body,
+        );
+        return { event: toEvent(eventDoc, resolveData), step };
+      }
+      default: {
+        // hook_received (and any future event-only types): store the event;
+        // no entity mutation needed at the storage level.
+        const eventDoc = await commitEventAtNextSlot(body);
+        return { event: toEvent(eventDoc, resolveData) };
+      }
+    }
+  }
+
+  const create = (async (
+    runId: string | null,
+    data: RunCreatedEventRequest | CreateEventRequest,
+    params?: CreateEventParams,
+  ): Promise<EventResult> => {
+    const result = await createImpl(runId, data, params);
+    const resolveData = params?.resolveData ?? 'all';
+
+    // Inline-delta optimization: the delta of events strictly after
+    // `sinceCursor`, exactly what `events.list` would return right now. It
+    // wins over the skipped-slot report (a strict superset, and the only one
+    // of the two that advances the caller's cursor), and applies to the
+    // hook_conflict a claimed-token create commits instead.
+    if (typeof params?.sinceCursor === 'string' && result.event) {
+      const page = await listEventsImpl({
+        runId: result.event.runId,
+        pagination: { cursor: params.sinceCursor, sortOrder: 'asc' },
+        resolveData,
+      });
+      return { ...result, events: page.data, cursor: page.cursor, hasMore: page.hasMore };
+    }
+
+    if (params?.eventCount !== undefined && result.event && result.events === undefined) {
+      return reportSkippedSlots(result, params.eventCount, resolveData);
+    }
+
+    return result;
+  }) as Storage['events']['create'];
 
   return {
     runs: {
@@ -1315,457 +2003,60 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           hasMore,
         };
       },
+
+      // Merge attribute changes onto the run entity via an etag-guarded
+      // replace, returning the post-merge snapshot.
+      async experimentalSetAttributes(
+        runId: string,
+        changes: AttributeChange[],
+        options?: { allowReservedAttributes?: boolean },
+      ) {
+        let lastError: unknown;
+        for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
+          const doc = await getRunDoc(runId);
+          if (!doc) {
+            throw new WorkflowRunNotFoundError(runId);
+          }
+          const existingAttributes = (doc.attributes ?? {}) as Record<string, string>;
+          validateAttributeChanges(changes, {
+            existingKeys: Object.keys(existingAttributes),
+            allowReservedAttributes: options?.allowReservedAttributes === true,
+          });
+          const attributes = applyAttributeChanges(existingAttributes, changes);
+          doc.attributes = attributes;
+          doc.updatedAt = new Date().toISOString();
+          try {
+            await commitBatch(
+              [
+                {
+                  operationType: BulkOperationType.Replace,
+                  id: doc.id as string,
+                  ...(typeof doc._etag === 'string' && { ifMatch: doc._etag }),
+                  resourceBody: toResourceBody(doc),
+                },
+              ],
+              runId,
+            );
+          } catch (error: unknown) {
+            if (isWrappedBatchError(error) || isPreconditionFailedError(error)) {
+              lastError = error;
+              continue;
+            }
+            throw error;
+          }
+          return { attributes };
+        }
+        throw (
+          lastError ??
+          new WorkflowWorldError(`Concurrent update contention on run "${runId}"`, {
+            status: 500,
+          })
+        );
+      },
     } as Storage['runs'],
 
     events: {
-      async create(
-        runId: string | null,
-        data: RunCreatedEventRequest | CreateEventRequest,
-        params?: CreateEventParams,
-      ): Promise<EventResult> {
-        const now = new Date();
-        // Resolved once so every return site below strips the same way.
-        const resolveData = params?.resolveData ?? 'all';
-
-        // For run_created events, generate a runId if null
-        const effectiveRunId = runId ?? (data.eventType === 'run_created' ? `wrun_${ulid()}` : '');
-
-        const effectiveSpecVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
-        const correlationId = 'correlationId' in data ? data.correlationId : undefined;
-        const eventData =
-          'eventData' in data ? (data.eventData as Record<string, unknown> | undefined) : undefined;
-
-        // ============================================================
-        // RESILIENT START: Bootstrap run from run_started eventData.
-        // Runs BEFORE the main eventId is allocated so the synthetic
-        // run_created ULID orders before this run_started in the
-        // eventId-sorted log.
-        // ============================================================
-        if (data.eventType === 'run_started' && eventData) {
-          const runInputData = eventData as {
-            deploymentId?: string;
-            workflowName?: string;
-            input?: unknown;
-            executionContext?: Record<string, unknown>;
-          };
-          if (
-            runInputData.deploymentId &&
-            runInputData.workflowName &&
-            runInputData.input !== undefined &&
-            !(await getRunDoc(effectiveRunId))
-          ) {
-            const runCreatedEventId = `wevt_${ulid()}`;
-            const runDoc: CosmosDoc = {
-              id: `run:${effectiveRunId}`,
-              type: 'run' as DocType,
-              runId: effectiveRunId,
-              workflowName: runInputData.workflowName,
-              specVersion: effectiveSpecVersion,
-              status: 'pending',
-              input: encodeCbor(runInputData.input),
-              executionContext: runInputData.executionContext,
-              deploymentId: runInputData.deploymentId,
-              createdAt: now.toISOString(),
-              updatedAt: now.toISOString(),
-            };
-            const syntheticEventDoc: CosmosDoc = {
-              id: `event:${effectiveRunId}:${runCreatedEventId}`,
-              type: 'event' as DocType,
-              runId: effectiveRunId,
-              eventId: runCreatedEventId,
-              eventType: 'run_created',
-              eventData: encodeCbor({
-                deploymentId: runInputData.deploymentId,
-                workflowName: runInputData.workflowName,
-                input: runInputData.input,
-                executionContext: runInputData.executionContext,
-              }),
-              specVersion: effectiveSpecVersion,
-              createdAt: now.toISOString(),
-            };
-            try {
-              await commitBatch(
-                [
-                  {
-                    operationType: BulkOperationType.Create,
-                    resourceBody: toResourceBody(syntheticEventDoc),
-                  },
-                  { operationType: BulkOperationType.Create, resourceBody: toResourceBody(runDoc) },
-                  // Seed the state marker with the bootstrapped run, matching
-                  // createRunFromEvent.
-                  {
-                    operationType: BulkOperationType.Create,
-                    resourceBody: toResourceBody(newStateMarkerDoc(effectiveRunId)),
-                  },
-                ],
-                effectiveRunId,
-              );
-            } catch (error: unknown) {
-              // A concurrent run_created won the race; the run exists,
-              // which is all the bootstrap needs.
-              if (isConflictError(error) || isWrappedBatchError(error)) {
-                if (!(await getRunDoc(effectiveRunId))) throw error;
-              } else {
-                throw error;
-              }
-            }
-          }
-        }
-
-        const eventId = `wevt_${ulid()}`;
-
-        const eventDoc: CosmosDoc = {
-          id: `event:${effectiveRunId}:${eventId}`,
-          type: 'event' as DocType,
-          runId: effectiveRunId,
-          eventId,
-          eventType: data.eventType,
-          eventData: encodeCbor(eventData || {}),
-          specVersion: effectiveSpecVersion,
-          createdAt: now.toISOString(),
-        };
-
-        // Strip eventData from run_started events before storage
-        if (data.eventType === 'run_started') {
-          delete eventDoc.eventData;
-        }
-
-        // Add optional correlationId if present
-        if (correlationId !== undefined) {
-          eventDoc.correlationId = correlationId;
-        }
-
-        // Parse and validate using EventSchema
-        // Note: Use original eventData (not encoded) for validation
-        const parsedInput: Record<string, unknown> = {
-          ...eventDoc,
-          eventData: eventData || {},
-          createdAt: now,
-        };
-        // Strip eventData from run_started events
-        if (data.eventType === 'run_started') {
-          delete parsedInput.eventData;
-        }
-        const parsed = EventSchema.parse(parsedInput);
-        const result: EventResult = { event: stripEventDataRefs(parsed, resolveData) };
-
-        // Cosmos has no serializable read, so the guard is a conditional Patch on the
-        // marker inside the same transactional batch as the event write. Strictly
-        // older snapshots are rejected; equal passes and absent fails open.
-        const stateUpdatedAt = params?.stateUpdatedAt;
-        const guard: StateGuard = { operations: [], stateUpdatedAt };
-        if (stateUpdatedAt !== undefined) {
-          const marker = await readStateMarker(effectiveRunId);
-          if (marker !== undefined) {
-            if (stateUpdatedAt < marker) {
-              throw new PreconditionFailedError(
-                `Event creation for run "${effectiveRunId}" is based on a stale snapshot ` +
-                  `(stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
-              );
-            }
-            guard.operations.push({
-              operationType: BulkOperationType.Patch,
-              id: stateMarkerId(effectiveRunId),
-              resourceBody: {
-                // Numeric literal built from a number we validated above, so
-                // there is nothing to interpolate unsafely.
-                condition: `from c where c.stateUpdatedAt <= ${stateUpdatedAt}`,
-                operations: [
-                  { op: PatchOperationType.set, path: '/guardCheckedAt', value: now.getTime() },
-                ],
-              },
-            });
-          }
-          // No marker document => run predates the guard (or has recorded no
-          // externally-originated event): nothing to be stale against.
-        } else if (EXTERNAL_EVENT_TYPES.has(data.eventType)) {
-          // Externally originated: this event becomes the new marker. Unconditional
-          // Upsert so a fan-out never contends on an etag; a racing advance can only
-          // leave the marker behind, which weakens the guard but never rejects.
-          const time = eventIdTime(eventId);
-          const marker = await readStateMarker(effectiveRunId);
-          if (time !== undefined && (marker === undefined || time > marker)) {
-            guard.operations.push({
-              operationType: BulkOperationType.Upsert,
-              resourceBody: toResourceBody({
-                ...newStateMarkerDoc(effectiveRunId),
-                stateUpdatedAt: time,
-              }),
-            });
-          }
-        }
-
-        // ============================================================
-        // VALIDATION: terminal-state and event-ordering guards.
-        // These run BEFORE the event document is written so rejected
-        // duplicates can never corrupt the replay log. The runtime
-        // relies on these errors (see @workflow/core step/run handlers):
-        // - RunExpiredError: run already terminal -> skip the message
-        // - EntityConflictError: duplicate/terminal entity -> treat as
-        //   an idempotent concurrent replay and continue
-        // - TooEarlyError: step retryAfter not reached -> defer via queue
-        // ============================================================
-        const runGuardedEvents = [
-          'run_started',
-          'run_completed',
-          'run_failed',
-          'run_cancelled',
-          'step_created',
-          'hook_created',
-          'wait_created',
-        ];
-        let currentRun: WorkflowRun | undefined;
-        if (runGuardedEvents.includes(data.eventType)) {
-          currentRun = await getRun(effectiveRunId);
-          const runIsTerminal = isTerminalWorkflowRunStatus(currentRun.status);
-
-          switch (data.eventType) {
-            case 'run_started': {
-              // For run_started on terminal runs, use RunExpiredError so the
-              // runtime knows to exit without retrying.
-              if (runIsTerminal) {
-                throw new RunExpiredError(
-                  `Workflow run "${effectiveRunId}" is already in terminal state "${currentRun.status}"`,
-                );
-              }
-              break;
-            }
-            case 'run_cancelled': {
-              // Idempotent operation: run_cancelled on an already cancelled run
-              // records the event without re-transitioning the run.
-              if (currentRun.status === 'cancelled') {
-                await commitEventDoc(eventDoc, effectiveRunId, guard);
-                result.run = currentRun;
-                return result;
-              }
-              if (runIsTerminal) {
-                throw new EntityConflictError(
-                  `Cannot transition run from terminal state "${currentRun.status}"`,
-                );
-              }
-              break;
-            }
-            case 'run_completed':
-            case 'run_failed': {
-              if (runIsTerminal) {
-                throw new EntityConflictError(
-                  `Cannot transition run from terminal state "${currentRun.status}"`,
-                );
-              }
-              break;
-            }
-            default: {
-              // step_created / hook_created / wait_created
-              if (runIsTerminal) {
-                throw new EntityConflictError(
-                  `Cannot create new entities on run in terminal state "${currentRun.status}"`,
-                );
-              }
-            }
-          }
-        }
-
-        const stepGuardedEvents = [
-          'step_started',
-          'step_completed',
-          'step_failed',
-          'step_retrying',
-        ];
-        if (stepGuardedEvents.includes(data.eventType) && correlationId) {
-          // Event ordering: the step must exist before these events (404 otherwise)
-          const currentStep = await getStep(effectiveRunId, correlationId);
-          if (isTerminalStepStatus(currentStep.status)) {
-            throw new EntityConflictError(
-              `Cannot modify step in terminal state "${currentStep.status}"`,
-            );
-          }
-          // Retried steps may be scheduled for later; defer early deliveries.
-          if (
-            data.eventType === 'step_started' &&
-            currentStep.retryAfter &&
-            currentStep.retryAfter.getTime() > Date.now()
-          ) {
-            throw new TooEarlyError(
-              `Cannot start step "${correlationId}": retryAfter timestamp has not been reached yet`,
-              {
-                retryAfter: Math.ceil((currentStep.retryAfter.getTime() - Date.now()) / 1000),
-              },
-            );
-          }
-        }
-
-        // Event ordering: hook_received/hook_disposed require an existing hook.
-        let existingHookDoc: CosmosDoc | undefined;
-        if (
-          (data.eventType === 'hook_received' || data.eventType === 'hook_disposed') &&
-          correlationId
-        ) {
-          existingHookDoc = await readRunPartitionDoc(
-            effectiveRunId,
-            `hook:${effectiveRunId}:${correlationId}`,
-          );
-          if (!existingHookDoc) {
-            throw new HookNotFoundError(correlationId);
-          }
-        }
-
-        // Entity side effects. All entity-bearing events commit the event
-        // document and the entity mutation in one same-partition
-        // transactional batch; the event doc is never written separately
-        // for these cases.
-        switch (data.eventType) {
-          case 'run_created': {
-            const { run } = await createRunFromEvent(
-              effectiveRunId,
-              eventData as RunCreatedEventRequest['eventData'],
-              effectiveSpecVersion,
-              eventDoc,
-            );
-            result.run = run;
-            break;
-          }
-          case 'step_created': {
-            const { step } = await createStepFromEvent(
-              effectiveRunId,
-              correlationId as string,
-              eventData as { stepName: string; input: unknown },
-              eventDoc,
-              guard,
-            );
-            result.step = step;
-            break;
-          }
-          case 'hook_created': {
-            const hookEventData = eventData as {
-              token: string;
-              metadata?: unknown;
-              isWebhook?: boolean;
-            };
-
-            if (!correlationId) {
-              console.error('[hook_created] Missing correlationId');
-            }
-            if (!hookEventData.token) {
-              console.error('[hook_created] Missing token in eventData');
-            }
-
-            const { hook, conflictEvent } = await createHookFromEvent(
-              effectiveRunId,
-              correlationId as string,
-              hookEventData,
-              effectiveSpecVersion,
-              eventDoc,
-              guard,
-            );
-            if (conflictEvent) {
-              result.event = stripEventDataRefs(conflictEvent, resolveData);
-            } else {
-              result.hook = hook;
-            }
-            break;
-          }
-          case 'hook_disposed': {
-            await disposeHookFromEvent(
-              effectiveRunId,
-              correlationId as string,
-              existingHookDoc as CosmosDoc,
-              eventDoc,
-              guard,
-            );
-            break;
-          }
-          case 'wait_created': {
-            result.wait = await createWaitFromEvent(
-              effectiveRunId,
-              correlationId as string,
-              eventData,
-              effectiveSpecVersion,
-              eventDoc,
-              guard,
-            );
-            break;
-          }
-          case 'wait_completed': {
-            result.wait = await completeWaitFromEvent(
-              effectiveRunId,
-              correlationId as string,
-              eventDoc,
-              guard,
-            );
-            break;
-          }
-          case 'run_started':
-          case 'run_completed':
-          case 'run_failed':
-          case 'run_cancelled': {
-            // Idempotency: run_started on an already running run is a replay;
-            // return the run without appending a duplicate event.
-            if (data.eventType === 'run_started' && currentRun?.status === 'running') {
-              result.run = currentRun;
-              break;
-            }
-            result.run = await updateRunFromEvent(
-              effectiveRunId,
-              data.eventType,
-              eventData,
-              eventDoc,
-              guard,
-            );
-            break;
-          }
-          case 'step_started':
-          case 'step_completed':
-          case 'step_failed':
-          case 'step_retrying': {
-            result.step = await updateStepFromEvent(
-              effectiveRunId,
-              correlationId as string,
-              data.eventType,
-              eventData,
-              eventDoc,
-              guard,
-            );
-            break;
-          }
-          default: {
-            // hook_received (and any future event-only types): store the
-            // event; no entity mutation needed at the storage level. Still a
-            // guarded batch so hook_received can advance the state marker
-            // atomically with its own event.
-            await commitEventDoc(eventDoc, effectiveRunId, guard);
-            break;
-          }
-        }
-
-        // Preload all events for run_started to reduce TTFB.
-        // Ordered by eventId (monotonic ULID); createdAt has millisecond
-        // precision, so concurrent events can tie and replay order would
-        // become nondeterministic.
-        if (data.eventType === 'run_started' && result.run) {
-          const eventsQuery: SqlQuerySpec = {
-            query:
-              'SELECT * FROM c WHERE c.type = "event" AND c.runId = @runId ORDER BY c.eventId ASC',
-            parameters: [{ name: '@runId', value: effectiveRunId }],
-          };
-          const { resources: eventDocs } = await withCosmosRetry(() =>
-            container.items.query(eventsQuery, { partitionKey: effectiveRunId }).fetchAll(),
-          );
-          result.events = eventDocs.map((doc: Record<string, unknown>) =>
-            stripEventDataRefs(deserializeEvent(doc), resolveData),
-          );
-          result.cursor = result.events.at(-1)?.eventId ?? null;
-          result.hasMore = false;
-        }
-
-        // The runtime reads the per-run event ceiling from the run_started
-        // response only, so it must also be present on the idempotent
-        // already-running replay path above.
-        if (data.eventType === 'run_started' && result.run) {
-          result.maxEvents = maxEventsPerRun;
-        }
-
-        return result;
-      },
+      create,
 
       async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {
         const doc = await readRunPartitionDoc(runId, `event:${runId}:${eventId}`);
@@ -1778,76 +2069,28 @@ export function createStorage(config: CosmosStorageConfig): Storage {
         return stripEventDataRefs(deserializeEvent(doc), params?.resolveData ?? 'all');
       },
 
-      async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
-        const { runId } = params;
-        const resolveData = params?.resolveData ?? 'all';
-        const limit = params?.pagination?.limit ?? 100;
-        const sortOrder = params.pagination?.sortOrder || 'asc';
-        const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
+      list: listEventsImpl,
 
-        // Order and paginate by eventId (monotonic ULID). createdAt has
-        // millisecond precision, so concurrent events can tie; replay order
-        // would become nondeterministic and cursor pagination could skip
-        // events sharing the boundary timestamp.
-        const conditions: string[] = ['c.type = "event"', 'c.runId = @runId'];
-        const parameters: { name: string; value: string | number }[] = [
-          { name: '@runId', value: runId },
-        ];
-
-        if (params?.pagination?.cursor) {
-          const op = sortOrder === 'asc' ? '>' : '<';
-          conditions.push(`c.eventId ${op} @cursor`);
-          parameters.push({ name: '@cursor', value: params.pagination.cursor });
-        }
-
-        const querySpec: SqlQuerySpec = {
-          query: `SELECT * FROM c WHERE ${conditions.join(' AND ')} ORDER BY c.eventId ${orderDir} OFFSET 0 LIMIT @limit`,
-          parameters: [...parameters, { name: '@limit', value: limit + 1 }],
-        };
-
-        const { resources } = await withCosmosRetry(() =>
-          container.items.query(querySpec, { partitionKey: runId }).fetchAll(),
-        );
-
-        const values = resources.slice(0, limit);
-        const hasMore = resources.length > limit;
-
-        return {
-          data: values.map((doc: Record<string, unknown>) =>
-            stripEventDataRefs(deserializeEvent(doc), resolveData),
-          ),
-          cursor:
-            values.length > 0
-              ? ((values[values.length - 1] as Record<string, unknown>).eventId as string)
-              : null,
-          hasMore,
-        };
-      },
-
-      async listByCorrelationId(params) {
+      async listByCorrelationId(params: ListEventsByCorrelationIdParams) {
         const { correlationId, runId } = params;
         const resolveData = params?.resolveData ?? 'all';
         const limit = params?.pagination?.limit ?? 100;
         const sortOrder = params.pagination?.sortOrder || 'asc';
         const orderDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
 
-        // Order and paginate by eventId (monotonic ULID), see events.list.
-        const conditions: string[] = ['c.type = "event"', 'c.correlationId = @correlationId'];
+        // A correlation id is only unique within its run, so the lookup is
+        // always run-scoped: the predicate rides the partition key (the
+        // container is partitioned on /runId), which also makes the
+        // (runId, eventId) pagination cursor unambiguous.
+        const conditions: string[] = [
+          'c.type = "event"',
+          'c.runId = @runId',
+          'c.correlationId = @correlationId',
+        ];
         const parameters: { name: string; value: string | number }[] = [
+          { name: '@runId', value: runId },
           { name: '@correlationId', value: correlationId },
         ];
-
-        // A correlation id is only unique within its run, so an unscoped lookup
-        // can return another run's events. When the caller supplies a run, push
-        // the predicate into the query and into the partition key (the events
-        // container is partitioned on /runId), which also turns the fan-out
-        // into a single-partition read. Filtering after the limit + 1 fetch
-        // would corrupt the cursor and hasMore, so it has to happen here.
-        // Older callers omit runId and keep the previous cross-partition path.
-        if (runId !== undefined) {
-          conditions.push('c.runId = @runId');
-          parameters.push({ name: '@runId', value: runId });
-        }
 
         // Same cursor predicate events.list uses. Without it the cursor is
         // silently ignored and every page repeats the first one.
@@ -1862,13 +2105,10 @@ export function createStorage(config: CosmosStorageConfig): Storage {
           parameters: [...parameters, { name: '@limit', value: limit + 1 }],
         };
 
-        const feedOptions: FeedOptions =
-          runId !== undefined
-            ? { maxItemCount: limit + 1, partitionKey: runId }
-            : { maxItemCount: limit + 1 };
-
         const { resources } = await withCosmosRetry(() =>
-          container.items.query(querySpec, feedOptions).fetchAll(),
+          container.items
+            .query(querySpec, { maxItemCount: limit + 1, partitionKey: runId })
+            .fetchAll(),
         );
 
         const values = resources.slice(0, limit);
@@ -1888,25 +2128,8 @@ export function createStorage(config: CosmosStorageConfig): Storage {
     },
 
     steps: {
-      async get(runId: string | undefined, stepId: string, params?: GetStepParams) {
-        if (runId) {
-          const step = await getStep(runId, stepId);
-          return filterData(step, params?.resolveData, ['input', 'output']);
-        }
-
-        // The contract allows omitting runId; fall back to a cross-partition
-        // lookup by stepId.
-        const querySpec: SqlQuerySpec = {
-          query: 'SELECT * FROM c WHERE c.type = "step" AND c.stepId = @stepId',
-          parameters: [{ name: '@stepId', value: stepId }],
-        };
-        const { resources } = await withCosmosRetry(() =>
-          container.items.query(querySpec).fetchAll(),
-        );
-        if (resources.length === 0) {
-          throw new WorkflowWorldError(`Step not found: ${stepId}`, { status: 404 });
-        }
-        const step = deserializeStep(resources[0]);
+      async get(runId: string, stepId: string, params?: GetStepParams) {
+        const step = await getStep(runId, stepId);
         return filterData(step, params?.resolveData, ['input', 'output']);
       },
 

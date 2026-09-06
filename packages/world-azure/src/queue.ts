@@ -3,13 +3,7 @@ import type { ServiceBusClient, ServiceBusSender } from '@azure/service-bus';
 import { ServiceBusAdministrationClient } from '@azure/service-bus';
 import { createWorkflowUrl } from '@workflow/utils';
 import type { Queue, QueueOptions } from '@workflow/world';
-import {
-  MessageId,
-  parseQueueName,
-  type QueueKind,
-  type QueuePayload,
-  type ValidQueueName,
-} from '@workflow/world';
+import { MessageId, type QueuePayload, type ValidQueueName } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 
@@ -46,13 +40,6 @@ interface PumpEnvelope {
   message: QueuePayload;
 }
 
-type Pathname = 'flow' | 'step';
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, Pathname>;
-
 /** Dedup window for Service Bus duplicate detection (ISO 8601 duration). */
 const DUPLICATE_DETECTION_WINDOW = 'PT15M';
 
@@ -78,8 +65,9 @@ function extractRunId(message: unknown): string | undefined {
 
 /**
  * In-process test pump used when no Service Bus client is configured. Replaces
- * the previous `@workflow/world-local` fallback. Two in-memory FIFOs feed an
- * HTTP dispatcher that targets `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ * the previous `@workflow/world-local` fallback. One in-memory FIFO feeds an
+ * HTTP dispatcher targeting `${baseUrl}/.well-known/workflow/v1/flow`; v5
+ * retired the step queue kind, so step executions ride the flow topic.
  *
  * Message bodies round-trip through the shared tagged-JSON codec so binary
  * payloads (e.g. the CBOR-transport `runInput.input` on workflow messages)
@@ -90,8 +78,8 @@ function createTestPump(config: ServiceBusConfig) {
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queue: PumpEnvelope[] = [];
+  const wakers: Array<() => void> = [];
   /**
    * In-flight messages by idempotency key: enqueueing the same key while a
    * prior message is still being processed returns the original messageId
@@ -106,21 +94,21 @@ function createTestPump(config: ServiceBusConfig) {
     }
   }
 
-  function enqueue(pathname: Pathname, envelope: PumpEnvelope) {
-    queues[pathname].push(envelope);
-    wakers[pathname].shift()?.();
+  function enqueue(envelope: PumpEnvelope) {
+    queue.push(envelope);
+    wakers.shift()?.();
   }
 
-  async function take(pathname: Pathname): Promise<PumpEnvelope | null> {
-    const existing = queues[pathname].shift();
+  async function take(): Promise<PumpEnvelope | null> {
+    const existing = queue.shift();
     if (existing) return existing;
     return new Promise((resolve) => {
-      wakers[pathname].push(() => resolve(queues[pathname].shift() ?? null));
+      wakers.push(() => resolve(queue.shift() ?? null));
     });
   }
 
-  async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
-    const url = createWorkflowUrl(resolveBaseUrl(config), { type: pathname });
+  async function dispatch(envelope: PumpEnvelope): Promise<void> {
+    const url = createWorkflowUrl(resolveBaseUrl(config), { type: 'flow' });
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -149,7 +137,7 @@ function createTestPump(config: ServiceBusConfig) {
       }
       const timeoutSeconds = (parsed as { timeoutSeconds?: number } | null)?.timeoutSeconds;
       if (typeof timeoutSeconds === 'number') {
-        void delay(timeoutSeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delay(timeoutSeconds * 1000).then(() => enqueue(envelope));
         return;
       }
     }
@@ -157,7 +145,7 @@ function createTestPump(config: ServiceBusConfig) {
     if (envelope.attempt < maxAttempts) {
       const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
       const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
-      void delay(backoff).then(() => enqueue(pathname, next));
+      void delay(backoff).then(() => enqueue(next));
     } else {
       settle(envelope);
       console.error(
@@ -166,15 +154,15 @@ function createTestPump(config: ServiceBusConfig) {
     }
   }
 
-  async function loop(pathname: Pathname) {
+  async function loop() {
     while (running) {
-      const envelope = await take(pathname);
+      const envelope = await take();
       if (!envelope) continue;
       try {
-        await dispatch(envelope, pathname);
+        await dispatch(envelope);
       } catch (err) {
         settle(envelope);
-        console.error(`[world-azure test pump] dispatch error on ${pathname}:`, err);
+        console.error('[world-azure test pump] dispatch error:', err);
       }
     }
   }
@@ -184,28 +172,27 @@ function createTestPump(config: ServiceBusConfig) {
      * Register + enqueue a message. Returns the previously registered
      * messageId when the idempotency key is already in flight.
      */
-    push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number): string {
+    push(envelope: PumpEnvelope, delaySeconds?: number): string {
       if (envelope.idempotencyKey) {
         const existing = inflightKeys.get(envelope.idempotencyKey);
         if (existing) return existing;
         inflightKeys.set(envelope.idempotencyKey, envelope.messageId);
       }
       if (delaySeconds && delaySeconds > 0) {
-        void delay(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delay(delaySeconds * 1000).then(() => enqueue(envelope));
       } else {
-        enqueue(pathname, envelope);
+        enqueue(envelope);
       }
       return envelope.messageId;
     },
     async start() {
       if (running) return;
       running = true;
-      void loop('flow');
-      void loop('step');
+      void loop();
     },
     stop() {
       running = false;
-      for (const list of Object.values(wakers)) for (const w of list) w();
+      for (const w of wakers) w();
     },
   };
 }
@@ -342,10 +329,8 @@ export function createQueue(config: ServiceBusConfig): Queue & {
   return {
     async queue(name, message, opts) {
       if (isTest) {
-        const { kind } = parseQueueName(name);
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         const effectiveId = testPump.push(
-          QUEUE_PATHNAMES[kind],
           {
             messageId,
             idempotencyKey: opts?.idempotencyKey,
