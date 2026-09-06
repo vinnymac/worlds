@@ -6,11 +6,11 @@ catalog:
   '@testcontainers/postgresql': ^12.1.0
   '@testcontainers/redis': ^12.1.0
   '@types/node': ^24.13.3
-  '@workflow/core': 4.8.5
-  '@workflow/errors': 4.2.1
-  '@workflow/utils': 4.1.4
-  '@workflow/world': 4.5.0
-  '@workflow/world-testing': 4.1.20
+  '@workflow/core': 5.0.0-beta.48
+  '@workflow/errors': 5.0.0-beta.20
+  '@workflow/utils': 5.0.0-beta.10
+  '@workflow/world': 5.0.0-beta.33
+  '@workflow/world-testing': 5.0.0-beta.48
   cbor-x: ^1.6.0
   drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2
@@ -45,9 +45,13 @@ allowBuilds:
   # Cloudflare Workers runtime - world-cloudflare tests
   'workerd': true
 
-pnpm:
-  overrides:
-    zod: 4.3.6
+overrides:
+  zod: 4.3.6
+  # workflow@5.0.0-beta.48 pins @workflow/sveltekit and @workflow/nest at
+  # 5.0.0-beta.48, but neither was published (both beta lines stop at .47).
+  # We use neither integration; pin the nearest published beta.
+  '@workflow/sveltekit': 5.0.0-beta.47
+  '@workflow/nest': 5.0.0-beta.47
 
 savePrefix: ''
 
@@ -128,3 +132,11 @@ minimumReleaseAgeExclude:
   - '@workflow/world-vercel@4.7.1'
   - '@workflow/world@4.5.0'
   - workflow@4.8.5
+  # workflow 5 beta line (young releases, tracked deliberately)
+  - '@workflow/core@5.0.0-beta.48'
+  - '@workflow/errors@5.0.0-beta.20'
+  - '@workflow/utils@5.0.0-beta.10'
+  - '@workflow/world@5.0.0-beta.33'
+  - '@workflow/world-testing@5.0.0-beta.48'
+  - '@workflow/world-local@5.0.0-beta.42'
+  - workflow@5.0.0-beta.48
