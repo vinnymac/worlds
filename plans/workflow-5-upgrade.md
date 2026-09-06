@@ -77,7 +77,10 @@ hint, not as a base; it predates 38 beta releases.
 ### Phase 3: World migrations (one PR-sized commit per world)
 Order: family archetypes first (redis, mysql), then the rest patterned
 on them.
-- [~] world-redis (archetype for redis family; agent running 2026-09-05)
+- [x] world-redis (archetype for redis family; commit 5a1c4f1, 87/87
+      tests incl. 16 conformance, independently re-verified). Follow-up
+      noted: hook_received-after-terminal TOCTOU still open, same as v4;
+      world-local closes it with terminal markers plus reap
 - [ ] world-postgres-redis
 - [~] world-mysql (archetype for SQL family; agent running 2026-09-05)
 - [ ] world-mysql-redis
