@@ -1,8 +1,43 @@
-import { createDebugLogger } from '@fantasticfour/shared';
+import { createDebugLogger, stringify } from '@fantasticfour/shared';
 
 export { compact, Mutex, Rc } from '@fantasticfour/shared';
-// `parse`/`stringify` take a fast path that skips JSON's reviver/replacer when
-// the payload holds no binary (~5x on parse, ~2x on stringify) with identical
-// semantics. It lives in the shared package so every world gets it.
 export { hasBinary, parse, stringify } from '@fantasticfour/shared';
 export const debug = createDebugLogger('redis-bullmq-world');
+
+/** JSON reviver converting tagged markers back to Uint8Array; accepts the
+ * current base64 tag and the legacy number-array tag. Dates are deliberately
+ * not revived; zod schemas coerce them, and a blanket reviver corrupts data. */
+function uint8ArrayReviver(_key: string, value: unknown): unknown {
+  if (value && typeof value === 'object') {
+    const marker = value as { __type?: unknown; __uint8array?: unknown; data?: unknown };
+    if (marker.__type === 'Uint8Array' && typeof marker.data === 'string') {
+      return new Uint8Array(Buffer.from(marker.data, 'base64'));
+    }
+    if (marker.__uint8array === true && Array.isArray(marker.data)) {
+      return new Uint8Array(marker.data as number[]);
+    }
+  }
+  return value;
+}
+
+/** Stringify an object with Uint8Array support. Delegates to the shared
+ * helper, which tags binary as base64; the previous number-array encoding
+ * cost ~450x more CPU to re-parse and ~2.7x more storage at 2MB. */
+export function stringifyWithUint8Array(obj: unknown): string {
+  return stringify(obj);
+}
+
+/**
+ * Parse JSON with Uint8Array support.
+ *
+ * Handing JSON a reviver forces V8 off its fast path and calls into JS per
+ * node, costing several times a plain parse. This world does not revive dates,
+ * so with no binary tag in the text the reviver has nothing to do and a plain
+ * parse is exactly equivalent.
+ */
+export function parseWithUint8Array<T>(json: string): T {
+  if (json.includes('"__type"') || json.includes('"__uint8array"')) {
+    return JSON.parse(json, uint8ArrayReviver) as T;
+  }
+  return JSON.parse(json) as T;
+}

@@ -1,4 +1,5 @@
-import { SPEC_VERSION_CURRENT, type Storage, type World } from '@workflow/world';
+import type { Storage, World } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { Redis } from 'ioredis';
 import type { RedisWorldConfig } from './config.js';
 import { createQueue, type QueueStats } from './queue.js';
@@ -20,6 +21,15 @@ function createStorage(redis: Redis, keyPrefix: string, maxEventsPerRun?: number
   };
 }
 
+export interface RedisBullmqWorld extends World {
+  /** Start the background BullMQ worker */
+  start(): Promise<void>;
+  /** Stop the worker and release all Redis connections */
+  close(): Promise<void>;
+  /** Get queue depth and health metrics for observability */
+  getQueueStats(): Promise<QueueStats>;
+}
+
 export function createWorld(
   config: RedisWorldConfig = {
     redis: process.env.WORKFLOW_REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379',
@@ -28,11 +38,11 @@ export function createWorld(
       Number.parseInt(process.env.WORKFLOW_REDIS_WORKER_CONCURRENCY || '10', 10) || 10,
     keyPrefix: process.env.WORKFLOW_REDIS_KEY_PREFIX || 'workflow:',
   },
-): World & { start(): Promise<void>; getQueueStats(): Promise<QueueStats> } {
+): RedisBullmqWorld {
   // Batches commands issued in the same event-loop tick into one write. Does
   // nothing for a single serial run, but collapses syscalls under concurrency:
   // measured 1.75x at 256 concurrent invocations, 1.15x at 32, a slight loss
-  // at 1. Workers default to 10 and go higher under load, so default on.
+  // at 1. BullMQ's blocking worker connections opt out in queue.ts.
   const autoPipelining = config.enableAutoPipelining ?? true;
   const redis =
     typeof config.redis === 'string'
@@ -49,18 +59,21 @@ export function createWorld(
     ...storage,
     ...streamer,
     ...queue,
-    // Declares support for the CBOR/binary-safe queue transport so core
-    // attaches runInput to workflow messages (resilient start). The queue
-    // serializes payloads with a tagged-JSON transport that round-trips
-    // Uint8Array values through BullMQ job data.
+    // Event ids are slot-numbered and allocated at the commit inside the Lua
+    // scripts, so this World is current-spec compliant by construction (no
+    // pre-assigned positions, no noop sealing needed).
     specVersion: SPEC_VERSION_CURRENT,
     async start() {
       await queue.start();
     },
     async close() {
       await queue.close();
-      await streamer.close();
-      await redis.quit();
+      await streamer.closeStreamer();
+      try {
+        await redis.quit();
+      } catch {
+        redis.disconnect();
+      }
     },
   };
 }

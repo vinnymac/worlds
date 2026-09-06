@@ -2,9 +2,8 @@ import { uint8ArrayReplacer } from '@fantasticfour/shared';
 import { hasBinary } from './util.js';
 import {
   MessageId,
-  parseQueueName,
   type Queue as QueueInterface,
-  type QueueKind,
+  type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
 import { createWorkflowUrl } from '@workflow/utils';
@@ -30,13 +29,8 @@ export interface QueueStats {
   delayed: number;
 }
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
-
 interface QueueJobData {
-  /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_...`) */
+  /** The full workflow queue name (e.g. `__wkf_workflow_wrun_...`) */
   queueName: ValidQueueName;
   /**
    * The queue payload, serialized with the tagged-JSON transport, forwarded
@@ -70,16 +64,18 @@ function queueMessageReviver(_key: string, value: unknown): unknown {
   return value;
 }
 
-function deserializeQueueMessage(text: string): unknown {
+function deserializeQueueMessage(text: string): QueuePayload {
   // Queue messages carry no Date fields, so with the tag absent a plain parse
   // is exactly equivalent.
-  return text.includes('"__type"') ? JSON.parse(text, queueMessageReviver) : JSON.parse(text);
+  return (
+    text.includes('"__type"') ? JSON.parse(text, queueMessageReviver) : JSON.parse(text)
+  ) as QueuePayload;
 }
 
 /**
  * Build the HTTP callback URL the BullMQ worker will POST to. The user must
- * mount `world.createQueueHandler(...)` at `/.well-known/workflow/v1/flow` and
- * `/.well-known/workflow/v1/step` (the Workflow DevKit convention).
+ * mount `world.createQueueHandler(...)` at `/.well-known/workflow/v1/flow`
+ * (the Workflow DevKit convention).
  */
 function resolveBaseUrl(config: RedisWorldConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -91,6 +87,13 @@ function resolveBaseUrl(config: RedisWorldConfig): string {
 /**
  * BullMQ-backed Queue. Job dispatch happens via HTTP fetch to the user's
  * server; this package does not embed a workflow runtime.
+ *
+ * One BullMQ queue per world: `${prefix}flows`. Steps travel on the workflow
+ * topic (v5 retired the step queue kind) carrying stepId/stepName in the
+ * payload, and execute in the combined flow handler. Waits are plain
+ * delaySeconds continuations, which BullMQ parks in its delayed set; a
+ * suspension enqueues its steps and waits as one parallel batch of jobs,
+ * each an independent job here.
  */
 export function createQueue(
   redis: Redis,
@@ -103,10 +106,7 @@ export function createQueue(
   const generateMessageId = monotonicFactory();
 
   const prefix = config.jobPrefix || 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  const queueName = `${prefix}flows`;
 
   const maxAttempts = config.maxAttempts ?? 5;
   const backoffType = config.backoffType ?? 'exponential';
@@ -137,18 +137,10 @@ export function createQueue(
     maxRetriesPerRequest: null,
   } as ConnectionOptions;
 
-  const bullQueues = new Map<QueueKind, Queue<QueueJobData>>();
-  const workers = new Map<QueueKind, Worker<QueueJobData>>();
+  const bullQueue = new Queue<QueueJobData>(queueName, { connection: connectionOptions });
+  let worker: Worker<QueueJobData> | undefined;
 
-  for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
-    bullQueues.set(kind, new Queue(jobName, { connection: connectionOptions }));
-  }
-
-  const queue: QueueInterface['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const bullQueue = bullQueues.get(kind);
-    if (!bullQueue) throw new Error(`No BullMQ queue registered for queue kind ${kind}`);
-
+  const queue: QueueInterface['queue'] = async (name, message, opts) => {
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
 
@@ -158,8 +150,8 @@ export function createQueue(
     // real failure (connection loss, OOM, ...) and swallowing it would strand
     // the run.
     await bullQueue.add(
-      queueName,
-      { queueName, message: serializeQueueMessage(message) },
+      name,
+      { queueName: name, message: serializeQueueMessage(message) },
       {
         jobId: messageId,
         delay: delayMs,
@@ -184,64 +176,61 @@ export function createQueue(
     return { messageId };
   };
 
-  function createProcessor(kind: QueueKind) {
-    const pathname = QUEUE_PATHNAMES[kind];
-    return async (job: Job<QueueJobData>, token?: string) => {
-      const baseUrl = resolveBaseUrl(config);
-      const url = createWorkflowUrl(baseUrl, { type: pathname });
-      const messageId = job.id ?? `msg_${generateMessageId()}`;
+  async function processJob(job: Job<QueueJobData>, token?: string): Promise<void> {
+    const baseUrl = resolveBaseUrl(config);
+    const url = createWorkflowUrl(baseUrl, { type: 'flow' });
+    const messageId = job.id ?? `msg_${generateMessageId()}`;
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-vqs-queue-name': job.data.queueName,
-          'x-vqs-message-id': messageId,
-          'x-vqs-message-attempt': String(job.attemptsMade + 1),
-        },
-        body: job.data.message,
-        signal: AbortSignal.timeout(httpTimeoutMs),
-      });
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vqs-queue-name': job.data.queueName,
+        'x-vqs-message-id': messageId,
+        'x-vqs-message-attempt': String(job.attemptsMade + 1),
+      },
+      body: job.data.message,
+      signal: AbortSignal.timeout(httpTimeoutMs),
+    });
 
-      if (response.ok) return;
+    if (response.ok) return;
 
-      const text = await response.text();
+    const text = await response.text();
 
-      // 503 with { timeoutSeconds } means "retry later without consuming an
-      // attempt": defer the job via BullMQ's delayed queue. BullMQ requires
-      // throwing DelayedError after moveToDelayed so the worker skips its
-      // completion/failure machinery for this invocation.
-      if (response.status === 503) {
-        let timeoutSeconds: number | undefined;
-        try {
-          const parsed = JSON.parse(text);
-          if (typeof parsed?.timeoutSeconds === 'number') {
-            timeoutSeconds = parsed.timeoutSeconds;
-          }
-        } catch {
-          // fall through to generic failure
+    // 503 with { timeoutSeconds } means "retry later without consuming an
+    // attempt": defer the job via BullMQ's delayed queue. BullMQ requires
+    // throwing DelayedError after moveToDelayed so the worker skips its
+    // completion/failure machinery for this invocation.
+    if (response.status === 503) {
+      let timeoutSeconds: number | undefined;
+      try {
+        const parsed = JSON.parse(text) as { timeoutSeconds?: unknown };
+        if (typeof parsed?.timeoutSeconds === 'number') {
+          timeoutSeconds = parsed.timeoutSeconds;
         }
-        if (timeoutSeconds !== undefined) {
-          const delayMs = timeoutSeconds * 1000;
-          await job.moveToDelayed(Date.now() + delayMs, token);
-          throw new DelayedError();
-        }
+      } catch {
+        // fall through to generic failure
       }
+      if (timeoutSeconds !== undefined) {
+        const delayMs = timeoutSeconds * 1000;
+        await job.moveToDelayed(Date.now() + delayMs, token);
+        throw new DelayedError();
+      }
+    }
 
-      throw new Error(`HTTP ${response.status}: ${text}`);
-    };
+    throw new Error(`HTTP ${response.status}: ${text}`);
   }
 
   const createQueueHandler: QueueInterface['createQueueHandler'] = (queueNamePrefix, handler) => {
     return async (req) => {
-      const queueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
+      const name = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
       const messageId = req.headers.get('x-vqs-message-id') as MessageId | null;
       const attemptStr = req.headers.get('x-vqs-message-attempt');
 
-      if (!queueName || !messageId || !attemptStr || !req.body) {
+      if (!name || !messageId || !attemptStr || !req.body) {
         return Response.json({ error: 'Missing required headers or body' }, { status: 400 });
       }
-      if (!queueName.startsWith(queueNamePrefix)) {
+      if (!name.startsWith(queueNamePrefix)) {
         return Response.json({ error: 'Unhandled queue' }, { status: 400 });
       }
 
@@ -249,7 +238,7 @@ export function createQueue(
 
       try {
         const body = deserializeQueueMessage(await req.text());
-        const result = await handler(body, { attempt, queueName, messageId });
+        const result = await handler(body, { attempt, queueName: name, messageId });
 
         if (result && typeof result.timeoutSeconds === 'number') {
           return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
@@ -264,57 +253,44 @@ export function createQueue(
 
   const getDeploymentId: QueueInterface['getDeploymentId'] = async () => 'redis';
 
-  async function startWorkers() {
+  async function startWorker() {
+    if (worker) return;
     const concurrency = config.queueConcurrency || 10;
 
-    for (const [kind, jobName] of Object.entries(Queues) as [QueueKind, string][]) {
-      const worker = new Worker<QueueJobData>(jobName, createProcessor(kind), {
-        connection: connectionOptions,
-        concurrency,
-        stalledInterval,
-        maxStalledCount,
-        // Low drainDelay reduces idle pickup latency.
-        drainDelay: 300,
-      });
+    worker = new Worker<QueueJobData>(queueName, processJob, {
+      connection: connectionOptions,
+      concurrency,
+      stalledInterval,
+      maxStalledCount,
+      // Low drainDelay reduces idle pickup latency.
+      drainDelay: 300,
+    });
 
-      worker.on('failed', (job, err) => {
-        console.error(`Job ${job?.id} failed:`, err);
-      });
-      worker.on('error', (err) => {
-        console.error('Worker error:', err);
-      });
+    worker.on('failed', (job, err) => {
+      console.error(`Job ${job?.id} failed:`, err);
+    });
+    worker.on('error', (err) => {
+      console.error('Worker error:', err);
+    });
 
-      workers.set(kind, worker);
-    }
-
-    await Promise.all(Array.from(workers.values()).map((worker) => worker.waitUntilReady()));
+    await worker.waitUntilReady();
   }
 
   async function getQueueStats(): Promise<QueueStats> {
-    const totals: QueueStats = {
-      waiting: 0,
-      active: 0,
-      completed: 0,
-      failed: 0,
-      delayed: 0,
+    const counts = await bullQueue.getJobCounts(
+      'waiting',
+      'active',
+      'completed',
+      'failed',
+      'delayed',
+    );
+    return {
+      waiting: counts.waiting,
+      active: counts.active,
+      completed: counts.completed,
+      failed: counts.failed,
+      delayed: counts.delayed,
     };
-
-    for (const bullQueue of bullQueues.values()) {
-      const counts = await bullQueue.getJobCounts(
-        'waiting',
-        'active',
-        'completed',
-        'failed',
-        'delayed',
-      );
-      totals.waiting += counts.waiting;
-      totals.active += counts.active;
-      totals.completed += counts.completed;
-      totals.failed += counts.failed;
-      totals.delayed += counts.delayed;
-    }
-
-    return totals;
   }
 
   return {
@@ -323,13 +299,14 @@ export function createQueue(
     queue,
     getQueueStats,
     async start() {
-      await startWorkers();
+      await startWorker();
     },
     async close() {
-      await Promise.all(Array.from(workers.values()).map((worker) => worker.close()));
-      workers.clear();
-      await Promise.all(Array.from(bullQueues.values()).map((bullQueue) => bullQueue.close()));
-      bullQueues.clear();
+      if (worker) {
+        await worker.close();
+        worker = undefined;
+      }
+      await bullQueue.close();
     },
   };
 }

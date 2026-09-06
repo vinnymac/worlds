@@ -66,7 +66,7 @@ export interface RedisWorldConfig {
   /**
    * Base URL the BullMQ worker uses to dispatch jobs back to the user's HTTP
    * server, which must mount `world.createQueueHandler(...)` at
-   * `/.well-known/workflow/v1/flow` and `/.well-known/workflow/v1/step`.
+   * `/.well-known/workflow/v1/flow`.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
    */
   baseUrl?: string;
