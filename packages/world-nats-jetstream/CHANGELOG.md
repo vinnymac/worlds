@@ -1,5 +1,11 @@
 # @fantasticfour/world-nats-jetstream
 
+## 1.7.0
+
+### Minor Changes
+
+- 8c6ce71: Add an `ackWaitMs` option for the JetStream consumers. Workers heartbeat with `working()` from their own event loop, so a step that blocks that loop for longer than the ack wait (30s by default) is redelivered while it still runs, spending a delivery from `max_deliver` each time; set `ackWaitMs` to outlast such steps. Heartbeats now fire every third of the ack wait the server reports for the shared durable consumer instead of a fixed 10s, capped at Node's timer limit. Each stream re-reads that value every 5s and heartbeats at once when it shrinks; if the read keeps failing it backs off to 60s, logs once, and recovers on its own. An existing durable keeps its ack wait unless `ackWaitMs` is set, in which case it is rewritten once per stream with a warning that names the value it replaced. Workers now pull one message at a time instead of buffering up to 100, whose ack waits ran down with no heartbeat: the in-flight ceiling per stream is `queueConcurrency` (10 by default) and each message costs one pull round trip, so raise `queueConcurrency` for throughput. A pull that fails with a transient JetStream status or the client's "heartbeats missed" is retried in place with escalating backoff, a run of 503s rebuilds the durable if it was deleted, and a worker's failure counter only resets after a delivery succeeds. `close()` now stops the workers before draining the connection: in-flight deliveries finish and ack, nothing pulls again, and the process can exit. Values outside 1000 ms to 24 days throw a RangeError at construction. Unset, the 30s ack wait applies as before.
+
 ## 1.6.0
 
 ### Minor Changes
