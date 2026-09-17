@@ -1,5 +1,12 @@
 # @fantasticfour/world-mysql-redis
 
+## 1.6.0
+
+### Minor Changes
+
+- 8c6ce71: Fence queue claims so a stalled execution cannot clobber its redelivery. Leases were keyed by the raw payload, so when an expired item was redelivered, the original execution's eventual ack, retry, or dead-letter removed the new delivery's processing entry and lease, and also released its idempotency key or scheduled a duplicate retry. A worker whose redelivered claim then crashed lost the message. Each claim now lives in a `:claims` sorted set under a unique token and is settled by an atomic compare-and-delete. A stale settle changes nothing and logs at debug, leaving the retry, dead-letter, and idempotency release to the current claim. Because a stale retry no longer advances the attempt, each lease expiry is now counted in a `:reclaims` hash and added to the delivery's attempt, so a delivery that keeps outliving its lease dead-letters after `maxAttempts` instead of redelivering forever. Its `:dlq` entry carries that counted attempt. Raw-item leases and processing entries from the previous version are still adopted and reclaimed, so rolling deploys are safe. Old-version workers ignore `:claims`, so an expired new-style claim is only reclaimed once a new-version process is running.
+- 8c6ce71: Add a `visibilityTimeoutMs` option for the queue lease. Each dispatched item is leased once for `httpTimeoutMs` plus 30s and never renewed, so a step that blocks the event loop long enough to delay the fetch abort outlives its lease, and another worker re-delivers the item while the first execution is still running. The lease could previously only be lengthened by raising `httpTimeoutMs`, which also governs the abort. It can now be set on its own, matching `@fantasticfour/world-mysql`. A non-integer value or one below `httpTimeoutMs` throws a `RangeError` at startup. Unset, the lease stays `httpTimeoutMs + 30_000` as before.
+
 ## 1.5.4
 
 ### Patch Changes
