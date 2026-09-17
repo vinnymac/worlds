@@ -53,6 +53,17 @@ interface NatsJetStreamWorldConfig {
   // Optional key prefix for KV buckets and streams (default: 'workflow_')
   keyPrefix?: string;
 
+  // How long JetStream waits for an ack before redelivering, in ms. Workers
+  // heartbeat from their event loop every third of this, so raise it if steps
+  // block the loop for longer. Set on the shared durable consumer, which every
+  // worker re-reads, so prefer the same value everywhere (min: 1_000,
+  // default: 30_000)
+  //
+  // Each worker pulls one message at a time, so a stream has at most
+  // queueConcurrency deliveries in flight and every message costs a pull round
+  // trip: raise queueConcurrency for throughput.
+  ackWaitMs?: number;
+
   // Per-run event ceiling reported to the runtime, which fails runs that
   // exceed it with MAX_EVENTS_EXCEEDED
   // (default: process.env.WORKFLOW_MAX_EVENTS, else 25_000)

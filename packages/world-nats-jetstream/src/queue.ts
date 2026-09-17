@@ -8,7 +8,7 @@ import {
   type ValidQueueName,
   WorkflowInvokePayloadSchema,
 } from '@workflow/world';
-import type { JetStreamClient, JsMsg } from '@nats-io/jetstream';
+import type { ConsumerConfig, ConsumerInfo, JetStreamClient, JsMsg } from '@nats-io/jetstream';
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from '@nats-io/jetstream';
 import type { KV } from '@nats-io/kv';
 import { Kvm } from '@nats-io/kv';
@@ -41,19 +41,73 @@ const BASE_BACKOFF_MS = 100;
 const MAX_BACKOFF_MS = 30_000;
 
 /**
- * How long JetStream waits for an ack before redelivering. Kept short so a
+ * Default time JetStream waits for an ack before redelivering. Kept short so a
  * crashed worker's messages come back quickly; long-running handlers extend
- * the deadline via `msg.working()` heartbeats (see ACK_PROGRESS_INTERVAL_MS).
+ * the deadline via `msg.working()` heartbeats at a third of the ack wait.
  */
-const ACK_WAIT_NANOS = 30 * 1_000_000_000; // 30 seconds
+const DEFAULT_ACK_WAIT_MS = 30_000;
+
+/** Largest delay `setTimeout` honors; beyond it Node fires after 1ms. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Below this a third-of-ack-wait heartbeat leaves no room for network latency. */
+const MIN_ACK_WAIT_MS = 1_000;
+
+/** Above this a third of the ack wait no longer fits in a `setTimeout`. */
+const MAX_ACK_WAIT_MS = MAX_TIMER_DELAY_MS * 3;
+
+/** How often each stream re-reads its durable's ack_wait, which another
+ * process with a different `ackWaitMs` may have changed. */
+const ACK_WAIT_REFRESH_MS = 5_000;
+
+/** Consecutive ack_wait refresh failures before a stream re-reads less often. */
+const MAX_REFRESH_FAILURES = 3;
+
+/** Refresh spacing once a stream's consumer info keeps failing. */
+const SLOW_ACK_WAIT_REFRESH_MS = 60_000;
+
+/** Consecutive failed pulls tolerated quietly before one is logged loudly. */
+const MAX_QUIET_PULL_FAILURES = 5;
 
 /**
- * Interval at which in-flight deliveries send `working()` progress heartbeats
- * to extend the ack deadline. Must be comfortably below ACK_WAIT_NANOS so a
- * handler that outlives ack_wait (HTTP dispatch allows up to httpTimeoutMs)
- * is never redelivered (and executed concurrently) while still running.
+ * Statuses `next()` rejects on that retrying the pull survives: a 503 while a
+ * server is unreachable, and the 409s a leadership change or request limit
+ * raises. A deleted consumer is not one: that needs the consumer rebuilt.
  */
-const ACK_PROGRESS_INTERVAL_MS = 10_000;
+function isTransientPullError(error: unknown): boolean {
+  if (!(error instanceof Error) || !('code' in error)) return false;
+  const { code } = error as Error & { code: unknown };
+  if (code === 503) return true;
+  return code === 409 && !/consumer deleted/i.test(error.message);
+}
+
+/** Current heartbeat cadence for one stream's shared durable. */
+interface AckWaitLease {
+  intervalMs: number;
+  /** In-flight heartbeats, fired at once when the interval shrinks. */
+  beats: Set<() => void>;
+}
+
+/** Validate `ackWaitMs` and convert it to the nanoseconds JetStream takes. */
+function resolveAckWaitNanos(configured?: number): number {
+  const ackWaitMs = configured ?? DEFAULT_ACK_WAIT_MS;
+  if (!Number.isInteger(ackWaitMs) || ackWaitMs < MIN_ACK_WAIT_MS || ackWaitMs > MAX_ACK_WAIT_MS) {
+    throw new RangeError(
+      `ackWaitMs must be an integer between ${MIN_ACK_WAIT_MS} and ${MAX_ACK_WAIT_MS}, got ${ackWaitMs}`,
+    );
+  }
+  return ackWaitMs * 1_000_000;
+}
+
+/** Heartbeat interval for the ack wait the server actually holds: a third of
+ * it, so a live delivery is never redelivered. Throws on an unusable value. */
+function progressIntervalFor(ackWaitNanos: number | undefined, consumer: string): number {
+  const intervalMs = Math.floor((ackWaitNanos ?? Number.NaN) / 3_000_000);
+  if (!(intervalMs >= 1 && intervalMs <= MAX_TIMER_DELAY_MS)) {
+    throw new Error(`consumer ${consumer} reported an unusable ack_wait of ${ackWaitNanos}ns`);
+  }
+  return intervalMs;
+}
 
 /**
  * Safety ceiling on `{ timeoutSeconds }` soft naks for a single message,
@@ -118,6 +172,8 @@ export function createQueue(
 ): Queue & { start(): Promise<void>; getHealth(): WorkerHealth } {
   const generateMessageId = monotonicFactory();
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
+  const ackWaitNanos = resolveAckWaitNanos(config.ackWaitMs);
+  const leases = new Map<string, AckWaitLease>();
 
   const prefix = config.jobPrefix || 'workflow_';
   const Streams = {
@@ -359,6 +415,7 @@ export function createQueue(
       if (response.ok) {
         msg.ack();
         health.lastSuccessfulFetch = Date.now();
+        health.consecutiveFailures = 0;
         health.totalProcessed++;
         if (softNaks > 0) clearSoftNaks(key);
         return;
@@ -414,19 +471,79 @@ export function createQueue(
     }
   }
 
+  /** Re-read the durable's ack_wait until it stops answering. */
+  function startAckWaitRefresh(
+    streamName: string,
+    consumerName: string,
+    jsm: Awaited<ReturnType<JetStreamClient['jetstreamManager']>>,
+    lease: AckWaitLease,
+  ): void {
+    let failures = 0;
+    let slowed = false;
+    // One self-rescheduling loop per stream for the life of the process: the
+    // lease it updates is shared with every in-flight heartbeat, so it backs
+    // off while consumer info fails rather than giving up and stranding them.
+    const schedule = (delayMs: number) => {
+      const timer = setTimeout(() => {
+        jsm.consumers
+          .info(streamName, consumerName)
+          .then((current) => {
+            if (slowed) {
+              slowed = false;
+              debug(`Refreshing ack_wait for ${consumerName} again`);
+            }
+            failures = 0;
+            adoptAckWait(lease, consumerName, current);
+          })
+          .catch((error: unknown) => {
+            failures++;
+            debug(`Could not refresh ack_wait for ${consumerName}`, { error });
+            if (failures === MAX_REFRESH_FAILURES) {
+              slowed = true;
+              console.error(
+                `[world-nats-jetstream worker] could not refresh ack_wait for ${consumerName} ${MAX_REFRESH_FAILURES} times; retrying every ${SLOW_ACK_WAIT_REFRESH_MS}ms, heartbeats stay at ${lease.intervalMs}ms meanwhile:`,
+                error,
+              );
+            }
+          })
+          .finally(() => {
+            schedule(
+              failures >= MAX_REFRESH_FAILURES ? SLOW_ACK_WAIT_REFRESH_MS : ACK_WAIT_REFRESH_MS,
+            );
+          });
+      }, delayMs);
+      // Fake timers in tests hand back a plain handle with no unref.
+      timer.unref?.();
+    };
+    schedule(ACK_WAIT_REFRESH_MS);
+  }
+
+  /** Heartbeat for the durable's reported ack_wait, at once if it shrank. */
+  function adoptAckWait(lease: AckWaitLease, consumerName: string, info: ConsumerInfo): void {
+    const intervalMs = progressIntervalFor(info.config.ack_wait, consumerName);
+    if (intervalMs === lease.intervalMs) return;
+    debug(
+      `${consumerName} ack_wait is now ${info.config.ack_wait}ns; heartbeating every ${intervalMs}ms`,
+    );
+    const shrank = intervalMs < lease.intervalMs;
+    lease.intervalMs = intervalMs;
+    if (shrank) for (const beat of lease.beats) beat();
+  }
+
   async function worker(kind: QueueKind, streamName: string) {
     try {
       const jetstream = await getJetStream();
       const jsm = await jetstream.jetstreamManager();
       const consumerName = `${streamName}_worker`;
 
+      let info: ConsumerInfo;
       try {
-        await jsm.consumers.add(streamName, {
+        info = await jsm.consumers.add(streamName, {
           durable_name: consumerName,
           ack_policy: AckPolicy.Explicit,
           deliver_policy: DeliverPolicy.All,
           max_deliver: MAX_DELIVER,
-          ack_wait: ACK_WAIT_NANOS,
+          ack_wait: ackWaitNanos,
           filter_subject: `${streamName}.>`,
         });
       } catch (err) {
@@ -434,21 +551,71 @@ export function createQueue(
         if (!message.includes('already') && !message.includes('in use')) {
           throw err;
         }
-        // The durable already exists with an older configuration (e.g. the
-        // previous max_deliver: 3); reconcile the retry policy in place.
-        await jsm.consumers.update(streamName, consumerName, {
-          max_deliver: MAX_DELIVER,
-          ack_wait: ACK_WAIT_NANOS,
-        });
+        // The durable already exists, possibly from an older version
+        // (max_deliver: 3) or another process. Reconcile only what this process
+        // is entitled to: rewriting ack_wait unasked makes two processes with
+        // different values flap it on every restart.
+        const current = await jsm.consumers.info(streamName, consumerName);
+        const changes: Partial<ConsumerConfig> = {};
+        if (current.config.max_deliver !== MAX_DELIVER) changes.max_deliver = MAX_DELIVER;
+        if (config.ackWaitMs !== undefined && current.config.ack_wait !== ackWaitNanos) {
+          console.warn(
+            `[world-nats-jetstream worker] ${consumerName} ack_wait is ${current.config.ack_wait}ns, not the configured ${ackWaitNanos}ns; rewriting it. Workers sharing this durable should use the same ackWaitMs.`,
+          );
+          changes.ack_wait = ackWaitNanos;
+        }
+        info =
+          Object.keys(changes).length > 0
+            ? await jsm.consumers.update(streamName, consumerName, changes)
+            : current;
       }
 
+      // The durable is shared, so heartbeat for the server's ack_wait rather than
+      // ours, and keep re-reading it: another process may change it at any time.
+      let lease = leases.get(streamName);
+      if (!lease) {
+        lease = {
+          intervalMs: progressIntervalFor(info.config.ack_wait, consumerName),
+          beats: new Set(),
+        };
+        leases.set(streamName, lease);
+        startAckWaitRefresh(streamName, consumerName, jsm, lease);
+      }
+      const streamLease = lease;
+      adoptAckWait(streamLease, consumerName, info);
+
       const consumer = await jetstream.consumers.get(streamName, consumerName);
-      const messages = await consumer.consume();
-
-      health.consecutiveFailures = 0;
       const pathname = QUEUE_PATHNAMES[kind];
+      let pullFailures = 0;
 
-      for await (const msg of messages) {
+      for (;;) {
+        // Pull one message at a time: a buffered delivery's ack wait would run
+        // with no heartbeat while this worker is busy with another.
+        let msg: JsMsg | null;
+        try {
+          msg = await consumer.next();
+          pullFailures = 0;
+        } catch (error) {
+          // next() is a fetch, so unlike consume() it rejects on the transient
+          // 409/503 statuses a server blip produces. Retry those in place
+          // rather than tearing the worker (and its consumer setup) down.
+          if (!isTransientPullError(error)) throw error;
+          pullFailures++;
+          const backoff = Math.min(BASE_BACKOFF_MS * 2 ** pullFailures, MAX_BACKOFF_MS);
+          debug(
+            `Pull from ${streamName} failed (pullFailures=${pullFailures}), retrying in ${backoff}ms`,
+            { error },
+          );
+          if (pullFailures === MAX_QUIET_PULL_FAILURES) {
+            console.error(
+              `[world-nats-jetstream worker] ${MAX_QUIET_PULL_FAILURES} consecutive pull failures on ${streamName}, still retrying:`,
+              error,
+            );
+          }
+          await delay(backoff);
+          continue;
+        }
+        if (!msg) continue;
         let envelope: MessageEnvelope;
         try {
           const data = new TextDecoder().decode(msg.data);
@@ -466,16 +633,22 @@ export function createQueue(
         // Extend the ack deadline while this delivery is ours: dispatch may run to
         // httpTimeoutMs, and a message queued behind another replay of the same run
         // would otherwise be redelivered to a second worker.
-        const progressTimer = setInterval(() => {
+        let heartbeat: ReturnType<typeof setTimeout> | undefined;
+        const beat = () => {
+          clearTimeout(heartbeat);
           msg.working();
-        }, ACK_PROGRESS_INTERVAL_MS);
+          heartbeat = setTimeout(beat, streamLease.intervalMs);
+        };
+        heartbeat = setTimeout(beat, streamLease.intervalMs);
+        streamLease.beats.add(beat);
 
         try {
           await runSerialized(workflowRunSerializationKey(kind, envelope.message), () =>
             deliver(msg, envelope, pathname, streamName, kind),
           );
         } finally {
-          clearInterval(progressTimer);
+          clearTimeout(heartbeat);
+          streamLease.beats.delete(beat);
         }
       }
     } catch (error) {

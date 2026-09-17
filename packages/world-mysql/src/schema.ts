@@ -210,6 +210,8 @@ export const jobs = schema.table(
       .notNull(),
     lockedAt: timestamp('locked_at', { fsp: 3 }),
     lockedBy: varchar('locked_by', { length: 255 }),
+    /** Fencing token set per claim; settles must match it */
+    claimToken: varchar('claim_token', { length: 64 }),
     error: text('error'),
     scheduledFor: timestamp('scheduled_for', { fsp: 3 }),
   },

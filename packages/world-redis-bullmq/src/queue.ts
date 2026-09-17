@@ -114,6 +114,10 @@ export function createQueue(
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
   const stalledInterval = config.stalledInterval ?? 30_000;
   const maxStalledCount = config.maxStalledCount ?? 1;
+  const lockDuration = config.lockDuration;
+  if (lockDuration !== undefined && (!Number.isSafeInteger(lockDuration) || lockDuration <= 0)) {
+    throw new RangeError(`lockDuration must be a positive integer, got ${lockDuration}`);
+  }
   const idempotencyTtlMs = config.idempotencyTtlMs;
 
   // Reuse the full ioredis options (tls, username, path, sentinels, ...) so
@@ -273,6 +277,7 @@ export function createQueue(
         concurrency,
         stalledInterval,
         maxStalledCount,
+        ...(lockDuration !== undefined && { lockDuration }),
         // Low drainDelay reduces idle pickup latency.
         drainDelay: 300,
       });

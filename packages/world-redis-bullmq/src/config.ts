@@ -64,6 +64,14 @@ export interface RedisWorldConfig {
   maxStalledCount?: number;
 
   /**
+   * How long a worker's job lock lives without renewal (ms). BullMQ renews it
+   * from the worker's event loop, so a step that blocks that loop for longer
+   * loses its lock and another worker re-delivers the job while it still runs.
+   * Default: BullMQ's own, 30000 (30s)
+   */
+  lockDuration?: number;
+
+  /**
    * Base URL the BullMQ worker uses to dispatch jobs back to the user's HTTP
    * server, which must mount `world.createQueueHandler(...)` at
    * `/.well-known/workflow/v1/flow` and `/.well-known/workflow/v1/step`.

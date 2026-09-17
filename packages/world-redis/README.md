@@ -63,6 +63,7 @@ await world.start();
 | `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
 | `keyPrefix`        | `string`                 | `workflow:`              | Prefix for all Redis keys               |
 | `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers      |
+| `heartbeatTtlMs`   | `number`                 | `90000`                  | Worker liveness TTL before reclaim (ms) |
 
 ## Redis Data Structures
 

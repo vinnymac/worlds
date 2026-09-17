@@ -44,6 +44,14 @@ export interface RedisWorldConfig {
   httpTimeoutMs?: number;
 
   /**
+   * How long a worker's liveness key lives without renewal (ms), refreshed
+   * every third of it. The refresh runs on the event loop, so a step blocking
+   * that loop for longer lets the reclaimer re-deliver its message while it still runs.
+   * Minimum 15_000. Default: 90_000 (90s)
+   */
+  heartbeatTtlMs?: number;
+
+  /**
    * Maximum retry attempts before dropping a job. Each hard failure
    * (non-2xx, non-503) increments the attempt counter and re-LPUSHes with
    * backoff. 503 + { timeoutSeconds } is a "soft" retry and does not consume

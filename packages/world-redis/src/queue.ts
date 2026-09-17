@@ -56,13 +56,14 @@ const DELAYED_POLL_INTERVAL_MS = 100;
 const PROMOTE_BATCH = 100;
 /** How often orphaned processing lists are reclaimed. */
 const RECLAIM_INTERVAL_MS = 30_000;
-/** Worker liveness key TTL. Generous so slow dispatches (long HTTP calls)
- * with a live heartbeat interval are never reclaimed prematurely. */
-const HEARTBEAT_TTL_SECONDS = 90;
-/** How often each worker refreshes its liveness key. */
-const HEARTBEAT_REFRESH_MS = 30_000;
+/** Default worker liveness key TTL (see `RedisWorldConfig.heartbeatTtlMs`). */
+const DEFAULT_HEARTBEAT_TTL_MS = 90_000;
+/** Longest delay setInterval accepts; larger values fire every 1ms instead. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** BLMOVE block timeout so worker loops can observe shutdown. */
 const BLOCK_TIMEOUT_SECONDS = 5;
+/** Heartbeats share the BLMOVE connection, so a refresh can wait out a block. */
+const MIN_HEARTBEAT_TTL_MS = BLOCK_TIMEOUT_SECONDS * 1000 * 3;
 /** Delivery is at-least-once: a reclaim can race a live-but-stalled worker,
  * so duplicate deliveries are possible and are deduplicated by the storage
  * layer's EntityConflictError guards. */
@@ -127,15 +128,19 @@ const LUA_PROMOTE_DUE = `
 
 /**
  * Atomically acknowledge a delivery: remove it from the worker's processing
- * list and (optionally) release its idempotency reservation.
+ * list and (optionally) release its idempotency reservation. Fenced: if the
+ * entry is gone, a reclaim already redelivered it, so shared state is untouched.
  *
  * KEYS[1] = processing list
  * KEYS[2] = idempotency key
  * ARGV[1] = envelope JSON as popped
  * ARGV[2] = release idempotency key ("1" | "0")
+ * Returns: 1 if settled, 0 if the claim was stale
  */
 const LUA_ACK = `
-  redis.call('LREM', KEYS[1], 1, ARGV[1])
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+    return 0
+  end
   if ARGV[2] == '1' then
     redis.call('DEL', KEYS[2])
   end
@@ -147,15 +152,19 @@ const LUA_ACK = `
  * and park (a possibly updated copy of) it in the delayed zset. Used for
  * both 503 soft retries and hard-failure backoff; the message is durable
  * in Redis for the entire wait, so a process restart cannot lose it.
+ * Fenced like LUA_ACK so a stale defer cannot duplicate a reclaimed message.
  *
  * KEYS[1] = processing list
  * KEYS[2] = delayed zset
  * ARGV[1] = old envelope JSON (as popped)
  * ARGV[2] = new envelope JSON
  * ARGV[3] = deliver-at ms
+ * Returns: 1 if settled, 0 if the claim was stale
  */
 const LUA_DEFER = `
-  redis.call('LREM', KEYS[1], 1, ARGV[1])
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+    return 0
+  end
   redis.call('ZADD', KEYS[2], tonumber(ARGV[3]), ARGV[2])
   return 1
 `;
@@ -227,6 +236,14 @@ export function createQueue(
   const generateMessageId = monotonicFactory();
   const maxAttempts = config.maxAttempts ?? 5;
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
+  const heartbeatTtlMs = config.heartbeatTtlMs ?? DEFAULT_HEARTBEAT_TTL_MS;
+  if (!Number.isSafeInteger(heartbeatTtlMs) || heartbeatTtlMs < MIN_HEARTBEAT_TTL_MS) {
+    throw new RangeError(
+      `heartbeatTtlMs must be an integer >= ${MIN_HEARTBEAT_TTL_MS}, got ${heartbeatTtlMs}`,
+    );
+  }
+  // Refresh three times per TTL so two missed refreshes still keep the key.
+  const heartbeatRefreshMs = Math.min(Math.floor(heartbeatTtlMs / 3), MAX_TIMER_DELAY_MS);
 
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
@@ -332,7 +349,7 @@ export function createQueue(
     item: string,
     envelope: MessageEnvelope,
   ) {
-    await client.eval(
+    const settled = await client.eval(
       LUA_ACK,
       2,
       processingKey,
@@ -340,6 +357,7 @@ export function createQueue(
       item,
       envelope.idempotencyKey ? '1' : '0',
     );
+    if (settled === 0) debug(`stale ack of ${envelope.messageId}: already reclaimed`);
   }
 
   /** Defer a delivery into the delayed zset (durable, restart-safe). */
@@ -351,7 +369,7 @@ export function createQueue(
     nextPayload: string,
     deliverAtMs: number,
   ) {
-    await client.eval(
+    const settled = await client.eval(
       LUA_DEFER,
       2,
       processingKey,
@@ -360,6 +378,7 @@ export function createQueue(
       nextPayload,
       Math.round(deliverAtMs).toString(),
     );
+    if (settled === 0) debug(`stale defer on ${processingKey}: already reclaimed`);
   }
 
   async function worker(kind: QueueKind, listKey: string) {
@@ -377,15 +396,15 @@ export function createQueue(
     // Liveness heartbeat. If this process dies, the key expires and the
     // reclaimer returns any in-flight message to the ready list.
     const heartbeat = setInterval(() => {
-      void workerRedis.set(ownerKey, '1', 'EX', HEARTBEAT_TTL_SECONDS).catch(() => {});
-    }, HEARTBEAT_REFRESH_MS);
+      void workerRedis.set(ownerKey, '1', 'PX', heartbeatTtlMs).catch(() => {});
+    }, heartbeatRefreshMs);
     heartbeat.unref();
 
     try {
       while (!stopped) {
         let item: string | null;
         try {
-          await workerRedis.set(ownerKey, '1', 'EX', HEARTBEAT_TTL_SECONDS);
+          await workerRedis.set(ownerKey, '1', 'PX', heartbeatTtlMs);
           item = await workerRedis.blmove(
             listKey,
             processingKey,

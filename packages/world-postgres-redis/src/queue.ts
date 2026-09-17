@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
@@ -32,6 +33,8 @@ const QUEUE_PATHNAMES = {
 
 /** How long an enqueue-dedup key survives if never explicitly released. */
 const DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** How long a message's reclaim count survives without being touched. */
+const RECLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often due delayed/expired-inflight messages are promoted to the ready list. */
 const PROMOTE_INTERVAL_MS = 1_000;
 /** Extra slack on top of the HTTP timeout before an unacked message redelivers. */
@@ -40,18 +43,118 @@ const VISIBILITY_BUFFER_MS = 60_000;
 const COMPLETED_IDEMPOTENCY_CACHE_LIMIT = 10_000;
 
 /**
+ * In-flight members are the envelope with a per-claim token spliced in as its
+ * first JSON field, so a stale executor can never settle a newer claim of the
+ * same bytes, and pre-fencing workers still parse promoted members.
+ */
+export const CLAIM_PREFIX = '{"__wfClaim":"';
+/** Length of the `<uuid>",` segment between CLAIM_PREFIX and the envelope body. */
+const CLAIM_TOKEN_SEGMENT = 38;
+
+function claimMemberFor(item: string): string {
+  return `${CLAIM_PREFIX}${randomUUID()}",${item.slice(1)}`;
+}
+
+function stripClaim(member: string): string {
+  return member.startsWith(CLAIM_PREFIX)
+    ? `{${member.slice(CLAIM_PREFIX.length + CLAIM_TOKEN_SEGMENT)}`
+    : member;
+}
+
+/**
  * Atomically move members with score <= ARGV[1] from the sorted set (KEYS[1])
- * to the ready list (KEYS[2]). Used for both the delayed queue and expired
- * in-flight (visibility timeout) recovery.
+ * to the ready list (KEYS[2]), stripping claim tokens (ARGV[2] is the prefix).
+ * Legacy untokened members are pushed verbatim. For expired claims, ARGV[3] is
+ * the reclaim counter key prefix (ARGV[4] its TTL); '' skips counting.
+ * Returns { moved, uncounted }: a member with no readable messageId is still
+ * promoted, since blocking the batch on it would stall every message behind
+ * it, but it redelivers unbounded, so the caller reports it.
  */
 const MOVE_DUE_SCRIPT = `
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+local prefix = ARGV[2]
+local uncounted = 0
 for _, member in ipairs(due) do
+  local item = member
+  if string.sub(member, 1, #prefix) == prefix then
+    item = '{' .. string.sub(member, #prefix + ${CLAIM_TOKEN_SEGMENT + 1})
+  end
+  local id = nil
+  if ARGV[3] ~= '' then
+    id = string.match(item, '^{"messageId":"([^"]+)"')
+    if not id then
+      local ok, decoded = pcall(cjson.decode, item)
+      if ok and type(decoded) == 'table' and type(decoded.messageId) == 'string' then
+        id = decoded.messageId
+      end
+    end
+    if not id then
+      uncounted = uncounted + 1
+    end
+  end
   redis.call('ZREM', KEYS[1], member)
-  redis.call('LPUSH', KEYS[2], member)
+  if id then
+    redis.call('INCR', ARGV[3] .. id)
+    redis.call('PEXPIRE', ARGV[3] .. id, ARGV[4])
+  end
+  redis.call('LPUSH', KEYS[2], item)
 end
-return #due
+return { #due, uncounted }
 `;
+
+/**
+ * Claim a popped item. KEYS: processing, inflight, reclaims counter. ARGV: raw
+ * item, deadline, claim member. Returns the reclaim count, or -1 if the item
+ * left the processing list (startup recovery requeued it).
+ */
+const CLAIM_SCRIPT = `
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return -1 end
+redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+return tonumber(redis.call('GET', KEYS[3]) or '0')
+`;
+
+/**
+ * Give back the reclaim this delivery consumed, for a duplicate that holds its
+ * claim without dispatching. KEYS: reclaims counter.
+ */
+const RELEASE_RECLAIM_SCRIPT = `
+local left = redis.call('DECR', KEYS[1])
+if left <= 0 then redis.call('DEL', KEYS[1]) end
+return left
+`;
+
+/**
+ * Compare-and-settle a claim. KEYS: inflight, delayed, dedup, reclaims counter.
+ * ARGV: claim member, mode ('drop' | 'release' | 'retry' | 'suspend'),
+ * deliverAt, payload, dedup PEXPIRE ms (or ''), messageId the dedup key must
+ * hold to be released (or ''), reclaim counter PEXPIRE ms. Returns 0 without
+ * side effects if the claim is gone. Release and retry reset the reclaim
+ * count; a suspension keeps it, and outlives its own delay.
+ */
+const SETTLE_SCRIPT = `
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then return 0 end
+if ARGV[2] == 'release' then
+  if ARGV[6] ~= '' and redis.call('GET', KEYS[3]) == ARGV[6] then
+    redis.call('DEL', KEYS[3])
+  end
+  redis.call('DEL', KEYS[4])
+elseif ARGV[2] == 'retry' or ARGV[2] == 'suspend' then
+  redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+  if ARGV[5] ~= '' then redis.call('PEXPIRE', KEYS[3], ARGV[5]) end
+  if ARGV[2] == 'retry' then
+    redis.call('DEL', KEYS[4])
+  else
+    redis.call('PEXPIRE', KEYS[4], ARGV[7])
+  end
+end
+return 1
+`;
+
+type Settlement =
+  | { mode: 'drop' }
+  | { mode: 'release' }
+  | { mode: 'retry'; deliverAt: number; payload: string }
+  | { mode: 'suspend'; deliverAt: number; payload: string; dedupTtlMs: number };
 
 function resolveBaseUrl(config: PostgresWorldConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -89,6 +192,18 @@ function binaryReviver(_key: string, value: unknown): unknown {
   return value;
 }
 
+function parseTimeoutSeconds(text: string): number | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && 'timeoutSeconds' in parsed) {
+      return typeof parsed.timeoutSeconds === 'number' ? parsed.timeoutSeconds : null;
+    }
+  } catch {
+    // Not JSON: treat as an ordinary failure.
+  }
+  return null;
+}
+
 interface OutboxQueuePayload {
   listKey: string;
   envelope: string;
@@ -119,7 +234,12 @@ export function createQueue(
   const generateMessageId = monotonicFactory();
   const maxAttempts = config.maxAttempts ?? 5;
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
-  const visibilityMs = httpTimeoutMs + VISIBILITY_BUFFER_MS;
+  const visibilityMs = config.visibilityTimeoutMs ?? httpTimeoutMs + VISIBILITY_BUFFER_MS;
+  if (!Number.isInteger(visibilityMs) || visibilityMs < httpTimeoutMs) {
+    throw new RangeError(
+      `world-postgres-redis: visibilityTimeoutMs must be an integer >= httpTimeoutMs (${httpTimeoutMs}), got ${visibilityMs}`,
+    );
+  }
 
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
@@ -140,7 +260,7 @@ export function createQueue(
   // Delivery-side dedup (same-process): completed keys are never re-executed,
   // in-flight keys cause duplicate deliveries to be acked without dispatch.
   const completedMessages = new Set<string>();
-  const inflightMessages = new Map<string, { item: string; execution: Promise<void> }>();
+  const inflightMessages = new Map<string, { claim: string; execution: Promise<void> }>();
 
   function markMessageCompleted(idempotencyKey: string): void {
     completedMessages.delete(idempotencyKey);
@@ -155,6 +275,7 @@ export function createQueue(
 
   const dedupKeyFor = (listKey: string, idempotencyKey: string) =>
     `${listKey}:dedup:${idempotencyKey}`;
+  const reclaimsPrefixFor = (listKey: string) => `${listKey}:reclaims:`;
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'postgres-redis';
 
@@ -291,13 +412,44 @@ export function createQueue(
     });
   }
 
-  async function releaseDedupKey(listKey: string, envelope: MessageEnvelope): Promise<void> {
-    if (!envelope.idempotencyKey) return;
-    try {
-      await redis.del(dedupKeyFor(listKey, envelope.idempotencyKey));
-    } catch (err) {
-      debug(`Queue: failed to release dedup key for ${envelope.idempotencyKey}:`, err);
+  /**
+   * Settle a claim atomically against its token. A stale executor (its claim
+   * expired and was redelivered) gets `false` and changes nothing in Redis.
+   */
+  async function settle(
+    workerRedis: Redis,
+    listKey: string,
+    claim: string,
+    envelope: MessageEnvelope,
+    settlement: Settlement,
+  ): Promise<boolean> {
+    const inflightKey = `${listKey}:inflight`;
+    const { idempotencyKey } = envelope;
+    // Without an idempotency key, ARGV gates every dedup write off; the key is
+    // an unused name in the dedup keyspace, never another structure.
+    const dedupKey = idempotencyKey ? dedupKeyFor(listKey, idempotencyKey) : `${listKey}:dedup:`;
+    const delayed =
+      settlement.mode === 'retry' || settlement.mode === 'suspend' ? settlement : null;
+    const settled = await workerRedis.eval(
+      SETTLE_SCRIPT,
+      4,
+      inflightKey,
+      `${listKey}:delayed`,
+      dedupKey,
+      `${reclaimsPrefixFor(listKey)}${envelope.messageId}`,
+      claim,
+      settlement.mode,
+      String(delayed?.deliverAt ?? 0),
+      delayed?.payload ?? '',
+      idempotencyKey && settlement.mode === 'suspend' ? String(settlement.dedupTtlMs) : '',
+      idempotencyKey ? envelope.messageId : '',
+      String(RECLAIM_TTL_MS),
+    );
+    if (settled !== 1) {
+      debug(`Queue: stale claim for ${envelope.messageId}, ${settlement.mode} settle skipped`);
+      return false;
     }
+    return true;
   }
 
   /**
@@ -335,138 +487,173 @@ export function createQueue(
     }
   }
 
+  /**
+   * `envelope.attempt` includes this message's reclaims (claims that expired
+   * before settling), so a delivery that keeps outliving its visibility
+   * deadline still exhausts its attempts instead of redelivering forever.
+   */
   async function executeItem(
     workerRedis: Redis,
     listKey: string,
     item: string,
+    claim: string,
     envelope: MessageEnvelope,
     kind: QueueKind,
   ): Promise<void> {
-    const inflightKey = `${listKey}:inflight`;
-    const delayedKey = `${listKey}:delayed`;
-    const ack = () => workerRedis.zrem(inflightKey, item);
-
-    const scheduleRetry = async (reason: string): Promise<void> => {
-      if (envelope.attempt < maxAttempts) {
-        const next: MessageEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
-        const backoffMs = computeBackoffMs(next.attempt, config);
-        // ZADD before ZREM: a crash in between double-delivers (benign)
-        // instead of losing the message.
-        await workerRedis.zadd(delayedKey, Date.now() + backoffMs, JSON.stringify(next));
-        await ack();
-      } else {
-        console.error(
-          `[world-postgres-redis worker] dropping ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
-        );
-        await failRunForExhaustedMessage(envelope, reason);
-        await releaseDedupKey(listKey, envelope);
-        await ack();
+    const deadLetter = async (reason: string): Promise<Settlement> => {
+      // Only the owner fails the run. Pushing its deadline out (XX: only if the
+      // claim still exists) keeps it from being redelivered during the DB write.
+      const deadline = Date.now() + visibilityMs;
+      if ((await workerRedis.zadd(`${listKey}:inflight`, 'XX', 'CH', deadline, claim)) === 0) {
+        debug(`Queue: stale claim for exhausted ${envelope.messageId}, not failing run`);
+        return { mode: 'release' };
       }
+      console.error(
+        `[world-postgres-redis worker] dropping ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
+      );
+      await failRunForExhaustedMessage(envelope, reason);
+      return { mode: 'release' };
+    };
+    const retryOrDeadLetter = async (reason: string): Promise<Settlement> => {
+      if (envelope.attempt >= maxAttempts) return deadLetter(reason);
+      const next: MessageEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
+      return {
+        mode: 'retry',
+        deliverAt: Date.now() + computeBackoffMs(next.attempt, config),
+        payload: JSON.stringify(next),
+      };
     };
 
+    if (envelope.attempt > maxAttempts) {
+      const reason = 'visibility timeout expired before the delivery settled';
+      await settle(workerRedis, listKey, claim, envelope, await deadLetter(reason));
+      return;
+    }
+
+    let settlement: Settlement;
     try {
       const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
+      const text = response.ok ? '' : await response.text();
+      const timeoutSeconds = response.status === 503 ? parseTimeoutSeconds(text) : null;
 
       if (response.ok) {
         if (envelope.idempotencyKey) {
           markMessageCompleted(envelope.idempotencyKey);
         }
-        await releaseDedupKey(listKey, envelope);
-        await ack();
-        return;
+        settlement = { mode: 'release' };
+      } else if (timeoutSeconds !== null) {
+        // Durable delayed redelivery: the wake-up survives process restarts,
+        // and the enqueue-dedup key outlives the delay.
+        const timeoutMs = timeoutSeconds * 1000;
+        settlement = {
+          mode: 'suspend',
+          deliverAt: Date.now() + timeoutMs,
+          payload: item,
+          dedupTtlMs: timeoutMs + DEDUP_TTL_MS,
+        };
+      } else {
+        settlement = await retryOrDeadLetter(`HTTP ${response.status}: ${text}`);
       }
-
-      const text = await response.text();
-
-      if (response.status === 503) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          parsed = null;
-        }
-        if (
-          parsed &&
-          typeof parsed === 'object' &&
-          typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
-        ) {
-          const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-          // Durable delayed redelivery: park the message in the delayed
-          // sorted set so the wake-up survives process restarts.
-          await workerRedis.zadd(delayedKey, Date.now() + timeoutMs, item);
-          if (envelope.idempotencyKey) {
-            // Keep the enqueue-dedup key alive at least as long as the delay.
-            try {
-              await workerRedis.pexpire(
-                dedupKeyFor(listKey, envelope.idempotencyKey),
-                timeoutMs + DEDUP_TTL_MS,
-              );
-            } catch (err) {
-              debug('Queue: failed to extend dedup TTL:', err);
-            }
-          }
-          await ack();
-          return;
-        }
-      }
-
-      await scheduleRetry(`HTTP ${response.status}: ${text}`);
     } catch (error) {
       console.error(`[world-postgres-redis worker] dispatch error on ${listKey}:`, error);
-      await scheduleRetry(String(error));
+      settlement = await retryOrDeadLetter(String(error));
     }
+    await settle(workerRedis, listKey, claim, envelope, settlement);
   }
 
   async function processItem(
     workerRedis: Redis,
     listKey: string,
     processingListKey: string,
-    item: string,
+    rawItem: string,
     kind: QueueKind,
   ): Promise<void> {
-    // Claim the item: record a visibility deadline in the in-flight sorted
-    // set, then drop it from the processing landing zone. If this worker
-    // dies mid-flight, the promote loop redelivers after the deadline.
-    await workerRedis.zadd(`${listKey}:inflight`, Date.now() + visibilityMs, item);
-    await workerRedis.lrem(processingListKey, 1, item);
-    const ack = () => workerRedis.zrem(`${listKey}:inflight`, item);
+    const inflightKey = `${listKey}:inflight`;
+    // Pre-fencing promoters push claim-tokened members verbatim.
+    const item = stripClaim(rawItem);
 
-    let envelope: MessageEnvelope;
+    let parsedEnvelope: MessageEnvelope;
     try {
       // Parsed without the binary reviver: tagged Uint8Array values stay
       // tagged so dispatch can round-trip them verbatim.
-      envelope = JSON.parse(item) as MessageEnvelope;
+      const parsed: unknown = JSON.parse(item);
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        typeof (parsed as { messageId?: unknown }).messageId !== 'string'
+      ) {
+        throw new Error('envelope is not an object with a messageId');
+      }
+      parsedEnvelope = parsed as MessageEnvelope;
     } catch (error) {
       console.error(`[world-postgres-redis worker] invalid envelope on ${listKey}:`, error);
-      await ack();
+      await workerRedis.lrem(processingListKey, 1, rawItem);
       return;
     }
 
+    // Atomically move the item from the processing landing zone into the
+    // in-flight set under a unique token with a visibility deadline. If this
+    // worker dies mid-flight, the promote loop redelivers after the deadline.
+    const claim = claimMemberFor(item);
+    const reclaims = await workerRedis.eval(
+      CLAIM_SCRIPT,
+      3,
+      processingListKey,
+      inflightKey,
+      `${reclaimsPrefixFor(listKey)}${parsedEnvelope.messageId}`,
+      rawItem,
+      String(Date.now() + visibilityMs),
+      claim,
+    );
+    if (typeof reclaims !== 'number') {
+      throw new Error(`world-postgres-redis: claim script returned ${String(reclaims)}`);
+    }
+    if (reclaims < 0) {
+      debug(`Queue: ${parsedEnvelope.messageId} was requeued before its claim, skipping`);
+      return;
+    }
+    const envelope: MessageEnvelope =
+      reclaims > 0
+        ? { ...parsedEnvelope, attempt: parsedEnvelope.attempt + reclaims }
+        : parsedEnvelope;
+
     const idempotencyKey = envelope.idempotencyKey;
     if (!idempotencyKey) {
-      await executeItem(workerRedis, listKey, item, envelope, kind);
+      await executeItem(workerRedis, listKey, item, claim, envelope, kind);
       return;
     }
     if (completedMessages.has(idempotencyKey)) {
-      await ack();
+      // Release the dedup key: a stalled original's release was fenced off.
+      await settle(workerRedis, listKey, claim, envelope, { mode: 'release' });
       return;
     }
     const existing = inflightMessages.get(idempotencyKey);
     if (existing) {
-      // Duplicate delivery while the original is still executing: ack it
-      // without dispatching. The original owns retry/reschedule handling.
-      // Byte-identical duplicates share the in-flight zset member with the
-      // original, so acking here would strip the original's visibility
-      // protection: leave that entry for the original's own ack.
-      if (existing.item !== item) {
-        await ack();
+      // Duplicate delivery while the original is still executing. If the
+      // original lost its claim, its settle is fenced, so this claim must
+      // survive (and later redeliver) to keep the message from being lost.
+      if ((await workerRedis.zscore(inflightKey, existing.claim)) !== null) {
+        await settle(workerRedis, listKey, claim, envelope, { mode: 'drop' });
+      } else {
+        // The original is still executing in this process, so this delivery
+        // must not dispatch. It holds the claim so the message survives the
+        // original's fenced settle, and gives back the reclaim it consumed:
+        // an undispatched hold is not a delivery attempt.
+        debug(`Queue: original claim for ${idempotencyKey} expired, keeping duplicate claim`);
+        if (reclaims > 0) {
+          await workerRedis.eval(
+            RELEASE_RECLAIM_SCRIPT,
+            1,
+            `${reclaimsPrefixFor(listKey)}${envelope.messageId}`,
+          );
+        }
       }
       return;
     }
-    const execution = executeItem(workerRedis, listKey, item, envelope, kind).finally(() => {
+    const execution = executeItem(workerRedis, listKey, item, claim, envelope, kind).finally(() => {
       inflightMessages.delete(idempotencyKey);
     });
-    inflightMessages.set(idempotencyKey, { item, execution });
+    inflightMessages.set(idempotencyKey, { claim, execution });
     await execution;
   }
 
@@ -501,8 +688,8 @@ export function createQueue(
 
   /**
    * Requeue items stranded in the processing landing zone by a crash between
-   * BRPOPLPUSH and the in-flight claim. The window is milliseconds wide, so
-   * the odd item stolen from a live worker just becomes a benign duplicate.
+   * BRPOPLPUSH and the in-flight claim. A live worker whose item is taken
+   * finds it gone when claiming and skips it.
    */
   async function recoverProcessingList(listKey: string): Promise<void> {
     const processingListKey = `${listKey}:processing`;
@@ -515,13 +702,36 @@ export function createQueue(
   /** Promote due delayed messages and expired in-flight messages. */
   async function promoteDueMessages(listKey: string): Promise<void> {
     const now = String(Date.now());
-    for (const source of [`${listKey}:delayed`, `${listKey}:inflight`]) {
+    const sources = [
+      { source: `${listKey}:delayed`, reclaims: '' },
+      { source: `${listKey}:inflight`, reclaims: reclaimsPrefixFor(listKey) },
+    ];
+    for (const { source, reclaims } of sources) {
+      let result: unknown;
       try {
-        await redis.eval(MOVE_DUE_SCRIPT, 2, source, listKey, now);
+        result = await redis.eval(
+          MOVE_DUE_SCRIPT,
+          2,
+          source,
+          listKey,
+          now,
+          CLAIM_PREFIX,
+          reclaims,
+          String(RECLAIM_TTL_MS),
+        );
       } catch (err) {
-        if (!closed) {
-          debug(`Queue: promote cycle failed for ${source}:`, err);
-        }
+        if (closed) continue;
+        debug(`Queue: promote cycle failed for ${source}:`, err);
+        continue;
+      }
+      // Outside the catch: a shape change is a bug, not a transient failure.
+      if (!Array.isArray(result) || typeof result[1] !== 'number') {
+        throw new TypeError(`MOVE_DUE_SCRIPT returned ${String(result)}`);
+      }
+      if (result[1] > 0) {
+        console.error(
+          `[world-postgres-redis] ${result[1]} expired claim(s) on ${source} carry no readable messageId; their redelivery is unbounded`,
+        );
       }
     }
   }

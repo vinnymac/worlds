@@ -12,6 +12,13 @@ export interface PostgresWorldConfig {
   baseUrl?: string;
   /** Per-job HTTP request timeout (ms). Default: 300_000 */
   httpTimeoutMs?: number;
+  /**
+   * How long a claimed job stays invisible before the promote loop redelivers
+   * it. The deadline is fixed at claim time and never renewed, so it must
+   * outlast the whole execution. Must be an integer >= httpTimeoutMs.
+   * Default: httpTimeoutMs + 60_000
+   */
+  visibilityTimeoutMs?: number;
   /** Maximum retry attempts before dropping a job. Default: 5 */
   maxAttempts?: number;
   /** Base backoff delay (ms). Default: 1000 */
