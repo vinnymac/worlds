@@ -58,12 +58,12 @@ await world.start();
 
 ## Configuration Options
 
-| Option             | Type                     | Default                  | Description                             |
-| ------------------ | ------------------------ | ------------------------ | --------------------------------------- |
-| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
-| `keyPrefix`        | `string`                 | `workflow:`              | Prefix for all Redis keys               |
-| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers      |
-| `heartbeatTtlMs`   | `number`                 | `90000`                  | Worker liveness TTL before reclaim (ms) |
+| Option             | Type                     | Default                  | Description                                                                                             |
+| ------------------ | ------------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options                                                                 |
+| `keyPrefix`        | `string`                 | `workflow:`              | Prefix for all Redis keys                                                                               |
+| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers                                                                      |
+| `heartbeatTtlMs`   | `number`                 | `90000`                  | Worker liveness TTL before reclaim (ms). Set to at least 1.5x the longest event-loop block; min `15000` |
 
 ## Redis Data Structures
 

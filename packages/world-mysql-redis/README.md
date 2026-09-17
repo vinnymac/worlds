@@ -63,7 +63,7 @@ interface MysqlRedisWorldConfig {
   queueConcurrency?: number; // Workers per queue (default: 10)
   deploymentId?: string; // Optional deployment tracking ID
   httpTimeoutMs?: number; // Per-job dispatch timeout (default: 300_000)
-  visibilityTimeoutMs?: number; // Lease before an in-flight item is requeued (default: httpTimeoutMs + 30_000)
+  visibilityTimeoutMs?: number; // Lease before an in-flight item is requeued (default: httpTimeoutMs + 30_000); must be an integer >= httpTimeoutMs, else a RangeError is thrown at startup
 }
 ```
 

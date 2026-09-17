@@ -57,7 +57,6 @@ interface JobEnvelope {
   message: QueuePayload;
 }
 
-/** Row shape returned by raw SQL SELECT on workflow_jobs (snake_case columns) */
 /**
  * MySQL errnos the queue's start-up probe reads as "migrations have not run".
  * Anything else (auth, connectivity) propagates untouched.
@@ -79,6 +78,7 @@ function isUnmigratedError(error: unknown): boolean {
 /** `max_attempts` column default, also the enqueue-time default for new rows. */
 const DEFAULT_MAX_ATTEMPTS = 3;
 
+/** Row shape returned by raw SQL SELECT on workflow_jobs (snake_case columns) */
 export interface RawJobRow {
   id: number;
   job_id: string;
@@ -342,11 +342,13 @@ async function enqueueJob(
 /**
  * WHERE clause matching only the claim this executor holds. A reclaim clears
  * the token and a redelivery sets a new one, so a stalled executor's settle
- * matches nothing. `<=>` makes a NULL token match NULL instead of nothing.
+ * matches nothing. `<=>` lets a NULL token match NULL (pre-migration claims);
+ * the status check stops that from settling an unclaimed row by id alone.
  */
 function claimedBy(job: RawJobRow): SQL | undefined {
   return and(
     eq(schema.jobs.id, job.id),
+    eq(schema.jobs.status, 'processing'),
     sql`${schema.jobs.claimToken} <=> ${job.claim_token}`,
     sql`${schema.jobs.lockedBy} <=> ${job.locked_by}`,
   );
@@ -369,6 +371,18 @@ function isStaleSettle(
     lockedBy: job.locked_by,
   });
   return true;
+}
+
+/**
+ * Release the job's own key reservation. Matching `message_id` keeps a delayed
+ * release from deleting a key that expired and was re-reserved by a newer job.
+ */
+async function releaseIdempotencyKey(db: Drizzle, job: RawJobRow, key: string): Promise<void> {
+  await db
+    .delete(schema.idempotency)
+    .where(
+      and(eq(schema.idempotency.idempotencyKey, key), eq(schema.idempotency.messageId, job.job_id)),
+    );
 }
 
 /** Returns false when the claim was lost and the settle did nothing. */
@@ -396,9 +410,7 @@ export async function handleJobFailure(
     // Permanent failure: release the idempotency key so the failed job does
     // not block a future re-enqueue of the same logical message.
     if (job.idempotency_key) {
-      await db
-        .delete(schema.idempotency)
-        .where(eq(schema.idempotency.idempotencyKey, job.idempotency_key));
+      await releaseIdempotencyKey(db, job, job.idempotency_key);
     }
     return true;
   }
@@ -436,8 +448,7 @@ export async function completeJob(
   // Release the idempotency key recorded at enqueue time. Rows written
   // before the idempotency_key column existed fall back to the messageId,
   // which was the default key.
-  const idempotencyKey = job.idempotency_key ?? job.job_id;
-  await db.delete(schema.idempotency).where(eq(schema.idempotency.idempotencyKey, idempotencyKey));
+  await releaseIdempotencyKey(db, job, job.idempotency_key ?? job.job_id);
   return true;
 }
 

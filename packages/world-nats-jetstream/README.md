@@ -57,7 +57,7 @@ interface NatsJetStreamWorldConfig {
   // heartbeat from their event loop every third of this, so raise it if steps
   // block the loop for longer. Set on the shared durable consumer, which every
   // worker re-reads, so prefer the same value everywhere (min: 1_000,
-  // default: 30_000)
+  // max: 2_073_600_000, which is 24 days; default: 30_000)
   //
   // Each worker pulls one message at a time, so a stream has at most
   // queueConcurrency deliveries in flight and every message costs a pull round

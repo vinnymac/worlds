@@ -21,6 +21,9 @@ interface PendingFetch {
   resolve: (response: Response) => void;
 }
 
+/** Every stubbed fetch of the running test, so afterEach can release them. */
+const stubbedFetches: PendingFetch[] = [];
+
 function stubFetch(): PendingFetch[] {
   const calls: PendingFetch[] = [];
   vi.stubGlobal(
@@ -29,11 +32,13 @@ function stubFetch(): PendingFetch[] {
       (_url: URL, init: RequestInit) =>
         new Promise<Response>((resolve) => {
           const headers = new Headers(init.headers);
-          calls.push({
+          const call = {
             messageId: headers.get('x-vqs-message-id'),
             attempt: headers.get('x-vqs-message-attempt'),
             resolve,
-          });
+          };
+          calls.push(call);
+          stubbedFetches.push(call);
         }),
     ),
   );
@@ -46,7 +51,13 @@ function envelope(messageId: string, idempotencyKey?: string): string {
     idempotencyKey,
     queueName: '__wkf_step_x',
     attempt: 1,
-    message: { workflowRunId: 'wrun_1' },
+    // Must satisfy QueuePayloadSchema, or the dead-letter path never fails the run.
+    message: {
+      workflowRunId: 'wrun_1',
+      workflowName: 'wf',
+      workflowStartedAt: 1,
+      stepId: 'step_1',
+    },
   });
 }
 
@@ -69,6 +80,8 @@ if (process.platform === 'win32') {
     });
 
     afterEach(async () => {
+      // Finish any stalled delivery, or close() waits on its worker forever.
+      for (const call of stubbedFetches.splice(0)) call.resolve(Response.json({ ok: true }));
       await Promise.all(queues.splice(0).map((queue) => queue.close()));
       await Promise.all(clients.splice(0).map((client) => client.quit()));
       vi.unstubAllGlobals();
@@ -215,18 +228,55 @@ if (process.platform === 'win32') {
       await vi.waitFor(
         () =>
           expect(console.error).toHaveBeenCalledWith(
-            expect.stringContaining('dropping msg_reclaim after 3 attempts'),
+            expect.stringContaining('dropping msg_reclaim after 2 attempts'),
           ),
         { timeout: 5_000 },
+      );
+      expect(createEvent).toHaveBeenCalledExactlyOnceWith(
+        'wrun_1',
+        expect.objectContaining({ eventType: 'run_failed' }),
       );
       expect(calls).toHaveLength(2);
       expect(await admin.zcard(inflightKey)).toBe(0);
       expect(await admin.llen(listKey)).toBe(0);
       expect(await admin.zcard(`${listKey}:delayed`)).toBe(0);
       expect(await admin.exists(`${listKey}:reclaims:msg_reclaim`)).toBe(0);
+    }, 20_000);
 
-      // Let the stalled deliveries finish so close() can drain its workers.
-      for (const call of calls) call.resolve(Response.json({ ok: true }));
+    test('keeps an exhausted claim when the run cannot be failed', async ({ onTestFinished }) => {
+      const jobPrefix = `keep_${randomUUID()}_`;
+      const listKey = `${jobPrefix}steps`;
+      const inflightKey = `${listKey}:inflight`;
+      const calls = stubFetch();
+      const admin = new Redis(url);
+      clients.push(admin);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      onTestFinished(() => {
+        vi.restoreAllMocks();
+      });
+      createEvent.mockRejectedValueOnce(new Error('postgres is down'));
+      await admin.lpush(listKey, envelope('msg_keep'));
+
+      const owner = connect();
+      await start(owner.client, { jobPrefix, maxAttempts: 1 }).start();
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      calls[0]?.resolve(Response.json({ error: 'boom' }, { status: 500 }));
+
+      // The run_failed write threw, so the claim survives unsettled.
+      await vi.waitFor(() =>
+        expect(console.error).toHaveBeenCalledWith(
+          expect.stringContaining('could not fail run for msg_keep'),
+          expect.any(Error),
+        ),
+      );
+      expect(await admin.zcard(inflightKey)).toBe(1);
+      expect(owner.settles).toHaveLength(0);
+
+      // Its expiry redelivers, and the dead-letter succeeds this time.
+      await expireClaim(admin, inflightKey, { settled: true });
+      expect(createEvent).toHaveBeenCalledTimes(2);
+      expect(calls).toHaveLength(1);
+      expect(await admin.exists(`${listKey}:reclaims:msg_keep`)).toBe(0);
     }, 20_000);
 
     test('a duplicate held while the original runs does not consume an attempt', async () => {

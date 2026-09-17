@@ -61,6 +61,8 @@ describe('createQueue visibility timeout', () => {
     { config: { httpTimeoutMs: 10_000 }, expected: 70_000 },
     { config: { visibilityTimeoutMs: 900_000 }, expected: 900_000 },
     { config: { httpTimeoutMs: 10_000, visibilityTimeoutMs: 10_000 }, expected: 10_000 },
+    // Only an explicit visibilityTimeoutMs has to be an integer.
+    { config: { httpTimeoutMs: 1_500.5 }, expected: 61_500.5 },
   ])('claims in-flight items for $expected ms with $config', async ({ config, expected }) => {
     vi.spyOn(Date, 'now').mockReturnValue(NOW);
     vi.stubGlobal(

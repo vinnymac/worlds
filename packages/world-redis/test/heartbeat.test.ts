@@ -42,11 +42,15 @@ describe('createQueue heartbeat', () => {
     await vi.waitFor(() => expect(workers.every((w) => w.set.mock.calls.length > 0)).toBe(true));
 
     expect(workers).toHaveLength(2);
-    for (const worker of workers) {
-      expect(worker.set).toHaveBeenCalledWith(expect.stringMatching(/:owner$/), '1', 'PX', ttl);
-    }
     const heartbeatDelays = setInterval.mock.calls.map(([, delay]) => delay);
     expect(heartbeatDelays).toEqual([refresh, refresh]);
+
+    // Fire each refresh once: the loop-top SET and the refresh must both use PX.
+    for (const [refreshHeartbeat] of setInterval.mock.calls) refreshHeartbeat();
+    const write = [expect.stringMatching(/:owner$/), '1', 'PX', ttl];
+    for (const worker of workers) {
+      expect(worker.set.mock.calls).toEqual([write, write]);
+    }
     await queue.stop();
   });
 

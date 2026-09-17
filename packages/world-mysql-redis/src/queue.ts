@@ -35,10 +35,8 @@ const IDEMPOTENCY_TTL_SECONDS = 86_400;
 const LEASE_GRACE_MS = 30_000;
 
 /**
- * Floor for how long an idle `:reclaims` hash survives (ms). Redis expires the
- * whole hash, so a quiet window drops every count: it undercounts and costs an
- * extra delivery, never a lost message. Per-message keys would have to be
- * derived inside Lua, which leaves them undeclared for Redis Cluster.
+ * Floor for how long an idle `:reclaims` hash survives (ms). Expiry drops every
+ * count at once, which costs an extra delivery, never a lost message.
  */
 const RECLAIMS_TTL_MS = 86_400_000;
 
@@ -164,7 +162,7 @@ return 1 + tonumber(redis.call('HGET', KEYS[3], redis.sha1hex(ARGV[1])) or 0)
  * KEYS[4] = idempotency key, KEYS[5] = reclaims hash
  * ARGV[1] = claim token, ARGV[2] = item, ARGV[3] = 'ack' | 'retry' | 'dead',
  * ARGV[4] = release idempotency key ('1' | '0'), ARGV[5] = retry payload,
- * ARGV[6] = retry deliver-at (ms)
+ * ARGV[6] = retry deliver-at (ms), ARGV[7] = dlq payload (counted attempt)
  */
 const SETTLE_SCRIPT = `
 if redis.call('ZREM', KEYS[1], ARGV[1] .. ARGV[2]) == 0 then
@@ -174,7 +172,7 @@ redis.call('HDEL', KEYS[5], redis.sha1hex(ARGV[2]))
 if ARGV[3] == 'retry' then
   redis.call('ZADD', KEYS[2], ARGV[6], ARGV[5])
 elseif ARGV[3] == 'dead' then
-  redis.call('LPUSH', KEYS[3], ARGV[2])
+  redis.call('LPUSH', KEYS[3], ARGV[7])
 end
 if ARGV[4] == '1' then
   redis.call('DEL', KEYS[4])
@@ -367,11 +365,12 @@ export function createQueue(
   type Settle =
     | { mode: 'ack'; releaseIdempotencyKey?: string }
     | { mode: 'retry'; payload: string; deliverAtMs: number }
-    | { mode: 'dead'; releaseIdempotencyKey?: string };
+    | { mode: 'dead'; payload: string; releaseIdempotencyKey?: string };
 
   /**
    * Atomically ack, reschedule, or dead-letter a claim. A stale claim leaves
    * the redelivered claim's lease, retry, and idempotency key to its owner.
+   * Returns whether the settle applied.
    */
   async function settle(
     workerRedis: Redis,
@@ -379,7 +378,7 @@ export function createQueue(
     token: string,
     item: string,
     action: Settle,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const keys = keysFor(listKey);
     const release = action.mode === 'retry' ? undefined : action.releaseIdempotencyKey;
     const settled = await workerRedis.eval(
@@ -396,10 +395,13 @@ export function createQueue(
       release ? '1' : '0',
       action.mode === 'retry' ? action.payload : '',
       action.mode === 'retry' ? String(action.deliverAtMs) : '0',
+      action.mode === 'dead' ? action.payload : '',
     );
     if (settled === 0) {
       debug(`worker skipped stale ${action.mode} on ${listKey}: claim was reclaimed`);
+      return false;
     }
+    return true;
   }
 
   async function processItem(
@@ -421,14 +423,25 @@ export function createQueue(
       return;
     }
 
-    if (envelope.attempt > maxAttempts) {
-      console.error(
-        `[world-mysql-redis worker] dead-lettering ${envelope.messageId}: lease expired ${reclaims} time(s), exhausting ${maxAttempts} attempts`,
-      );
-      await settle(workerRedis, listKey, token, item, {
+    // The item with its counted attempt, for payloads that outlive this claim.
+    const counted = reclaims > 0 ? stringify(envelope) : item;
+
+    /** Logs only once the dead-letter applied: a stale claim's never happens. */
+    const deadLetter = async (message: string) => {
+      const applied = await settle(workerRedis, listKey, token, item, {
         mode: 'dead',
+        payload: counted,
         releaseIdempotencyKey: envelope.idempotencyKey,
       });
+      if (applied) console.error(`[world-mysql-redis worker] ${message}`);
+    };
+
+    // Only lease expiries dead-letter undispatched: a retry payload above a
+    // lowered maxAttempts still gets its delivery.
+    if (reclaims > 0 && envelope.attempt > maxAttempts) {
+      await deadLetter(
+        `dead-lettering ${envelope.messageId}: lease expired ${reclaims} time(s), exhausting ${maxAttempts} attempts`,
+      );
       return;
     }
 
@@ -442,13 +455,9 @@ export function createQueue(
           deliverAtMs: Date.now() + backoffMs,
         });
       } else {
-        console.error(
-          `[world-mysql-redis worker] dead-lettering ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
+        await deadLetter(
+          `dead-lettering ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
         );
-        await settle(workerRedis, listKey, token, item, {
-          mode: 'dead',
-          releaseIdempotencyKey: envelope.idempotencyKey,
-        });
       }
     };
 
@@ -482,7 +491,7 @@ export function createQueue(
           const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
           await settle(workerRedis, listKey, token, item, {
             mode: 'retry',
-            payload: reclaims > 0 ? stringify(envelope) : item,
+            payload: counted,
             deliverAtMs: Date.now() + timeoutMs,
           });
           return;

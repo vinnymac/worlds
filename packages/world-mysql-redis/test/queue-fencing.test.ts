@@ -169,15 +169,56 @@ describe('claim fencing', () => {
       await redis.zadd(`${prefix}steps:claims`, 0, claim);
     }
     await vi.waitFor(async () => expect(await redis.llen(`${prefix}steps:dlq`)).toBe(1));
-    expect(error).toHaveBeenCalledWith(expect.stringContaining('lease expired 2 time(s)'));
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('lease expired 2 time(s)')),
+    );
+    // The DLQ entry carries the counted attempt, not the enqueued one.
+    const [dead] = await redis.lrange(`${prefix}steps:dlq`, 0, -1);
+    expect(parse<{ attempt: number }>(dead).attempt).toBe(3);
     expect(calls).toHaveLength(2);
     expect(await claimsOf(prefix)).toEqual([]);
     expect(await redis.exists(`${prefix}steps:reclaims`)).toBe(0);
     expect(await redis.exists(`${prefix}steps:idempotent:k`)).toBe(0);
 
+    // The second delivery ran at maxAttempts, so its stale settle is a dead-letter.
     for (const resolve of calls) resolve(new Response('boom', { status: 500 }));
     await vi.waitFor(() =>
       expect(debug.filter((line) => line.includes('skipped stale'))).toHaveLength(2),
+    );
+    expect(debug.filter((line) => line.includes('skipped stale dead'))).toHaveLength(1);
+    const deadLetterLogs = error.mock.calls.filter(([m]) => String(m).includes('dead-lettering'));
+    expect(deadLetterLogs).toHaveLength(1);
+    expect(await redis.llen(`${prefix}steps:dlq`)).toBe(1);
+    expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(0);
+    queue.stop();
+  }, 30_000);
+
+  test('dispatches a retry above a lowered maxAttempts that never lost a lease', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const prefix = 'lowered_';
+    // A retry payload scheduled before maxAttempts was lowered to 2.
+    const item = stringify({
+      messageId: 'msg_01LOWERED',
+      queueName: QUEUE_NAME,
+      attempt: 5,
+      message: {},
+    });
+    await redis.lpush(`${prefix}steps`, item);
+
+    const calls = stubFetch();
+    const queue = start(prefix, { maxAttempts: 2 });
+    await queue.start();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(await redis.llen(`${prefix}steps:dlq`)).toBe(0);
+    expect(error).not.toHaveBeenCalled();
+
+    // Its failure is what dead-letters it, with the payload untouched.
+    calls[0](new Response('boom', { status: 500 }));
+    await vi.waitFor(async () =>
+      expect(await redis.lrange(`${prefix}steps:dlq`, 0, -1)).toEqual([item]),
+    );
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('after 5 attempts')),
     );
     expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(0);
     queue.stop();
@@ -295,6 +336,69 @@ describe('claim fencing', () => {
     expect(await redis.llen(`${prefix}steps:processing`)).toBe(0);
     expect(await redis.llen(`${prefix}steps`)).toBe(0);
     expect(calls).toHaveLength(1);
+    queue.stop();
+  }, 30_000);
+
+  test('adopts a processing entry that has no lease, then reclaims it', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const prefix = 'orphan_';
+    const item = stringify({
+      messageId: 'msg_01ORPHAN',
+      queueName: QUEUE_NAME,
+      attempt: 1,
+      message: {},
+    });
+    // A worker died between its pop and its lease.
+    await redis.lpush(`${prefix}steps:processing`, item);
+
+    const calls = stubFetch();
+    const queue = start(prefix);
+    await queue.start();
+    await vi.waitFor(async () =>
+      expect(await redis.zrange(`${prefix}steps:leases`, '0', '-1')).toEqual([item]),
+    );
+    expect(calls).toHaveLength(0);
+
+    await redis.zadd(`${prefix}steps:leases`, 0, item);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(await redis.hvals(`${prefix}steps:reclaims`)).toEqual(['1']);
+    expect(await claimsOf(prefix)).toHaveLength(1);
+    expect(await redis.zcard(`${prefix}steps:leases`)).toBe(0);
+    expect(await redis.llen(`${prefix}steps:processing`)).toBe(0);
+
+    calls[0](Response.json({ ok: true }));
+    await vi.waitFor(async () => expect(await claimsOf(prefix)).toEqual([]));
+    expect(await redis.exists(`${prefix}steps:reclaims`)).toBe(0);
+    queue.stop();
+  }, 30_000);
+
+  test('a claim whose processing entry is gone writes nothing', async () => {
+    const debug = captureDebug();
+    const prefix = 'unclaimed_';
+    const calls = stubFetch();
+    // Empty the processing list in the pop-to-claim window, as a reclaim would.
+    const duplicate = redis.duplicate.bind(redis);
+    vi.spyOn(redis, 'duplicate').mockImplementation((options) => {
+      const worker = duplicate(options);
+      const pop = worker.brpoplpush.bind(worker);
+      vi.spyOn(worker, 'brpoplpush').mockImplementation(async (source, destination, timeout) => {
+        const popped = await pop(source, destination, timeout);
+        if (popped) await redis.del(`${prefix}steps:processing`);
+        return popped;
+      });
+      return worker;
+    });
+
+    const queue = start(prefix);
+    await queue.queue(QUEUE_NAME, MESSAGE);
+    await queue.start();
+    await vi.waitFor(() =>
+      expect(debug.filter((line) => line.includes('reclaimed before its claim'))).toHaveLength(1),
+    );
+    expect(await claimsOf(prefix)).toEqual([]);
+    expect(await redis.exists(`${prefix}steps:reclaims`)).toBe(0);
+    expect(await redis.zcard(`${prefix}steps:leases`)).toBe(0);
+    expect(calls).toHaveLength(0);
     queue.stop();
   }, 30_000);
 });

@@ -366,6 +366,7 @@ export function createQueue(
     listKey: string,
     processingKey: string,
     item: string,
+    messageId: string,
     nextPayload: string,
     deliverAtMs: number,
   ) {
@@ -378,7 +379,7 @@ export function createQueue(
       nextPayload,
       Math.round(deliverAtMs).toString(),
     );
-    if (settled === 0) debug(`stale defer on ${processingKey}: already reclaimed`);
+    if (settled === 0) debug(`stale defer of ${messageId}: already reclaimed`);
   }
 
   async function worker(kind: QueueKind, listKey: string) {
@@ -396,7 +397,11 @@ export function createQueue(
     // Liveness heartbeat. If this process dies, the key expires and the
     // reclaimer returns any in-flight message to the ready list.
     const heartbeat = setInterval(() => {
-      void workerRedis.set(ownerKey, '1', 'PX', heartbeatTtlMs).catch(() => {});
+      void workerRedis.set(ownerKey, '1', 'PX', heartbeatTtlMs).catch((error: unknown) => {
+        if (stopped) return;
+        // A missed refresh can let the key expire and the message be reclaimed.
+        console.error(`[world-redis worker] heartbeat refresh failed on ${listKey}:`, error);
+      });
     }, heartbeatRefreshMs);
     heartbeat.unref();
 
@@ -469,7 +474,15 @@ export function createQueue(
               typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
             ) {
               const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-              await defer(workerRedis, listKey, processingKey, item, item, Date.now() + timeoutMs);
+              await defer(
+                workerRedis,
+                listKey,
+                processingKey,
+                item,
+                envelope.messageId,
+                item,
+                Date.now() + timeoutMs,
+              );
               continue;
             }
           }
@@ -485,6 +498,7 @@ export function createQueue(
               listKey,
               processingKey,
               item,
+              envelope.messageId,
               stringifyWithUint8Array(next),
               Date.now() + backoffMs,
             );
@@ -509,6 +523,7 @@ export function createQueue(
                 listKey,
                 processingKey,
                 item,
+                envelope.messageId,
                 stringifyWithUint8Array(next),
                 Date.now() + backoffMs,
               );

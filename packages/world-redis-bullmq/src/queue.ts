@@ -35,6 +35,12 @@ const QUEUE_PATHNAMES = {
   step: 'step',
 } as const satisfies Record<QueueKind, string>;
 
+/**
+ * Node coerces a timer delay above this to 1 ms. BullMQ derives its lock
+ * renewal timer from lockDuration, so the option is capped here.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 interface QueueJobData {
   /** The actual workflow/step queue name, including the suffix (e.g. `__wkf_workflow_wrun_...`) */
   queueName: ValidQueueName;
@@ -115,8 +121,13 @@ export function createQueue(
   const stalledInterval = config.stalledInterval ?? 30_000;
   const maxStalledCount = config.maxStalledCount ?? 1;
   const lockDuration = config.lockDuration;
-  if (lockDuration !== undefined && (!Number.isSafeInteger(lockDuration) || lockDuration <= 0)) {
-    throw new RangeError(`lockDuration must be a positive integer, got ${lockDuration}`);
+  if (
+    lockDuration !== undefined &&
+    (!Number.isSafeInteger(lockDuration) || lockDuration <= 0 || lockDuration > MAX_TIMER_DELAY_MS)
+  ) {
+    throw new RangeError(
+      `lockDuration must be a positive integer <= ${MAX_TIMER_DELAY_MS}, got ${lockDuration}`,
+    );
   }
   const idempotencyTtlMs = config.idempotencyTtlMs;
 

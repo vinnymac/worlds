@@ -8,6 +8,7 @@ import {
   QueuePayloadSchema,
   type ValidQueueName,
 } from '@workflow/world';
+import { EntityConflictError, WorkflowRunNotFoundError } from '@workflow/errors';
 import { createWorkflowUrl } from '@workflow/utils';
 import { eq } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
@@ -37,6 +38,7 @@ const DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often due delayed/expired-inflight messages are promoted to the ready list. */
 const PROMOTE_INTERVAL_MS = 1_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 300_000;
 /** Extra slack on top of the HTTP timeout before an unacked message redelivers. */
 const VISIBILITY_BUFFER_MS = 60_000;
 /** Cap on the delivery-side completed-idempotency-key cache. */
@@ -124,6 +126,17 @@ return left
 `;
 
 /**
+ * Push a live claim's deadline out. KEYS: inflight. ARGV: deadline, claim
+ * member. Returns 0 if the claim is gone. ZADD XX CH cannot tell that apart
+ * from an unchanged score.
+ */
+const EXTEND_CLAIM_SCRIPT = `
+if not redis.call('ZSCORE', KEYS[1], ARGV[2]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+return 1
+`;
+
+/**
  * Compare-and-settle a claim. KEYS: inflight, delayed, dedup, reclaims counter.
  * ARGV: claim member, mode ('drop' | 'release' | 'retry' | 'suspend'),
  * deliverAt, payload, dedup PEXPIRE ms (or ''), messageId the dedup key must
@@ -204,6 +217,22 @@ function parseTimeoutSeconds(text: string): number | null {
   return null;
 }
 
+/**
+ * The in-flight visibility window. Exported so `createWorld` can reject a bad
+ * `visibilityTimeoutMs` before it opens any connection.
+ */
+export function resolveVisibilityMs(config: PostgresWorldConfig): number {
+  const httpTimeoutMs = config.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+  const visibilityMs = config.visibilityTimeoutMs;
+  if (visibilityMs === undefined) return httpTimeoutMs + VISIBILITY_BUFFER_MS;
+  if (!Number.isSafeInteger(visibilityMs) || visibilityMs < httpTimeoutMs) {
+    throw new RangeError(
+      `world-postgres-redis: visibilityTimeoutMs must be an integer >= httpTimeoutMs (${httpTimeoutMs}), got ${visibilityMs}`,
+    );
+  }
+  return visibilityMs;
+}
+
 interface OutboxQueuePayload {
   listKey: string;
   envelope: string;
@@ -233,13 +262,8 @@ export function createQueue(
 ): Queue & { start(): Promise<void>; close(): Promise<void>; outboxRelay: OutboxRelay } {
   const generateMessageId = monotonicFactory();
   const maxAttempts = config.maxAttempts ?? 5;
-  const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
-  const visibilityMs = config.visibilityTimeoutMs ?? httpTimeoutMs + VISIBILITY_BUFFER_MS;
-  if (!Number.isInteger(visibilityMs) || visibilityMs < httpTimeoutMs) {
-    throw new RangeError(
-      `world-postgres-redis: visibilityTimeoutMs must be an integer >= httpTimeoutMs (${httpTimeoutMs}), got ${visibilityMs}`,
-    );
-  }
+  const httpTimeoutMs = config.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+  const visibilityMs = resolveVisibilityMs(config);
 
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
@@ -455,15 +479,17 @@ export function createQueue(
   /**
    * Fail the run loudly when a message exhausts its delivery attempts, so the
    * run reaches a terminal state instead of silently never completing.
+   * Returns false when the write failed and the message must not be dropped.
    */
   async function failRunForExhaustedMessage(
     envelope: MessageEnvelope,
+    attempts: number,
     reason: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const parsed = QueuePayloadSchema.safeParse(
       JSON.parse(JSON.stringify(envelope.message), binaryReviver),
     );
-    if (!parsed.success) return;
+    if (!parsed.success) return true;
     const message = parsed.data;
     const runId =
       'runId' in message
@@ -471,19 +497,28 @@ export function createQueue(
         : 'workflowRunId' in message
           ? message.workflowRunId
           : null;
-    if (!runId) return;
+    if (!runId) return true;
     try {
       await events.create(runId, {
         eventType: 'run_failed',
         eventData: {
           error: {
-            message: `Queue delivery for "${envelope.queueName}" failed after ${envelope.attempt} attempts: ${reason}`,
+            message: `Queue delivery for "${envelope.queueName}" failed after ${attempts} attempts: ${reason}`,
           },
         },
       });
+      return true;
     } catch (err) {
-      // Run may already be terminal (EntityConflictError); that's fine.
-      debug(`Queue: could not record run_failed for dropped message ${envelope.messageId}:`, err);
+      // An already-terminal or missing run has nothing left to fail.
+      if (EntityConflictError.is(err) || WorkflowRunNotFoundError.is(err)) {
+        debug(`Queue: run_failed for dropped message ${envelope.messageId} not needed:`, err);
+        return true;
+      }
+      console.error(
+        `[world-postgres-redis worker] could not fail run for ${envelope.messageId}, keeping its claim:`,
+        err,
+      );
+      return false;
     }
   }
 
@@ -500,22 +535,29 @@ export function createQueue(
     envelope: MessageEnvelope,
     kind: QueueKind,
   ): Promise<void> {
-    const deadLetter = async (reason: string): Promise<Settlement> => {
-      // Only the owner fails the run. Pushing its deadline out (XX: only if the
-      // claim still exists) keeps it from being redelivered during the DB write.
-      const deadline = Date.now() + visibilityMs;
-      if ((await workerRedis.zadd(`${listKey}:inflight`, 'XX', 'CH', deadline, claim)) === 0) {
+    /** Null keeps the claim, so its expiry redelivers and dead-letters again. */
+    const deadLetter = async (reason: string, attempts: number): Promise<Settlement | null> => {
+      // Only the owner fails the run. Pushing its deadline out keeps the claim
+      // from being redelivered during the DB write.
+      const extended = await workerRedis.eval(
+        EXTEND_CLAIM_SCRIPT,
+        1,
+        `${listKey}:inflight`,
+        String(Date.now() + visibilityMs),
+        claim,
+      );
+      if (extended !== 1) {
         debug(`Queue: stale claim for exhausted ${envelope.messageId}, not failing run`);
         return { mode: 'release' };
       }
+      if (!(await failRunForExhaustedMessage(envelope, attempts, reason))) return null;
       console.error(
-        `[world-postgres-redis worker] dropping ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
+        `[world-postgres-redis worker] dropping ${envelope.messageId} after ${attempts} attempts: ${reason}`,
       );
-      await failRunForExhaustedMessage(envelope, reason);
       return { mode: 'release' };
     };
-    const retryOrDeadLetter = async (reason: string): Promise<Settlement> => {
-      if (envelope.attempt >= maxAttempts) return deadLetter(reason);
+    const retryOrDeadLetter = async (reason: string): Promise<Settlement | null> => {
+      if (envelope.attempt >= maxAttempts) return deadLetter(reason, envelope.attempt);
       const next: MessageEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
       return {
         mode: 'retry',
@@ -526,11 +568,13 @@ export function createQueue(
 
     if (envelope.attempt > maxAttempts) {
       const reason = 'visibility timeout expired before the delivery settled';
-      await settle(workerRedis, listKey, claim, envelope, await deadLetter(reason));
+      // The reclaim that pushed this past the budget was never dispatched.
+      const settlement = await deadLetter(reason, envelope.attempt - 1);
+      if (settlement) await settle(workerRedis, listKey, claim, envelope, settlement);
       return;
     }
 
-    let settlement: Settlement;
+    let settlement: Settlement | null;
     try {
       const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
       const text = response.ok ? '' : await response.text();
@@ -558,7 +602,7 @@ export function createQueue(
       console.error(`[world-postgres-redis worker] dispatch error on ${listKey}:`, error);
       settlement = await retryOrDeadLetter(String(error));
     }
-    await settle(workerRedis, listKey, claim, envelope, settlement);
+    if (settlement) await settle(workerRedis, listKey, claim, envelope, settlement);
   }
 
   async function processItem(
@@ -577,12 +621,16 @@ export function createQueue(
       // Parsed without the binary reviver: tagged Uint8Array values stay
       // tagged so dispatch can round-trip them verbatim.
       const parsed: unknown = JSON.parse(item);
+      // `attempt` is checked too: reclaims are added to it below.
       if (
         !parsed ||
         typeof parsed !== 'object' ||
-        typeof (parsed as { messageId?: unknown }).messageId !== 'string'
+        !('messageId' in parsed) ||
+        typeof parsed.messageId !== 'string' ||
+        !('attempt' in parsed) ||
+        typeof parsed.attempt !== 'number'
       ) {
-        throw new Error('envelope is not an object with a messageId');
+        throw new Error('envelope is not an object with a messageId and an attempt');
       }
       parsedEnvelope = parsed as MessageEnvelope;
     } catch (error) {
@@ -606,7 +654,7 @@ export function createQueue(
       claim,
     );
     if (typeof reclaims !== 'number') {
-      throw new Error(`world-postgres-redis: claim script returned ${String(reclaims)}`);
+      throw new TypeError(`CLAIM_SCRIPT returned ${String(reclaims)}`);
     }
     if (reclaims < 0) {
       debug(`Queue: ${parsedEnvelope.messageId} was requeued before its claim, skipping`);

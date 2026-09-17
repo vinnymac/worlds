@@ -28,6 +28,7 @@ describe('createQueue workers', () => {
   test.each([
     { config: {}, expected: undefined },
     { config: { lockDuration: 330_000 }, expected: 330_000 },
+    { config: { lockDuration: 2_147_483_647 }, expected: 2_147_483_647 },
   ])('passes lockDuration $expected to every worker', async ({ config, expected }) => {
     const queue = createQueue(redis, { redis: 'redis://localhost:6379', ...config });
     await queue.start();
@@ -40,7 +41,7 @@ describe('createQueue workers', () => {
     await queue.close();
   });
 
-  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+  test.each([0, -1, 1.5, 2_147_483_648, Number.NaN, Number.POSITIVE_INFINITY])(
     'rejects lockDuration %s',
     (lockDuration) => {
       expect(() => createQueue(redis, { redis: 'redis://localhost:6379', lockDuration })).toThrow(

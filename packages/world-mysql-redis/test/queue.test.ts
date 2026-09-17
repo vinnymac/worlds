@@ -75,6 +75,9 @@ describe('createQueue lease', () => {
     { visibilityTimeoutMs: 0 },
     { visibilityTimeoutMs: -1 },
     { visibilityTimeoutMs: 1.5 },
+    // Above httpTimeoutMs, so only the integer check rejects these.
+    { visibilityTimeoutMs: 300_000.5 },
+    { httpTimeoutMs: 10_000, visibilityTimeoutMs: 10_000.5 },
     { visibilityTimeoutMs: 299_999 },
     { httpTimeoutMs: 60_000, visibilityTimeoutMs: 59_999 },
   ])('rejects %o', (config) => {

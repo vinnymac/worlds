@@ -89,6 +89,9 @@ export function createWorld(
       await queue.start();
     },
     async close() {
+      // Workers first: a pull issued on a draining connection throws, and the
+      // drain flushes the acks of the deliveries this waits for.
+      await queue.close();
       if (nc) {
         await nc.drain();
         await nc.close();

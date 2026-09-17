@@ -45,8 +45,10 @@ export interface RedisWorldConfig {
 
   /**
    * How long a worker's liveness key lives without renewal (ms), refreshed
-   * every third of it. The refresh runs on the event loop, so a step blocking
-   * that loop for longer lets the reclaimer re-deliver its message while it still runs.
+   * every third of it. The refresh runs on the event loop, and the last one can
+   * be a third of the TTL old when a step starts blocking that loop, so a block
+   * longer than two thirds of the TTL lets the reclaimer re-deliver the message
+   * while it still runs. Set it to at least 1.5x the longest event-loop block.
    * Minimum 15_000. Default: 90_000 (90s)
    */
   heartbeatTtlMs?: number;
