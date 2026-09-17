@@ -71,12 +71,13 @@ This package provides advanced queue capabilities through BullMQ:
 
 ## Configuration Options
 
-| Option             | Type                     | Default                  | Description                             |
-| ------------------ | ------------------------ | ------------------------ | --------------------------------------- |
-| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
-| `keyPrefix`        | `string`                 | `workflow:`              | Prefix for storage keys                 |
-| `jobPrefix`        | `string`                 | `workflow_`              | Prefix for BullMQ queue names           |
-| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers      |
+| Option             | Type                     | Default                  | Description                                                                                                           |
+| ------------------ | ------------------------ | ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options                                                                               |
+| `keyPrefix`        | `string`                 | `workflow:`              | Prefix for storage keys                                                                                               |
+| `jobPrefix`        | `string`                 | `workflow_`              | Prefix for BullMQ queue names                                                                                         |
+| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers                                                                                    |
+| `lockDuration`     | `number`                 | BullMQ's `30000`         | Job lock TTL before another worker takes over (ms). Set to at least 2x the longest event-loop block; max `2147483647` |
 
 ## Redis Data Structures
 

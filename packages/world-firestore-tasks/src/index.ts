@@ -30,6 +30,13 @@ export interface FirestoreTasksWorldConfig {
   /** Per-run event ceiling reported on `run_started`
    * (`EventResult.maxEvents`). Defaults to `WORKFLOW_MAX_EVENTS`, then 25,000. */
   maxEventsPerRun?: number;
+  /**
+   * How long Cloud Tasks waits for a task's response (ms) before failing the
+   * attempt and retrying it while the first request may still run. Integer in
+   * [15_000, 1_800_000], else construction throws. Cloud Tasks only; the test
+   * pump keeps its 300_000 HTTP timeout. Default: Cloud Tasks' own, 600_000 (10 minutes)
+   */
+  dispatchDeadlineMs?: number;
 }
 
 export function createFirestoreTasksWorld(
@@ -86,6 +93,7 @@ export function createFirestoreTasksWorld(
     queueName: queueId,
     targetUrl: target,
     deploymentId,
+    dispatchDeadlineMs: config.dispatchDeadlineMs,
   });
 
   const streamer = createStreamer({

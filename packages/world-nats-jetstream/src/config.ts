@@ -54,6 +54,16 @@ export interface NatsJetStreamWorldConfig {
   /** Per-job HTTP request timeout (ms). Default: 300_000 */
   httpTimeoutMs?: number;
 
+  /**
+   * How long JetStream waits for an ack before redelivering (ms). Workers send
+   * `working()` heartbeats from their event loop every third of this, so a step
+   * that blocks that loop for longer is redelivered while it still runs.
+   * Set on the shared durable consumer, so keep it equal across workers.
+   * Must be an integer from 1_000 to 2_073_600_000 (24 days), else createWorld
+   * throws a RangeError. Default: 30_000
+   */
+  ackWaitMs?: number;
+
   /** Ceiling on events a run may accumulate, reported as
    * `EventResult.maxEvents`. Must be a positive integer.
    * Default: `WORKFLOW_MAX_EVENTS`, else 25_000 */

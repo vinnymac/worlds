@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
@@ -12,6 +13,7 @@ import type { Redis } from 'ioredis';
 import { monotonicFactory } from 'ulid';
 import { parse, stringify } from '@fantasticfour/shared';
 import type { MysqlRedisWorldConfig } from './config.js';
+import { debug } from './util.js';
 
 interface MessageEnvelope {
   messageId: string;
@@ -29,8 +31,14 @@ const QUEUE_PATHNAMES = {
 /** How long an idempotency reservation is held (seconds). */
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
 
-/** Extra slack past the HTTP timeout before a processing lease is reclaimed. */
+/** Default slack past the HTTP timeout before a processing lease is reclaimed. */
 const LEASE_GRACE_MS = 30_000;
+
+/**
+ * Floor for how long an idle `:reclaims` hash survives (ms). Expiry drops every
+ * count at once, which costs an extra delivery, never a lost message.
+ */
+const RECLAIMS_TTL_MS = 86_400_000;
 
 /** How often the delayed-delivery pump and lease reclaimer run. */
 const MAINTENANCE_INTERVAL_MS = 250;
@@ -40,6 +48,9 @@ const MAINTENANCE_BATCH_SIZE = 100;
 
 /** How long a worker blocks waiting for an item before re-checking stop. */
 const POP_TIMEOUT_SECONDS = 5;
+
+/** Claim members are `${randomUUID()}${item}`; the UUID is always 36 chars. */
+const CLAIM_TOKEN_LENGTH = 36;
 
 /**
  * Atomically reserve an idempotency key and enqueue the payload.
@@ -83,28 +94,96 @@ return #due
 `;
 
 /**
- * Requeue processing-list entries whose lease expired (worker died mid-flight).
+ * Requeue in-flight entries whose lease expired (worker died or stalled).
+ * `:claims` members are token-prefixed per claim; `:leases` members are raw
+ * items from pre-fencing workers or adopted orphans, reclaimed only while
+ * the processing list still holds them. Each requeue bumps the item's
+ * `:reclaims` count (keyed by SHA-1 of the item), which workers add to the
+ * attempt so a delivery that keeps outliving its lease still dead-letters.
  *
- * KEYS[1] = lease zset, KEYS[2] = processing list, KEYS[3] = ready list
- * ARGV[1] = now (ms), ARGV[2] = batch limit
+ * KEYS[1] = lease zset, KEYS[2] = processing list, KEYS[3] = ready list,
+ * KEYS[4] = claims zset, KEYS[5] = reclaims hash
+ * ARGV[1] = now (ms), ARGV[2] = batch limit, ARGV[3] = claim token length,
+ * ARGV[4] = reclaims TTL (ms)
  */
 const RECLAIM_SCRIPT = `
-local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 local moved = 0
+local function requeue(item)
+  redis.call('LPUSH', KEYS[3], item)
+  redis.call('HINCRBY', KEYS[5], redis.sha1hex(item), 1)
+  moved = moved + 1
+end
+local claims = redis.call('ZRANGEBYSCORE', KEYS[4], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+for _, member in ipairs(claims) do
+  redis.call('ZREM', KEYS[4], member)
+  requeue(string.sub(member, tonumber(ARGV[3]) + 1))
+end
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 for _, item in ipairs(due) do
   redis.call('ZREM', KEYS[1], item)
   if redis.call('LREM', KEYS[2], 1, item) > 0 then
-    redis.call('LPUSH', KEYS[3], item)
-    moved = moved + 1
+    requeue(item)
   end
+end
+if moved > 0 then
+  redis.call('PEXPIRE', KEYS[5], ARGV[4])
 end
 return moved
 `;
 
 /**
+ * Convert a popped item into a fenced claim. Fails if the processing entry is
+ * gone, i.e. an adopted orphan lease expired and the reclaimer requeued it.
+ * Drops any raw lease adopted for this item in the pop-to-claim window: the
+ * claim supersedes it, and a leftover raw lease would later reclaim whichever
+ * delivery holds identical bytes.
+ * Returns 0 on failure, else 1 + the item's reclaim count.
+ *
+ * KEYS[1] = processing list, KEYS[2] = claims zset, KEYS[3] = reclaims hash,
+ * KEYS[4] = lease zset
+ * ARGV[1] = item, ARGV[2] = claim token, ARGV[3] = lease deadline (ms)
+ */
+const CLAIM_SCRIPT = `
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
+redis.call('ZREM', KEYS[4], ARGV[1])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2] .. ARGV[1])
+return 1 + tonumber(redis.call('HGET', KEYS[3], redis.sha1hex(ARGV[1])) or 0)
+`;
+
+/**
+ * Settle a claim only if this claim still owns it (compare-and-delete).
+ * A stale claim, already reclaimed and redelivered, changes nothing. The
+ * owner's settle clears the item's reclaim count: a retry payload carries
+ * the counted attempt forward.
+ *
+ * KEYS[1] = claims zset, KEYS[2] = delayed zset, KEYS[3] = dlq list,
+ * KEYS[4] = idempotency key, KEYS[5] = reclaims hash
+ * ARGV[1] = claim token, ARGV[2] = item, ARGV[3] = 'ack' | 'retry' | 'dead',
+ * ARGV[4] = release idempotency key ('1' | '0'), ARGV[5] = retry payload,
+ * ARGV[6] = retry deliver-at (ms), ARGV[7] = dlq payload (counted attempt)
+ */
+const SETTLE_SCRIPT = `
+if redis.call('ZREM', KEYS[1], ARGV[1] .. ARGV[2]) == 0 then
+  return 0
+end
+redis.call('HDEL', KEYS[5], redis.sha1hex(ARGV[2]))
+if ARGV[3] == 'retry' then
+  redis.call('ZADD', KEYS[2], ARGV[6], ARGV[5])
+elseif ARGV[3] == 'dead' then
+  redis.call('LPUSH', KEYS[3], ARGV[7])
+end
+if ARGV[4] == '1' then
+  redis.call('DEL', KEYS[4])
+end
+return 1
+`;
+
+/**
  * Assign a lease to processing-list entries that have none. This closes the
- * crash window between BRPOPLPUSH and the worker's lease registration: an
- * orphaned entry adopted here will later expire and be reclaimed.
+ * crash window between BRPOPLPUSH and CLAIM_SCRIPT (and a pre-fencing worker's
+ * lease ZADD): an orphaned entry adopted here will later expire and be reclaimed.
  *
  * KEYS[1] = processing list, KEYS[2] = lease zset
  * ARGV[1] = lease deadline (ms)
@@ -146,9 +225,9 @@ function computeBackoffMs(attempt: number, config: MysqlRedisWorldConfig): numbe
  *   live in a `:delayed` sorted set scored by deliver-at time; a maintenance
  *   pump atomically moves due entries to the ready list. No delivery ever
  *   depends on an in-process timer surviving.
- * - Every popped item gets a lease in a `:leases` sorted set; entries whose
- *   lease expires (worker crashed mid-dispatch) are atomically moved back to
- *   the ready list by the reclaimer.
+ * - Every popped item becomes a claim in a `:claims` sorted set, fenced by a
+ *   per-claim token; expired claims (worker crashed or stalled) are moved back
+ *   to the ready list, and a stale claim's settle is a no-op.
  * - Messages that exhaust maxAttempts are pushed to a `:dlq` list and their
  *   idempotency reservation is released so core's replay-driven re-enqueue
  *   can self-heal the run.
@@ -166,7 +245,19 @@ export function createQueue(
   const generateMessageId = monotonicFactory();
   const maxAttempts = config.maxAttempts ?? 5;
   const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
-  const leaseMs = httpTimeoutMs + LEASE_GRACE_MS;
+  const { visibilityTimeoutMs } = config;
+  if (
+    visibilityTimeoutMs !== undefined &&
+    !(Number.isSafeInteger(visibilityTimeoutMs) && visibilityTimeoutMs >= httpTimeoutMs)
+  ) {
+    // A lease shorter than the dispatch timeout guarantees concurrent redelivery.
+    throw new RangeError(
+      `[world-mysql-redis] visibilityTimeoutMs must be an integer >= httpTimeoutMs (${httpTimeoutMs}), got ${visibilityTimeoutMs}`,
+    );
+  }
+  const leaseMs = visibilityTimeoutMs ?? httpTimeoutMs + LEASE_GRACE_MS;
+  // Outlive a requeued item's wait for a free worker, and at least two leases.
+  const reclaimsTtlMs = Math.max(RECLAIMS_TTL_MS, leaseMs * 2);
 
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
@@ -180,7 +271,10 @@ export function createQueue(
     ready: listKey,
     delayed: `${listKey}:delayed`,
     processing: `${listKey}:processing`,
+    /** Raw-item leases: orphan adoption and pre-fencing workers. */
     leases: `${listKey}:leases`,
+    claims: `${listKey}:claims`,
+    reclaims: `${listKey}:reclaims`,
     dlq: `${listKey}:dlq`,
     channel: `chan:${listKey}`,
     idempotency: (key: string) => `${listKey}:idempotent:${key}`,
@@ -268,73 +362,86 @@ export function createQueue(
     });
   }
 
-  /** Remove a handled item from the processing list and its lease. */
-  async function ack(
-    workerRedis: Redis,
-    listKey: string,
-    item: string,
-    releaseIdempotencyKey?: string,
-  ): Promise<void> {
-    const keys = keysFor(listKey);
-    const multi = workerRedis.multi().lrem(keys.processing, 1, item).zrem(keys.leases, item);
-    if (releaseIdempotencyKey) {
-      multi.del(keys.idempotency(releaseIdempotencyKey));
-    }
-    await multi.exec();
-  }
+  type Settle =
+    | { mode: 'ack'; releaseIdempotencyKey?: string }
+    | { mode: 'retry'; payload: string; deliverAtMs: number }
+    | { mode: 'dead'; payload: string; releaseIdempotencyKey?: string };
 
   /**
-   * Durably schedule a payload for redelivery: add it to the delayed sorted
-   * set BEFORE removing the in-flight copy, so a crash between the two steps
-   * duplicates (at-least-once) instead of losing the message.
+   * Atomically ack, reschedule, or dead-letter a claim. A stale claim leaves
+   * the redelivered claim's lease, retry, and idempotency key to its owner.
+   * Returns whether the settle applied.
    */
-  async function requeueLater(
+  async function settle(
     workerRedis: Redis,
     listKey: string,
+    token: string,
     item: string,
-    payload: string,
-    deliverAtMs: number,
-  ): Promise<void> {
+    action: Settle,
+  ): Promise<boolean> {
     const keys = keysFor(listKey);
-    await workerRedis
-      .multi()
-      .zadd(keys.delayed, deliverAtMs, payload)
-      .lrem(keys.processing, 1, item)
-      .zrem(keys.leases, item)
-      .exec();
-  }
-
-  /** Move an exhausted message to the dead-letter list and release its key. */
-  async function deadLetter(
-    workerRedis: Redis,
-    listKey: string,
-    item: string,
-    releaseIdempotencyKey?: string,
-  ): Promise<void> {
-    const keys = keysFor(listKey);
-    const multi = workerRedis
-      .multi()
-      .lpush(keys.dlq, item)
-      .lrem(keys.processing, 1, item)
-      .zrem(keys.leases, item);
-    if (releaseIdempotencyKey) {
-      multi.del(keys.idempotency(releaseIdempotencyKey));
+    const release = action.mode === 'retry' ? undefined : action.releaseIdempotencyKey;
+    const settled = await workerRedis.eval(
+      SETTLE_SCRIPT,
+      5,
+      keys.claims,
+      keys.delayed,
+      keys.dlq,
+      keys.idempotency(release ?? ''),
+      keys.reclaims,
+      token,
+      item,
+      action.mode,
+      release ? '1' : '0',
+      action.mode === 'retry' ? action.payload : '',
+      action.mode === 'retry' ? String(action.deliverAtMs) : '0',
+      action.mode === 'dead' ? action.payload : '',
+    );
+    if (settled === 0) {
+      debug(`worker skipped stale ${action.mode} on ${listKey}: claim was reclaimed`);
+      return false;
     }
-    await multi.exec();
+    return true;
   }
 
   async function processItem(
     workerRedis: Redis,
     listKey: string,
+    token: string,
     item: string,
+    reclaims: number,
     kind: QueueKind,
   ): Promise<void> {
     let envelope: MessageEnvelope;
     try {
-      envelope = parse<MessageEnvelope>(item);
+      const parsed = parse<MessageEnvelope>(item);
+      // Each lease expiry spent a delivery that never settled its own retry.
+      envelope = { ...parsed, attempt: parsed.attempt + reclaims };
     } catch (error) {
       console.error(`[world-mysql-redis worker] invalid envelope on ${listKey}:`, error);
-      await ack(workerRedis, listKey, item);
+      await settle(workerRedis, listKey, token, item, { mode: 'ack' });
+      return;
+    }
+
+    // The item with its counted attempt, for payloads that outlive this claim.
+    const counted = reclaims > 0 ? stringify(envelope) : item;
+
+    /** Logs only once the dead-letter applied: a stale claim's never happens. */
+    const deadLetter = async (message: string) => {
+      const applied = await settle(workerRedis, listKey, token, item, {
+        mode: 'dead',
+        payload: counted,
+        releaseIdempotencyKey: envelope.idempotencyKey,
+      });
+      if (applied) console.error(`[world-mysql-redis worker] ${message}`);
+    };
+
+    // Only lease expiries dead-letter undispatched: a retry payload above a
+    // lowered maxAttempts still gets its delivery.
+    if (reclaims > 0 && envelope.attempt > maxAttempts) {
+      await deadLetter(
+        `dead-lettering ${envelope.messageId}: lease expired ${reclaims} time(s), exhausting ${maxAttempts} attempts`,
+      );
       return;
     }
 
@@ -342,12 +449,15 @@ export function createQueue(
       if (envelope.attempt < maxAttempts) {
         const next: MessageEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
         const backoffMs = computeBackoffMs(next.attempt, config);
-        await requeueLater(workerRedis, listKey, item, stringify(next), Date.now() + backoffMs);
+        await settle(workerRedis, listKey, token, item, {
+          mode: 'retry',
+          payload: stringify(next),
+          deliverAtMs: Date.now() + backoffMs,
+        });
       } else {
-        console.error(
-          `[world-mysql-redis worker] dead-lettering ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
+        await deadLetter(
+          `dead-lettering ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
         );
-        await deadLetter(workerRedis, listKey, item, envelope.idempotencyKey);
       }
     };
 
@@ -355,7 +465,10 @@ export function createQueue(
       const response = await dispatch(envelope, QUEUE_PATHNAMES[kind]);
 
       if (response.ok) {
-        await ack(workerRedis, listKey, item, envelope.idempotencyKey);
+        await settle(workerRedis, listKey, token, item, {
+          mode: 'ack',
+          releaseIdempotencyKey: envelope.idempotencyKey,
+        });
         return;
       }
 
@@ -373,10 +486,14 @@ export function createQueue(
           typeof parsed === 'object' &&
           typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
         ) {
-          // Suspension: redeliver the same envelope (attempt unchanged)
-          // after the requested timeout.
+          // Suspension: redeliver the same envelope (attempt unchanged, but
+          // keeping any counted reclaims) after the requested timeout.
           const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-          await requeueLater(workerRedis, listKey, item, item, Date.now() + timeoutMs);
+          await settle(workerRedis, listKey, token, item, {
+            mode: 'retry',
+            payload: counted,
+            deliverAtMs: Date.now() + timeoutMs,
+          });
           return;
         }
       }
@@ -407,10 +524,28 @@ export function createQueue(
           continue;
         }
         if (!item) continue;
-        // Lease the item so the reclaimer can requeue it if this process
-        // dies mid-dispatch.
-        await workerRedis.zadd(keys.leases, Date.now() + leaseMs, item);
-        await processItem(workerRedis, listKey, item, kind);
+        // Lease the item under a fresh token so the reclaimer can requeue it
+        // and a stale settle from an earlier claim cannot clear this one.
+        const token = randomUUID();
+        const claimed = await workerRedis.eval(
+          CLAIM_SCRIPT,
+          4,
+          keys.processing,
+          keys.claims,
+          keys.reclaims,
+          keys.leases,
+          item,
+          token,
+          String(Date.now() + leaseMs),
+        );
+        if (typeof claimed !== 'number') {
+          throw new TypeError(`CLAIM_SCRIPT returned ${String(claimed)}`);
+        }
+        if (claimed === 0) {
+          debug(`worker ${listKey} item was reclaimed before its claim`);
+          continue;
+        }
+        await processItem(workerRedis, listKey, token, item, claimed - 1, kind);
       }
     } finally {
       await workerRedis.quit();
@@ -443,12 +578,16 @@ export function createQueue(
         );
         const reclaimed = await redis.eval(
           RECLAIM_SCRIPT,
-          3,
+          5,
           keys.leases,
           keys.processing,
           keys.ready,
+          keys.claims,
+          keys.reclaims,
           String(Date.now()),
           String(MAINTENANCE_BATCH_SIZE),
+          String(CLAIM_TOKEN_LENGTH),
+          String(reclaimsTtlMs),
         );
         if (typeof reclaimed === 'number' && reclaimed > 0) {
           console.warn(

@@ -144,12 +144,14 @@ All tables use ULID-based primary keys for monotonic ordering and include timest
 
 ## Configuration Options
 
-| Option             | Type                     | Default                  | Description                             |
-| ------------------ | ------------------------ | ------------------------ | --------------------------------------- |
-| `connectionString` | `string`                 | Required                 | PostgreSQL connection URL               |
-| `redis`            | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options |
-| `jobPrefix`        | `string`                 | `workflow_`              | Prefix for Redis job queue keys         |
-| `queueConcurrency` | `number`                 | `10`                     | Number of concurrent queue workers      |
+| Option                | Type                     | Default                  | Description                                                                                     |
+| --------------------- | ------------------------ | ------------------------ | ----------------------------------------------------------------------------------------------- |
+| `connectionString`    | `string`                 | Required                 | PostgreSQL connection URL                                                                       |
+| `redis`               | `string \| RedisOptions` | `redis://localhost:6379` | Redis connection URL or ioredis options                                                         |
+| `jobPrefix`           | `string`                 | `workflow_`              | Prefix for Redis job queue keys                                                                 |
+| `queueConcurrency`    | `number`                 | `10`                     | Number of concurrent queue workers                                                              |
+| `httpTimeoutMs`       | `number`                 | `300000`                 | Abort timeout for each job dispatch                                                             |
+| `visibilityTimeoutMs` | `number`                 | `httpTimeoutMs + 60000`  | How long a claimed job stays invisible before redelivery; must be an integer >= `httpTimeoutMs` |
 
 ## Querying Workflow Data
 

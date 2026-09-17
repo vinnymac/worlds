@@ -25,7 +25,12 @@ describe('Queue (Redis integration)', () => {
 
   const received: ReceivedMessage[] = [];
   /** Per-test response override: return a status to short-circuit. */
-  let respond: (attempt: number) => { status: number; body?: string } | undefined = () => undefined;
+  let respond: (
+    attempt: number,
+  ) =>
+    | { status: number; body?: string }
+    | undefined
+    | Promise<{ status: number; body?: string } | undefined> = () => undefined;
 
   const queues: ReturnType<typeof createQueue>[] = [];
   let prefixCounter = 0;
@@ -75,7 +80,7 @@ describe('Queue (Redis integration)', () => {
       req.on('end', () => {
         void (async () => {
           const attempt = Number.parseInt(String(req.headers['x-vqs-message-attempt']), 10);
-          const override = respond(attempt);
+          const override = await respond(attempt);
           if (override) {
             res.statusCode = override.status;
             res.setHeader('content-type', 'application/json');
@@ -251,5 +256,69 @@ describe('Queue (Redis integration)', () => {
 
     await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 15_000 });
     expect(await redis.llen(`${jobPrefix}flows:processing:dead-host-1-abc`)).toBe(0);
+  }, 30_000);
+
+  /**
+   * Stalls worker A mid-dispatch, expires its owner key, and lets worker B
+   * reclaim and hold the redelivery, then settles A with `staleResult`.
+   */
+  async function reclaimWhileStalled(staleResult: { status: number; body?: string }) {
+    const jobPrefix = `qtestfence_${Date.now()}_`;
+    const settlers: ((result: { status: number; body?: string }) => void)[] = [];
+    respond = () => new Promise((resolve) => settlers.push(resolve));
+    const config = { redis: '', jobPrefix, queueConcurrency: 1, baseUrl };
+    // A huge TTL means A only writes its owner key at the top of each loop.
+    const a = createQueue(redis, { ...config, heartbeatTtlMs: 3_000_000 });
+    queues.push(a);
+    await a.start();
+    await a.queue(queueName, payload, { idempotencyKey: 'fenced' });
+    await vi.waitFor(() => expect(settlers).toHaveLength(1), { timeout: 10_000 });
+
+    const owners = await redis.keys(`${jobPrefix}flows:processing:*:owner`);
+    expect(owners).toHaveLength(1);
+    const ownerKey = owners[0];
+    await redis.del(ownerKey);
+
+    const b = createQueue(redis, config);
+    queues.push(b);
+    await b.start();
+    await vi.waitFor(() => expect(settlers).toHaveLength(2), { timeout: 10_000 });
+
+    settlers[0](staleResult);
+    // A rewrites its owner key only after the settle call returns.
+    await vi.waitFor(async () => expect(await redis.exists(ownerKey)).toBe(1), { timeout: 10_000 });
+    return { jobPrefix, settlers, settleRedelivery: settlers[1] };
+  }
+
+  it('ignores a stale ack after its message was reclaimed', async () => {
+    const { jobPrefix, settlers, settleRedelivery } = await reclaimWhileStalled({
+      status: 200,
+      body: '{}',
+    });
+    const reservation = `${jobPrefix}flows:idempotent:fenced`;
+    // The redelivery still runs, so the key stays reserved and dedups.
+    expect(await redis.exists(reservation)).toBe(1);
+    await queues[0].queue(queueName, payload, { idempotencyKey: 'fenced' });
+    await new Promise((resolve) => global.setTimeout(resolve, 500));
+    expect(settlers).toHaveLength(2);
+
+    settleRedelivery({ status: 200, body: '{}' });
+    await vi.waitFor(async () => expect(await redis.exists(reservation)).toBe(0), {
+      timeout: 10_000,
+    });
+  }, 30_000);
+
+  it('ignores a stale defer after its message was reclaimed', async () => {
+    const { jobPrefix, settlers, settleRedelivery } = await reclaimWhileStalled({
+      status: 503,
+      body: JSON.stringify({ timeoutSeconds: 60 }),
+    });
+    const delayed = `${jobPrefix}flows:delayed`;
+    expect(await redis.zcard(delayed)).toBe(0);
+    await new Promise((resolve) => global.setTimeout(resolve, 500));
+    expect(settlers).toHaveLength(2);
+
+    settleRedelivery({ status: 503, body: JSON.stringify({ timeoutSeconds: 60 }) });
+    await vi.waitFor(async () => expect(await redis.zcard(delayed)).toBe(1), { timeout: 10_000 });
   }, 30_000);
 });

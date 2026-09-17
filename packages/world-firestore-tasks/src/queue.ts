@@ -35,6 +35,8 @@ interface CloudTasksConfig {
   maxAttempts?: number;
   /** Base backoff delay (ms) for test pump retries. Default: 1000 */
   backoffDelayMs?: number;
+  /** Cloud Tasks `dispatchDeadline` (ms) for created tasks. Default: Cloud Tasks' own, 10 minutes */
+  dispatchDeadlineMs?: number;
 }
 
 interface PumpEnvelope {
@@ -60,6 +62,20 @@ const QUEUE_PATHNAMES = {
  * on `processed_tasks.expiresAt` to garbage-collect markers.
  */
 const PROCESSED_TASK_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Cloud Tasks' accepted `dispatchDeadline` range for HTTP targets. */
+const MIN_DISPATCH_DEADLINE_MS = 15_000;
+const MAX_DISPATCH_DEADLINE_MS = 1_800_000;
+
+function toDispatchDeadline(ms: number | undefined) {
+  if (ms === undefined) return undefined;
+  if (!Number.isInteger(ms) || ms < MIN_DISPATCH_DEADLINE_MS || ms > MAX_DISPATCH_DEADLINE_MS) {
+    throw new RangeError(
+      `dispatchDeadlineMs must be an integer in [${MIN_DISPATCH_DEADLINE_MS}, ${MAX_DISPATCH_DEADLINE_MS}], got ${ms}`,
+    );
+  }
+  return { seconds: Math.floor(ms / 1000), nanos: (ms % 1000) * 1_000_000 };
+}
 
 /**
  * Sanitize a string for use as a Cloud Tasks task name.
@@ -243,6 +259,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
 } {
   const { client, firestore, project, location, queueName, targetUrl, deploymentId } = config;
 
+  const dispatchDeadline = toDispatchDeadline(config.dispatchDeadlineMs);
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
 
@@ -344,6 +361,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
               scheduleTime: {
                 seconds: Math.floor(Date.now() / 1000) + delaySeconds,
               },
+              dispatchDeadline,
             },
           });
         }
@@ -412,6 +430,7 @@ export function createQueue(config: CloudTasksConfig): Queue & {
         scheduleTime: opts?.delaySeconds
           ? { seconds: Math.floor(Date.now() / 1000) + opts.delaySeconds }
           : undefined,
+        dispatchDeadline,
       };
 
       try {

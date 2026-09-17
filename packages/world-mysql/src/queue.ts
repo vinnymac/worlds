@@ -10,9 +10,9 @@ import {
 } from '@workflow/world';
 import { createWorkflowUrl } from '@workflow/utils';
 import { decode, encode } from 'cbor-x';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, type SQL, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { monotonicFactory } from 'ulid';
+import { monotonicFactory, ulid } from 'ulid';
 import { type QueueMetrics, metrics } from './metrics.js';
 import * as schema from './schema.js';
 import { debug } from './util.js';
@@ -57,8 +57,29 @@ interface JobEnvelope {
   message: QueuePayload;
 }
 
+/**
+ * MySQL errnos the queue's start-up probe reads as "migrations have not run".
+ * Anything else (auth, connectivity) propagates untouched.
+ */
+const UNMIGRATED_ERRNOS = new Set([
+  1054, // ER_BAD_FIELD_ERROR
+  1146, // ER_NO_SUCH_TABLE
+]);
+
+function isUnmigratedError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    'errno' in error &&
+    typeof error.errno === 'number' &&
+    UNMIGRATED_ERRNOS.has(error.errno)
+  );
+}
+
+/** `max_attempts` column default, also the enqueue-time default for new rows. */
+const DEFAULT_MAX_ATTEMPTS = 3;
+
 /** Row shape returned by raw SQL SELECT on workflow_jobs (snake_case columns) */
-interface RawJobRow {
+export interface RawJobRow {
   id: number;
   job_id: string;
   queue_name: string;
@@ -71,6 +92,7 @@ interface RawJobRow {
   updated_at: Date;
   locked_at: Date | null;
   locked_by: string | null;
+  claim_token: string | null;
   error: string | null;
   scheduled_for: Date | null;
 }
@@ -172,6 +194,7 @@ export async function reclaimStaleJobs(db: Drizzle, visibilityTimeoutMs: number)
     SET \`status\` = 'pending',
         \`locked_at\` = NULL,
         \`locked_by\` = NULL,
+        \`claim_token\` = NULL,
         \`updated_at\` = NOW(3)
     WHERE \`status\` = 'processing'
       AND \`locked_at\` < DATE_SUB(NOW(3), INTERVAL ${timeoutSeconds} SECOND)
@@ -185,6 +208,7 @@ export async function reclaimStaleJobs(db: Drizzle, visibilityTimeoutMs: number)
         \`error\` = 'Job lock expired: worker crashed or timed out',
         \`locked_at\` = NULL,
         \`locked_by\` = NULL,
+        \`claim_token\` = NULL,
         \`updated_at\` = NOW(3)
     WHERE \`status\` = 'processing'
       AND \`locked_at\` < DATE_SUB(NOW(3), INTERVAL ${timeoutSeconds} SECOND)
@@ -203,7 +227,7 @@ export async function reclaimStaleJobs(db: Drizzle, visibilityTimeoutMs: number)
   return resetRows + failedRows;
 }
 
-async function fetchJob(
+export async function fetchJob(
   db: Drizzle,
   queueName: string,
   workerId: string,
@@ -225,11 +249,13 @@ async function fetchJob(
     const job = rows[0];
     if (!job || !job.id) return null;
 
+    const claimToken = ulid();
     await tx.execute(sql`
       UPDATE \`workflow\`.\`workflow_jobs\`
       SET \`status\` = 'processing',
           \`locked_at\` = NOW(),
           \`locked_by\` = ${workerId},
+          \`claim_token\` = ${claimToken},
           \`attempt\` = \`attempt\` + 1,
           \`updated_at\` = NOW()
       WHERE \`id\` = ${job.id}
@@ -239,6 +265,7 @@ async function fetchJob(
       ...job,
       status: 'processing',
       locked_by: workerId,
+      claim_token: claimToken,
       attempt: (job.attempt ?? 0) + 1,
     };
   });
@@ -312,52 +339,140 @@ async function enqueueJob(
   }
 }
 
-async function handleJobFailure(db: Drizzle, job: RawJobRow, error: unknown): Promise<void> {
+/**
+ * WHERE clause matching only the claim this executor holds. A reclaim clears
+ * the token and a redelivery sets a new one, so a stalled executor's settle
+ * matches nothing. `<=>` lets a NULL token match NULL (pre-migration claims);
+ * the status check stops that from settling an unclaimed row by id alone.
+ */
+function claimedBy(job: RawJobRow): SQL | undefined {
+  return and(
+    eq(schema.jobs.id, job.id),
+    eq(schema.jobs.status, 'processing'),
+    sql`${schema.jobs.claimToken} <=> ${job.claim_token}`,
+    sql`${schema.jobs.lockedBy} <=> ${job.locked_by}`,
+  );
+}
+
+/**
+ * mysql2 connects with CLIENT_FOUND_ROWS, so affectedRows counts matched rows
+ * (not changed rows) for UPDATE; 0 means the claim is no longer ours.
+ */
+function isStaleSettle(
+  result: [{ affectedRows: number }, unknown],
+  job: RawJobRow,
+  op: string,
+): boolean {
+  if (result[0].affectedRows > 0) return false;
+  debug('Ignoring stale settle for reclaimed job', {
+    op,
+    jobId: job.job_id,
+    attempt: job.attempt,
+    lockedBy: job.locked_by,
+  });
+  return true;
+}
+
+/**
+ * Release the job's own key reservation. Matching `message_id` keeps a delayed
+ * release from deleting a key that expired and was re-reserved by a newer job.
+ */
+async function releaseIdempotencyKey(db: Drizzle, job: RawJobRow, key: string): Promise<void> {
+  await db
+    .delete(schema.idempotency)
+    .where(
+      and(eq(schema.idempotency.idempotencyKey, key), eq(schema.idempotency.messageId, job.job_id)),
+    );
+}
+
+/** Returns false when the claim was lost and the settle did nothing. */
+export async function handleJobFailure(
+  db: Drizzle,
+  job: RawJobRow,
+  error: unknown,
+): Promise<boolean> {
   const errorMessage = error instanceof Error ? error.message : String(error);
   const attempt = job.attempt ?? 1;
-  const maxAttempts = job.max_attempts ?? 3;
+  const maxAttempts = job.max_attempts ?? DEFAULT_MAX_ATTEMPTS;
 
   if (attempt >= maxAttempts) {
-    await db
+    const updated = await db
       .update(schema.jobs)
       .set({
         status: 'failed',
         error: errorMessage,
         lockedAt: null,
         lockedBy: null,
+        claimToken: null,
       })
-      .where(eq(schema.jobs.id, job.id));
+      .where(claimedBy(job));
+    if (isStaleSettle(updated, job, 'fail')) return false;
     // Permanent failure: release the idempotency key so the failed job does
     // not block a future re-enqueue of the same logical message.
     if (job.idempotency_key) {
-      await db
-        .delete(schema.idempotency)
-        .where(eq(schema.idempotency.idempotencyKey, job.idempotency_key));
+      await releaseIdempotencyKey(db, job, job.idempotency_key);
     }
-  } else {
-    const backoffMs = Math.min(1000 * 2 ** (attempt - 1), 30000);
-    const scheduledFor = new Date(Date.now() + backoffMs);
-
-    await db
-      .update(schema.jobs)
-      .set({
-        status: 'pending',
-        error: errorMessage,
-        lockedAt: null,
-        lockedBy: null,
-        scheduledFor,
-      })
-      .where(eq(schema.jobs.id, job.id));
+    return true;
   }
+  const backoffMs = Math.min(1000 * 2 ** (attempt - 1), 30000);
+  const scheduledFor = new Date(Date.now() + backoffMs);
+
+  const updated = await db
+    .update(schema.jobs)
+    .set({
+      status: 'pending',
+      error: errorMessage,
+      lockedAt: null,
+      lockedBy: null,
+      claimToken: null,
+      scheduledFor,
+    })
+    .where(claimedBy(job));
+  return !isStaleSettle(updated, job, 'retry');
 }
 
-async function completeJob(db: Drizzle, job: RawJobRow): Promise<void> {
-  await db.delete(schema.jobs).where(eq(schema.jobs.id, job.id));
+/**
+ * Returns false when the claim was lost and the settle did nothing. `onSettled`
+ * runs the moment the row is gone, before the idempotency key is released, so a
+ * throw from that release cannot unrecord a job that did complete.
+ */
+export async function completeJob(
+  db: Drizzle,
+  job: RawJobRow,
+  onSettled?: () => void,
+): Promise<boolean> {
+  const deleted = await db.delete(schema.jobs).where(claimedBy(job));
+  // A stale executor must not release the key the live claim still owns.
+  if (isStaleSettle(deleted, job, 'complete')) return false;
+  onSettled?.();
   // Release the idempotency key recorded at enqueue time. Rows written
   // before the idempotency_key column existed fall back to the messageId,
   // which was the default key.
-  const idempotencyKey = job.idempotency_key ?? job.job_id;
-  await db.delete(schema.idempotency).where(eq(schema.idempotency.idempotencyKey, idempotencyKey));
+  await releaseIdempotencyKey(db, job, job.idempotency_key ?? job.job_id);
+  return true;
+}
+
+/**
+ * Re-schedule after a 503 timeoutSeconds without consuming an attempt.
+ * Returns false when the claim was lost and the settle did nothing.
+ */
+export async function rescheduleJob(
+  db: Drizzle,
+  job: RawJobRow,
+  timeoutMs: number,
+): Promise<boolean> {
+  const updated = await db
+    .update(schema.jobs)
+    .set({
+      status: 'pending',
+      lockedAt: null,
+      lockedBy: null,
+      claimToken: null,
+      scheduledFor: new Date(Date.now() + timeoutMs),
+      attempt: Math.max(0, (job.attempt ?? 1) - 1),
+    })
+    .where(claimedBy(job));
+  return !isStaleSettle(updated, job, 'reschedule');
 }
 
 /**
@@ -375,7 +490,7 @@ export function createQueue(
   const {
     pollIntervalMs = 50,
     concurrency = 10,
-    maxAttempts = 3,
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
     workerId = `worker_${monotonicFactory()()}`,
     idempotencyTtlMs = 5 * 60 * 1000,
     cleanupIntervalMs = 60 * 1000,
@@ -478,8 +593,8 @@ export function createQueue(
       );
 
       if (response.ok) {
-        await completeJob(db, job);
-        metrics.recordProcessed(listKey, Date.now() - startTime);
+        // A stale settle is not counted: the live claim records its own outcome.
+        await completeJob(db, job, () => metrics.recordProcessed(listKey, Date.now() - startTime));
         return;
       }
 
@@ -498,30 +613,22 @@ export function createQueue(
           typeof (parsed as { timeoutSeconds?: unknown }).timeoutSeconds === 'number'
         ) {
           const timeoutMs = (parsed as { timeoutSeconds: number }).timeoutSeconds * 1000;
-          // Re-schedule without consuming an attempt.
-          await db
-            .update(schema.jobs)
-            .set({
-              status: 'pending',
-              lockedAt: null,
-              lockedBy: null,
-              scheduledFor: new Date(Date.now() + timeoutMs),
-              attempt: Math.max(0, (job.attempt ?? 1) - 1),
-            })
-            .where(eq(schema.jobs.id, job.id));
+          await rescheduleJob(db, job, timeoutMs);
           return;
         }
       }
 
       throw new Error(`HTTP ${response.status}: ${text}`);
     } catch (error) {
-      const isRetry = (job.attempt ?? 1) < (job.max_attempts ?? maxAttempts);
-      metrics.recordError(listKey, isRetry);
+      // Same rule handleJobFailure applies, so a dead-letter is never counted as a retry.
+      const isRetry = (job.attempt ?? 1) < (job.max_attempts ?? DEFAULT_MAX_ATTEMPTS);
       console.error(
         `[world-mysql processJob] Error processing job ${job.job_id} (attempt ${job.attempt}/${job.max_attempts}):`,
         error instanceof Error ? error.message : error,
       );
-      await handleJobFailure(db, job, error);
+      if (await handleJobFailure(db, job, error)) {
+        metrics.recordError(listKey, isRetry);
+      }
     }
   }
 
@@ -559,6 +666,24 @@ export function createQueue(
     getDeploymentId,
     queue,
     async start() {
+      // Without migration 0005 every claim fails and workers retry forever,
+      // so refuse to start instead.
+      try {
+        await db.execute(sql`SELECT ${schema.jobs.claimToken} FROM ${schema.jobs} LIMIT 0`);
+      } catch (error) {
+        // drizzle wraps the mysql2 error, so read the errno off either level.
+        if (
+          isUnmigratedError(error) ||
+          (error instanceof Error && isUnmigratedError(error.cause))
+        ) {
+          throw new Error(
+            '[world-mysql] workflow_jobs is missing its claim_token column (or the table itself); run world-mysql-setup to apply migrations',
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+
       running = true;
 
       // Recover jobs orphaned by a previous crashed process before workers

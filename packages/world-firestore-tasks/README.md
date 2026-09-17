@@ -173,15 +173,16 @@ Typically 30-50% cheaper than AWS DynamoDB + SQS.
 
 ## Configuration Options
 
-| Option         | Type               | Description                                |
-| -------------- | ------------------ | ------------------------------------------ |
-| `firestore`    | `Firestore`        | Firestore client instance                  |
-| `tasksClient`  | `CloudTasksClient` | Cloud Tasks client instance                |
-| `project`      | `string`           | GCP project ID                             |
-| `location`     | `string`           | Cloud Tasks location (e.g., 'us-central1') |
-| `queueName`    | `string`           | Cloud Tasks queue name                     |
-| `targetUrl`    | `string`           | HTTP endpoint for task delivery            |
-| `deploymentId` | `string`           | Deployment identifier                      |
+| Option               | Type               | Description                                                                                                                                |
+| -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `firestore`          | `Firestore`        | Firestore client instance                                                                                                                  |
+| `tasksClient`        | `CloudTasksClient` | Cloud Tasks client instance                                                                                                                |
+| `project`            | `string`           | GCP project ID                                                                                                                             |
+| `location`           | `string`           | Cloud Tasks location (e.g., 'us-central1')                                                                                                 |
+| `queueName`          | `string`           | Cloud Tasks queue name                                                                                                                     |
+| `targetUrl`          | `string`           | HTTP endpoint for task delivery                                                                                                            |
+| `deploymentId`       | `string`           | Deployment identifier                                                                                                                      |
+| `dispatchDeadlineMs` | `number`           | How long Cloud Tasks waits for a task's response before retrying it. Integer in 15000..1800000. Default: Cloud Tasks' own, 600000 (10 min) |
 
 ## Environment Variables
 

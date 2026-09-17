@@ -50,18 +50,29 @@ export interface RedisWorldConfig {
   backoffDelayMs?: number;
 
   /**
-   * How often workers check for stalled jobs (ms). A job is considered stalled
-   * when a worker has not sent a heartbeat within this interval.
+   * How often workers check for stalled jobs (ms). A job is stalled when its
+   * lock has expired (see `lockDuration`); the check returns it to the wait
+   * list for another worker.
    * Default: 30000 (30s)
    */
   stalledInterval?: number;
 
   /**
-   * Number of consecutive stall checks with no heartbeat before a job is
-   * marked as failed. Total stall tolerance = stalledInterval * maxStalledCount.
+   * How many times a job may be recovered from a stall before it is marked as
+   * failed instead.
    * Default: 1
    */
   maxStalledCount?: number;
+
+  /**
+   * How long a worker's job lock lives without renewal (ms). BullMQ renews it
+   * from the worker's event loop once it is between a quarter and half of this
+   * old, so a step blocking that loop for longer than half of it can lose the
+   * lock and be re-delivered while it still runs. Set it to at least 2x the
+   * longest event-loop block. Maximum 2_147_483_647 (Node's timer limit).
+   * Default: BullMQ's own, 30000 (30s)
+   */
+  lockDuration?: number;
 
   /**
    * Base URL the BullMQ worker uses to dispatch jobs back to the user's HTTP

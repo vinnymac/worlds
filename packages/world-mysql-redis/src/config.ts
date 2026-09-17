@@ -13,6 +13,13 @@ export interface MysqlRedisWorldConfig {
   baseUrl?: string;
   /** Per-job HTTP request timeout (ms). Default: 300_000 */
   httpTimeoutMs?: number;
+  /**
+   * How long a dispatched item's lease lives before the reclaimer requeues it
+   * (ms). The lease is never renewed, so a step that blocks the event loop past
+   * it is redelivered while still running. Must be an integer >= httpTimeoutMs.
+   * Default: httpTimeoutMs + 30_000
+   */
+  visibilityTimeoutMs?: number;
   /** Maximum retry attempts before dropping a job. Default: 5 */
   maxAttempts?: number;
   /** Base backoff delay (ms). Default: 1000 */

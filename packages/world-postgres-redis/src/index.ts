@@ -6,7 +6,7 @@ import type { PostgresWorldConfig } from './config.js';
 import { createClient, type Drizzle } from './drizzle/index.js';
 import { createHealthCheck, type PostgresRedisHealthResult } from './health.js';
 import { createRunUpdateSubscriber, type RunUpdateListener } from './notify.js';
-import { createQueue } from './queue.js';
+import { createQueue, resolveVisibilityMs } from './queue.js';
 import {
   createEventsStorage,
   type EventsStorageOptions,
@@ -40,6 +40,9 @@ export function createWorld(
   getHealth(): Promise<PostgresRedisHealthResult>;
   subscribeToRunUpdates(listener: RunUpdateListener): () => void;
 } {
+  // Throws on a bad config before any connection is opened.
+  resolveVisibilityMs(config);
+
   // Create Redis client for queue
   // Batches commands issued in the same event-loop tick into one write;
   // a win under concurrency, neutral for a single serial caller. Blocking
