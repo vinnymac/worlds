@@ -85,11 +85,11 @@ This package provides advanced queue capabilities through BullMQ:
 
 - Hashes: `workflow:run:{runId}`, `workflow:step:{runId}:{stepId}`
 - Sorted Sets: `workflow:runs:index`, `workflow:runs:by_status:{status}`
+- Events: `workflow:event:{runId}:{eventId}`, indexed by slot in `workflow:events:by_run:{runId}`; the slot comes from `INCR` on `workflow:events:seq:{runId}` inside the script that stores the event
 
 **BullMQ Queues:**
 
-- `{jobPrefix}flows` - Workflow invocations
-- `{jobPrefix}steps` - Step executions
+- `{jobPrefix}flows` - Workflow invocations and queued steps (v5 has one queue kind)
 - Plus BullMQ internal structures for job management
 
 ## Monitoring

@@ -49,3 +49,28 @@ export class Rc {
     return this.count;
   }
 }
+
+/**
+ * Replaces every Node `Buffer` in a decoded value with a plain `Uint8Array`
+ * over the same bytes. Drivers and cbor-x hand back Buffers, and the runtime
+ * checks serialized payloads by exact type, so a Buffer where a Uint8Array
+ * belongs reads as a value it does not recognize.
+ */
+export function toPlainBytes<T>(value: T): T {
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map(toPlainBytes) as T;
+  }
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = toPlainBytes(v);
+    return out as T;
+  }
+  return value;
+}

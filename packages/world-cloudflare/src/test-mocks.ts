@@ -91,12 +91,23 @@ class MockWorkflowRunDOStub {
     this.store = createMemoryStore(() => getDOStorage(runId));
   }
 
+  /**
+   * A Durable Object runs one storage transaction at a time, so concurrent
+   * applyEvent calls on one run commit in sequence. The mock reproduces that
+   * with a promise chain; without it, concurrent writers would race for the
+   * same slot, which the real object never allows.
+   */
+  private applyChain: Promise<unknown> = Promise.resolve();
+
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
-    return applyEvent(this.store, {
-      ...request,
-      nextEventId: () => `wevt_${this.nextUlid()}`,
-      now: new Date(),
-    });
+    const result = this.applyChain.then(() =>
+      applyEvent(this.store, {
+        ...request,
+        now: new Date(),
+      }),
+    );
+    this.applyChain = result.catch(() => undefined);
+    return result;
   }
 
   async getRun(): Promise<WorkflowRun | null> {

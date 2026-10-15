@@ -45,8 +45,8 @@
   "dependencies": {
     "@upstash/qstash": "^2.8.7",
     "@upstash/redis": "^1.35.0",
-    "@workflow/errors": "catalog:",
-    "@workflow/world": "catalog:",
+    "@workflow/errors": "catalog:v4",
+    "@workflow/world": "catalog:v4",
     "ulid": "catalog:"
   },
   "devDependencies": {
@@ -54,7 +54,7 @@
     "@fantasticfour/testing": "workspace:*",
     "@testcontainers/redis": "catalog:",
     "@types/node": "catalog:",
-    "@workflow/world-testing": "catalog:",
+    "@workflow/world-testing": "catalog:v4",
     "testcontainers": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:",

@@ -2,17 +2,19 @@ import { setTimeout } from 'node:timers/promises';
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
-import { asEventRequest, expectEventType } from '@fantasticfour/testing';
-import { ulidToDate } from '@workflow/world';
+import { asEventRequest, describeV5Storage, expectEventType } from '@fantasticfour/testing';
+import { eventIdToSlot } from '@workflow/world';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createStorage } from '../src/storage.js';
 import { clearMockData, createMockEnv } from '../src/test-mocks.js';
+
+// Failure events carry the runtime's serialized error as opaque bytes.
+const errorBytes = new TextEncoder().encode('serialized-error');
 
 describe('Storage (Cloudflare Durable Objects integration)', () => {
   let storage: ReturnType<typeof createStorage>;
@@ -34,6 +36,8 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
   afterAll(() => {
     // Cleanup
   });
+
+  describeV5Storage(() => storage);
 
   /**
    * Helper: create a run via the event-sourced API.
@@ -194,17 +198,16 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         const result = await storage.events.create(created.runId, {
           eventType: 'run_failed',
           eventData: {
-            error: {
-              message: 'Something went wrong',
-              code: 'ERR_001',
-            },
+            error: errorBytes,
+            errorCode: 'ERR_001',
           },
         });
 
         const updated = result.run!;
         expect(updated.status).toBe('failed');
-        expect(updated.error?.message).toBe('Something went wrong');
-        expect(updated.error?.code).toBe('ERR_001');
+        // v5 errors are the runtime's serialized bytes, stored verbatim.
+        expect(updated.error).toEqual(errorBytes);
+        expect(updated.errorCode).toBe('ERR_001');
         expect(updated.completedAt).toBeInstanceOf(Date);
       });
     });
@@ -357,7 +360,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
           eventType: 'step_retrying',
           correlationId: 'step-123',
           eventData: {
-            error: 'retry error',
+            error: errorBytes,
           },
         });
 
@@ -366,7 +369,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         // counter only advances on step_started.
         expect(updated.status).toBe('pending');
         expect(updated.attempt).toBe(1);
-        expect(updated.error?.message).toBe('retry error');
+        expect(updated.error).toEqual(errorBytes);
 
         const restarted = await storage.events.create(testRunId, {
           eventType: 'step_started',
@@ -433,7 +436,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         const event = result.event!;
         expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
+        expect(eventIdToSlot(event.eventId)).not.toBeNull();
         expect(event.eventType).toBe('step_started');
         expect(event.correlationId).toBe('corr_123');
         expect(event.createdAt).toBeInstanceOf(Date);
@@ -455,7 +458,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         const event = result.event!;
         expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
+        expect(eventIdToSlot(event.eventId)).not.toBeNull();
         expect(event.eventType).toBe('step_failed');
         expect(event.correlationId).toBe('corr_123');
         expect(event.createdAt).toBeInstanceOf(Date);
@@ -634,7 +637,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         await seedInterleaved(testRunId, ['corr-a'], 1);
 
         await expect(
-          storage.events.listByCorrelationId({ correlationId: 'corr-a' }),
+          storage.events.listByCorrelationId({ correlationId: 'corr-a' } as never),
         ).rejects.toSatisfy((error) => WorkflowWorldError.is(error) && error.status === 400);
       });
     });
@@ -1153,8 +1156,8 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
     });
   });
 
-  describe('run_failed error mapping', () => {
-    it('should preserve string errors and errorCode', async () => {
+  describe('failure error storage', () => {
+    it('stores run_failed error bytes verbatim with errorCode', async () => {
       const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
@@ -1165,17 +1168,22 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       const result = await storage.events.create(run.runId, {
         eventType: 'run_failed',
         eventData: {
-          error: 'plain string failure',
+          error: errorBytes,
           errorCode: 'MAX_DELIVERIES_EXCEEDED',
         },
       });
 
       expect(result.run?.status).toBe('failed');
-      expect(result.run?.error?.message).toBe('plain string failure');
-      expect(result.run?.error?.code).toBe('MAX_DELIVERIES_EXCEEDED');
+      expect(result.run?.error).toEqual(errorBytes);
+      expect(result.run?.error).toBeInstanceOf(Uint8Array);
+      expect(result.run?.errorCode).toBe('MAX_DELIVERIES_EXCEEDED');
+
+      const fetched = await storage.runs.get(run.runId);
+      expect(fetched.error).toEqual(errorBytes);
+      expect(fetched.errorCode).toBe('MAX_DELIVERIES_EXCEEDED');
     });
 
-    it('should preserve string errors on step_failed', async () => {
+    it('stores step_failed error bytes verbatim', async () => {
       const run = await createRun({
         deploymentId: 'deployment-123',
         workflowName: 'test-workflow',
@@ -1190,11 +1198,12 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       const result = await storage.events.create(run.runId, {
         eventType: 'step_failed',
         correlationId: 'step-1',
-        eventData: { error: 'string step failure', stack: 'at somewhere' },
+        eventData: { error: errorBytes },
       });
 
-      expect(result.step?.error?.message).toBe('string step failure');
-      expect(result.step?.error?.stack).toBe('at somewhere');
+      expect(result.step?.error).toEqual(errorBytes);
+      const fetched = await storage.steps.get(run.runId, 'step-1');
+      expect(fetched.error).toEqual(errorBytes);
     });
   });
 
@@ -1507,158 +1516,6 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
       expect(seen).toHaveLength(7);
       expect(new Set(seen).size).toBe(7);
-    });
-  });
-
-  describe('Optimistic concurrency guard (stateUpdatedAt, world 4.3.1)', () => {
-    /** ULID time (epoch ms) of an event id, i.e. the state-marker unit. */
-    function eventTime(eventId: string): number {
-      const time = ulidToDate(eventId.slice(eventId.lastIndexOf('_') + 1))?.getTime();
-      if (time === undefined) throw new Error(`not a decodable event id: ${eventId}`);
-      return time;
-    }
-
-    /** Drive a run until an externally-originated step_completed has advanced the
-     * state marker, and report the marker value. */
-    async function runWithMarker(): Promise<{ runId: string; marker: number }> {
-      const run = await createRun({
-        deploymentId: 'test-deployment',
-        workflowName: 'guard-workflow',
-        input: [],
-      });
-      await storage.events.create(run.runId, { eventType: 'run_started' });
-      await storage.events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: 'step-guard',
-        eventData: { stepName: 'guarded', input: [] },
-      });
-      await storage.events.create(run.runId, {
-        eventType: 'step_started',
-        correlationId: 'step-guard',
-        eventData: {},
-      });
-      // No stateUpdatedAt -> externally originated -> advances the marker.
-      const completed = await storage.events.create(run.runId, {
-        eventType: 'step_completed',
-        correlationId: 'step-guard',
-        eventData: { result: 'ok' },
-      });
-      return { runId: run.runId, marker: eventTime(completed.event!.eventId) };
-    }
-
-    it('rejects a strictly older snapshot with PreconditionFailedError', async () => {
-      const { runId, marker } = await runWithMarker();
-
-      await expect(
-        storage.events.create(
-          runId,
-          {
-            eventType: 'wait_created',
-            correlationId: 'wait-stale',
-            eventData: { resumeAt: new Date(Date.now() + 60_000) },
-          },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
-
-      // The rejected create must not have appended anything.
-      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
-      expect(events.data.some((e) => e.eventType === 'wait_created')).toBe(false);
-    });
-
-    it('accepts an equal snapshot and does not advance the marker', async () => {
-      const { runId, marker } = await runWithMarker();
-
-      // Equal passes (anti-livelock for an up-to-date client)...
-      await storage.events.create(
-        runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-a',
-          eventData: { resumeAt: new Date(Date.now() + 60_000) },
-        },
-        { stateUpdatedAt: marker },
-      );
-      // ...and a replay-origin create must not move the marker forward, so the
-      // same snapshot still passes afterwards.
-      await storage.events.create(
-        runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-b',
-          eventData: { resumeAt: new Date(Date.now() + 60_000) },
-        },
-        { stateUpdatedAt: marker },
-      );
-
-      const events = await storage.events.list({ runId, pagination: { limit: 100 } });
-      expect(events.data.filter((e) => e.eventType === 'wait_created')).toHaveLength(2);
-    });
-
-    it('fails open when no snapshot is supplied', async () => {
-      const { runId } = await runWithMarker();
-
-      const result = await storage.events.create(runId, {
-        eventType: 'wait_created',
-        correlationId: 'wait-unguarded',
-        eventData: { resumeAt: new Date(Date.now() + 60_000) },
-      });
-      expect(result.event).toBeDefined();
-    });
-
-    it('advances the marker on an externally-originated hook_received', async () => {
-      const run = await createRun({
-        deploymentId: 'test-deployment',
-        workflowName: 'guard-hook-workflow',
-        input: [],
-      });
-      await storage.events.create(run.runId, { eventType: 'run_started' });
-      await storage.events.create(run.runId, {
-        eventType: 'hook_created',
-        correlationId: 'hook-guard',
-        eventData: { token: 'token-guard' },
-      });
-      const received = await storage.events.create(run.runId, {
-        eventType: 'hook_received',
-        correlationId: 'hook-guard',
-        eventData: { payload: {} },
-      });
-      const marker = eventTime(received.event!.eventId);
-
-      await expect(
-        storage.events.create(
-          run.runId,
-          {
-            eventType: 'hook_disposed',
-            correlationId: 'hook-guard',
-            eventData: {},
-          },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toSatisfy((err) => PreconditionFailedError.is(err));
-    });
-
-    it('does not arm the guard from run lifecycle events', async () => {
-      // run_created / run_started are created without a snapshot but are NOT
-      // externally originated; treating them as such would 412 every replay.
-      const run = await createRun({
-        deploymentId: 'test-deployment',
-        workflowName: 'guard-lifecycle-workflow',
-        input: [],
-      });
-      const started = await storage.events.create(run.runId, { eventType: 'run_started' });
-      const startedAt = eventTime(started.event!.eventId);
-
-      const result = await storage.events.create(
-        run.runId,
-        {
-          eventType: 'wait_created',
-          correlationId: 'wait-x',
-          eventData: { resumeAt: new Date(Date.now() + 60_000) },
-        },
-        { stateUpdatedAt: startedAt - 1000 },
-      );
-      expect(result.event).toBeDefined();
     });
   });
 

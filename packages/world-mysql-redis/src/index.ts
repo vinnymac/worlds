@@ -1,5 +1,5 @@
 import type { HealthCheckable } from '@fantasticfour/shared';
-import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
+import { mintedSpecVersion, type World } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { Redis } from 'ioredis';
 import mysql from 'mysql2/promise';
@@ -47,13 +47,12 @@ export function createWorld(
   const streamer = createStreamer(db);
 
   return {
-    // Declare the highest spec version this world supports. With spec
-    // version 3+, `start()` includes the run input in the queue message
-    // (binary-safe queue transport), which enables the resilient-start
-    // path in `events.create('run_started')`. That path is required for
-    // correctness: the runtime creates `run_created` and enqueues the
-    // workflow message in parallel, so `run_started` can win the race.
-    specVersion: SPEC_VERSION_CURRENT,
+    // The version stamped on new runs: the current spec by default, or slot
+    // identity when WORKFLOW_SEALED_LOG=0, read per world rather than at
+    // module load. Both are inside the range the runtime accepts. Event
+    // slots are allocated at the commit, so no position is ever left empty
+    // and this World never writes a `noop`.
+    specVersion: mintedSpecVersion(),
     ...storage,
     ...streamer,
     ...queue,

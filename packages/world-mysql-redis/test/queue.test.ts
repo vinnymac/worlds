@@ -8,7 +8,7 @@ const NOW = 1_000_000;
 
 const item = stringify({
   messageId: 'msg_01',
-  queueName: '__wkf_step_test',
+  queueName: '__wkf_workflow_test',
   attempt: 1,
   message: {},
 });
@@ -64,9 +64,10 @@ describe('createQueue lease', () => {
       ...config,
     });
     await queue.start();
-    await vi.waitFor(() => expect(leases).toHaveLength(2));
+    // One worker: v5 has a single (workflow) queue kind.
+    await vi.waitFor(() => expect(leases).toHaveLength(1));
     queue.stop();
-    expect(leases).toEqual([NOW + expected, NOW + expected]);
+    expect(leases).toEqual([NOW + expected]);
   });
 
   test.each([

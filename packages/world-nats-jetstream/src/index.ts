@@ -1,4 +1,4 @@
-import { SPEC_VERSION_CURRENT, type Storage, type World } from '@workflow/world';
+import { mintedSpecVersion, type SpecVersion, type Storage, type World } from '@workflow/world';
 import { connect, type NatsConnection } from '@nats-io/transport-node';
 import { jetstream, type JetStreamClient } from '@nats-io/jetstream';
 import type { NatsJetStreamWorldConfig } from './config.js';
@@ -15,10 +15,11 @@ import { createStreamer } from './streamer.js';
 function createStorage(
   getJetStream: () => Promise<JetStreamClient>,
   keyPrefix: string,
+  specVersion: SpecVersion,
   terminalRunTTLMs?: number,
   maxEventsPerRun?: number,
 ): Storage {
-  const config = { getJetStream, keyPrefix, terminalRunTTLMs, maxEventsPerRun };
+  const config = { getJetStream, keyPrefix, specVersion, terminalRunTTLMs, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -62,9 +63,16 @@ export function createWorld(
 
   const keyPrefix = config.keyPrefix || 'workflow_';
 
+  // The version stamped on new runs: 8 by default, or the slot-identity
+  // version when WORKFLOW_SEALED_LOG=0. Read per world, not at module load.
+  // Events are allocated at the commit, so a run's log never has a hole and
+  // this World never writes a `noop`.
+  const specVersion = mintedSpecVersion();
+
   const storage = createStorage(
     getJetStream,
     keyPrefix,
+    specVersion,
     config.terminalRunTTLMs,
     config.maxEventsPerRun,
   );
@@ -72,14 +80,13 @@ export function createWorld(
   const queue = createQueue(getJetStream, config);
 
   return {
-    // Declare the highest spec version this world supports. With spec
-    // version 3+, `start()` includes the run input in the queue message
-    // (CBOR queue transport), which enables the resilient-start path in
-    // `events.create('run_started')`. That path is required for
-    // correctness here: the runtime creates `run_created` and enqueues
-    // the workflow message in parallel, and JetStream delivers to the
-    // in-process worker fast enough that `run_started` can win the race.
-    specVersion: SPEC_VERSION_CURRENT,
+    // `start()` includes the run input in the queue message, which enables
+    // the resilient-start path in `events.create('run_started')`. That path
+    // is required for correctness here: the runtime creates `run_created`
+    // and enqueues the workflow message in parallel, and JetStream delivers
+    // to the in-process worker fast enough that `run_started` can win the
+    // race.
+    specVersion,
     ...storage,
     ...streamer,
     ...queue,

@@ -1,6 +1,6 @@
 import mysql from 'mysql2/promise';
 import type { World } from '@workflow/world';
-import { reenqueueActiveRuns, SPEC_VERSION_CURRENT } from '@workflow/world';
+import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
 import { drizzle } from 'drizzle-orm/mysql2';
 import { createQueue, type MysqlQueueConfig } from './queue.js';
 import * as schema from './schema.js';
@@ -58,10 +58,11 @@ export function createMysqlWorld(
   const streamer = createStreamer(db);
 
   return {
-    // Declaring SPEC_VERSION_CURRENT enables the resilient-start path:
-    // runs are created at the current spec version and queue messages carry
-    // runInput, which requires the binary-safe tagged-JSON queue transport.
-    specVersion: SPEC_VERSION_CURRENT,
+    // The version stamped on new runs: the sealed-log version by default, or
+    // slot identity when WORKFLOW_SEALED_LOG=0. Read per world, not at module
+    // load. Events are allocated at commit, so no position is ever left
+    // empty and this World never writes a `noop`.
+    specVersion: mintedSpecVersion(),
     ...storage,
     ...queue,
     ...streamer,

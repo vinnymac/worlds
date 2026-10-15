@@ -37,6 +37,10 @@ interface MessageEnvelope {
   idempotencyKey?: string;
   queueName: ValidQueueName;
   message: QueuePayload;
+  /** Epoch ms before which the message must not be delivered
+   * (`QueueOptions.delaySeconds`). JetStream has no delayed publish, so the
+   * worker naks an early delivery for the remainder. */
+  notBefore?: number;
 }
 
 /** Health statistics for a queue worker. */
@@ -174,9 +178,10 @@ const NAK_DELAY_MS = 5_000;
  */
 const SOFT_NAK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// v5 has one queue kind: orchestration and queued step invocations share the
+// workflow stream and the combined flow route.
 const QUEUE_PATHNAMES = {
   workflow: 'flow',
-  step: 'step',
 } as const satisfies Record<QueueKind, string>;
 
 function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
@@ -191,7 +196,7 @@ function resolveBaseUrl(config: NatsJetStreamWorldConfig): string {
  * in work-queue mode. Deduplication uses `Nats-Msg-Id` (configurable window).
  *
  * Worker delivery: messages are pulled from JetStream and dispatched via HTTP
- * fetch to `${baseUrl}/.well-known/workflow/v1/{flow|step}`. JetStream itself
+ * fetch to `${baseUrl}/.well-known/workflow/v1/flow`. JetStream itself
  * handles redelivery via `max_deliver` and `nak()`.
  *
  * Message payloads are serialized with the shared tagged-JSON codec so that
@@ -231,7 +236,6 @@ export function createQueue(
   const prefix = config.jobPrefix || 'workflow_';
   const Streams = {
     workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
   } as const satisfies Record<QueueKind, string>;
 
   const dedupWindowMs = config.dedupWindowMs ?? DEFAULT_DEDUP_WINDOW_MS;
@@ -253,12 +257,12 @@ export function createQueue(
   const inflightWorkflowRuns = new Map<string, Promise<void>>();
 
   /** Serialization key for a delivery, or `undefined` when it may run freely.
-   * Only workflow invocations are keyed; step deliveries stay parallel so
-   * fan-out is preserved. */
+   * Only workflow replays are keyed; step executions (a `stepId` on the
+   * workflow topic) stay parallel so fan-out is preserved. */
   function workflowRunSerializationKey(kind: QueueKind, message: QueuePayload): string | undefined {
     if (kind !== 'workflow') return undefined;
     const invoke = WorkflowInvokePayloadSchema.safeParse(message);
-    if (!invoke.success) return undefined;
+    if (!invoke.success || invoke.data.stepId !== undefined) return undefined;
     return `workflow:${invoke.data.runId}`;
   }
 
@@ -371,8 +375,8 @@ export function createQueue(
   const queue: Queue['queue'] = async (queueName, message, opts) => {
     await initStreams();
 
-    const { kind, id } = parseQueueName(queueName);
-    const streamName = Streams[kind];
+    const { id } = parseQueueName(queueName);
+    const streamName = Streams.workflow;
     const subject = `${streamName}.${id}`;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const idempotencyKey = opts?.idempotencyKey ?? messageId;
@@ -382,6 +386,9 @@ export function createQueue(
       idempotencyKey: opts?.idempotencyKey,
       queueName,
       message,
+      ...(opts?.delaySeconds && opts.delaySeconds > 0
+        ? { notBefore: Date.now() + opts.delaySeconds * 1000 }
+        : {}),
     };
     const payload = stringify(envelope);
 
@@ -414,8 +421,11 @@ export function createQueue(
           queueName: reqQueueName,
           messageId: reqMessageId,
         });
-        if (result && typeof result.timeoutSeconds === 'number') {
-          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        // `{ timeoutSeconds: 0 }` means "redeliver now", so test the type,
+        // not truthiness.
+        const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)?.timeoutSeconds;
+        if (typeof timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds }, { status: 503 });
         }
         return Response.json({ ok: true });
       } catch (error) {
@@ -427,7 +437,7 @@ export function createQueue(
   async function dispatch(
     envelope: MessageEnvelope,
     attempt: number,
-    pathname: 'flow' | 'step',
+    pathname: 'flow',
   ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
     const url = createWorkflowUrl(baseUrl, { type: pathname });
@@ -449,12 +459,22 @@ export function createQueue(
   async function deliver(
     msg: JsMsg,
     envelope: MessageEnvelope,
-    pathname: 'flow' | 'step',
+    pathname: 'flow',
     streamName: string,
     kind: QueueKind,
   ): Promise<void> {
     const key = softNakKey(kind, msg);
     try {
+      // A delayed message delivered early: hold it for the remainder. Counted
+      // as a suspension, not a failed delivery.
+      const remainingMs = (envelope.notBefore ?? 0) - Date.now();
+      if (remainingMs > 0) {
+        const softNaks = msg.info.deliveryCount > 1 ? await readSoftNaks(key) : 0;
+        await writeSoftNaks(key, softNaks + 1);
+        msg.nak(Math.min(remainingMs, MAX_TIMER_DELAY_MS));
+        return;
+      }
+
       // Report only *failed* deliveries as the attempt, so core's poison-pill
       // escalation (attempt > MAX_QUEUE_DELIVERIES) still fires on a genuinely
       // stuck message but a run that merely suspends is never killed as a

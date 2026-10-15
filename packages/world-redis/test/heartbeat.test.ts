@@ -41,9 +41,10 @@ describe('createQueue heartbeat', () => {
     await queue.start();
     await vi.waitFor(() => expect(workers.every((w) => w.set.mock.calls.length > 0)).toBe(true));
 
-    expect(workers).toHaveLength(2);
+    // One worker per queue kind at concurrency 1, and v5 has a single kind.
+    expect(workers).toHaveLength(1);
     const heartbeatDelays = setInterval.mock.calls.map(([, delay]) => delay);
-    expect(heartbeatDelays).toEqual([refresh, refresh]);
+    expect(heartbeatDelays).toEqual([refresh]);
 
     // Fire each refresh once: the loop-top SET and the refresh must both use PX.
     for (const [refreshHeartbeat] of setInterval.mock.calls) refreshHeartbeat();

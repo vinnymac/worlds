@@ -16,6 +16,7 @@ export const MIGRATION_FILES = [
   '0003_runs_state_updated_at.sql',
   '0004_events_entity_creation_unique.sql',
   '0005_jobs_claim_token.sql',
+  '0006_workflow_v5.sql',
 ];
 
 /**

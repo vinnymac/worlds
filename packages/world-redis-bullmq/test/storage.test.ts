@@ -1,7 +1,6 @@
 import { setTimeout } from 'node:timers/promises';
-import { expectRejectedWith } from '@fantasticfour/testing';
+import { describeV5Storage, expectRejectedWith } from '@fantasticfour/testing';
 import { RedisContainer } from '@testcontainers/redis';
-import { PreconditionFailedError } from '@workflow/errors';
 import type { Event } from '@workflow/world';
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, test } from 'vitest';
@@ -92,6 +91,8 @@ describe('Storage (Redis integration)', () => {
   beforeEach(async () => {
     await flushTestKeys();
   });
+
+  describeV5Storage(() => ({ events, runs, steps }));
 
   afterAll(async () => {
     await redis.quit();
@@ -276,26 +277,6 @@ describe('Storage (Redis integration)', () => {
       it('should throw error for non-existent step', async () => {
         await expect(steps.get(testRunId, 'missing-step')).rejects.toMatchObject({ status: 404 });
       });
-
-      it('should find step by stepId without runId using SCAN', async () => {
-        const created = await createStep(testRunId, {
-          stepId: 'unique-step-scan-test',
-          stepName: 'test-step',
-          input: ['input1'],
-        });
-
-        // Retrieve without runId (uses SCAN instead of KEYS)
-        const retrieved = await steps.get(undefined, 'unique-step-scan-test');
-        expect(retrieved.stepId).toBe(created.stepId);
-        expect(retrieved.runId).toBe(testRunId);
-        expect(retrieved.stepName).toBe('test-step');
-      });
-
-      it('should throw 404 when step not found without runId', async () => {
-        await expect(steps.get(undefined, 'nonexistent-step-id')).rejects.toMatchObject({
-          status: 404,
-        });
-      });
     });
 
     describe('update via events', () => {
@@ -361,7 +342,7 @@ describe('Storage (Redis integration)', () => {
         });
 
         expect(result.event?.runId).toBe(testRunId);
-        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventId).toMatch(/^evnt_\d{26}$/);
         expect(result.event?.eventType).toBe('step_started');
         expect(result.event?.correlationId).toBe('corr_123');
         expect(result.event?.createdAt).toBeInstanceOf(Date);
@@ -387,7 +368,7 @@ describe('Storage (Redis integration)', () => {
         });
 
         expect(result.event?.runId).toBe(testRunId);
-        expect(result.event?.eventId).toMatch(/^wevt_/);
+        expect(result.event?.eventId).toMatch(/^evnt_\d{26}$/);
         expect(result.event?.eventType).toBe('step_failed');
         expect(result.event?.correlationId).toBe('corr_123');
         expect(result.event?.createdAt).toBeInstanceOf(Date);
@@ -438,6 +419,7 @@ describe('Storage (Redis integration)', () => {
         });
 
         const result = await events.listByCorrelationId({
+          runId: testRunId,
           correlationId,
           pagination: {},
         });
@@ -483,6 +465,7 @@ describe('Storage (Redis integration)', () => {
         });
 
         const result = await events.listByCorrelationId({
+          runId: testRunId,
           correlationId: hookId,
           pagination: {},
         });
@@ -559,26 +542,6 @@ describe('Storage (Redis integration)', () => {
 
         expect(result.data.map((e) => e.eventId)).toEqual(seeded.a);
         expect(result.data.every((e) => e.runId === seeded.runA)).toBe(true);
-        expect(result.hasMore).toBe(false);
-      });
-
-      it('should list every run when runId is omitted', async () => {
-        const seeded = await seedInterleavedRuns();
-
-        const result = await events.listByCorrelationId({
-          correlationId: sharedCorrelationId,
-          pagination: {},
-        });
-
-        // Also pins the interleaving the scoped pagination test relies on.
-        expect(result.data.map((e) => e.eventId)).toEqual([
-          seeded.a[0],
-          seeded.b[0],
-          seeded.a[1],
-          seeded.b[1],
-          seeded.a[2],
-          seeded.b[2],
-        ]);
         expect(result.hasMore).toBe(false);
       });
 
@@ -718,6 +681,7 @@ describe('Storage (Redis integration)', () => {
       expect(stepResults.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
       expectRejectedWith(stepResults, 'EntityConflictError');
       const stepEvents = await events.listByCorrelationId({
+        runId: run.runId,
         correlationId: stepId,
         pagination: {},
       });
@@ -736,6 +700,7 @@ describe('Storage (Redis integration)', () => {
       );
       expect(hookResults.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
       const hookEvents = await events.listByCorrelationId({
+        runId: run.runId,
         correlationId: hookId,
         pagination: {},
       });
@@ -947,6 +912,7 @@ describe('Storage (Redis integration)', () => {
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const eventList = await events.listByCorrelationId({
+        runId: run.runId,
         correlationId: hookId,
         pagination: {},
       });
@@ -990,6 +956,7 @@ describe('Storage (Redis integration)', () => {
       ).rejects.toMatchObject({ name: 'EntityConflictError' });
 
       const eventList = await events.listByCorrelationId({
+        runId: run.runId,
         correlationId: hookId,
         pagination: {},
       });
@@ -1084,7 +1051,7 @@ describe('Storage (Redis integration)', () => {
         }
         await redis.xadd(key, '7-13', 'data', '', 'eof', 'true');
 
-        const stream = await streamer.readFromStream(streamName);
+        const stream = await streamer.streams.get('wrun_stream', streamName);
         const reader = stream.getReader();
         const chunks: string[] = [];
         for (;;) {
@@ -1194,126 +1161,6 @@ describe('Storage (Redis integration)', () => {
     });
   });
 
-  describe('optimistic concurrency (stateUpdatedAt guard)', () => {
-    const runStateKey = (runId: string) => `${keyPrefix}run:state:${runId}`;
-
-    /** Create a run that is running with one completed step, so the per-run
-     * state marker has been advanced by an externally-originated event. */
-    async function runWithMarker() {
-      const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      const step = await createStep(run.runId, { stepId: 'external-step' });
-      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
-      await events.create(run.runId, {
-        eventType: 'step_completed',
-        correlationId: step.stepId,
-        eventData: { result: 'ok' },
-      });
-      const raw = await redis.get(runStateKey(run.runId));
-      expect(raw).not.toBeNull();
-      return { run, marker: Number(raw) };
-    }
-
-    it('does not advance the marker on run lifecycle events', async () => {
-      const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      expect(await redis.get(runStateKey(run.runId))).toBeNull();
-    });
-
-    it('advances the marker on an externally-originated step_completed', async () => {
-      const { marker } = await runWithMarker();
-      expect(marker).toBeGreaterThan(0);
-    });
-
-    it('does not advance the marker for a replay-origin create', async () => {
-      const run = await createRun();
-      await events.create(run.runId, { eventType: 'run_started' });
-      const step = await createStep(run.runId, { stepId: 'replay-step' });
-      await events.create(run.runId, { eventType: 'step_started', correlationId: step.stepId });
-      await events.create(
-        run.runId,
-        {
-          eventType: 'step_completed',
-          correlationId: step.stepId,
-          eventData: { result: 'ok' },
-        },
-        { stateUpdatedAt: Date.now() },
-      );
-      expect(await redis.get(runStateKey(run.runId))).toBeNull();
-    });
-
-    it('rejects a strictly older stateUpdatedAt with PreconditionFailedError', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          {
-            eventType: 'step_created',
-            correlationId: 'stale-step',
-            eventData: { stepName: 'stale', input: [] },
-          },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toThrow(PreconditionFailedError);
-      // The guarded write must not have landed.
-      expect(await redis.get(`${keyPrefix}step:${run.runId}:stale-step`)).toBeNull();
-    });
-
-    it('accepts an equal stateUpdatedAt (anti-livelock)', async () => {
-      const { run, marker } = await runWithMarker();
-      const result = await events.create(
-        run.runId,
-        {
-          eventType: 'step_created',
-          correlationId: 'equal-step',
-          eventData: { stepName: 'equal', input: [] },
-        },
-        { stateUpdatedAt: marker },
-      );
-      expect(result.step?.stepId).toBe('equal-step');
-    });
-
-    it('falls open when no stateUpdatedAt is supplied', async () => {
-      const { run } = await runWithMarker();
-      const result = await events.create(run.runId, {
-        eventType: 'step_created',
-        correlationId: 'unguarded-step',
-        eventData: { stepName: 'unguarded', input: [] },
-      });
-      expect(result.step?.stepId).toBe('unguarded-step');
-    });
-
-    it('rejects a stale run_completed without marking the run terminal', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          { eventType: 'run_completed', eventData: { output: [] } },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toThrow(PreconditionFailedError);
-
-      const current = await runs.get(run.runId);
-      expect(current.status).toBe('running');
-    });
-
-    it('rejects a stale hook_created', async () => {
-      const { run, marker } = await runWithMarker();
-      await expect(
-        events.create(
-          run.runId,
-          {
-            eventType: 'hook_created',
-            correlationId: 'hook-guard',
-            eventData: { token: 'token-guard' },
-          },
-          { stateUpdatedAt: marker - 1 },
-        ),
-      ).rejects.toThrow(PreconditionFailedError);
-      expect(await redis.get(`${keyPrefix}hook:hook-guard`)).toBeNull();
-    });
-  });
-
   // The compact `run:meta:` key and the per-run hook token map are both
   // written going forward but are absent from runs that already existed when
   // they were introduced. Each read path has to degrade to the old behaviour
@@ -1413,10 +1260,8 @@ describe('Storage (Redis integration)', () => {
         eventData: { error: 'boom', retryAfter },
       });
 
-      // ListEventsByCorrelationIdParams takes no runId; the correlation id is
-      // already run-scoped. The extra property was silently dropped before
-      // tests were typechecked.
       const stored = await events.listByCorrelationId({
+        runId: run.runId,
         correlationId: step.stepId,
       });
       const retrying = stored.data.find((e) => e.eventType === 'step_retrying');
@@ -1435,7 +1280,7 @@ describe('Storage (Redis integration)', () => {
     const rapidPairCount = 16;
 
     /**
-     * Core derives `stateUpdatedAt` from the LAST event the log returns rather
+     * Event ids are slot positions; the log returns them in slot order rather
      * than the maximum, so the log has to sort by eventId. Race two event types
      * that need a different number of round trips to reach their append: the
      * cheaper ones land ahead of events minted before them, which an index

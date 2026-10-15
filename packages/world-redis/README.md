@@ -71,7 +71,7 @@ await world.start();
 
 - `workflow:run:{runId}`
 - `workflow:step:{runId}:{stepId}`
-- `workflow:event:{eventId}`
+- `workflow:event:{runId}:{eventId}` (event ids are slot positions within the run)
 - `workflow:hook:{hookId}`
 
 **Sorted Sets** - Indexes for queries:
@@ -80,18 +80,22 @@ await world.start();
 - `workflow:runs:by_name:{workflowName}`
 - `workflow:runs:by_status:{status}`
 - `workflow:steps:by_run:{runId}`
-- `workflow:events:by_run:{runId}`
+- `workflow:events:by_run:{runId}` (scored by slot)
+- `workflow:events:by_correlation:{runId}:{correlationId}`
+
+**Counters** - Per-run event slot sequence, `INCR`'d in the script that appends the event:
+
+- `workflow:events:seq:{runId}`
 
 **Lists** - Job queues:
 
-- `workflow:queue:flows`
-- `workflow:queue:steps`
+- `workflow:queue:flows` (orchestration and queued steps share it)
 
 **Streams** - Ordered stream chunks (base64-encoded, with an `eof` marker):
 
 - `workflow:stream:{name}`
 
-**Sets** - Stream membership index (powers `listStreamsByRunId`):
+**Sets** - Stream membership index (powers `streams.list`):
 
 - `workflow:streams:by_run:{runId}`
 

@@ -1,4 +1,4 @@
-import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
+import { mintedSpecVersion, type World } from '@workflow/world';
 import { type CloudflareQueueConfig, createQueue } from './queue.js';
 import { type CloudflareStorageConfig, createStorage } from './storage.js';
 import { type CloudflareStreamerConfig, createStreamer } from './streamer.js';
@@ -38,12 +38,23 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
   const deploymentId =
     config?.deploymentId || process.env.CLOUDFLARE_DEPLOYMENT_ID || 'cloudflare-default';
 
+  // The version stamped on new runs: the sealed-log version by default, or
+  // slot identity when WORKFLOW_SEALED_LOG=0. Read per world, not at module
+  // load, and without assuming `process` exists (a Worker without
+  // nodejs_compat has none). Events are allocated at commit inside the run's
+  // Durable Object, so no position is ever left empty and this World never
+  // writes a `noop`.
+  const specVersion = mintedSpecVersion(
+    (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {},
+  );
+
   const storage = createStorage({
     env: {
       WORKFLOW_DB: env.WORKFLOW_DB,
       WORKFLOW_INDEX: env.WORKFLOW_INDEX,
     },
     deploymentId,
+    specVersion,
     maxEventsPerRun: config?.maxEventsPerRun,
   });
 
@@ -65,10 +76,7 @@ export function createCloudflareWorld(config?: CloudflareWorldConfig): World {
     ...storage,
     ...queue,
     ...streamer,
-    // Enables resilient start: runs are created at the current spec version,
-    // so the queue message carries runInput and run_started can bootstrap the
-    // run when run_created has not landed yet.
-    specVersion: SPEC_VERSION_CURRENT,
+    specVersion,
   };
 }
 

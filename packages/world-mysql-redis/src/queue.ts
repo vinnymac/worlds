@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
-  parseQueueName,
   type Queue,
   type QueueKind,
   type QueuePayload,
@@ -25,7 +24,6 @@ interface MessageEnvelope {
 
 const QUEUE_PATHNAMES = {
   workflow: 'flow',
-  step: 'step',
 } as const satisfies Record<QueueKind, string>;
 
 /** How long an idempotency reservation is held (seconds). */
@@ -262,7 +260,6 @@ export function createQueue(
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
     workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
   } as const satisfies Record<QueueKind, string>;
 
   let stopped = false;
@@ -284,7 +281,9 @@ export function createQueue(
     config.deploymentId ?? 'mysql-redis';
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
+    // v5 has one queue kind: orchestration and queued step invocations
+    // share the workflow topic and the combined flow route.
+    const kind: QueueKind = 'workflow';
     const keys = keysFor(Queues[kind]);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
 
@@ -336,8 +335,9 @@ export function createQueue(
           queueName: reqQueueName,
           messageId: reqMessageId,
         });
-        if (result && typeof result.timeoutSeconds === 'number') {
-          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)?.timeoutSeconds;
+        if (typeof timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds }, { status: 503 });
         }
         return Response.json({ ok: true });
       } catch (error) {
@@ -346,7 +346,7 @@ export function createQueue(
     };
   };
 
-  async function dispatch(envelope: MessageEnvelope, pathname: 'flow' | 'step'): Promise<Response> {
+  async function dispatch(envelope: MessageEnvelope, pathname: 'flow'): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
     const url = createWorkflowUrl(baseUrl, { type: pathname });
     return fetch(url, {

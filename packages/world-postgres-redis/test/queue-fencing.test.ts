@@ -49,14 +49,13 @@ function envelope(messageId: string, idempotencyKey?: string): string {
   return JSON.stringify({
     messageId,
     idempotencyKey,
-    queueName: '__wkf_step_x',
+    queueName: '__wkf_workflow_x',
     attempt: 1,
     // Must satisfy QueuePayloadSchema, or the dead-letter path never fails the run.
     message: {
-      workflowRunId: 'wrun_1',
-      workflowName: 'wf',
-      workflowStartedAt: 1,
+      runId: 'wrun_1',
       stepId: 'step_1',
+      stepName: 'step',
     },
   });
 }
@@ -149,7 +148,7 @@ if (process.platform === 'win32') {
       'stale $outcome settle after redelivery leaves the new claim intact',
       async ({ status, maxAttempts }) => {
         const jobPrefix = `fence_${randomUUID()}_`;
-        const listKey = `${jobPrefix}steps`;
+        const listKey = `${jobPrefix}flows`;
         const inflightKey = `${listKey}:inflight`;
         const dedupKey = `${listKey}:dedup:k`;
         const calls = stubFetch();
@@ -199,7 +198,7 @@ if (process.platform === 'win32') {
       onTestFinished,
     }) => {
       const jobPrefix = `reclaim_${randomUUID()}_`;
-      const listKey = `${jobPrefix}steps`;
+      const listKey = `${jobPrefix}flows`;
       const inflightKey = `${listKey}:inflight`;
       const calls = stubFetch();
       const admin = new Redis(url);
@@ -245,7 +244,7 @@ if (process.platform === 'win32') {
 
     test('keeps an exhausted claim when the run cannot be failed', async ({ onTestFinished }) => {
       const jobPrefix = `keep_${randomUUID()}_`;
-      const listKey = `${jobPrefix}steps`;
+      const listKey = `${jobPrefix}flows`;
       const inflightKey = `${listKey}:inflight`;
       const calls = stubFetch();
       const admin = new Redis(url);
@@ -281,7 +280,7 @@ if (process.platform === 'win32') {
 
     test('a duplicate held while the original runs does not consume an attempt', async () => {
       const jobPrefix = `hold_${randomUUID()}_`;
-      const listKey = `${jobPrefix}steps`;
+      const listKey = `${jobPrefix}flows`;
       const inflightKey = `${listKey}:inflight`;
       const reclaimsKey = `${listKey}:reclaims:msg_hold`;
       const calls = stubFetch();
@@ -319,7 +318,7 @@ if (process.platform === 'win32') {
 
     test('promotes an expired claim with no readable messageId and says so', async () => {
       const jobPrefix = `unreadable_${randomUUID()}_`;
-      const listKey = `${jobPrefix}steps`;
+      const listKey = `${jobPrefix}flows`;
       const inflightKey = `${listKey}:inflight`;
       const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
       stubFetch();
@@ -342,7 +341,7 @@ if (process.platform === 'win32') {
 
     test('a 503 suspension keeps the reclaim count', async () => {
       const jobPrefix = `suspend_${randomUUID()}_`;
-      const listKey = `${jobPrefix}steps`;
+      const listKey = `${jobPrefix}flows`;
       const inflightKey = `${listKey}:inflight`;
       const reclaimsKey = `${listKey}:reclaims:msg_suspend`;
       const calls = stubFetch();
@@ -379,7 +378,7 @@ if (process.platform === 'win32') {
       'a stalled success releases $name dedup key',
       async ({ held, expected }) => {
         const jobPrefix = `dedup_${randomUUID()}_`;
-        const listKey = `${jobPrefix}steps`;
+        const listKey = `${jobPrefix}flows`;
         const inflightKey = `${listKey}:inflight`;
         const dedupKey = `${listKey}:dedup:k`;
         const calls = stubFetch();
@@ -411,7 +410,7 @@ if (process.platform === 'win32') {
 
     test('skips an item the startup recovery requeued before it was claimed', async () => {
       const jobPrefix = `recover_${randomUUID()}_`;
-      const listKey = `${jobPrefix}steps`;
+      const listKey = `${jobPrefix}flows`;
       const processingKey = `${listKey}:processing`;
       const calls = stubFetch();
       const admin = new Redis(url);
@@ -456,7 +455,7 @@ if (process.platform === 'win32') {
       'delivers and acks a $format',
       async ({ legacy }) => {
         const jobPrefix = `fence_${randomUUID()}_`;
-        const listKey = `${jobPrefix}steps`;
+        const listKey = `${jobPrefix}flows`;
         const inflightKey = `${listKey}:inflight`;
         const calls = stubFetch();
         const admin = new Redis(url);

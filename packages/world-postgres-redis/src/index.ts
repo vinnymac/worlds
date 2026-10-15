@@ -1,5 +1,5 @@
 import type { Storage, World } from '@workflow/world';
-import { reenqueueActiveRuns, SPEC_VERSION_CURRENT } from '@workflow/world';
+import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
 import { Redis } from 'ioredis';
 import createPostgres from 'postgres';
 import type { PostgresWorldConfig } from './config.js';
@@ -66,11 +66,12 @@ export function createWorld(
   const runUpdateSubscriber = createRunUpdateSubscriber(postgres);
 
   return {
-    // Declares support for the current spec (CBOR queue transport +
-    // resilient-start runInput bootstrap). Without this, core creates runs at
-    // the baseline spec and never sends runInput through the queue, so a
-    // transiently failed run_created can never be recovered.
-    specVersion: SPEC_VERSION_CURRENT,
+    // The version stamped on new runs: the current spec by default, or slot
+    // identity when WORKFLOW_SEALED_LOG=0, read per world rather than at
+    // module load. Both are inside the range the runtime accepts. Event
+    // slots are allocated at the commit, so no position is ever left empty
+    // and this World never writes a `noop`.
+    specVersion: mintedSpecVersion(),
     ...storage,
     ...streamer,
     ...queue,

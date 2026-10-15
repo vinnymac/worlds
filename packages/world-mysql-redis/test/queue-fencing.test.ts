@@ -3,16 +3,16 @@ import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redi
 import { Redis } from 'ioredis';
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 import { parse, stringify } from '@fantasticfour/shared';
-import type { StepInvokePayload, ValidQueueName } from '@workflow/world';
+import type { WorkflowInvokePayload, ValidQueueName } from '@workflow/world';
 import type { MysqlRedisWorldConfig } from '../src/config.js';
 import { createQueue } from '../src/queue.js';
 
-const QUEUE_NAME: ValidQueueName = '__wkf_step_test';
-const MESSAGE: StepInvokePayload = {
-  workflowName: 'wf',
-  workflowRunId: 'wrun_01',
-  workflowStartedAt: 0,
+const QUEUE_NAME: ValidQueueName = '__wkf_workflow_test';
+// A queued step invocation: v5 carries it on the workflow topic.
+const MESSAGE: WorkflowInvokePayload = {
+  runId: 'wrun_01',
   stepId: 'step_01',
+  stepName: 'step',
 };
 
 let container: StartedRedisContainer;
@@ -72,7 +72,7 @@ function start(prefix: string, config: Partial<MysqlRedisWorldConfig> = {}) {
   return queue;
 }
 
-const claimsOf = (prefix: string) => redis.zrange(`${prefix}steps:claims`, '0', '-1');
+const claimsOf = (prefix: string) => redis.zrange(`${prefix}flows:claims`, '0', '-1');
 
 const outcomes = [
   {
@@ -125,27 +125,27 @@ describe('claim fencing', () => {
 
       // Expire the first claim so the reclaimer redelivers it to worker B.
       const [first] = await claimsOf(prefix);
-      await redis.zadd(`${prefix}steps:claims`, 0, first);
+      await redis.zadd(`${prefix}flows:claims`, 0, first);
       await vi.waitFor(() => expect(calls).toHaveLength(2));
       const [second] = await claimsOf(prefix);
       expect(second).not.toBe(first);
-      const deadline = await redis.zscore(`${prefix}steps:claims`, second);
+      const deadline = await redis.zscore(`${prefix}flows:claims`, second);
 
       calls[0](response());
       await vi.waitFor(() =>
         expect(debug.filter((line) => line.includes(`skipped stale ${stale}`))).toHaveLength(1),
       );
       expect(await claimsOf(prefix)).toEqual([second]);
-      expect(await redis.zscore(`${prefix}steps:claims`, second)).toBe(deadline);
-      expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(0);
-      expect(await redis.llen(`${prefix}steps:dlq`)).toBe(0);
-      expect(await redis.exists(`${prefix}steps:idempotent:k`)).toBe(1);
+      expect(await redis.zscore(`${prefix}flows:claims`, second)).toBe(deadline);
+      expect(await redis.zcard(`${prefix}flows:delayed`)).toBe(0);
+      expect(await redis.llen(`${prefix}flows:dlq`)).toBe(0);
+      expect(await redis.exists(`${prefix}flows:idempotent:k`)).toBe(1);
 
       calls[1](response());
       await vi.waitFor(async () => expect(await claimsOf(prefix)).toEqual([]));
-      expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(after.delayed);
-      expect(await redis.llen(`${prefix}steps:dlq`)).toBe(after.dlq);
-      expect(await redis.exists(`${prefix}steps:idempotent:k`)).toBe(after.idempotencyKey);
+      expect(await redis.zcard(`${prefix}flows:delayed`)).toBe(after.delayed);
+      expect(await redis.llen(`${prefix}flows:dlq`)).toBe(after.dlq);
+      expect(await redis.exists(`${prefix}flows:idempotent:k`)).toBe(after.idempotencyKey);
       expect(debug.filter((line) => line.includes('skipped stale'))).toHaveLength(1);
       queue.stop();
     },
@@ -166,19 +166,19 @@ describe('claim fencing', () => {
     for (const delivered of [1, 2]) {
       await vi.waitFor(() => expect(calls).toHaveLength(delivered));
       const [claim] = await claimsOf(prefix);
-      await redis.zadd(`${prefix}steps:claims`, 0, claim);
+      await redis.zadd(`${prefix}flows:claims`, 0, claim);
     }
-    await vi.waitFor(async () => expect(await redis.llen(`${prefix}steps:dlq`)).toBe(1));
+    await vi.waitFor(async () => expect(await redis.llen(`${prefix}flows:dlq`)).toBe(1));
     await vi.waitFor(() =>
       expect(error).toHaveBeenCalledWith(expect.stringContaining('lease expired 2 time(s)')),
     );
     // The DLQ entry carries the counted attempt, not the enqueued one.
-    const [dead] = await redis.lrange(`${prefix}steps:dlq`, 0, -1);
+    const [dead] = await redis.lrange(`${prefix}flows:dlq`, 0, -1);
     expect(parse<{ attempt: number }>(dead).attempt).toBe(3);
     expect(calls).toHaveLength(2);
     expect(await claimsOf(prefix)).toEqual([]);
-    expect(await redis.exists(`${prefix}steps:reclaims`)).toBe(0);
-    expect(await redis.exists(`${prefix}steps:idempotent:k`)).toBe(0);
+    expect(await redis.exists(`${prefix}flows:reclaims`)).toBe(0);
+    expect(await redis.exists(`${prefix}flows:idempotent:k`)).toBe(0);
 
     // The second delivery ran at maxAttempts, so its stale settle is a dead-letter.
     for (const resolve of calls) resolve(new Response('boom', { status: 500 }));
@@ -188,8 +188,8 @@ describe('claim fencing', () => {
     expect(debug.filter((line) => line.includes('skipped stale dead'))).toHaveLength(1);
     const deadLetterLogs = error.mock.calls.filter(([m]) => String(m).includes('dead-lettering'));
     expect(deadLetterLogs).toHaveLength(1);
-    expect(await redis.llen(`${prefix}steps:dlq`)).toBe(1);
-    expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(0);
+    expect(await redis.llen(`${prefix}flows:dlq`)).toBe(1);
+    expect(await redis.zcard(`${prefix}flows:delayed`)).toBe(0);
     queue.stop();
   }, 30_000);
 
@@ -203,24 +203,24 @@ describe('claim fencing', () => {
       attempt: 5,
       message: {},
     });
-    await redis.lpush(`${prefix}steps`, item);
+    await redis.lpush(`${prefix}flows`, item);
 
     const calls = stubFetch();
     const queue = start(prefix, { maxAttempts: 2 });
     await queue.start();
     await vi.waitFor(() => expect(calls).toHaveLength(1));
-    expect(await redis.llen(`${prefix}steps:dlq`)).toBe(0);
+    expect(await redis.llen(`${prefix}flows:dlq`)).toBe(0);
     expect(error).not.toHaveBeenCalled();
 
     // Its failure is what dead-letters it, with the payload untouched.
     calls[0](new Response('boom', { status: 500 }));
     await vi.waitFor(async () =>
-      expect(await redis.lrange(`${prefix}steps:dlq`, 0, -1)).toEqual([item]),
+      expect(await redis.lrange(`${prefix}flows:dlq`, 0, -1)).toEqual([item]),
     );
     await vi.waitFor(() =>
       expect(error).toHaveBeenCalledWith(expect.stringContaining('after 5 attempts')),
     );
-    expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(0);
+    expect(await redis.zcard(`${prefix}flows:delayed`)).toBe(0);
     queue.stop();
   }, 30_000);
 
@@ -234,15 +234,15 @@ describe('claim fencing', () => {
     await queue.start();
     await vi.waitFor(() => expect(calls).toHaveLength(1));
     const [claim] = await claimsOf(prefix);
-    await redis.zadd(`${prefix}steps:claims`, 0, claim);
+    await redis.zadd(`${prefix}flows:claims`, 0, claim);
     await vi.waitFor(() => expect(calls).toHaveLength(2));
-    expect(await redis.hlen(`${prefix}steps:reclaims`)).toBe(1);
+    expect(await redis.hlen(`${prefix}flows:reclaims`)).toBe(1);
 
     calls[1](new Response('boom', { status: 500 }));
-    await vi.waitFor(async () => expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(1));
-    const [retry] = await redis.zrange(`${prefix}steps:delayed`, '0', '-1');
+    await vi.waitFor(async () => expect(await redis.zcard(`${prefix}flows:delayed`)).toBe(1));
+    const [retry] = await redis.zrange(`${prefix}flows:delayed`, '0', '-1');
     expect(parse<{ attempt: number }>(retry).attempt).toBe(3);
-    expect(await redis.hlen(`${prefix}steps:reclaims`)).toBe(0);
+    expect(await redis.hlen(`${prefix}flows:reclaims`)).toBe(0);
     calls[0](new Response('boom', { status: 500 }));
     queue.stop();
   }, 30_000);
@@ -258,8 +258,8 @@ describe('claim fencing', () => {
     });
     // The state orphan adoption leaves behind: a raw lease on bytes still queued.
     // Its deadline is far out, so only the claim can remove it.
-    await redis.zadd(`${prefix}steps:leases`, Date.now() + 600_000, item);
-    await redis.lpush(`${prefix}steps`, item);
+    await redis.zadd(`${prefix}flows:leases`, Date.now() + 600_000, item);
+    await redis.lpush(`${prefix}flows`, item);
 
     const calls = stubFetch();
     const queue = start(prefix);
@@ -268,12 +268,12 @@ describe('claim fencing', () => {
     expect(await claimsOf(prefix)).toHaveLength(1);
     // Left behind, this lease would later reclaim whichever delivery holds the
     // same bytes, counting a phantom reclaim against it.
-    expect(await redis.zcard(`${prefix}steps:leases`)).toBe(0);
+    expect(await redis.zcard(`${prefix}flows:leases`)).toBe(0);
 
     // A suspension re-pushes identical bytes; nothing may count a reclaim.
     calls[0](Response.json({ timeoutSeconds: 0 }, { status: 503 }));
     await vi.waitFor(() => expect(calls).toHaveLength(2));
-    expect(await redis.hlen(`${prefix}steps:reclaims`)).toBe(0);
+    expect(await redis.hlen(`${prefix}flows:reclaims`)).toBe(0);
 
     calls[1](Response.json({ ok: true }));
     await vi.waitFor(async () => expect(await claimsOf(prefix)).toEqual([]));
@@ -289,15 +289,15 @@ describe('claim fencing', () => {
     await queue.start();
     await vi.waitFor(() => expect(calls).toHaveLength(1));
     const [claim] = await claimsOf(prefix);
-    await redis.zadd(`${prefix}steps:claims`, 0, claim);
+    await redis.zadd(`${prefix}flows:claims`, 0, claim);
     await vi.waitFor(() => expect(calls).toHaveLength(2));
 
     // Suspension leaves the attempt alone, but the reclaim it already spent stays counted.
     calls[1](Response.json({ timeoutSeconds: 60 }, { status: 503 }));
-    await vi.waitFor(async () => expect(await redis.zcard(`${prefix}steps:delayed`)).toBe(1));
-    const [suspended] = await redis.zrange(`${prefix}steps:delayed`, '0', '-1');
+    await vi.waitFor(async () => expect(await redis.zcard(`${prefix}flows:delayed`)).toBe(1));
+    const [suspended] = await redis.zrange(`${prefix}flows:delayed`, '0', '-1');
     expect(parse<{ attempt: number }>(suspended).attempt).toBe(2);
-    expect(await redis.hlen(`${prefix}steps:reclaims`)).toBe(0);
+    expect(await redis.hlen(`${prefix}flows:reclaims`)).toBe(0);
 
     calls[0](Response.json({ ok: true }));
     queue.stop();
@@ -313,28 +313,28 @@ describe('claim fencing', () => {
       message: {},
     });
     // An expired raw-item lease written by the previous version.
-    await redis.lpush(`${prefix}steps:processing`, item);
-    await redis.zadd(`${prefix}steps:leases`, 0, item);
+    await redis.lpush(`${prefix}flows:processing`, item);
+    await redis.zadd(`${prefix}flows:leases`, 0, item);
 
     const calls = stubFetch();
     const queue = start(prefix);
     await queue.start();
     await vi.waitFor(() => expect(calls).toHaveLength(1));
-    expect(await redis.zcard(`${prefix}steps:leases`)).toBe(0);
+    expect(await redis.zcard(`${prefix}flows:leases`)).toBe(0);
     expect(await claimsOf(prefix)).toHaveLength(1);
 
     // The previous version's ack from the stalled original execution.
     await redis
       .multi()
-      .lrem(`${prefix}steps:processing`, 1, item)
-      .zrem(`${prefix}steps:leases`, item)
+      .lrem(`${prefix}flows:processing`, 1, item)
+      .zrem(`${prefix}flows:leases`, item)
       .exec();
     expect(await claimsOf(prefix)).toHaveLength(1);
 
     calls[0](Response.json({ ok: true }));
     await vi.waitFor(async () => expect(await claimsOf(prefix)).toEqual([]));
-    expect(await redis.llen(`${prefix}steps:processing`)).toBe(0);
-    expect(await redis.llen(`${prefix}steps`)).toBe(0);
+    expect(await redis.llen(`${prefix}flows:processing`)).toBe(0);
+    expect(await redis.llen(`${prefix}flows`)).toBe(0);
     expect(calls).toHaveLength(1);
     queue.stop();
   }, 30_000);
@@ -349,26 +349,26 @@ describe('claim fencing', () => {
       message: {},
     });
     // A worker died between its pop and its lease.
-    await redis.lpush(`${prefix}steps:processing`, item);
+    await redis.lpush(`${prefix}flows:processing`, item);
 
     const calls = stubFetch();
     const queue = start(prefix);
     await queue.start();
     await vi.waitFor(async () =>
-      expect(await redis.zrange(`${prefix}steps:leases`, '0', '-1')).toEqual([item]),
+      expect(await redis.zrange(`${prefix}flows:leases`, '0', '-1')).toEqual([item]),
     );
     expect(calls).toHaveLength(0);
 
-    await redis.zadd(`${prefix}steps:leases`, 0, item);
+    await redis.zadd(`${prefix}flows:leases`, 0, item);
     await vi.waitFor(() => expect(calls).toHaveLength(1));
-    expect(await redis.hvals(`${prefix}steps:reclaims`)).toEqual(['1']);
+    expect(await redis.hvals(`${prefix}flows:reclaims`)).toEqual(['1']);
     expect(await claimsOf(prefix)).toHaveLength(1);
-    expect(await redis.zcard(`${prefix}steps:leases`)).toBe(0);
-    expect(await redis.llen(`${prefix}steps:processing`)).toBe(0);
+    expect(await redis.zcard(`${prefix}flows:leases`)).toBe(0);
+    expect(await redis.llen(`${prefix}flows:processing`)).toBe(0);
 
     calls[0](Response.json({ ok: true }));
     await vi.waitFor(async () => expect(await claimsOf(prefix)).toEqual([]));
-    expect(await redis.exists(`${prefix}steps:reclaims`)).toBe(0);
+    expect(await redis.exists(`${prefix}flows:reclaims`)).toBe(0);
     queue.stop();
   }, 30_000);
 
@@ -383,7 +383,7 @@ describe('claim fencing', () => {
       const pop = worker.brpoplpush.bind(worker);
       vi.spyOn(worker, 'brpoplpush').mockImplementation(async (source, destination, timeout) => {
         const popped = await pop(source, destination, timeout);
-        if (popped) await redis.del(`${prefix}steps:processing`);
+        if (popped) await redis.del(`${prefix}flows:processing`);
         return popped;
       });
       return worker;
@@ -396,8 +396,8 @@ describe('claim fencing', () => {
       expect(debug.filter((line) => line.includes('reclaimed before its claim'))).toHaveLength(1),
     );
     expect(await claimsOf(prefix)).toEqual([]);
-    expect(await redis.exists(`${prefix}steps:reclaims`)).toBe(0);
-    expect(await redis.zcard(`${prefix}steps:leases`)).toBe(0);
+    expect(await redis.exists(`${prefix}flows:reclaims`)).toBe(0);
+    expect(await redis.zcard(`${prefix}flows:leases`)).toBe(0);
     expect(calls).toHaveLength(0);
     queue.stop();
   }, 30_000);

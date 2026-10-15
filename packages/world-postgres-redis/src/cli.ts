@@ -23,6 +23,7 @@ const MIGRATION_FILES = [
   '0004_hooks_token_unique_stream_run_id.sql',
   '0005_runs_state_updated_at.sql',
   '0006_events_entity_creation_unique.sql',
+  '0007_workflow_v5.sql',
 ];
 
 // Files that must run OUTSIDE a transaction, statement by statement: 0006

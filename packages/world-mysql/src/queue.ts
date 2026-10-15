@@ -1,9 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
-  parseQueueName,
   type Queue,
-  type QueueKind,
   type QueueOptions,
   type QueuePayload,
   type ValidQueueName,
@@ -18,11 +16,6 @@ import * as schema from './schema.js';
 import { debug } from './util.js';
 
 type Drizzle = MySql2Database<typeof schema>;
-
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, string>;
 
 export interface MysqlQueueConfig {
   /** Poll interval in milliseconds (default: 100) */
@@ -500,11 +493,9 @@ export function createQueue(
 
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-  const prefix = 'workflow_';
-  const Queues = {
-    workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
-  } as const satisfies Record<QueueKind, string>;
+  // v5 has a single queue kind: workflow orchestration and queued step
+  // invocations share the workflow topic and the combined flow route.
+  const listKey = 'workflow_flows';
 
   let running = false;
 
@@ -515,9 +506,6 @@ export function createQueue(
     message: QueuePayload,
     opts?: QueueOptions,
   ) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
-
     const envelope: JobEnvelope = { queueName, message };
 
     return enqueueJob(db, listKey, envelope, {
@@ -550,8 +538,9 @@ export function createQueue(
           queueName: reqQueueName,
           messageId: reqMessageId,
         });
-        if (result && typeof result.timeoutSeconds === 'number') {
-          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)?.timeoutSeconds;
+        if (typeof timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds }, { status: 503 });
         }
         return Response.json({ ok: true });
       } catch (error) {
@@ -564,10 +553,9 @@ export function createQueue(
     envelope: JobEnvelope,
     messageId: string,
     attempt: number,
-    pathname: 'flow' | 'step',
   ): Promise<Response> {
     const baseUrl = resolveBaseUrl(config);
-    const url = createWorkflowUrl(baseUrl, { type: pathname });
+    const url = createWorkflowUrl(baseUrl, { type: 'flow' });
     return fetch(url, {
       method: 'POST',
       headers: {
@@ -581,16 +569,11 @@ export function createQueue(
     });
   }
 
-  async function processJob(job: RawJobRow, listKey: string, kind: QueueKind): Promise<void> {
+  async function processJob(job: RawJobRow): Promise<void> {
     const startTime = Date.now();
     try {
       const envelope = decode(job.payload) as JobEnvelope;
-      const response = await dispatch(
-        envelope,
-        job.job_id,
-        job.attempt ?? 1,
-        QUEUE_PATHNAMES[kind],
-      );
+      const response = await dispatch(envelope, job.job_id, job.attempt ?? 1);
 
       if (response.ok) {
         // A stale settle is not counted: the live claim records its own outcome.
@@ -632,14 +615,14 @@ export function createQueue(
     }
   }
 
-  async function worker(kind: QueueKind, listKey: string, workerIdx: number) {
-    const wId = `${workerId}_${kind}_${workerIdx}`;
+  async function worker(workerIdx: number) {
+    const wId = `${workerId}_workflow_${workerIdx}`;
 
     while (running) {
       try {
         const job = await fetchJob(db, listKey, wId);
         if (job) {
-          await processJob(job, listKey, kind);
+          await processJob(job);
         } else {
           await delay(pollIntervalMs);
         }
@@ -651,13 +634,10 @@ export function createQueue(
   }
 
   function startWorkers() {
-    const entries = Object.entries(Queues) as [QueueKind, string][];
-    for (const [kind, listKey] of entries) {
-      for (let i = 0; i < concurrency; i++) {
-        worker(kind, listKey, i).catch((error) => {
-          console.error(`[world-mysql] Worker for ${listKey} crashed:`, error);
-        });
-      }
+    for (let i = 0; i < concurrency; i++) {
+      worker(i).catch((error) => {
+        console.error(`[world-mysql] Worker for ${listKey} crashed:`, error);
+      });
     }
   }
 

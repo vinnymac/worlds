@@ -2,7 +2,6 @@ import { uint8ArrayReplacer } from '@fantasticfour/shared';
 import { hasBinary } from './util.js';
 import {
   MessageId,
-  parseQueueName,
   type Queue as QueueInterface,
   type QueueKind,
   type ValidQueueName,
@@ -32,7 +31,6 @@ export interface QueueStats {
 
 const QUEUE_PATHNAMES = {
   workflow: 'flow',
-  step: 'step',
 } as const satisfies Record<QueueKind, string>;
 
 /**
@@ -84,8 +82,8 @@ function deserializeQueueMessage(text: string): unknown {
 
 /**
  * Build the HTTP callback URL the BullMQ worker will POST to. The user must
- * mount `world.createQueueHandler(...)` at `/.well-known/workflow/v1/flow` and
- * `/.well-known/workflow/v1/step` (the Workflow DevKit convention).
+ * mount `world.createQueueHandler(...)` at `/.well-known/workflow/v1/flow`
+ * (the Workflow DevKit convention), which also runs queued steps.
  */
 function resolveBaseUrl(config: RedisWorldConfig): string {
   if (config.baseUrl) return config.baseUrl;
@@ -111,7 +109,6 @@ export function createQueue(
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
     workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
   } as const satisfies Record<QueueKind, string>;
 
   const maxAttempts = config.maxAttempts ?? 5;
@@ -160,9 +157,10 @@ export function createQueue(
   }
 
   const queue: QueueInterface['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const bullQueue = bullQueues.get(kind);
-    if (!bullQueue) throw new Error(`No BullMQ queue registered for queue kind ${kind}`);
+    // v5 has one queue kind: orchestration and queued step invocations
+    // share the workflow topic and the combined flow route.
+    const bullQueue = bullQueues.get('workflow');
+    if (!bullQueue) throw new Error('No BullMQ queue registered for the workflow queue');
 
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     const delayMs = opts?.delaySeconds ? Math.max(0, opts.delaySeconds * 1000) : undefined;
@@ -266,8 +264,9 @@ export function createQueue(
         const body = deserializeQueueMessage(await req.text());
         const result = await handler(body, { attempt, queueName, messageId });
 
-        if (result && typeof result.timeoutSeconds === 'number') {
-          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)?.timeoutSeconds;
+        if (typeof timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds }, { status: 503 });
         }
         return Response.json({ ok: true });
       } catch (error) {

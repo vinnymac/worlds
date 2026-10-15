@@ -24,5 +24,5 @@ export {
   type HealthCheckable,
   timeOperation,
 } from './health.js';
-export { compact, Mutex, Rc } from './util.js';
+export { compact, Mutex, Rc, toPlainBytes } from './util.js';
 export type { Cborized } from './cbor.js';

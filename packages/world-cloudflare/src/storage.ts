@@ -1,7 +1,6 @@
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   RunExpiredError,
   RunNotSupportedError,
   TooEarlyError,
@@ -9,8 +8,8 @@ import {
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
+  AnyEventRequest,
   CreateEventParams,
-  CreateEventRequest,
   Event,
   EventResult,
   GetEventParams,
@@ -25,7 +24,6 @@ import type {
   ListWorkflowRunsParams,
   PaginatedResponse,
   ResolveData,
-  RunCreatedEventRequest,
   Step,
   StepWithoutData,
   Storage,
@@ -33,6 +31,7 @@ import type {
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import {
+  entityResolveData,
   EventSchema,
   HookSchema,
   SPEC_VERSION_CURRENT,
@@ -84,6 +83,9 @@ export interface CloudflareStorageConfig {
     WORKFLOW_INDEX: KVNamespace;
   };
   deploymentId: string;
+  /** The spec version the World declares, stamped on runs and events that
+   * arrive without one. */
+  specVersion?: number;
   /** Per-run event ceiling reported as `EventResult.maxEvents`. Defaults to
    * `WORKFLOW_MAX_EVENTS` or {@link DEFAULT_MAX_EVENTS_PER_RUN}. */
   maxEventsPerRun?: number;
@@ -167,7 +169,7 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 function throwOutcomeError(
   outcome: ApplyEventFailure,
   runId: string,
-  data: CreateEventRequest | RunCreatedEventRequest,
+  data: AnyEventRequest,
 ): never {
   switch (outcome.code) {
     case 'RUN_NOT_FOUND':
@@ -182,8 +184,8 @@ function throwOutcomeError(
       throw new RunExpiredError(outcome.message);
     case 'TOO_EARLY':
       throw new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds });
-    case 'PRECONDITION_FAILED':
-      throw new PreconditionFailedError(outcome.message);
+    case 'INVALID_ARGUMENT':
+      throw new WorkflowWorldError(outcome.message, { status: 400 });
     case 'RUN_NOT_SUPPORTED':
       throw new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT);
     case 'LEGACY_RUN_NOT_SUPPORTED':
@@ -265,8 +267,16 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // Status filtering is best-effort within a page: it is applied after
         // KV pagination, so a page may return fewer than `limit` matches
         // while hasMore is still true.
-        const statusFiltered = params?.status
-          ? filtered.filter((r) => r.status === params.status)
+        // A run matches a status list if its status is any of them; an empty
+        // list matches no run, like SQL `IN ()`.
+        const statuses =
+          params?.status === undefined
+            ? undefined
+            : Array.isArray(params.status)
+              ? params.status
+              : [params.status];
+        const statusFiltered = statuses
+          ? filtered.filter((r) => (statuses as readonly string[]).includes(r.status))
           : filtered;
 
         return {
@@ -280,7 +290,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     events: {
       async create(
         runId: string | null,
-        data: RunCreatedEventRequest | CreateEventRequest,
+        data: AnyEventRequest,
         params?: CreateEventParams,
       ): Promise<EventResult> {
         // For run_created events, generate a runId server-side if absent.
@@ -315,13 +325,14 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         // Guards, event append, and entity mutation run in ONE DO storage
         // transaction (see apply-event.ts). The event is schema-validated
-        // before anything is persisted. `stateUpdatedAt` rides along so the
-        // optimistic-concurrency check is atomic with the append.
+        // before anything is persisted. `eventCount` rides along so a write
+        // that lands past the slot it expected reports what it skipped.
         const outcome = await stub.applyEvent({
           runId: effectiveRunId,
           data,
           tokenHolder,
-          stateUpdatedAt: params?.stateUpdatedAt,
+          eventCount: params?.eventCount,
+          specVersion: config.specVersion,
         });
 
         if (!outcome.ok) {
@@ -365,13 +376,17 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         // Honour resolveData on the create return path, matching the read
         // paths and every sibling world.
-        const resolveData = params?.resolveData ?? 'all';
-        return {
+        const eventsResolveData = params?.resolveData ?? 'all';
+        const resolveData = entityResolveData(eventsResolveData);
+        const events = outcome.events?.map((e) => stripEventDataRefs(e, eventsResolveData));
+        const result: EventResult = {
           event: outcome.event && stripEventDataRefs(outcome.event, resolveData),
           run: outcome.run,
           step: outcome.step,
           hook: outcome.hook,
-          events: outcome.events?.map((e) => stripEventDataRefs(e, resolveData)),
+          // The lazy start that created the step owns it; losers got
+          // EntityConflictError.
+          ...(outcome.stepCreated ? { stepCreated: true as const } : {}),
           // The runtime reads the ceiling from the run_started response only,
           // so it must also be present on the idempotent already-running
           // replay path -- keying off the request type covers both.
@@ -379,6 +394,14 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             ? { maxEvents: maxEventsPerRun }
             : {}),
         };
+        if (!events) return result;
+        // The run_started preload, or the span a bumped write skipped.
+        return {
+          ...result,
+          events,
+          cursor: events.at(-1)?.eventId ?? null,
+          hasMore: false,
+        } as EventResult;
       },
 
       async get(runId: string, eventId: string, params?: GetEventParams): Promise<Event> {

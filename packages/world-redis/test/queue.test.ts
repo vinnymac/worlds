@@ -141,21 +141,16 @@ describe('Queue (Redis integration)', () => {
     const input = new Uint8Array([1, 2, 3, 250]);
     await q.queue(queueName, {
       runId: 'wrun_binary',
-      runInput: {
-        input,
-        deploymentId: 'redis',
-        workflowName: 'wf',
-        specVersion: 3,
-      },
+      input,
     });
 
     await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 10_000 });
     const message = received[0].body;
-    if (!('runId' in message) || !message.runInput) {
-      throw new Error('expected a workflow payload with runInput');
+    if ('__healthCheck' in message || !message.input) {
+      throw new Error('expected a workflow payload with input');
     }
-    expect(message.runInput.input).toBeInstanceOf(Uint8Array);
-    expect(Array.from(message.runInput.input as Uint8Array)).toEqual([1, 2, 3, 250]);
+    expect(message.input).toBeInstanceOf(Uint8Array);
+    expect(Array.from(message.input as Uint8Array)).toEqual([1, 2, 3, 250]);
   }, 30_000);
 
   it('parks delaySeconds messages durably and delivers them after a restart', async () => {

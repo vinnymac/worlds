@@ -68,3 +68,6 @@ target
 
 # Claude local settings
 .claude/settings.local.json
+
+# Bundled conformance harness (built by test/spec.test.ts)
+.conformance/

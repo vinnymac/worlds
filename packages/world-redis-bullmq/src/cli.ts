@@ -60,7 +60,7 @@ async function setupRedis() {
     );
     console.log(`  - Sorted Sets: ${keyPrefix}runs:*, ${keyPrefix}steps:*, ${keyPrefix}events:*`);
     console.log(`  - Streams: ${keyPrefix}stream:*`);
-    console.log(`  - BullMQ Queues: workflow_flows, workflow_steps`);
+    console.log(`  - BullMQ Queues: workflow_flows`);
   } catch (error) {
     exitCode = 1;
     console.error('Failed to setup Redis:', error);

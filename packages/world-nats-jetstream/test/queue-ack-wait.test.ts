@@ -81,7 +81,7 @@ function fakeJetStream(options: FakeOptions = {}) {
   });
   const pending = options.messages ? [...options.messages] : [];
   const next = vi.fn(async (stream: string) => {
-    if (!stream.endsWith('steps')) return await new Promise<JsMsg>(() => {});
+    if (!stream.endsWith('flows')) return await new Promise<JsMsg>(() => {});
     const pull = pending.shift();
     if (pull instanceof Error) throw pull;
     if (typeof pull === 'function') return await pull();
@@ -95,9 +95,9 @@ function fakeJetStream(options: FakeOptions = {}) {
     jetstreamManager: async () => jsm,
     consumers: { get: async (stream: string) => ({ next: () => next(stream) }) },
   };
-  /** Calls a mock received for the steps stream, the only one given messages. */
+  /** Calls a mock received for the flows stream, the only one given messages. */
   const forSteps = (mock: { mock: { calls: [string, ...unknown[]][] } }) =>
-    mock.mock.calls.filter(([stream]) => stream.endsWith('steps')).length;
+    mock.mock.calls.filter(([stream]) => stream.endsWith('flows')).length;
   return {
     add,
     update,
@@ -224,7 +224,7 @@ describe('createQueue ackWaitMs', () => {
   ])('creates consumers with ack_wait $nanos', async ({ ackWaitMs, nanos }) => {
     const { add, update, getJetStream } = fakeJetStream();
     await startQueue(getJetStream, { ...baseConfig, ackWaitMs });
-    await vi.waitFor(() => expect(add).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(add).toHaveBeenCalledTimes(1));
     for (const [, cfg] of add.mock.calls) expect(cfg.ack_wait).toBe(nanos);
     expect(update).not.toHaveBeenCalled();
   });
@@ -233,7 +233,7 @@ describe('createQueue ackWaitMs', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { update, getJetStream } = fakeJetStream({ existing: true, existingAckWait: 30e9 });
     await startQueue(getJetStream, { ...baseConfig, ackWaitMs: 120_000 });
-    await vi.waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     for (const [, , cfg] of update.mock.calls) expect(cfg.ack_wait).toBe(120_000_000_000);
     // The warning names both the value it replaces and the one it writes.
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ack_wait is 30000000000ns'));
@@ -248,7 +248,7 @@ describe('createQueue ackWaitMs', () => {
       existingMaxDeliver: MAX_DELIVER,
     });
     await startQueue(getJetStream, { ...baseConfig, ackWaitMs: 120_000 });
-    await until(() => next.mock.calls.length === 2);
+    await until(() => next.mock.calls.length === 1);
     expect(update).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
   });
@@ -260,11 +260,11 @@ describe('createQueue ackWaitMs', () => {
       existingAckWait: 30e9,
     });
     await startQueue(getJetStream, { ...baseConfig, queueConcurrency: 5, ackWaitMs: 120_000 });
-    await until(() => next.mock.calls.length === 10);
-    // Two streams: one add, one update and one warning each, not one per worker.
-    expect(add).toHaveBeenCalledTimes(2);
-    expect(update).toHaveBeenCalledTimes(2);
-    expect(warn).toHaveBeenCalledTimes(2);
+    await until(() => next.mock.calls.length === 5);
+    // One stream: one add, one update and one warning, not one per worker.
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   test('leaves an existing ack_wait alone when ackWaitMs is unset', async () => {
@@ -274,7 +274,7 @@ describe('createQueue ackWaitMs', () => {
       existingMaxDeliver: MAX_DELIVER,
     });
     await startQueue(getJetStream);
-    await until(() => next.mock.calls.length === 2);
+    await until(() => next.mock.calls.length === 1);
     expect(update).not.toHaveBeenCalled();
   });
 
@@ -285,7 +285,7 @@ describe('createQueue ackWaitMs', () => {
       existingMaxDeliver: 3,
     });
     await startQueue(getJetStream);
-    await vi.waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     for (const [, , cfg] of update.mock.calls) {
       expect(cfg.max_deliver).toBe(MAX_DELIVER);
       expect(cfg.ack_wait).toBeUndefined();
@@ -394,8 +394,8 @@ describe('createQueue ackWaitMs', () => {
     await until(() => first.ack.mock.calls.length > 0 && responses.length === 2);
     // A pull that worked starts the next outage's backoff from the bottom.
     expect(backoffs.delays).toEqual([200, 400, 200]);
-    // Two streams, one consumer each: no restart re-ran the setup.
-    expect(add).toHaveBeenCalledTimes(2);
+    // One stream, one consumer: no restart re-ran the setup.
+    expect(add).toHaveBeenCalledTimes(1);
     responses[1]?.(Response.json({ ok: true }));
     await until(() => second.ack.mock.calls.length > 0);
   });
@@ -410,7 +410,7 @@ describe('createQueue ackWaitMs', () => {
     });
     await startQueue(getJetStream);
     await until(() => responses.length === 1);
-    expect(add).toHaveBeenCalledTimes(2);
+    expect(add).toHaveBeenCalledTimes(1);
     expect(error).not.toHaveBeenCalled();
     responses[0]?.(Response.json({ ok: true }));
     await until(() => ack.mock.calls.length > 0);
@@ -488,7 +488,7 @@ describe('createQueue ackWaitMs', () => {
     });
     const refreshErrors = () =>
       error.mock.calls.filter(([message]) =>
-        String(message).includes('could not refresh ack_wait for workflow_steps_worker'),
+        String(message).includes('could not refresh ack_wait for workflow_flows_worker'),
       ).length;
     // A 300s heartbeat interval, so no beat is due before the refresh recovers.
     await startQueue(getJetStream, { ...baseConfig, ackWaitMs: 900_000 });
@@ -636,17 +636,17 @@ describe('createQueue close', () => {
     vi.useFakeTimers({ toFake: [...FAKE_TIMERS] });
     const { consumerInfo, next, getJetStream } = fakeJetStream();
     const queue = await startQueue(getJetStream);
-    await until(() => next.mock.calls.length === 2);
-    expect(vi.getTimerCount()).toBe(2);
+    await until(() => next.mock.calls.length === 1);
+    expect(vi.getTimerCount()).toBe(1);
 
-    // Both refreshes fire and are still unanswered when close() runs.
+    // The refresh fires and are still unanswered when close() runs.
     vi.advanceTimersByTime(5_000);
-    expect(consumerInfo).toHaveBeenCalledTimes(2);
+    expect(consumerInfo).toHaveBeenCalledTimes(1);
     await queue.close();
     await flush();
     expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(SLOW_REFRESH_MS);
     await flush();
-    expect(consumerInfo).toHaveBeenCalledTimes(2);
+    expect(consumerInfo).toHaveBeenCalledTimes(1);
   });
 });

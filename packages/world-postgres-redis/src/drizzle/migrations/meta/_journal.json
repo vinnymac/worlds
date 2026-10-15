@@ -50,6 +50,13 @@
       "when": 1787000000000,
       "tag": "0006_events_entity_creation_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1795000000000,
+      "tag": "0007_workflow_v5",
+      "breakpoints": true
     }
   ]
 }

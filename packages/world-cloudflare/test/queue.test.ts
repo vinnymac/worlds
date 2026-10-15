@@ -116,7 +116,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
     });
 
     it('should send a tagged-JSON text envelope', async () => {
-      const queueName = 'test-queue' as ValidQueueName;
+      const queueName = '__wkf_workflow_test' as ValidQueueName;
       const message = asMessage({ data: 'test-message' });
 
       const result = await queue.queue(queueName, message);
@@ -141,7 +141,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
     });
 
     it('should include the idempotency key in the envelope', async () => {
-      const queueName = 'test-queue' as ValidQueueName;
+      const queueName = '__wkf_workflow_test' as ValidQueueName;
       const idempotencyKey = 'unique-key-123';
 
       await queue.queue(queueName, asMessage({ data: 'test' }), { idempotencyKey });
@@ -151,14 +151,16 @@ describe('Queue (Cloudflare Queues integration)', () => {
     });
 
     it('should pass delaySeconds through to Cloudflare Queues', async () => {
-      await queue.queue('test-queue' as ValidQueueName, asMessage({}), { delaySeconds: 42 });
+      await queue.queue('__wkf_workflow_test' as ValidQueueName, asMessage({}), {
+        delaySeconds: 42,
+      });
 
       expect(sent[0].options).toMatchObject({ delaySeconds: 42 });
     });
 
     it('should generate unique monotonic message IDs', async () => {
-      const first = await queue.queue('test-queue' as ValidQueueName, asMessage({}));
-      const second = await queue.queue('test-queue' as ValidQueueName, asMessage({}));
+      const first = await queue.queue('__wkf_workflow_test' as ValidQueueName, asMessage({}));
+      const second = await queue.queue('__wkf_workflow_test' as ValidQueueName, asMessage({}));
 
       expect(first.messageId).toMatch(/^msg_/);
       expect(second.messageId).toMatch(/^msg_/);
@@ -167,7 +169,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
 
     it('should round-trip Uint8Array payloads (binary-safe transport)', async () => {
       const input = new Uint8Array([0, 1, 2, 250, 251, 252]);
-      await queue.queue('test-queue' as ValidQueueName, {
+      await queue.queue('__wkf_workflow_test' as ValidQueueName, {
         runId: 'wrun_1',
         runInput: { input, deploymentId: 'd', workflowName: 'w', specVersion: 3 },
       });
@@ -190,7 +192,7 @@ describe('Queue (Cloudflare Queues integration)', () => {
         boolean: true,
       });
 
-      await queue.queue('test-queue' as ValidQueueName, message);
+      await queue.queue('__wkf_workflow_test' as ValidQueueName, message);
 
       const envelope = parse<{ message: unknown }>(sent[0].body);
       expect(envelope.message).toEqual(message);
@@ -253,19 +255,31 @@ describe('Queue (Cloudflare Queues integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      const first = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 1 }), {
-        idempotencyKey: 'step-abc',
-      });
-      const second = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 1 }), {
-        idempotencyKey: 'step-abc',
-      });
+      const first = await queue.queue(
+        '__wkf_workflow_a' as ValidQueueName,
+        asMessage({ data: 1 }),
+        {
+          idempotencyKey: 'step-abc',
+        },
+      );
+      const second = await queue.queue(
+        '__wkf_workflow_a' as ValidQueueName,
+        asMessage({ data: 1 }),
+        {
+          idempotencyKey: 'step-abc',
+        },
+      );
 
       // Same inflight message: the duplicate enqueue returns the original id
       expect(second.messageId).toBe(first.messageId);
 
-      const third = await queue.queue('__wkf_step_a' as ValidQueueName, asMessage({ data: 2 }), {
-        idempotencyKey: 'step-other',
-      });
+      const third = await queue.queue(
+        '__wkf_workflow_a' as ValidQueueName,
+        asMessage({ data: 2 }),
+        {
+          idempotencyKey: 'step-other',
+        },
+      );
       expect(third.messageId).not.toBe(first.messageId);
     });
   });

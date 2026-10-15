@@ -143,11 +143,10 @@ interface PumpEnvelope {
   idempotencyKey?: string;
 }
 
-type Pathname = 'flow' | 'step';
+type Pathname = 'flow';
 
 const QUEUE_PATHNAMES = {
   workflow: 'flow',
-  step: 'step',
 } as const satisfies Record<QueueKind, Pathname>;
 
 function resolveBaseUrl(config: CloudflareQueueConfig): string {
@@ -171,8 +170,8 @@ function createTestPump(config: CloudflareQueueConfig) {
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [] };
+  const wakers: Record<Pathname, Array<() => void>> = { flow: [] };
   /** Inflight messageIds by idempotencyKey (world-local queue.js semantics). */
   const inflightMessages = new Map<string, MessageId>();
   let running = false;
@@ -276,7 +275,6 @@ function createTestPump(config: CloudflareQueueConfig) {
       if (running) return;
       running = true;
       void loop('flow');
-      void loop('step');
     },
     stop() {
       running = false;
@@ -302,6 +300,9 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
 
   return {
     async queue(queueName, message, opts) {
+      // Throws on a name outside the `__wkf_workflow_` convention. v5 has a
+      // single queue kind, so the parsed parts are not needed.
+      parseQueueName(queueName);
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
         // flight; core re-enqueues every still-pending step on every replay
@@ -310,7 +311,9 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
         if (existing) {
           return { messageId: existing };
         }
-        const { kind } = parseQueueName(queueName);
+        // v5 has one queue kind: orchestration and queued step invocations
+        // share the workflow topic and the combined flow route.
+        const kind: QueueKind = 'workflow';
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         testPump.push(
           QUEUE_PATHNAMES[kind],
@@ -370,8 +373,10 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
               queueName: reqQueueName,
               messageId: reqMessageId,
             });
-            if (result && typeof result.timeoutSeconds === 'number') {
-              return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+            const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)
+              ?.timeoutSeconds;
+            if (typeof timeoutSeconds === 'number') {
+              return Response.json({ timeoutSeconds }, { status: 503 });
             }
             return Response.json({ ok: true });
           } catch (error) {
@@ -466,7 +471,9 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
           // failure total, then ack. The claim stays held (the copy re-enters
           // it via claimIdentity) so duplicates are still fenced during the
           // wait, and Cloudflare's retry budget is left untouched.
-          if (result && typeof result.timeoutSeconds === 'number') {
+          const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)
+            ?.timeoutSeconds;
+          if (typeof timeoutSeconds === 'number') {
             const suspensions = (envelope.suspensionCount ?? 0) + 1;
             if (suspensions > MAX_SOFT_RESENDS) {
               // Refuse to keep the soft loop going. Returning 500 makes the
@@ -486,7 +493,7 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
             }
 
             debug('[Cloudflare Queue Handler] Handler requested redelivery:', {
-              timeoutSeconds: result.timeoutSeconds,
+              timeoutSeconds,
             });
             await env.WORKFLOW_QUEUE.send(
               stringify({
@@ -496,7 +503,7 @@ export function createQueue(config: CloudflareQueueConfig): Queue & { start(): P
               }),
               {
                 contentType: 'text',
-                delaySeconds: Math.max(0, Math.ceil(result.timeoutSeconds)),
+                delaySeconds: Math.max(0, Math.ceil(timeoutSeconds)),
               },
             );
             return new Response(JSON.stringify({ ok: true, suspended: true }), { status: 200 });

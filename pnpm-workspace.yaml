@@ -6,11 +6,11 @@ catalog:
   '@testcontainers/postgresql': ^12.1.0
   '@testcontainers/redis': ^12.1.0
   '@types/node': ^24.13.3
-  '@workflow/core': 4.8.5
-  '@workflow/errors': 4.2.1
-  '@workflow/utils': 4.1.4
-  '@workflow/world': 4.5.0
-  '@workflow/world-testing': 4.1.20
+  '@workflow/core': 5.2.2
+  '@workflow/errors': 5.0.4
+  '@workflow/utils': 5.0.2
+  '@workflow/world': 5.0.4
+  '@workflow/world-testing': 5.0.5
   cbor-x: ^1.6.0
   drizzle-kit: ^0.31.10
   drizzle-orm: ^0.45.2
@@ -22,6 +22,16 @@ catalog:
   typescript: 7.0.2
   ulid: ^3.0.2
   vitest: ^4.1.11
+
+# Packages not yet migrated to the Workflow SDK v5 World contract stay on the
+# v4 line until they are; a v5 runtime refuses their spec version.
+catalogs:
+  v4:
+    '@workflow/core': 4.8.5
+    '@workflow/errors': 4.2.1
+    '@workflow/utils': 4.1.4
+    '@workflow/world': 4.5.0
+    '@workflow/world-testing': 4.1.20
 
 # pnpm v11: Allow build scripts for required native dependencies
 # See: https://pnpm.io/11.x/migration#build-scripts-blocking
@@ -47,7 +57,7 @@ allowBuilds:
 
 pnpm:
   overrides:
-    zod: 4.3.6
+    zod: 4.5.4
 
 savePrefix: ''
 
@@ -111,20 +121,20 @@ minimumReleaseAgeExclude:
   - oxlint@1.79.0
   - turbo@2.10.11
   - vitest@4.1.11
-  - '@workflow/astro@4.0.20'
+  - '@workflow/astro@4.0.20 || 5.0.5'
   - '@workflow/builders@4.1.10'
   - '@workflow/cli@4.3.9'
   - '@workflow/core@4.8.5'
   - '@workflow/nest@4.0.21'
   - '@workflow/next@4.1.9'
-  - '@workflow/nitro@4.1.11'
-  - '@workflow/nuxt@4.0.21'
+  - '@workflow/nitro@4.1.11 || 5.0.5'
+  - '@workflow/nuxt@4.0.21 || 5.0.5'
   - '@workflow/rollup@4.0.20'
-  - '@workflow/sveltekit@4.0.20'
+  - '@workflow/sveltekit@4.0.20 || 5.0.5'
   - '@workflow/vite@4.0.20'
   - '@workflow/web@4.1.21'
   - '@workflow/world-local@4.4.0'
-  - '@workflow/world-testing@4.1.20'
+  - '@workflow/world-testing@4.1.20 || 5.0.5'
   - '@workflow/world-vercel@4.7.1'
   - '@workflow/world@4.5.0'
-  - workflow@4.8.5
+  - workflow@4.8.5 || 5.2.2

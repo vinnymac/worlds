@@ -19,6 +19,7 @@ export const MIGRATION_FILES = [
   '0005_stream_chunks_run_id.sql',
   '0006_runs_state_updated_at.sql',
   '0007_events_entity_creation_unique.sql',
+  '0008_workflow_v5.sql',
 ];
 
 /**

@@ -166,10 +166,18 @@ Five KV buckets for entity storage:
 ```
 workflow_runs:          WorkflowRun entities (key: runId)
 workflow_steps:         Step entities (key: "runId:stepId")
-workflow_events:        Event entities (key: eventId)
+workflow_run_events:    The run's event log (key: "runId.eventId")
+workflow_event_heads:   Advisory per-run head slot (key: runId)
 workflow_hooks:         Hook entities (key: hookId)
 workflow_hooks_by_token: Token->hookId mapping
 ```
+
+Event IDs are slot positions in the run's log (`evnt_` plus a zero-padded slot, from
+`slotToEventId`). An event is committed by an atomic `create()` of its own slot key, so the
+slot claim and the write are one operation: a writer that loses a slot moves to the next one,
+and a run's log is dense from 1. Runs created by 4.x releases keep their ULID logs in the
+`workflow_events` bucket; they stay readable and can be cancelled, and any other write to them
+is refused.
 
 **Benefits:**
 
@@ -180,12 +188,15 @@ workflow_hooks_by_token: Token->hookId mapping
 
 ### Queuing: JetStream Work Queues
 
-Two streams for job processing:
+One stream for job processing:
 
 ```
-workflow_flows:  Workflow execution jobs
-workflow_steps:  Step execution jobs
+workflow_flows:  Workflow replays and queued step executions
 ```
+
+Queued steps travel on the workflow stream (a `stepId` in the payload) and run in the combined
+flow route. `QueueOptions.delaySeconds` is honoured by holding an early delivery with `nak()`
+until it is due.
 
 **Features:**
 
@@ -315,6 +326,21 @@ nats-server -js -m 8GB --store_dir /fast/ssd/path
 - Have existing NATS expertise bottleneck
 
 ## Migration Guide
+
+### From 4.x to Workflow SDK v5
+
+This release implements World spec version 8 (`workflow` 5.2, `@workflow/world` 5.0.x) and
+declares it with `mintedSpecVersion()`, so `WORKFLOW_SEALED_LOG=0` stamps new runs at 6 instead.
+Hook token takeover (`capabilities.hookForceClaim`) is not implemented.
+
+A v5 runtime cannot replay a run whose events have ULID IDs. Finish in-flight runs on the 4.x
+release before deploying this one, and drain the `workflow_steps` stream: v5 has no step queue,
+so nothing consumes it after the upgrade.
+
+The KV buckets are not transactional across keys, so an entity write and its event are separate
+writes. A writer that crashes between them leaves the entity without its creation event; the
+next delivery of that creation finds the entity, sees no committed creation event, and appends
+it. A creation claim left pending by a crashed writer is taken over after 30 seconds.
 
 ### From Redis World
 

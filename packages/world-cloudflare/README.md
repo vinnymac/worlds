@@ -109,11 +109,16 @@ id = "your-kv-namespace-id"
 
 This package includes comprehensive tests:
 
-- **storage.test.ts**: CRUD operations, Durable Object integration, status transitions
-- **spec.test.ts**: @workflow/world interface compliance
+- **storage.test.ts**: CRUD operations, Durable Object integration, status transitions, and the shared v5 storage suite (slot-numbered events, bump-and-report, lazy step start)
+- **spec.test.ts**: the `@workflow/world-testing` conformance suite, run against the in-memory bindings in `src/test-mocks.ts` through `test/conformance/harness.ts`
+- **real-workers.test.ts** (`pnpm test:workers`): the same transactions against real Durable Objects in workerd, including concurrent writers racing for one run's slots
 - **durable-objects.test.ts**: DO isolation, state persistence, KV indexing, concurrent updates
 
-Total: ~1,350 lines of test coverage ensuring production reliability.
+## Workflow SDK v5
+
+This World implements World spec version 8 (`workflow` 5.2, `@workflow/world` 5.0.x) and declares it with `mintedSpecVersion()`, so `WORKFLOW_SEALED_LOG=0` stamps new runs at 6 instead. Event IDs are slot positions in the run's log, allocated inside the run's Durable Object transaction, so a run's log has no holes and this World never writes a `noop`. Hook token takeover (`capabilities.hookForceClaim`) is not implemented.
+
+Runs created by a 4.x release cannot be replayed by this release. Drain in-flight runs, including any messages still on the retired step queue, before deploying it.
 
 ## Cost Estimate
 

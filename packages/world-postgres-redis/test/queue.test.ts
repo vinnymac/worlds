@@ -23,14 +23,14 @@ const baseConfig = {
 function createRedis() {
   const item = JSON.stringify({
     messageId: 'msg_1',
-    queueName: '__wkf_step_x',
+    queueName: '__wkf_workflow_x',
     attempt: 1,
     message: {},
   });
   let delivered = false;
   const worker = {
     brpoplpush: vi.fn(async (source: string) => {
-      if (!delivered && source.endsWith('steps')) {
+      if (!delivered && source.endsWith('flows')) {
         delivered = true;
         return item;
       }

@@ -8,7 +8,6 @@ import {
 } from '@workflow/world';
 import { sql } from 'drizzle-orm';
 import {
-  bigint,
   boolean,
   customType,
   index,
@@ -52,6 +51,22 @@ type DrizzlishOfType<T extends object> = {
  */
 export type SerializedContent = any[];
 
+/**
+ * Optional `WorkflowRun` fields this World does not store yet. Each one is
+ * optional surface the runtime routes around when absent (dynamic workflows,
+ * per-run encryption keys).
+ */
+type UnpersistedRunFields = 'dynamicWorkflowCode' | 'encryptionPublicKey';
+
+/** Optional `Hook` fields this World does not store yet (hook token
+ * retention, durable resume capabilities, force-claim lineage). */
+type UnpersistedHookFields =
+  | 'isSystem'
+  | 'tokenRetentionUntil'
+  | 'resumeContext'
+  | 'resumeCapabilities'
+  | 'claimedFrom';
+
 export const runs = schema.table(
   'workflow_runs',
   {
@@ -68,7 +83,13 @@ export const runs = schema.table(
     /** @deprecated */
     inputJson: jsonb('input').$type<SerializedContent>(),
     input: Cbor<SerializedContent>()('input_cbor'),
-    error: text('error'),
+    /** @deprecated legacy JSON-stringified `{ message, stack, code }` */
+    errorJson: text('error'),
+    /** The thrown value as the runtime serialized it, stored verbatim. */
+    error: Cbor<unknown>()('error_cbor'),
+    errorCode: varchar('error_code'),
+    /** Run attributes, set by run_created and attr_set. */
+    attributes: jsonb('attributes').$type<Record<string, string>>(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
       .defaultNow()
@@ -78,14 +99,20 @@ export const runs = schema.table(
     startedAt: timestamp('started_at'),
     specVersion: integer('spec_version'),
     expiredAt: timestamp('expired_at'),
-    /** Epoch-ms ULID time of the most recent externally-originated event for this
-     * run. Not part of the `WorkflowRun` contract, stripped before return. */
-    stateUpdatedAt: bigint('state_updated_at', { mode: 'number' }),
+    /** How many events the run's log holds, which is also the slot of its
+     * latest event. Advanced in the transaction that appends each event (see
+     * `insertEvent`). Not part of the `WorkflowRun` contract, stripped before
+     * return. */
+    eventCount: integer('event_count').default(0).notNull(),
   } satisfies DrizzlishOfType<
     Cborized<
-      Omit<WorkflowRun, 'input'> & { input?: unknown },
-      'input' | 'output' | 'executionContext'
-    > & { stateUpdatedAt?: number }
+      // Nullable column: WorkflowRunSchema reads a missing value as {}.
+      Omit<WorkflowRun, 'input' | 'attributes' | UnpersistedRunFields> & {
+        input?: unknown;
+        attributes?: Record<string, string>;
+      },
+      'input' | 'output' | 'executionContext' | 'error'
+    > & { eventCount: number; errorJson?: string }
   >,
   (tb) => [index().on(tb.workflowName), index().on(tb.status)],
 );
@@ -93,7 +120,7 @@ export const runs = schema.table(
 export const events = schema.table(
   'workflow_events',
   {
-    eventId: varchar('id').primaryKey(),
+    eventId: varchar('id').notNull(),
     eventType: varchar('type').$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -103,8 +130,13 @@ export const events = schema.table(
     eventDataJson: jsonb('payload'),
     eventData: Cbor<unknown>()('payload_cbor'),
     specVersion: integer('spec_version'),
-  } satisfies DrizzlishOfType<Cborized<Event & { eventData?: undefined }, 'eventData'>>,
+  } satisfies DrizzlishOfType<
+    Cborized<Omit<Event, 'resumeId'> & { eventData?: undefined }, 'eventData'>
+  >,
   (tb) => [
+    // Event ids are slot positions within a run, so they are unique only
+    // together with the run id.
+    primaryKey({ columns: [tb.runId, tb.eventId] }),
     index().on(tb.runId),
     index().on(tb.correlationId),
     // A redelivered creation event must conflict (surfaced as
@@ -129,7 +161,10 @@ export const steps = schema.table(
     /** @deprecated */
     outputJson: jsonb('output').$type<SerializedContent>(),
     output: Cbor<SerializedContent>()('output_cbor'),
-    error: text('error'),
+    /** @deprecated legacy JSON-stringified `{ message, stack }` */
+    errorJson: text('error'),
+    /** The thrown value as the runtime serialized it, stored verbatim. */
+    error: Cbor<unknown>()('error_cbor'),
     attempt: integer('attempt').notNull(),
     startedAt: timestamp('started_at'),
     completedAt: timestamp('completed_at'),
@@ -140,7 +175,9 @@ export const steps = schema.table(
       .notNull(),
     retryAfter: timestamp('retry_after'),
     specVersion: integer('spec_version'),
-  } satisfies DrizzlishOfType<Cborized<Step, 'input' | 'output'>>,
+  } satisfies DrizzlishOfType<
+    Cborized<Step, 'input' | 'output' | 'error'> & { errorJson?: string }
+  >,
   (tb) => [index().on(tb.runId), index().on(tb.status)],
 );
 
@@ -159,7 +196,7 @@ export const hooks = schema.table(
     metadata: Cbor<unknown>()('metadata_cbor'),
     specVersion: integer('spec_version'),
     isWebhook: boolean('is_webhook'),
-  } satisfies DrizzlishOfType<Cborized<Hook, 'metadata'>>,
+  } satisfies DrizzlishOfType<Cborized<Omit<Hook, UnpersistedHookFields>, 'metadata'>>,
   // token is UNIQUE so concurrent hook_created calls for the same token
   // cannot both insert (the hook_created handler routes the loser to the
   // duplicate / hook_conflict paths).

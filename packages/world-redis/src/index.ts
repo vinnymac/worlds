@@ -1,5 +1,5 @@
 import type { Storage, World } from '@workflow/world';
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { mintedSpecVersion } from '@workflow/world';
 import { Redis } from 'ioredis';
 import type { RedisWorldConfig } from './config.js';
 import { createQueue, type QueueStats } from './queue.js';
@@ -11,8 +11,13 @@ import {
 } from './storage.js';
 import { createStreamer, type StreamStats } from './streamer.js';
 
-function createStorage(redis: Redis, keyPrefix: string, maxEventsPerRun?: number): Storage {
-  const config = { redis, keyPrefix, maxEventsPerRun };
+function createStorage(
+  redis: Redis,
+  keyPrefix: string,
+  specVersion: number,
+  maxEventsPerRun?: number,
+): Storage {
+  const config = { redis, keyPrefix, specVersion, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -53,7 +58,12 @@ export function createWorld(
 
   const keyPrefix = config.keyPrefix || 'workflow:';
 
-  const storage = createStorage(redis, keyPrefix, config.maxEventsPerRun);
+  // The version stamped on new runs: the sealed-log version by default, or
+  // slot identity when WORKFLOW_SEALED_LOG=0. Read per world, not at module
+  // load. Events are allocated at commit, so no position is ever left empty
+  // and this World never writes a `noop`.
+  const specVersion = mintedSpecVersion();
+  const storage = createStorage(redis, keyPrefix, specVersion, config.maxEventsPerRun);
   const streamer = createStreamer({ redis, keyPrefix });
 
   const queue = createQueue(redis, config);
@@ -62,12 +72,7 @@ export function createWorld(
     ...storage,
     ...streamer,
     ...queue,
-    // Declaring the current spec version enables resilient start: core
-    // includes runInput on the first queue delivery, and run_started
-    // bootstraps the run when it wins the race against run_created. The
-    // queue transport is binary-safe (Uint8Array round-trips), which this
-    // spec version requires.
-    specVersion: SPEC_VERSION_CURRENT,
+    specVersion,
     async start() {
       await queue.start();
     },

@@ -1,19 +1,27 @@
-import { test } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createTestSuite } from '@workflow/world-testing';
+// Opt-in suite: it asserts the world honours WORKFLOW_MAX_EVENTS via
+// EventResult.maxEvents.
+import { eventLimit } from '@workflow/world-testing/dist/src/event-limit.mjs';
+import { beforeAll, test } from 'vitest';
 
-// The shared conformance suite takes a package name and boots a Node server
-// that imports that world itself:
-//
-//   createTestSuite(pkgName: string)  ->  startServer({ world: pkgName })
-//
-// There is no seam for injecting a pre-built world, so it cannot supply the
-// Durable Object, Queue, and KV bindings `createWorld` needs. Every other world
-// passes its own package name; this file passed a factory instead, which
-// typechecked only because tests were excluded from `pnpm typecheck` -- the
-// suite silently never ran here.
-//
-// Real Cloudflare coverage lives in test/real-workers.test.ts, which exercises
-// actual workerd via @cloudflare/vitest-pool-workers, plus the storage, queue,
-// and streamer suites in this directory.
-test.todo(
-  'conformance suite needs a world-injection seam in @workflow/world-testing to run against workerd',
-);
+// The suite spawns a Node server that loads `WORKFLOW_TARGET_WORLD` and calls
+// its `createWorld()` with no arguments. test/conformance/harness.ts supplies
+// the Durable Object, KV, and Queue bindings from the in-memory mocks, which
+// run the production `applyEvent` core; it is bundled to plain JS first so the
+// server can import it. Real workerd coverage is in test/real-workers.test.ts.
+const packageDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+const harness = join(packageDir, '.conformance', 'harness.js');
+
+beforeAll(() => {
+  execFileSync('pnpm', ['exec', 'tsdown', '--config', 'tsdown.conformance.config.ts'], {
+    cwd: packageDir,
+    stdio: 'ignore',
+  });
+}, 60_000);
+
+test('smoke', () => {});
+createTestSuite(harness);
+eventLimit(harness);

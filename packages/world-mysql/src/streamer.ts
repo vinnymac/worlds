@@ -79,183 +79,179 @@ export function createStreamer(drizzle: MySql2Database<typeof schema>): Streamer
   }
 
   return {
-    async writeToStream(
-      name: string,
-      _runId: string | Promise<string>,
-      chunk: string | Uint8Array,
-    ) {
-      // Await runId if it's a promise to ensure proper flushing
-      const runId = await _runId;
+    streams: {
+      async write(runId: string, name: string, chunk: string | Uint8Array) {
+        await drizzle.insert(streams).values({
+          chunkId: genChunkId(),
+          streamId: name,
+          runId,
+          chunkData: toBuffer(chunk),
+          eof: false,
+          sequence: Date.now(),
+        });
+      },
 
-      await drizzle.insert(streams).values({
-        chunkId: genChunkId(),
-        streamId: name,
-        runId,
-        chunkData: toBuffer(chunk),
-        eof: false,
-        sequence: Date.now(),
-      });
-    },
+      async close(runId: string, name: string): Promise<void> {
+        await drizzle.insert(streams).values({
+          chunkId: genChunkId(),
+          streamId: name,
+          runId,
+          chunkData: Buffer.from([]),
+          eof: true,
+          sequence: Date.now(),
+        });
+      },
 
-    async closeStream(name: string, _runId: string | Promise<string>): Promise<void> {
-      // Await runId if it's a promise to ensure proper flushing
-      const runId = await _runId;
+      async get(
+        _runId: string,
+        name: string,
+        startIndex?: number,
+      ): Promise<ReadableStream<Uint8Array>> {
+        let closed = false;
 
-      await drizzle.insert(streams).values({
-        chunkId: genChunkId(),
-        streamId: name,
-        runId,
-        chunkData: Buffer.from([]),
-        eof: true,
-        sequence: Date.now(),
-      });
-    },
+        // startIndex is a chunk index: positive skips that many data chunks
+        // from the start, negative starts that many chunks before the end.
+        let remainingSkip = startIndex ?? 0;
+        if (remainingSkip < 0) {
+          const dataCount = await countDataChunks(name);
+          remainingSkip = Math.max(0, dataCount + remainingSkip);
+        }
 
-    async readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>> {
-      let closed = false;
+        return new ReadableStream<Uint8Array>({
+          async start(controller) {
+            // Cursor over the monotonic ULID chunkId. The empty string sorts
+            // before every ULID, so '' starts at the beginning.
+            let lastChunkId = '';
 
-      // startIndex is a chunk index: positive skips that many data chunks
-      // from the start, negative starts that many chunks before the end.
-      let remainingSkip = startIndex ?? 0;
-      if (remainingSkip < 0) {
-        const dataCount = await countDataChunks(name);
-        remainingSkip = Math.max(0, dataCount + remainingSkip);
-      }
+            // Use a polling loop in start() rather than pull() because
+            // Node.js ReadableStream doesn't reliably re-invoke pull()
+            // when it resolves without enqueuing data.
+            const poll = async () => {
+              while (!closed) {
+                const chunks = await drizzle
+                  .select({
+                    chunkId: streams.chunkId,
+                    eof: streams.eof,
+                    data: streams.chunkData,
+                  })
+                  .from(streams)
+                  .where(and(eq(streams.streamId, name), sql`${streams.chunkId} > ${lastChunkId}`))
+                  .orderBy(asc(streams.chunkId))
+                  .limit(50);
 
-      return new ReadableStream<Uint8Array>({
-        async start(controller) {
-          // Cursor over the monotonic ULID chunkId. The empty string sorts
-          // before every ULID, so '' starts at the beginning.
-          let lastChunkId = '';
-
-          // Use a polling loop in start() rather than pull() because
-          // Node.js ReadableStream doesn't reliably re-invoke pull()
-          // when it resolves without enqueuing data.
-          const poll = async () => {
-            while (!closed) {
-              const chunks = await drizzle
-                .select({
-                  chunkId: streams.chunkId,
-                  eof: streams.eof,
-                  data: streams.chunkData,
-                })
-                .from(streams)
-                .where(and(eq(streams.streamId, name), sql`${streams.chunkId} > ${lastChunkId}`))
-                .orderBy(asc(streams.chunkId))
-                .limit(50);
-
-              if (!chunks.length) {
-                await new Promise((resolve) => setTimeout(resolve, 100));
-                continue;
-              }
-
-              for (const chunk of chunks) {
-                lastChunkId = chunk.chunkId;
-
-                if (chunk.eof) {
-                  closed = true;
-                  controller.close();
-                  return;
-                }
-
-                if (remainingSkip > 0) {
-                  remainingSkip--;
+                if (!chunks.length) {
+                  await new Promise((resolve) => setTimeout(resolve, 100));
                   continue;
                 }
 
-                if (chunk.data.byteLength) {
-                  controller.enqueue(new Uint8Array(chunk.data));
+                for (const chunk of chunks) {
+                  lastChunkId = chunk.chunkId;
+
+                  if (chunk.eof) {
+                    closed = true;
+                    controller.close();
+                    return;
+                  }
+
+                  if (remainingSkip > 0) {
+                    remainingSkip--;
+                    continue;
+                  }
+
+                  if (chunk.data.byteLength) {
+                    controller.enqueue(new Uint8Array(chunk.data));
+                  }
                 }
               }
-            }
-          };
+            };
 
-          poll().catch(() => {
-            // Stream cancelled or error - silently close
-            if (!closed) {
-              closed = true;
-              try {
-                controller.close();
-              } catch {
-                // Already closed
+            poll().catch(() => {
+              // Stream cancelled or error - silently close
+              if (!closed) {
+                closed = true;
+                try {
+                  controller.close();
+                } catch {
+                  // Already closed
+                }
               }
-            }
-          });
-        },
+            });
+          },
 
-        cancel() {
-          closed = true;
-        },
-      });
-    },
+          cancel() {
+            closed = true;
+          },
+        });
+      },
 
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      const results = await drizzle
-        .selectDistinct({ streamId: streams.streamId })
-        .from(streams)
-        .where(eq(streams.runId, runId));
-      return results.map((r) => r.streamId);
-    },
+      async list(runId: string): Promise<string[]> {
+        const results = await drizzle
+          .selectDistinct({ streamId: streams.streamId })
+          .from(streams)
+          .where(eq(streams.runId, runId));
+        return results.map((r) => r.streamId);
+      },
 
-    async getStreamChunks(
-      name: string,
-      _runId: string,
-      options?: GetChunksOptions,
-    ): Promise<StreamChunksResponse> {
-      const limit = options?.limit ?? 100;
-      const cursor = decodeChunkCursor(options?.cursor);
+      async getChunks(
+        _runId: string,
+        name: string,
+        options?: GetChunksOptions,
+      ): Promise<StreamChunksResponse> {
+        const limit = options?.limit ?? 100;
+        const cursor = decodeChunkCursor(options?.cursor);
 
-      // Fetch only data rows (exclude EOF) with limit + 1 to detect hasMore.
-      const rows = await drizzle
-        .select({
-          chunkId: streams.chunkId,
-          data: streams.chunkData,
-        })
-        .from(streams)
-        .where(
-          and(
-            eq(streams.streamId, name),
-            eq(streams.eof, false),
-            cursor ? sql`${streams.chunkId} > ${cursor.c}` : undefined,
-          ),
-        )
-        .orderBy(asc(streams.chunkId))
-        .limit(limit + 1);
+        // Fetch only data rows (exclude EOF) with limit + 1 to detect hasMore.
+        const rows = await drizzle
+          .select({
+            chunkId: streams.chunkId,
+            data: streams.chunkData,
+          })
+          .from(streams)
+          .where(
+            and(
+              eq(streams.streamId, name),
+              eq(streams.eof, false),
+              cursor ? sql`${streams.chunkId} > ${cursor.c}` : undefined,
+            ),
+          )
+          .orderBy(asc(streams.chunkId))
+          .limit(limit + 1);
 
-      const hasMore = rows.length > limit;
-      const pageRows = rows.slice(0, limit);
-      const baseIndex = cursor?.i ?? 0;
+        const hasMore = rows.length > limit;
+        const pageRows = rows.slice(0, limit);
+        const baseIndex = cursor?.i ?? 0;
 
-      const chunks: StreamChunk[] = pageRows.map((row, i) => ({
-        index: baseIndex + i,
-        data: new Uint8Array(row.data),
-      }));
+        const chunks: StreamChunk[] = pageRows.map((row, i) => ({
+          index: baseIndex + i,
+          data: new Uint8Array(row.data),
+        }));
 
-      const lastRow = pageRows.at(-1);
-      const nextCursor =
-        hasMore && lastRow
-          ? Buffer.from(
-              JSON.stringify({
-                c: lastRow.chunkId,
-                i: baseIndex + pageRows.length,
-              } satisfies ChunkCursor),
-            ).toString('base64')
-          : null;
+        const lastRow = pageRows.at(-1);
+        const nextCursor =
+          hasMore && lastRow
+            ? Buffer.from(
+                JSON.stringify({
+                  c: lastRow.chunkId,
+                  i: baseIndex + pageRows.length,
+                } satisfies ChunkCursor),
+              ).toString('base64')
+            : null;
 
-      return {
-        data: chunks,
-        cursor: nextCursor,
-        hasMore,
-        done: await isStreamDone(name),
-      };
-    },
+        return {
+          data: chunks,
+          cursor: nextCursor,
+          hasMore,
+          done: await isStreamDone(name),
+        };
+      },
 
-    async getStreamInfo(name: string, _runId: string): Promise<StreamInfoResponse> {
-      const dataCount = await countDataChunks(name);
-      return {
-        tailIndex: dataCount - 1,
-        done: await isStreamDone(name),
-      };
+      async getInfo(_runId: string, name: string): Promise<StreamInfoResponse> {
+        const dataCount = await countDataChunks(name);
+        return {
+          tailIndex: dataCount - 1,
+          done: await isStreamDone(name),
+        };
+      },
     },
   };
 }

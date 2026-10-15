@@ -1,15 +1,17 @@
 import {
   EntityConflictError,
   HookNotFoundError,
-  PreconditionFailedError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
+  AnyEventRequest,
+  CreateEventParams,
   Event,
   EventResult,
+  EventsResolveData,
   Hook,
   ListEventsParams,
   ListHooksParams,
@@ -18,21 +20,26 @@ import type {
   Step,
   StepWithoutData,
   Storage,
-  StructuredError,
   WorkflowRun,
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import {
+  applyAttributeChanges,
+  entityResolveData,
   EventSchema,
+  isChildEntityCreationEvent,
+  eventIdToSlot,
   HookSchema,
   SPEC_VERSION_CURRENT,
+  slotToEventId,
   StepSchema,
   stripEventDataRefs,
+  validateAttributeChanges,
   WorkflowRunSchema,
 } from '@workflow/world';
-import { and, desc, eq, getTableColumns, gt, lt, notInArray, sql } from 'drizzle-orm';
+import { and, desc, eq, getTableColumns, gt, inArray, lt, notInArray, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { decodeTime, monotonicFactory } from 'ulid';
+import { monotonicFactory } from 'ulid';
 import type { SerializedContent } from './schema.js';
 import * as schema from './schema.js';
 import { compact } from './util.js';
@@ -69,45 +76,22 @@ function resolveMaxEventsPerRun(configured: number | undefined): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EVENTS_PER_RUN;
 }
 
-/** Event types that advance the `state_updated_at` marker when created
- * without a `stateUpdatedAt`. Excludes `run_created` / `run_started` /
- * `run_failed`, which core also omits it on. */
-const EXTERNAL_STATE_EVENT_TYPES: readonly string[] = ['hook_received', 'step_completed'];
-
-/** Epoch ms encoded in a `wevt_<ulid>` id. The client strips at the last `_`. */
-function eventIdTime(eventId: string): number {
-  return decodeTime(eventId.slice(eventId.lastIndexOf('_') + 1));
-}
-
-/** Locks the run row so the marker check and the event insert are one
- * serializable unit, before the event ULID is allocated so ids stay
- * commit-ordered. Returns whether the caller must advance the marker. */
-async function lockRunState(
-  tx: DrizzleOrTx,
-  runId: string,
-  eventType: string,
-  stateUpdatedAt: number | undefined,
-): Promise<boolean> {
-  const guarded = stateUpdatedAt !== undefined;
-  const advances = !guarded && EXTERNAL_STATE_EVENT_TYPES.includes(eventType);
-  if (!guarded && !advances) return false;
-
-  const [row] = await tx
-    .select({ stateUpdatedAt: schema.runs.stateUpdatedAt })
+/**
+ * Locks the run row for the rest of the transaction.
+ *
+ * Every write that appends to a run's log takes this lock first, so writers to
+ * one run are serialized in a single lock order (run row, then entity rows).
+ * That is what makes the event slot taken at the end of the transaction the
+ * next one in commit order: a writer cannot take a slot while another writer
+ * holding a lower one is still uncommitted.
+ */
+async function lockRun(tx: DrizzleOrTx, runId: string): Promise<void> {
+  await tx
+    .select({ runId: schema.runs.runId })
     .from(schema.runs)
     .where(eq(schema.runs.runId, runId))
     .limit(1)
     .for('update');
-
-  if (guarded) {
-    const marker = row?.stateUpdatedAt;
-    if (marker != null && stateUpdatedAt < marker) {
-      throw new PreconditionFailedError(
-        `Workflow run "${runId}" advanced past the caller's snapshot (stateUpdatedAt ${stateUpdatedAt} < ${marker})`,
-      );
-    }
-  }
-  return advances;
 }
 
 /** True when `error` is MySQL ER_DUP_ENTRY on the given key/index name
@@ -123,14 +107,14 @@ function isDuplicateKeyError(error: unknown, keyName: string): boolean {
   return errorCode === 'ER_DUP_ENTRY' && errorMessage.includes(keyName);
 }
 
-/** Advance the run's state marker to the ULID time of the event just written.
- * `GREATEST` keeps it monotonic without a read-modify-write. */
-async function advanceStateMarker(tx: DrizzleOrTx, runId: string, eventId: string): Promise<void> {
-  const marker = eventIdTime(eventId);
-  await tx
-    .update(schema.runs)
-    .set({ stateUpdatedAt: sql`GREATEST(COALESCE(${schema.runs.stateUpdatedAt}, 0), ${marker})` })
-    .where(eq(schema.runs.runId, runId));
+/**
+ * Puts the stored error back on `error`: the serialized payload when there is
+ * one, else the legacy JSON text written before v5. Drops the legacy column
+ * either way, since it is not part of the entity contract.
+ */
+function restoreError(value: { error?: unknown; errorJson?: string | null }): void {
+  value.error = value.error ?? parseErrorJson(value.errorJson ?? null);
+  delete value.errorJson;
 }
 
 /**
@@ -160,25 +144,12 @@ function parseErrorJson(errorJson: string | null): any {
  * Deserialize run data, handling legacy error fields.
  */
 function deserializeRunError(run: any): WorkflowRun {
-  // stateUpdatedAt is our internal optimistic-concurrency marker column, not a
-  // WorkflowRun field; drop it here so it never leaks onto a returned entity.
-  const { errorStack, errorCode, stateUpdatedAt: _stateUpdatedAt, ...rest } = run;
-
-  // If no legacy fields, return as-is
-  if (!errorStack && !errorCode) {
-    return rest as WorkflowRun;
-  }
-
-  // Very old legacy: separate errorStack/errorCode fields
-  const existingError = rest.error as StructuredError | undefined;
-  return {
-    ...rest,
-    error: {
-      message: existingError?.message || '',
-      stack: existingError?.stack || errorStack,
-      code: existingError?.code || errorCode,
-    },
-  } as WorkflowRun;
+  // eventCount is the run's slot counter, not a WorkflowRun field; drop it
+  // here so it never leaks onto a returned entity. errorCode is a column of
+  // its own and the error is the runtime's serialized payload, so neither is
+  // rebuilt into a legacy `{ message, stack, code }` object.
+  const { eventCount: _eventCount, ...rest } = run;
+  return rest as WorkflowRun;
 }
 
 /**
@@ -255,7 +226,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
         throw new WorkflowRunNotFoundError(id);
       }
       applyCborFallback(value);
-      value.error = parseErrorJson(value.error);
+      restoreError(value);
       const deserialized = deserializeRunError(compact(value));
       const parsed = WorkflowRunSchema.parse(deserialized);
       const resolveData = params?.resolveData ?? 'all';
@@ -272,7 +243,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
           and(
             map(fromCursor, (c: string) => lt(runs.runId, c)),
             map(params?.workflowName, (wf: string) => eq(runs.workflowName, wf)),
-            map(params?.status, (s) => eq(runs.status, s as any)),
+            statusFilter(params?.status),
           ),
         )
         .orderBy(desc(runs.runId))
@@ -284,7 +255,7 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
       return {
         data: values.map((v) => {
           applyCborFallback(v);
-          v.error = parseErrorJson(v.error);
+          restoreError(v);
           const deserialized = deserializeRunError(compact(v));
           const parsed = WorkflowRunSchema.parse(deserialized);
           return filterRunData(parsed, resolveData);
@@ -296,12 +267,23 @@ export function createRunsStorage(drizzle: Drizzle): Storage['runs'] {
   };
 }
 
+/**
+ * `runs.list` takes one status or several. An empty array matches nothing,
+ * like SQL `IN ()`, which is distinct from omitting the filter.
+ */
+function statusFilter(status: WorkflowRun['status'] | WorkflowRun['status'][] | undefined) {
+  if (status === undefined) return undefined;
+  if (!Array.isArray(status)) return eq(schema.runs.status, status);
+  return status.length === 0 ? sql`false` : inArray(schema.runs.status, status);
+}
+
 function map<T, R>(obj: T | null | undefined, fn: (v: T) => R): undefined | R {
   return obj ? fn(obj) : undefined;
 }
 
 /** Server-generated columns of a freshly inserted event row. */
 interface InsertedEventRow {
+  eventId: string;
   createdAt: Date;
   occurredAt: Date | null;
 }
@@ -349,7 +331,7 @@ export function createEventsStorage(
       .limit(1);
     if (!value) return undefined;
     applyCborFallback(value);
-    value.error = parseErrorJson(value.error);
+    restoreError(value);
     return deserializeRunError(compact(value));
   }
 
@@ -366,13 +348,12 @@ export function createEventsStorage(
       .limit(1);
     if (!value) return undefined;
     applyCborFallbackStep(value);
-    value.error = parseErrorJson(value.error);
+    restoreError(value);
     return deserializeStepError(compact(value));
   }
 
   interface EventRowInsert {
     runId: string;
-    eventId: string;
     correlationId?: string;
     eventType: Event['eventType'];
     eventData?: unknown;
@@ -380,12 +361,58 @@ export function createEventsStorage(
     specVersion: number;
   }
 
-  // MySQL has no INSERT ... RETURNING, so insert then re-read the
-  // server-generated timestamps for the event row.
-  async function insertEvent(db: DrizzleOrTx, values: EventRowInsert): Promise<InsertedEventRow> {
+  /**
+   * Appends one event to its run's log at the next free slot.
+   *
+   * Must run inside a transaction that already holds {@link lockRun} (or that
+   * inserted the run row itself). The slot comes from the run row's
+   * `event_count`, advanced by an `UPDATE` in the same transaction: it commits
+   * or rolls back with the event, so a write that does not land leaves no
+   * hole, and the row lock keeps a second writer from taking the next slot
+   * until this one commits. `LAST_INSERT_ID(expr)` hands the new count back on
+   * the UPDATE's own OK packet, so allocation costs no extra round trip.
+   *
+   * MySQL has no INSERT ... RETURNING, so the server-generated timestamps are
+   * re-read afterwards.
+   */
+  async function insertEvent(tx: DrizzleOrTx, values: EventRowInsert): Promise<InsertedEventRow> {
+    const [advanced] = await tx
+      .update(schema.runs)
+      .set({ eventCount: sql`LAST_INSERT_ID(${schema.runs.eventCount} + 1)` })
+      .where(eq(schema.runs.runId, values.runId));
+    if (advanced.affectedRows === 0) {
+      throw new WorkflowRunNotFoundError(values.runId);
+    }
+    const eventId = slotToEventId(Number(advanced.insertId));
+    // A wait completes once. Its creation is deduplicated by the entity
+    // creation index; its completion is checked here, under the run row lock
+    // the slot UPDATE just took, so two completions cannot both pass.
+    if (values.eventType === 'wait_completed' && values.correlationId) {
+      const [completed] = await tx
+        .select({ eventId: events.eventId })
+        .from(events)
+        .where(
+          and(
+            eq(events.runId, values.runId),
+            eq(events.correlationId, values.correlationId),
+            eq(events.eventType, 'wait_completed'),
+          ),
+        )
+        .limit(1);
+      if (completed) {
+        throw new EntityConflictError(`Wait "${values.correlationId}" already completed`);
+      }
+    }
     try {
-      await db.insert(events).values(values);
+      await tx.insert(events).values({ ...values, eventId });
     } catch (error: unknown) {
+      // The insert failed but the transaction may still commit (a caller can
+      // catch a dedup conflict), so give the slot back first: the row lock
+      // guarantees nobody advanced the count past it meanwhile.
+      await tx
+        .update(schema.runs)
+        .set({ eventCount: sql`${schema.runs.eventCount} - 1` })
+        .where(eq(schema.runs.runId, values.runId));
       // A duplicate creation row surfaces as EntityConflictError, the dedup
       // signal the runtime expects on redelivered creates. Gated on the index
       // name so other ER_DUP_ENTRY violations still propagate raw.
@@ -396,22 +423,74 @@ export function createEventsStorage(
       }
       throw error;
     }
-    const [created] = await db
+    const [created] = await tx
       .select({ createdAt: events.createdAt, occurredAt: events.occurredAt })
       .from(events)
-      .where(eq(events.eventId, values.eventId))
+      .where(and(eq(events.runId, values.runId), eq(events.eventId, eventId)))
       .limit(1);
     if (!created) {
-      throw new EntityConflictError(`Event ${values.eventId} could not be created`);
+      throw new EntityConflictError(`Event ${eventId} could not be created`);
     }
-    return created;
+    return { eventId, ...created };
+  }
+
+  /**
+   * The report half of bump-and-report: the events on the slots between the
+   * one the writer expected (`eventCount + 1`) and the one its write landed on.
+   * Undefined when the write took the slot it asked for, or the caller sent no
+   * count. Slots commit in order under the run row lock, so the span is
+   * complete by the time the write that skipped it has committed.
+   */
+  async function reportSkippedSlots(
+    runId: string,
+    committedEventId: string,
+    eventCount: number | undefined,
+    resolveData: EventsResolveData,
+  ): Promise<{ events: Event[]; cursor: string | null; hasMore: boolean } | undefined> {
+    const committedSlot = eventIdToSlot(committedEventId);
+    if (eventCount === undefined || committedSlot === null || committedSlot <= eventCount + 1) {
+      return undefined;
+    }
+    const rows = await drizzle
+      .select()
+      .from(events)
+      .where(
+        and(
+          eq(events.runId, runId),
+          gt(events.eventId, slotToEventId(Math.max(eventCount, 0))),
+          lt(events.eventId, committedEventId),
+        ),
+      )
+      .orderBy(events.eventId);
+    if (rows.length === 0) return undefined;
+    return {
+      events: rows.map((row) => {
+        applyCborFallbackEvent(row);
+        return stripEventDataRefs(EventSchema.parse(compact(row)), resolveData);
+      }),
+      cursor: rows.at(-1)!.eventId,
+      hasMore: false,
+    };
+  }
+
+  /** Attaches the {@link reportSkippedSlots} span, if any, to a create's result. */
+  async function withSkippedSlots(
+    result: EventResult,
+    runId: string,
+    committedEventId: string,
+    eventCount: number | undefined,
+    resolveData: EventsResolveData,
+  ): Promise<EventResult> {
+    const skipped = await reportSkippedSlots(runId, committedEventId, eventCount, resolveData);
+    return skipped ? { ...result, ...skipped } : result;
   }
 
   return {
-    async create(runId, data, params): Promise<EventResult> {
-      let eventId: string | undefined;
-      const getEventId = () => (eventId ??= `wevt_${ulid()}`);
-
+    async create(
+      runId: string | null,
+      data: AnyEventRequest,
+      params?: CreateEventParams,
+    ): Promise<EventResult> {
       // For run_created events, generate runId server-side if null or empty
       let effectiveRunId: string;
       if (data.eventType === 'run_created' && (!runId || runId === '')) {
@@ -424,7 +503,9 @@ export function createEventsStorage(
 
       // specVersion is always sent by the runtime, but we provide a fallback for safety
       const effectiveSpecVersion: number = data.specVersion ?? SPEC_VERSION_CURRENT;
-      const resolveData = params?.resolveData ?? 'all';
+      // Event pages may skip step inputs; entity reads take the plain form.
+      const eventsResolveData: EventsResolveData = params?.resolveData ?? 'all';
+      const resolveData = entityResolveData(eventsResolveData);
       const now = new Date();
 
       // ============================================================
@@ -457,6 +538,7 @@ export function createEventsStorage(
             workflowName?: string;
             input?: any;
             executionContext?: any;
+            attributes?: Record<string, string>;
           };
           if (
             runInputData.deploymentId &&
@@ -476,6 +558,7 @@ export function createEventsStorage(
                   workflowName: runInputData.workflowName!,
                   input: runInputData.input as SerializedContent,
                   executionContext: runInputData.executionContext as SerializedContent | undefined,
+                  attributes: runInputData.attributes,
                   status: 'pending',
                   specVersion: effectiveSpecVersion,
                 });
@@ -492,15 +575,15 @@ export function createEventsStorage(
                   .limit(1);
                 return existing ?? null;
               }
-              await tx.insert(events).values({
+              await insertEvent(tx, {
                 runId: effectiveRunId,
-                eventId: `wevt_${ulid()}`,
                 eventType: 'run_created',
                 eventData: {
                   deploymentId: runInputData.deploymentId,
                   workflowName: runInputData.workflowName,
                   input: runInputData.input,
                   executionContext: runInputData.executionContext,
+                  attributes: runInputData.attributes,
                 },
                 specVersion: effectiveSpecVersion,
               });
@@ -509,6 +592,14 @@ export function createEventsStorage(
           }
         }
       }
+
+      // Lazy step start: a step_started carrying step-creation data (stepName
+      // + input) may arrive with no prior step_created. It creates the step
+      // and a synthetic step_created event in the same transaction as the
+      // start, and the step INSERT is the ownership claim: a caller that finds
+      // the step already created lost, and must not run the body.
+      const createsChildEntity = isChildEntityCreationEvent(data);
+      const lazyStepStart = createsChildEntity && data.eventType === 'step_started';
 
       // Run terminal state validation
       if (currentRun && isTerminal(currentRun.status)) {
@@ -520,28 +611,35 @@ export function createEventsStorage(
           const fullRun = await fetchRun(drizzle, effectiveRunId);
 
           // Create the event (still record it)
-          const eventRow = await insertEvent(drizzle, {
-            runId: effectiveRunId,
-            eventId: getEventId(),
-            correlationId: data.correlationId,
-            eventType: data.eventType,
-            eventData: 'eventData' in data ? data.eventData : undefined,
-            occurredAt: params?.occurredAt,
-            specVersion: effectiveSpecVersion,
+          const eventRow = await drizzle.transaction(async (tx) => {
+            await lockRun(tx, effectiveRunId);
+            return insertEvent(tx, {
+              runId: effectiveRunId,
+              correlationId: data.correlationId,
+              eventType: data.eventType,
+              eventData: 'eventData' in data ? data.eventData : undefined,
+              occurredAt: params?.occurredAt,
+              specVersion: effectiveSpecVersion,
+            });
           });
 
           const result = {
             ...data,
             ...compact(eventRow),
             runId: effectiveRunId,
-            eventId: getEventId(),
           };
           const parsed = EventSchema.parse(result);
-          return {
-            event: stripEventDataRefs(parsed, resolveData),
-            run: fullRun,
-            ...(fullRun ? { maxEvents } : {}),
-          };
+          return withSkippedSlots(
+            {
+              event: stripEventDataRefs(parsed, resolveData),
+              run: fullRun,
+              ...(fullRun ? { maxEvents } : {}),
+            },
+            effectiveRunId,
+            eventRow.eventId,
+            params?.eventCount,
+            eventsResolveData,
+          );
         }
 
         // For run_started on terminal runs, use RunExpiredError so the
@@ -559,10 +657,17 @@ export function createEventsStorage(
           );
         }
 
-        // Creating new entities on terminal runs is not allowed
-        if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
+        // Creating new entities on terminal runs is not allowed, and a lazy
+        // step_started creates one.
+        if (createsChildEntity) {
           throw new EntityConflictError(
             `Cannot create new entities on run in terminal state "${currentRun.status}"`,
+          );
+        }
+
+        if (data.eventType === 'attr_set') {
+          throw new EntityConflictError(
+            `Cannot set attributes on run in terminal state "${currentRun.status}"`,
           );
         }
       }
@@ -592,19 +697,27 @@ export function createEventsStorage(
 
         validatedStep = existingStep ?? null;
 
-        if (!validatedStep) {
+        if (!validatedStep && !lazyStepStart) {
           throw new WorkflowWorldError(`Step "${data.correlationId}" not found`, { status: 404 });
         }
-
+        if (lazyStepStart && validatedStep) {
+          throw new EntityConflictError(`Step "${data.correlationId}" already created`);
+        }
+      }
+      if (validatedStep) {
         if (isTerminal(validatedStep.status)) {
           throw new EntityConflictError(
             `Cannot modify step in terminal state "${validatedStep.status}"`,
           );
         }
 
-        // On terminal runs: only allow completing/failing in-progress steps
+        // On terminal runs: only allow completing/failing in-progress steps.
+        // A step_started is refused even when the step still reads `running`:
+        // that is a redelivery of a start an earlier delivery already
+        // claimed, and nothing would ever read the outcome of running the
+        // body again.
         if (currentRun && isTerminal(currentRun.status)) {
-          if (validatedStep.status !== 'running') {
+          if (data.eventType === 'step_started' || validatedStep.status !== 'running') {
             throw new RunExpiredError(
               `Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
             );
@@ -636,15 +749,12 @@ export function createEventsStorage(
         let step: Step | undefined;
         let hook: Hook | undefined;
 
-        // Taking the run row lock here, before any entity write and before the event
-        // ULID is allocated, makes the marker check and this insert one serializable
-        // unit; a rejection rolls the whole create back.
-        const advancesStateMarker = await lockRunState(
-          tx,
-          effectiveRunId,
-          data.eventType,
-          params?.stateUpdatedAt,
-        );
+        // Taking the run row lock before any entity write gives every writer
+        // to this run the same lock order, and is what serializes slot
+        // allocation in insertEvent. run_created inserts the row instead.
+        if (data.eventType !== 'run_created') {
+          await lockRun(tx, effectiveRunId);
+        }
 
         // Handle run_created event: create the run entity
         if (data.eventType === 'run_created') {
@@ -653,6 +763,7 @@ export function createEventsStorage(
             workflowName: string;
             input: any[];
             executionContext?: Record<string, any>;
+            attributes?: Record<string, string>;
           };
           // Plain INSERT: the runs PK is the duplicate arbiter. An upsert's
           // affectedRows cannot distinguish a fresh insert from a no-op
@@ -665,6 +776,9 @@ export function createEventsStorage(
               workflowName: eventData.workflowName,
               input: eventData.input as SerializedContent,
               executionContext: eventData.executionContext as SerializedContent | undefined,
+              // Attributes start from the run_created payload ($parentRunId and
+              // $rootRunId for a child run); attr_set changes them later.
+              attributes: eventData.attributes,
               status: 'pending',
               specVersion: effectiveSpecVersion,
             });
@@ -762,24 +876,15 @@ export function createEventsStorage(
         // Handle run_failed event: update run status and cleanup hooks.
         // Uses conditional UPDATE to prevent failing an already-terminal run.
         if (data.eventType === 'run_failed') {
-          const eventData = (data as any).eventData as {
-            error: any;
-            errorCode?: string;
-          };
-          const errorMessage =
-            typeof eventData.error === 'string'
-              ? eventData.error
-              : (eventData.error?.message ?? 'Unknown error');
-          const errorObj: StructuredError = {
-            message: errorMessage,
-            stack: eventData.error?.stack,
-            code: eventData.errorCode,
-          };
+          // The error is the thrown value as the runtime serialized it;
+          // consumers hydrate it, so it is stored verbatim.
+          const eventData = data.eventData as { error: unknown; errorCode?: string };
           const [updated] = await tx
             .update(schema.runs)
             .set({
               status: 'failed',
-              error: JSON.stringify(errorObj),
+              error: eventData.error,
+              errorCode: eventData.errorCode,
               completedAt: now,
               updatedAt: now,
             })
@@ -847,6 +952,33 @@ export function createEventsStorage(
           await tx.delete(schema.hooks).where(eq(schema.hooks.runId, effectiveRunId));
         }
 
+        // Handle attr_set event: apply the changes to the run's attributes.
+        // The run row is locked (lockRun above), so the read-modify-write is
+        // serialized against every other writer to this run.
+        if (data.eventType === 'attr_set') {
+          const { changes, allowReservedAttributes } = data.eventData;
+          const [existing] = await tx
+            .select({ attributes: schema.runs.attributes })
+            .from(schema.runs)
+            .where(eq(schema.runs.runId, effectiveRunId))
+            .limit(1);
+          if (!existing) {
+            throw new WorkflowRunNotFoundError(effectiveRunId);
+          }
+          validateAttributeChanges(changes, {
+            existingKeys: Object.keys(existing.attributes ?? {}),
+            allowReservedAttributes: allowReservedAttributes === true,
+          });
+          await tx
+            .update(schema.runs)
+            .set({
+              attributes: applyAttributeChanges(existing.attributes ?? undefined, changes),
+              updatedAt: now,
+            })
+            .where(eq(schema.runs.runId, effectiveRunId));
+          run = await fetchRun(tx, effectiveRunId, resolveData);
+        }
+
         // Handle step_created event: create step entity
         if (data.eventType === 'step_created') {
           const eventData = (data as any).eventData as {
@@ -873,6 +1005,35 @@ export function createEventsStorage(
         // validation read; that closes the race where another writer
         // completes/fails the step between validation and start.
         if (data.eventType === 'step_started') {
+          if (lazyStepStart) {
+            const lazyData = data.eventData as { stepName: string; input: unknown };
+            try {
+              await tx.insert(schema.steps).values({
+                runId: effectiveRunId,
+                stepId: data.correlationId!,
+                stepName: lazyData.stepName,
+                input: lazyData.input as SerializedContent,
+                status: 'pending',
+                attempt: 0,
+                specVersion: effectiveSpecVersion,
+              });
+            } catch (error: unknown) {
+              if (isDuplicateKeyError(error, 'PRIMARY')) {
+                throw new EntityConflictError(`Step "${data.correlationId}" already created`);
+              }
+              throw error;
+            }
+            // Replay still needs to see step_created before step_started; it
+            // commits with the step row and the start, or not at all.
+            await insertEvent(tx, {
+              runId: effectiveRunId,
+              correlationId: data.correlationId,
+              eventType: 'step_created',
+              eventData: { stepName: lazyData.stepName, input: lazyData.input },
+              specVersion: effectiveSpecVersion,
+            });
+          }
+
           // Retried steps may be scheduled for later. Enforce the backoff
           // recorded by step_retrying; the runtime converts TooEarlyError
           // into a delayed re-enqueue.
@@ -974,22 +1135,14 @@ export function createEventsStorage(
         // Uses conditional UPDATE to prevent failing an already-terminal step.
         if (data.eventType === 'step_failed') {
           const eventData = (data as any).eventData as {
-            error?: any;
-            stack?: string;
+            error?: unknown;
           };
-          const errorMessage =
-            typeof eventData?.error === 'string'
-              ? eventData.error
-              : (eventData?.error?.message ?? 'Unknown error');
 
           const [updated] = await tx
             .update(schema.steps)
             .set({
               status: 'failed',
-              error: JSON.stringify({
-                message: errorMessage,
-                stack: eventData?.stack,
-              }),
+              error: eventData?.error,
               completedAt: now,
             })
             .where(
@@ -1029,23 +1182,15 @@ export function createEventsStorage(
         // Uses conditional UPDATE to prevent retrying an already-terminal step.
         if (data.eventType === 'step_retrying') {
           const eventData = (data as any).eventData as {
-            error?: any;
-            stack?: string;
+            error?: unknown;
             retryAfter?: Date;
           };
-          const errorMessage =
-            typeof eventData?.error === 'string'
-              ? eventData.error
-              : (eventData?.error?.message ?? 'Unknown error');
 
           const [updated] = await tx
             .update(schema.steps)
             .set({
               status: 'pending',
-              error: JSON.stringify({
-                message: errorMessage,
-                stack: eventData?.stack,
-              }),
+              error: eventData?.error,
               retryAfter: eventData?.retryAfter,
             })
             .where(
@@ -1142,7 +1287,6 @@ export function createEventsStorage(
               };
               const eventRow = await insertEvent(tx, {
                 runId: effectiveRunId,
-                eventId: getEventId(),
                 correlationId: data.correlationId,
                 eventType: 'hook_conflict',
                 eventData: conflictEventData,
@@ -1191,27 +1335,28 @@ export function createEventsStorage(
           }
         }
 
-        // Strip eventData from run_started; it belongs on run_created only.
-        const storedEventData =
+        // Strip eventData from run_started; it belongs on run_created only. A
+        // lazy step_started keeps its stepName (replay checks it) but drops the
+        // input, which lives on the synthetic step_created.
+        let storedEventData: unknown =
           data.eventType === 'run_started'
             ? undefined
             : 'eventData' in data
               ? data.eventData
               : undefined;
+        if (lazyStepStart) {
+          const { input: _input, ...rest } = data.eventData as Record<string, unknown>;
+          storedEventData = rest;
+        }
 
         const eventRow = await insertEvent(tx, {
           runId: effectiveRunId,
-          eventId: getEventId(),
           correlationId: data.correlationId,
           eventType: data.eventType,
           eventData: storedEventData,
           occurredAt: params?.occurredAt,
           specVersion: effectiveSpecVersion,
         });
-
-        if (advancesStateMarker) {
-          await advanceStateMarker(tx, effectiveRunId, getEventId());
-        }
 
         return { kind: 'event-created', eventRow, run, step, hook };
       });
@@ -1233,22 +1378,26 @@ export function createEventsStorage(
           eventData: outcome.conflictEventData,
           ...compact(outcome.eventRow),
           runId: effectiveRunId,
-          eventId: getEventId(),
         };
         const parsedConflict = EventSchema.parse(conflictResult);
-        return {
-          event: stripEventDataRefs(parsedConflict, resolveData),
-          run: undefined,
-          step: undefined,
-          hook: undefined,
-        };
+        return withSkippedSlots(
+          {
+            event: stripEventDataRefs(parsedConflict, resolveData),
+            run: undefined,
+            step: undefined,
+            hook: undefined,
+          },
+          effectiveRunId,
+          outcome.eventRow.eventId,
+          params?.eventCount,
+          eventsResolveData,
+        );
       }
 
       const result = {
         ...data,
         ...compact(outcome.eventRow),
         runId: effectiveRunId,
-        eventId: getEventId(),
       };
       if (data.eventType === 'run_started') {
         delete (result as any).eventData;
@@ -1266,18 +1415,37 @@ export function createEventsStorage(
         allEvents = eventRows.map((e) => {
           applyCborFallbackEvent(e);
           const p = EventSchema.parse(compact(e));
-          return stripEventDataRefs(p, resolveData);
+          return stripEventDataRefs(p, eventsResolveData);
         });
       }
 
-      return {
+      const created: EventResult = {
         event: stripEventDataRefs(parsed, resolveData),
+        // The lazy start that created the step owns it; losers got
+        // EntityConflictError above.
+        ...(lazyStepStart ? { stepCreated: true as const } : {}),
         run: outcome.run,
         step: outcome.step,
         hook: outcome.hook,
-        events: allEvents,
         ...(outcome.run ? { maxEvents } : {}),
       };
+      // The run_started preload already carries the whole log, which covers
+      // any span this write skipped.
+      if (allEvents) {
+        return {
+          ...created,
+          events: allEvents,
+          cursor: allEvents.at(-1)?.eventId ?? null,
+          hasMore: false,
+        };
+      }
+      return withSkippedSlots(
+        created,
+        effectiveRunId,
+        outcome.eventRow.eventId,
+        params?.eventCount,
+        eventsResolveData,
+      );
     },
     async get(runId, eventId, params) {
       const [value] = await drizzle
@@ -1339,13 +1507,10 @@ export function createEventsStorage(
         .from(events)
         .where(
           and(
+            // A correlation id is unique within its run, not across runs: two
+            // runs can hold the same one, so the lookup is always run-scoped.
+            eq(events.runId, params.runId),
             eq(events.correlationId, params.correlationId),
-            // A correlation id is unique within its run, not across runs, so a
-            // caller that supplies a run id gets the lookup scoped to that run.
-            // Older cores omit it and keep the previous unscoped behavior. The
-            // predicate belongs in the WHERE clause: filtering after the query
-            // would break LIMIT and the cursor.
-            map(params.runId, (id: string) => eq(events.runId, id)),
             map(params.pagination?.cursor, (c: string) => order.compare(events.eventId, c)),
           ),
         )
@@ -1365,7 +1530,7 @@ export function createEventsStorage(
         hasMore: all.length > limit,
       };
     },
-  };
+  } as Storage['events'];
 }
 
 export function createHooksStorage(drizzle: Drizzle): Storage['hooks'] {
@@ -1427,11 +1592,8 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
   const steps = schema.steps;
 
   return {
-    get: (async (runId: string | undefined, stepId: string, params?: any) => {
-      // If runId is not provided, query only by stepId
-      const whereClause = runId
-        ? and(eq(steps.stepId, stepId), eq(steps.runId, runId))
-        : eq(steps.stepId, stepId);
+    get: (async (runId: string, stepId: string, params?: any) => {
+      const whereClause = and(eq(steps.stepId, stepId), eq(steps.runId, runId));
 
       const [value] = await drizzle
         .select(params?.resolveData === 'none' ? stepColumnsWithoutData : undefined)
@@ -1445,7 +1607,7 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
         });
       }
       applyCborFallbackStep(value);
-      value.error = parseErrorJson(value.error);
+      restoreError(value);
       const deserialized = deserializeStepError(compact(value));
       const parsed = StepSchema.parse(deserialized);
       const resolveData = params?.resolveData ?? 'all';
@@ -1473,7 +1635,7 @@ export function createStepsStorage(drizzle: Drizzle): Storage['steps'] {
       return {
         data: values.map((v) => {
           applyCborFallbackStep(v);
-          v.error = parseErrorJson(v.error);
+          restoreError(v);
           const deserialized = deserializeStepError(compact(v));
           const parsed = StepSchema.parse(deserialized);
           return filterStepData(parsed, resolveData);

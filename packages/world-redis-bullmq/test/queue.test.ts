@@ -32,7 +32,8 @@ describe('createQueue workers', () => {
   ])('passes lockDuration $expected to every worker', async ({ config, expected }) => {
     const queue = createQueue(redis, { redis: 'redis://localhost:6379', ...config });
     await queue.start();
-    expect(Worker).toHaveBeenCalledTimes(2);
+    // One worker per queue kind, and v5 has a single kind.
+    expect(Worker).toHaveBeenCalledTimes(1);
     for (const [, , options] of Worker.mock.calls) {
       // An own `undefined` key would override BullMQ's default via Object.assign.
       expect('lockDuration' in options).toBe(expected !== undefined);

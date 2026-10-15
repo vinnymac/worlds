@@ -118,7 +118,6 @@ export class WorkflowRunDO extends DurableObject {
     return await this.ctx.storage.transaction(async (txn) =>
       applyEvent(storeFrom(txn), {
         ...request,
-        nextEventId: () => `wevt_${this.nextUlid()}`,
         now: new Date(),
       }),
     );

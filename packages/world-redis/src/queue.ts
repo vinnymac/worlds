@@ -2,7 +2,6 @@ import { hostname } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MessageId,
-  parseQueueName,
   type Queue,
   type QueueKind,
   type QueuePayload,
@@ -19,11 +18,8 @@ import { debug, parseWithUint8Array, stringifyWithUint8Array } from './util.js';
  */
 export interface QueueStats {
   workflowsPending: number;
-  stepsPending: number;
   workflowsDelayed: number;
-  stepsDelayed: number;
   workflowsIdempotencyKeys: number;
-  stepsIdempotencyKeys: number;
   totalPending: number;
 }
 
@@ -42,7 +38,6 @@ interface MessageEnvelope {
 
 const QUEUE_PATHNAMES = {
   workflow: 'flow',
-  step: 'step',
 } as const satisfies Record<QueueKind, string>;
 
 /** TTL for idempotency reservations. A safety net only: reservations are
@@ -211,14 +206,14 @@ function computeBackoffMs(attempt: number, config: RedisWorldConfig): number {
 }
 
 /**
- * Redis Lists queue. Two lists per world:
- * - `${prefix}flows` for workflow jobs
- * - `${prefix}steps` for step jobs
+ * Redis Lists queue. One list per world, `${prefix}flows`: workflow
+ * orchestration and queued step invocations share it, as v5 has a single
+ * queue kind.
  *
  * `queue()` atomically reserves the idempotency key and LPUSHes a JSON
  * envelope (or ZADDs it into `${list}:delayed` when delaySeconds is set).
  * Workers BLMOVE into a per-worker `${list}:processing:*` list, dispatch the
- * payload via HTTP fetch to `${baseUrl}/.well-known/workflow/v1/${flow|step}`,
+ * payload via HTTP fetch to `${baseUrl}/.well-known/workflow/v1/flow`,
  * and only then remove the entry; a crash mid-dispatch leaves the message in
  * the processing list, where the reclaimer returns it to the ready list once
  * the worker's heartbeat expires. Retries and 503-soft-retry park the message
@@ -248,7 +243,6 @@ export function createQueue(
   const prefix = config.jobPrefix || 'workflow_';
   const Queues = {
     workflow: `${prefix}flows`,
-    step: `${prefix}steps`,
   } as const satisfies Record<QueueKind, string>;
 
   const delayedKey = (listKey: string) => `${listKey}:delayed`;
@@ -273,8 +267,9 @@ export function createQueue(
   const getDeploymentId: Queue['getDeploymentId'] = async () => 'redis';
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    const { kind } = parseQueueName(queueName);
-    const listKey = Queues[kind];
+    // v5 has one queue kind: orchestration and queued step invocations
+    // share the workflow topic and the combined flow route.
+    const listKey = Queues.workflow;
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
 
     const envelope: MessageEnvelope = {
@@ -330,8 +325,9 @@ export function createQueue(
         // serialized with the matching replacer.
         const body = parseWithUint8Array<QueuePayload>(await req.text());
         const result = await handler(body, { attempt, queueName, messageId });
-        if (result && typeof result.timeoutSeconds === 'number') {
-          return Response.json({ timeoutSeconds: result.timeoutSeconds }, { status: 503 });
+        const timeoutSeconds = (result as { timeoutSeconds?: unknown } | undefined)?.timeoutSeconds;
+        if (typeof timeoutSeconds === 'number') {
+          return Response.json({ timeoutSeconds }, { status: 503 });
         }
         return Response.json({ ok: true });
       } catch (error) {
@@ -628,32 +624,17 @@ export function createQueue(
 
   async function getQueueStats(): Promise<QueueStats> {
     const flowsKey = Queues.workflow;
-    const stepsKey = Queues.step;
-
-    const [
-      workflowsPending,
-      stepsPending,
-      workflowsDelayed,
-      stepsDelayed,
-      workflowsIdempotencyKeys,
-      stepsIdempotencyKeys,
-    ] = await Promise.all([
+    const [workflowsPending, workflowsDelayed, workflowsIdempotencyKeys] = await Promise.all([
       redis.llen(flowsKey),
-      redis.llen(stepsKey),
       redis.zcard(delayedKey(flowsKey)),
-      redis.zcard(delayedKey(stepsKey)),
       countKeys(`${flowsKey}:idempotent:*`),
-      countKeys(`${stepsKey}:idempotent:*`),
     ]);
 
     const stats: QueueStats = {
       workflowsPending,
-      stepsPending,
       workflowsDelayed,
-      stepsDelayed,
       workflowsIdempotencyKeys,
-      stepsIdempotencyKeys,
-      totalPending: workflowsPending + stepsPending + workflowsDelayed + stepsDelayed,
+      totalPending: workflowsPending + workflowsDelayed,
     };
 
     debug('queue stats', stats);

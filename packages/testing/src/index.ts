@@ -40,7 +40,11 @@ export function expectEventType<E extends { eventType: string }, T extends E['ev
  * assignable to all members at once. This is an explicit, test-only widening
  * that asserts nothing. Reach for it only where the tag genuinely comes from a
  * loop, never to silence a mismatch on a fixed event type.
+ *
+ * The request type comes from the call site, so a package on another
+ * `@workflow/world` major than this one gets its own `CreateEventRequest`.
  */
-export function asEventRequest(request: unknown): CreateEventRequest {
-  return request as CreateEventRequest;
+export function asEventRequest<R = CreateEventRequest>(request: unknown): R {
+  return request as R;
 }
+export { describeV5Storage, type StorageUnderTest } from './v5-storage.js';

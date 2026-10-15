@@ -1,4 +1,4 @@
-import { SPEC_VERSION_CURRENT, type Storage, type World } from '@workflow/world';
+import { mintedSpecVersion, type Storage, type World } from '@workflow/world';
 import { Redis } from 'ioredis';
 import type { RedisWorldConfig } from './config.js';
 import { createQueue, type QueueStats } from './queue.js';
@@ -10,8 +10,13 @@ import {
 } from './storage.js';
 import { createStreamer } from './streamer.js';
 
-function createStorage(redis: Redis, keyPrefix: string, maxEventsPerRun?: number): Storage {
-  const config = { redis, keyPrefix, maxEventsPerRun };
+function createStorage(
+  redis: Redis,
+  keyPrefix: string,
+  specVersion: number,
+  maxEventsPerRun?: number,
+): Storage {
+  const config = { redis, keyPrefix, specVersion, maxEventsPerRun };
   return {
     runs: createRunsStorage(config),
     events: createEventsStorage(config),
@@ -42,18 +47,19 @@ export function createWorld(
   const keyPrefix = config.keyPrefix || 'workflow:';
 
   const queue = createQueue(redis, config);
-  const storage = createStorage(redis, keyPrefix, config.maxEventsPerRun);
+  // The version stamped on new runs: the sealed-log version by default, or
+  // slot identity when WORKFLOW_SEALED_LOG=0. Read per world, not at module
+  // load. Events are allocated at commit, so no position is ever left empty
+  // and this World never writes a `noop`.
+  const specVersion = mintedSpecVersion();
+  const storage = createStorage(redis, keyPrefix, specVersion, config.maxEventsPerRun);
   const streamer = createStreamer({ redis, keyPrefix });
 
   return {
     ...storage,
     ...streamer,
     ...queue,
-    // Declares support for the CBOR/binary-safe queue transport so core
-    // attaches runInput to workflow messages (resilient start). The queue
-    // serializes payloads with a tagged-JSON transport that round-trips
-    // Uint8Array values through BullMQ job data.
-    specVersion: SPEC_VERSION_CURRENT,
+    specVersion,
     async start() {
       await queue.start();
     },
